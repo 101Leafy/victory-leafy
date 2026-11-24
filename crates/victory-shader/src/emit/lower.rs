@@ -1210,8 +1210,9 @@ fn own_bits_on() -> bool {
 /// wave, the view heap's limit, where the raw twins of its views start, and
 /// what it writes for the console's own hardware.
 pub fn host_settings() -> [u32; 4] {
-    // (bit 31 of the last: `VICTORY_COLOR_FINITE`, so the key is the same while it is off)
-    let rdna = host_rdna() | u32::from(color_finite_on()) << 31;
+    // (bit 31 of the last: `VICTORY_COLOR_FINITE`, bit 30: helper lane waves, so the key is
+    // the same while they are off)
+    let rdna = host_rdna() | u32::from(color_finite_on()) << 31 | u32::from(super::helper_lane_waves()) << 30;
     [host_max_wave(), super::shader::view_heap_limit(), super::shader::raw_views(), rdna]
 }
 
@@ -5412,7 +5413,8 @@ impl<'a> Lower<'a> {
     /// along every triangle's edges (upstream #908, the fix of #1733 for this tree's form).
     fn first_lane(&mut self, x: V, guard: Option<V>) -> (V, V) {
         let (first, any) = self.first_live_lane(x, guard);
-        if !self.s.pixel || !super::helper_own() {
+        // (With shader model 6.7 the host's wave operations take helper lanes in.)
+        if !self.s.pixel || !super::helper_own() || super::helper_lane_waves() {
             return (first, any);
         }
         let helper = self.helper_lane();
