@@ -1594,6 +1594,21 @@ impl<'a> Lower<'a> {
                     || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
                     || reads_mask_as_data(x.st, i)
             }) || lane_constant_masks(x.st)
+                // (selects and carry-ins on a mask no rule followed test this lane's bit)
+                || insts().any(|i| {
+                    matches!(
+                        i.name(),
+                        "v_cndmask_b32" | "v_add_co_ci_u32" | "v_sub_co_ci_u32" | "v_subrev_co_ci_u32"
+                    ) && match &i.fields {
+                        Fields::Valu(v) => match v.src.get(2) {
+                            Some(&Operand::Scalar { code, .. }) => {
+                                i.read(Reg::S(code)).is_none_or(|m| !x.st.masks.contains_key(&m))
+                            }
+                            _ => false,
+                        },
+                        _ => false,
+                    }
+                })
                 // (a branch the wave takes together asks the wave)
                 || !x.st.wide.is_empty();
             let mut wave = if x.native.wave64 { 64 } else { 32 };
@@ -4897,6 +4912,67 @@ impl<'a> Lower<'a> {
         // ("WAVE64-WIDE stopped ... a branch around it cannot be", measured on
         // water_shading:CS_TransmissionVolumetrics_VolumePortalsOnly 2026-11-26).
         self.exchange.as_ref().is_none_or(|(_, _, all)| all.get(b).copied().unwrap_or(true))
+    }
+
+    /// This lane's select condition from a mask operand (`v_cndmask_b32`,
+    /// `*_ci_u32`): the tracked boolean when `structure` followed it, an inline
+    /// 0 or -1 as a constant, or with console lanes this lane's bit of the
+    /// register (the pair in wave64).
+    fn mask_cond(
+        &mut self,
+        inst: &Inst,
+        op: Option<&Operand>,
+        at: usize,
+        err: Why,
+    ) -> Result<V, Why> {
+        let held = |l: &mut Self| {
+            // Each host wave taken as a wave of its own has no console lane
+            // numbers to pick the bits by.
+            if l.local {
+                return Err("a constant lane mask in a half-wave");
+            }
+            l.cross_lane(false)
+        };
+        match op {
+            Some(&Operand::Const(k)) => {
+                let x = crate::resource::inline(k).ok_or(err)?;
+                if x == 0 {
+                    Ok(self.s.m.bool(false))
+                } else if x == u32::MAX {
+                    Ok(self.s.m.bool(true))
+                } else if self.console_lanes && self.mask_data == MaskData::Console {
+                    held(self)?;
+                    let lo = self.s.m.i32(x);
+                    let hi = self.s.m.i32(if (x as i32) < 0 { u32::MAX } else { 0 });
+                    Ok(self.lane_bit(at, lo, Some(hi)))
+                } else {
+                    Err("a constant lane mask")
+                }
+            }
+            Some(&Operand::Scalar { code, .. }) => {
+                let mask = inst.read(Reg::S(code));
+                if let Some(m) = mask.and_then(|v| self.x.st.masks.get(&v).copied()) {
+                    return self.boolean(m, at);
+                }
+                // A mask the code holds as a number (a constant bit pattern:
+                // every other lane, every other pair...): this lane's bit of
+                // it. Exact where host lanes are the console's.
+                if !self.console_lanes || self.mask_data != MaskData::Console {
+                    return Err(err);
+                }
+                held(self)?;
+                let lo = self.i32_of(mask.ok_or(err)?).map_err(|_| err)?;
+                // wave64: the register after it holds lanes 32-63.
+                let hi = if self.x.native.wave64 {
+                    let h = inst.read(Reg::S(code + 1)).ok_or(err)?;
+                    Some(self.i32_of(h).map_err(|_| err)?)
+                } else {
+                    None
+                };
+                Ok(self.lane_bit(at, lo, hi))
+            }
+            _ => Err(err),
+        }
     }
 
     /// This lane's bit of the mask `lo`, `hi` (wave64).
@@ -9040,41 +9116,8 @@ impl<'a> Lower<'a> {
                 float(self, r)
             }
             "v_cndmask_b32" => {
-                let mask = match v.src.get(2) {
-                    Some(&Operand::Scalar { code, .. }) => inst.read(Reg::S(code)),
-                    _ => None,
-                };
-                const UNTRACKED: Why = "a select on an untracked mask";
-                let cond = match mask.and_then(|m| self.x.st.masks.get(&m).copied()) {
-                    Some(m) => self.boolean(m, c)?,
-                    // A mask the code holds as a number (a constant bit
-                    // pattern: every other lane, every other pair...):
-                    // this lane's bit of it. Exact where host lanes are
-                    // the console's.
-                    None if self.mask_data == MaskData::Console => {
-                        // Each host wave taken as a wave of its own has no
-                        // console lane numbers to pick the bits by.
-                        if self.local {
-                            return Err("a constant lane mask in a half-wave");
-                        }
-                        let m = mask.ok_or(UNTRACKED)?;
-                        let lo = self.i32_of(m).map_err(|_| UNTRACKED)?;
-                        // wave64: the register after it holds lanes 32-63.
-                        let high = match v.src.get(2) {
-                            Some(&Operand::Scalar { code, .. }) if self.x.native.wave64 => {
-                                Some(inst.read(Reg::S(code + 1)).ok_or(UNTRACKED)?)
-                            }
-                            _ => None,
-                        };
-                        let hi = match high {
-                            Some(h) => Some(self.i32_of(h).map_err(|_| UNTRACKED)?),
-                            None => None,
-                        };
-                        self.cross_lane(false)?;
-                        self.lane_bit(c, lo, hi)
-                    }
-                    None => return Err(UNTRACKED),
-                };
+                let cond =
+                    self.mask_cond(inst, v.src.get(2), c, "a select on an untracked mask")?;
                 if v.abs != 0 || v.neg != 0 {
                     let (a, bb) = (f(self, 0)?, f(self, 1)?);
                     let r = self.s.m.select(c, cond, bb, a);
@@ -9092,14 +9135,12 @@ impl<'a> Lower<'a> {
                     std::mem::swap(&mut a, &mut bb);
                 }
                 let cin = if name.ends_with("_ci_u32") {
-                    let m = match v.src.get(2) {
-                        Some(&Operand::Scalar { code, .. }) => inst.read(Reg::S(code)),
-                        _ => None,
-                    };
-                    let m = m
-                        .and_then(|m| self.x.st.masks.get(&m).copied())
-                        .ok_or("a carry-in from an untracked mask")?;
-                    Some(self.boolean(m, c)?)
+                    Some(self.mask_cond(
+                        inst,
+                        v.src.get(2),
+                        c,
+                        "a carry-in from an untracked mask",
+                    )?)
                 } else {
                     None
                 };
