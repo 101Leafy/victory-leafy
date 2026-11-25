@@ -90,7 +90,14 @@ pub(crate) struct Lowered {
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
+    /// Whether depth and stencil are tested before it runs.
+    #[cfg(test)]
+    pub early_depth: bool,
 }
+
+/// `DB_SHADER_CONTROL.DEPTH_BEFORE_SHADER` (AMD's register headers, as in
+/// Linux's `gc_10_3_0_sh_mask.h`).
+const DEPTH_BEFORE_SHADER: u32 = 1 << 12;
 
 pub(crate) struct Parts<'a> {
     pub native: &'a NativeProgram,
@@ -1746,6 +1753,18 @@ impl<'a> Lower<'a> {
                 s.wave_size = Some(wave);
             }
         }
+        // The console tests depth and stencil before the program runs
+        // (`DB_SHADER_CONTROL.DEPTH_BEFORE_SHADER`, bit 12, as the compiler
+        // sets it for `[earlydepthstencil]`): so must the host. Without the
+        // flag a host runs a program that writes unordered views for hidden
+        // pixels too, tests depth after it, and keeps those writes.
+        if let StageIo::Ps {
+            db_shader_control, ..
+        } = &x.native.io
+            && db_shader_control & DEPTH_BEFORE_SHADER != 0
+        {
+            s.flags |= flags::EARLY_DEPTH;
+        }
         // The title's barriers a thread of the group may never reach, which
         // leaves the others waiting on the host: those in blocks some lanes
         // do not run, and all of them in a program with a loop closed by a
@@ -2834,6 +2853,8 @@ impl<'a> Lower<'a> {
             barrier_modes: self.s.m.barrier_modes(),
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
+            #[cfg(test)]
+            early_depth: self.s.flags & flags::EARLY_DEPTH != 0,
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -13233,6 +13254,85 @@ mod tests {
             let shader = shader.unwrap_or_else(|e| panic!("wave64={wave64}, host={host}: {e:?}"));
             assert_eq!(shader.barrier_modes, vec![expected]);
         }
+    }
+
+    /// A pixel program the console runs after the depth test
+    /// (`DEPTH_BEFORE_SHADER`) runs after it on the host too
+    /// (`[earlydepthstencil]`): it writes an unordered view, so without the
+    /// flag the host would run it, and keep its writes, for hidden pixels.
+    /// Without the bit it is not forced.
+    #[test]
+    fn pixel_programs_tested_before_they_run_keep_that_order() {
+        let code: Vec<u32> = vec![
+            0xBE84_0308, // s_mov_b32 s4, s8
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF40C_0302,
+            0xFA00_0000, // s_load_dwordx8 s[12:19], s[4:5], 0x0
+            0x7E00_0280, // v_mov_b32 v0, 0
+            0x7E02_0280, // v_mov_b32 v1, 0
+            0x7E04_02F2, // v_mov_b32 v2, 1.0
+            0x7E06_0280, // v_mov_b32 v3, 0
+            0x7E08_0280, // v_mov_b32 v4, 0
+            0x7E0A_02F2, // v_mov_b32 v5, 1.0
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0xF020_1F08,
+            0x0003_0200, // image_store v[2:5], v[0:1], s[12:19] dmask:0xf dim:2D unorm
+            0xF800_1890,
+            0x0000_0000, // exp null off, off, off, off done vm
+            S_ENDPGM,
+        ];
+        let lowered = |db_shader_control| {
+            let native = NativeProgram {
+                stage: HwStage::Ps,
+                wave64: true,
+                vgprs: 8,
+                layout: vec![RootParam {
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data: 8,
+                    slot: 0,
+                }],
+                used: vec![UsedResource {
+                    kind: ResourceType::Uav,
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    lower_bound: 0,
+                    stride: 0,
+                    dwords: 8,
+                    user_data: 8,
+                    slot: 0,
+                }],
+                io: StageIo::Ps {
+                    inputs: vec![],
+                    input_addr: 0,
+                    db_shader_control,
+                    patches: vec![],
+                },
+                code: code.iter().flat_map(|w| w.to_le_bytes()).collect(),
+            };
+            let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+            let st = structure::structure(&p).unwrap();
+            let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+            let io = io::raise(&p, &native).unwrap();
+            lower(&Parts {
+                native: &native,
+                p: &p,
+                st: &st,
+                io: &io,
+                res: &res,
+                inputs: vec![],
+                outputs: vec![],
+                prims: vec![],
+                mesh_stride: 0,
+            })
+            .unwrap()
+        };
+        // DEPTH_BEFORE_SHADER, with the Z order the console pairs it with
+        // (early Z then late Z, bits 4-5).
+        assert!(lowered(1 << 12 | 1 << 4).early_depth);
+        assert!(!lowered(1 << 4).early_depth);
     }
 
     #[test]
