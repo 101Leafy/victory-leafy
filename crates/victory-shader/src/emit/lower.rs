@@ -402,6 +402,9 @@ struct Lower<'a> {
     /// handed to host waves (`wave_base`), and the base made in the entry block.
     halves: Option<u32>,
     wave_base: Option<V>,
+    /// Console lanes in a group that is not 1-D, in the console's wave size: the LDS dword of
+    /// `wave_base`'s counter, which gives the relabelled threads their ids (`thread_id`).
+    ticket: Option<u32>,
     /// A dispatch whose last group may be short, with EXEC on entry the launched lanes
     /// ([`Structured::launched`]): whether this thread was launched (made in the entry block),
     /// and the console wave's EXEC on entry as two dwords once asked for.
@@ -1556,6 +1559,8 @@ impl<'a> Lower<'a> {
         let mut exchange: Option<(u32, bool, Vec<bool>)> = None;
         // a console wave64 program in host waves of 32: the LDS dword of `wave_base`'s counter
         let mut halves: Option<u32> = None;
+        // console lanes in a 2-D or 3-D group: the LDS dword of `wave_base`'s counter
+        let mut ticket: Option<u32> = None;
         // D3D12 caps thread-group shared memory at 32 KiB (8,192 dwords).
         const MAX_LDS_DWORDS: u32 = 8192;
         let paired = PAIRED.get() && x.native.wave64 && host_max_wave() == 32;
@@ -1727,6 +1732,15 @@ impl<'a> Lower<'a> {
                 let slot = if s.lds_dwords < MAX_LDS_DWORDS { s.lds_dwords } else { 0 };
                 s.lds_dwords = s.lds_dwords.max(slot + 1);
                 halves = Some(slot);
+            } else if console_lanes && (cs.threads[1], cs.threads[2]) != (1, 1) && group > wave {
+                // A host may put threads of several rows into one wave (NVIDIA fills 2-D groups
+                // 24, 32 or 64 wide, or not a power of two wide, with 16 x 2 tiles), where the
+                // wave's first flat id rounded down gives two waves one base: each wave takes
+                // its run of ids from a counter instead (`wave_base`). 1-D groups keep the
+                // rounding, as hosts put their threads into waves in order.
+                let slot = if s.lds_dwords < MAX_LDS_DWORDS { s.lds_dwords } else { 0 };
+                s.lds_dwords = s.lds_dwords.max(slot + 1);
+                ticket = Some(slot);
             }
             if console_lanes || one_wave && s.lds_dwords > 0 {
                 s.wave_size = Some(wave);
@@ -1902,6 +1916,7 @@ impl<'a> Lower<'a> {
             pair: None,
             halves,
             wave_base: None,
+            ticket,
             launched: None,
             launched_exec: None,
             flat: None,
@@ -4582,9 +4597,11 @@ impl<'a> Lower<'a> {
     /// consecutive thread indices (NVIDIA's 8 x 8 groups), so each wave takes the next 32 (64)
     /// from an LDS counter instead: every thread zeroes it, the group meets, each wave's first
     /// lane adds 32 (64) and the wave takes what it found. Branch-free, in the entry block,
-    /// which every thread runs.
+    /// which every thread runs. With `ticket`, the same in the console's wave size. A group
+    /// that does not fill its last host wave: only full waves add, and the one partial wave
+    /// (the group's last threads, its lanes from 0) takes the last run.
     fn wave_base(&mut self) -> Option<V> {
-        let slot = self.halves?;
+        let slot = self.halves.or(self.ticket)?;
         if let Some(v) = self.wave_base {
             return Some(v);
         }
@@ -4597,11 +4614,41 @@ impl<'a> Lower<'a> {
         self.group_sync(e);
         let lane = self.s.op(e, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
         let first = self.s.m.cmp(e, pred::EQ, lane, zero);
-        let step = self.s.m.i32(if self.twin.is_some() { 64 } else { 32 });
-        let add = self.s.m.select(e, first, step, zero);
+        let host = self.s.wave_size.unwrap_or(32);
+        let step = if self.twin.is_some() {
+            64
+        } else if self.halves.is_some() {
+            32
+        } else {
+            host
+        };
+        let group = self.s.threads.map_or(0, |t| t.iter().product::<u32>());
+        let full = (group % host != 0).then(|| {
+            let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+            let on = self.s.m.bool(true);
+            let ballot = self.s.op(e, "waveActiveBallot", Attr::NoUnwind, four, 116, &[on]);
+            let mut live = zero;
+            for word in 0..host.div_ceil(32) {
+                let w = self.s.m.extract(e, ballot, word);
+                let n = self.s.op(e, "unaryBits.i32", Attr::ReadNone, i32t, 31, &[w]);
+                live = self.s.m.bin(e, Bin::Add, live, n);
+            }
+            let hk = self.s.m.i32(host);
+            self.s.m.cmp(e, pred::EQ, live, hk)
+        });
+        let first = match full {
+            Some(f) => self.s.m.bin(e, Bin::And, first, f),
+            None => first,
+        };
+        let stepk = self.s.m.i32(step);
+        let add = self.s.m.select(e, first, stepk, zero);
         let ptr = self.s.m.element(e, lds, k);
         let old = self.s.m.atomic(e, Rmw::Add, ptr, add);
-        let base = self.s.op(e, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[old]);
+        let mut base = self.s.op(e, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[old]);
+        if let Some(f) = full {
+            let last = self.s.m.i32(group / host * step);
+            base = self.s.m.select(e, f, base, last);
+        }
         self.s.flags |= flags::WAVE_OPS;
         // a counter in the program's own LDS (the paired form's, when it has no dword to
         // spare): every wave has its base before any thread runs the program
@@ -5210,9 +5257,10 @@ impl<'a> Lower<'a> {
 
     /// Component `c` of the thread id in the group. With console lanes, the
     /// thread is relabelled so that its host lane is its console lane: the
-    /// flat id is the wave's first lane's, rounded down to the wave size,
-    /// plus the lane index. (A bijection while each host wave holds a
-    /// wave-aligned run of flat ids, as the console's waves do.) In the paired form, of the
+    /// flat id is the wave's base plus the lane index. In a 1-D group the base
+    /// is the wave's first flat id rounded down to the wave size (a bijection
+    /// while each host wave holds a wave-aligned run of flat ids, as hosts
+    /// give 1-D groups); in others it comes from `wave_base`. In the paired form, of the
     /// console lane being lowered, in the console's group (the host's is a row of half as
     /// many threads).
     fn thread_id(&mut self, c: u8) -> Val {
@@ -5238,25 +5286,30 @@ impl<'a> Lower<'a> {
                 _ => self.s.m.bin(e, Bin::UDiv, f, xy),
             });
         }
-        let flat = self.s.op(
-            e,
-            "flattenedThreadIdInGroup.i32",
-            Attr::ReadNone,
-            i32t,
-            96,
-            &[],
-        );
-        let first = self.s.op(
-            e,
-            "waveReadLaneFirst.i32",
-            Attr::NoUnwind,
-            i32t,
-            118,
-            &[flat],
-        );
-        let wave = self.s.wave_size.expect("set with console lanes");
-        let mask = self.s.m.i32(!(wave - 1));
-        let base = self.s.m.bin(e, Bin::And, first, mask);
+        let base = match self.wave_base() {
+            Some(base) => base,
+            None => {
+                let flat = self.s.op(
+                    e,
+                    "flattenedThreadIdInGroup.i32",
+                    Attr::ReadNone,
+                    i32t,
+                    96,
+                    &[],
+                );
+                let first = self.s.op(
+                    e,
+                    "waveReadLaneFirst.i32",
+                    Attr::NoUnwind,
+                    i32t,
+                    118,
+                    &[flat],
+                );
+                let wave = self.s.wave_size.expect("set with console lanes");
+                let mask = self.s.m.i32(!(wave - 1));
+                self.s.m.bin(e, Bin::And, first, mask)
+            }
+        };
         let lane = self.lane_index();
         let f = self.s.m.bin(e, Bin::Add, base, lane);
         self.s.flags |= flags::WAVE_OPS;

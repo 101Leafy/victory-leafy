@@ -96,6 +96,8 @@ mod intersect_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
 mod idiom;
+#[cfg(all(test, windows))]
+mod lane_order_tests;
 mod link;
 pub(crate) mod lower;
 mod own_bits;

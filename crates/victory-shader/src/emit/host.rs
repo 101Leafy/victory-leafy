@@ -288,6 +288,23 @@ impl Host {
         unsafe { self.device.CreateComputePipelineState(&desc) }.map_err(|e| self.explained(e))
     }
 
+    /// The wave sizes this device runs, fewest and most lanes
+    /// (`D3D12_FEATURE_D3D12_OPTIONS1`); a program declaring a wave size
+    /// outside them is refused.
+    pub fn wave_lanes(&self) -> Result<(u32, u32), String> {
+        let mut o = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+        // SAFETY: the feature query writes the structure of the given size.
+        unsafe {
+            self.device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS1,
+                (&raw mut o).cast(),
+                size_of_val(&o) as u32,
+            )
+        }
+        .map_err(err)?;
+        Ok((o.WaveLaneCountMin, o.WaveLaneCountMax))
+    }
+
     /// The error with the debug layer's messages since the last call, if
     /// the layer is on (`VICTORY_D3D12_DEBUG`).
     fn explained(&self, e: windows::core::Error) -> String {
