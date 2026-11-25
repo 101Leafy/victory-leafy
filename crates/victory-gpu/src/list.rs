@@ -703,6 +703,24 @@ pub(crate) struct Barrier {
     last: u64,
 }
 
+/// An unordered access barrier on `texture`, or on every resource when the
+/// host texture has no unordered access: naming it then is a debug layer
+/// error (523, missing bind flags) and `Close` fails with `E_INVALIDARG`.
+#[cfg(windows)]
+fn uav_barrier_for(texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource) -> Barrier {
+    use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    use windows::core::Interface;
+    // SAFETY: a plain query on a live host resource.
+    let flags = unsafe { texture.GetDesc() }.Flags;
+    if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
+        return UAV_BARRIER;
+    }
+    Barrier {
+        first: texture.as_raw().cast_const().cast(),
+        ..UAV_BARRIER
+    }
+}
+
 /// The barrier on host resources, or `None` if it names a resource the host
 /// GPU does not have (buffers so far).
 #[cfg(windows)]
@@ -741,20 +759,16 @@ fn host_barrier(list: &crate::host::HostList, b: &Barrier) -> Option<Barrier> {
             },
             ..*b
         }),
-        2 => Some(Barrier {
-            first: if b.first.is_null() {
-                b.first
-            } else {
-                // A depth texture's unordered access is its colour twin's
-                // (the host gives the depth texture none): the barrier is
-                // on the texture shaders write.
-                match crate::resource::twin_resource(b.first) {
-                    Some(twin) => twin.as_raw().cast_const().cast(),
-                    None => host(b.first)?,
-                }
+        2 if b.first.is_null() => Some(UAV_BARRIER),
+        // A depth texture's unordered access is its colour twin's (the host
+        // gives the depth texture none): the barrier is on the texture
+        // shaders write. Console barrier flags are dropped.
+        2 => Some(uav_barrier_for(
+            match crate::resource::twin_resource(b.first) {
+                Some(twin) => twin,
+                None => crate::resource::host_resource(b.first)?,
             },
-            ..*b
-        }),
+        )),
         _ => None,
     }
 }
@@ -1791,19 +1805,10 @@ extern "system" fn clear_rtv(
             unsafe { std::slice::from_raw_parts(rects.cast(), count as usize) }
         });
         const RENDER_TARGET: u32 = 0x4;
+        ensure_state(list, record.resource, RENDER_TARGET);
         let rtv = host.rtv(Some(texture), record.desc().as_ref());
         // SAFETY: an open list, a fresh view of a live texture.
-        unsafe {
-            if let Some((_, before)) = list.transition(record.resource, RENDER_TARGET) {
-                use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATES as State;
-                list.list.ResourceBarrier(&[crate::host::transition(
-                    texture,
-                    State(before as i32),
-                    State(RENDER_TARGET as i32),
-                )]);
-            }
-            list.list.ClearRenderTargetView(rtv, color, rects);
-        }
+        unsafe { list.list.ClearRenderTargetView(rtv, color, rects) };
     }
     #[cfg(not(windows))]
     let _ = (this, handle, color, count, rects);
@@ -2917,6 +2922,70 @@ mod tests {
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         for object in [buffer, list, allocator] {
             assert_eq!(release(object), 0);
+        }
+    }
+
+    /// An unordered access barrier on a host texture without unordered access
+    /// (a depth texture) becomes one on every resource, and the list closes.
+    #[cfg(windows)]
+    #[test]
+    fn uav_barrier_on_non_uav_texture_falls_back_to_global() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::*;
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let make = |format, flags, initial| -> ID3D12Resource {
+            let heap = D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_DEFAULT,
+                ..Default::default()
+            };
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: 4,
+                Height: 4,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: format,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
+                Flags: flags,
+                ..Default::default()
+            };
+            let mut texture: Option<ID3D12Resource> = None;
+            // SAFETY: a small texture on the live host device.
+            unsafe {
+                host.device
+                    .CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, initial, None, &mut texture)
+                    .unwrap();
+            }
+            texture.unwrap()
+        };
+        let depth = make(
+            DXGI_FORMAT_R32_TYPELESS,
+            D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
+            D3D12_RESOURCE_STATE_DEPTH_WRITE,
+        );
+        let colour = make(
+            DXGI_FORMAT_R8G8B8A8_UNORM,
+            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        );
+        let on_depth = uav_barrier_for(&depth);
+        assert_eq!(on_depth.kind, 2);
+        assert!(on_depth.first.is_null());
+        let on_colour = uav_barrier_for(&colour);
+        assert_eq!(on_colour.kind, 2);
+        assert!(!on_colour.first.is_null());
+        let list = host.new_list().expect("host command list");
+        // SAFETY: the host's barrier layout; live resources.
+        unsafe {
+            let barriers = [
+                std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(on_depth),
+                std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(on_colour),
+            ];
+            list.list.ResourceBarrier(&barriers);
+            list.list.Close().expect("the list closes");
         }
     }
 }
