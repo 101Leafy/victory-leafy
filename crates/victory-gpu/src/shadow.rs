@@ -434,7 +434,8 @@ pub(crate) fn card_stats() -> [u64; 10] {
 /// for each 64 KiB piece (a copy that does not start on a piece boundary
 /// has one piece more).
 pub(crate) fn card_hash_bytes(size: u64) -> u64 {
-    (size / PIECE as u64 + 2) * 16
+    let each = if crate::host::card_pages() { 64 * 16 } else { 16 };
+    (size / PIECE as u64 + 2) * each
 }
 
 /// A buffer of `size` bytes in the card's memory for a title buffer's
@@ -1214,6 +1215,22 @@ fn card_piece_of(start: usize, len: usize, span: &CardSpan, i: u32) -> (usize, u
     (lo.max(span.from as usize), hi.min(span.to as usize))
 }
 
+/// The runs of `lo..hi` in the pages of `mask`, page p `base + 4096 * p` on.
+fn pages_of(base: usize, lo: usize, hi: usize, mask: u16) -> Vec<(usize, usize)> {
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    for p in (0..16).filter(|p| mask & (1 << p) != 0) {
+        let (a, b) = ((base + p * 4096).max(lo), (base + (p + 1) * 4096).min(hi));
+        if a >= b {
+            continue;
+        }
+        match runs.last_mut() {
+            Some(last) if last.1 == a => last.1 = b,
+            _ => runs.push((a, b)),
+        }
+    }
+    runs
+}
+
 /// The offsets [`Shadow::card_hashed`] gives, for a card's buffer of `size`
 /// bytes for title memory from `start` on.
 fn card_hashed_of(start: usize, size: usize, piece: usize) -> (usize, usize) {
@@ -1223,7 +1240,16 @@ fn card_hashed_of(start: usize, size: usize, piece: usize) -> (usize, usize) {
 
 #[cfg(test)]
 mod card_tests {
-    use super::{CardSpan, PIECE, card_hashed_of, card_piece_of, card_span_of, joined, joined_piece_runs};
+    use super::{CardSpan, PIECE, card_hashed_of, card_piece_of, card_span_of, joined, joined_piece_runs, pages_of};
+
+    /// Changed pages come down as runs, cut to what the range holds.
+    #[test]
+    fn changed_pages_are_fetched_as_runs() {
+        assert_eq!(pages_of(0, 0, 65536, 0b1011), vec![(0, 8192), (12288, 16384)]);
+        assert_eq!(pages_of(0x1000, 0x1800, 0x3800, 0b11), vec![(0x1800, 0x3000)]);
+        assert_eq!(pages_of(0, 0, 0x800, 0b10), Vec::<(usize, usize)>::new());
+        assert_eq!(pages_of(0, 0, 65536, 0x8000), vec![(61440, 65536)]);
+    }
 
     /// `card_dirty` takes the copies touched since its last call, from the
     /// list they went into when touched ([`super::TOUCHED`]), each once, and
@@ -5878,6 +5904,17 @@ impl Shadow {
     /// The offsets of piece `i` of `span` that lie in the span.
     pub(crate) fn card_piece(&self, span: &CardSpan, i: u32) -> (usize, usize) {
         card_piece_of(self.start as usize, self.len as usize, span, i)
+    }
+
+    /// Of piece `i` of `span`, what lies in the pages `mask` names (bit p:
+    /// the 4 KiB from 4 KiB times p on from where the card hashes the piece),
+    /// joined where they touch. All of the piece for a full mask.
+    pub(crate) fn card_pages(&self, span: &CardSpan, i: u32, mask: u16) -> Vec<(usize, usize)> {
+        let (lo, hi) = self.card_piece(span, i);
+        if mask == u16::MAX {
+            return vec![(lo, hi)];
+        }
+        pages_of(self.card_hashed(span.first + i).0, lo, hi, mask)
     }
 
     /// The piece that holds offset `at`.

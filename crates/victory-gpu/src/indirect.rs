@@ -1052,6 +1052,67 @@ void main() {
         assert_eq!(run(&mut warp, 2), [0, 0, 0]);
     }
 
+    /// The compare built with `PAGES` (`VICTORY_CARD_PAGES`): above the flag,
+    /// the 4 KiB pages that differ, from where the piece starts in the copy.
+    #[test]
+    fn warp_card_compare_with_pages_tells_the_pages() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        let source = format!("#define PAGES 1\n{}", crate::host::CARD_COMPARE);
+        let compare = compile_cs(&warp.device, &source).expect("the card compare with pages must compile on WARP");
+        const PIECE: usize = 64 << 10;
+        const PIECES: u32 = 2;
+        // The copy starts 0x1800 into its first piece.
+        const SKEW: usize = 0x1800;
+        let size = PIECE * PIECES as usize;
+        let (_now, now_ptr, now_gpu) = warp.shared_buffer(size as u64);
+        let (_hashes, _, hashes_gpu) = warp.shared_buffer(64 * 16 * u64::from(PIECES));
+        let (_differs, differs_ptr, differs_gpu) = warp.shared_buffer(64);
+        let content: Vec<u8> = (0..size).map(|i| (i * 31 + i / 251) as u8).collect();
+        // SAFETY: the mapping holds `size` bytes.
+        unsafe { std::ptr::copy_nonoverlapping(content.as_ptr(), now_ptr, size) };
+        let run = |warp: &mut WarpHarness, mode: u32| -> [u32; 2] {
+            // SAFETY: our open list, live buffers, the compare's own root
+            // signature; the mappings hold what is read and written.
+            unsafe {
+                for piece in 0..PIECES as usize {
+                    differs_ptr.cast::<u32>().add(piece).write_volatile(7);
+                }
+                warp.list.SetComputeRootSignature(&compare.root);
+                warp.list.SetPipelineState(&compare.pso);
+                let constants = [0u32, SKEW as u32, size as u32, PIECES, 0, mode];
+                warp.list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+                warp.list.SetComputeRootShaderResourceView(1, now_gpu);
+                warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
+                warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
+                warp.list.Dispatch(PIECES, 1, 1);
+            }
+            warp.submit_and_wait();
+            // SAFETY: as above.
+            [0, 1].map(|piece| unsafe { differs_ptr.cast::<u32>().add(piece).read_volatile() })
+        };
+        // SAFETY (each): inside the mapping.
+        let set = |at: usize, value: u8| unsafe { now_ptr.add(at).write_volatile(value) };
+        assert_eq!(run(&mut warp, 0), [7, 7]);
+        assert_eq!(run(&mut warp, 2), [0, 0]);
+        // Piece 0 holds the copy's first 0xE800 bytes, its pages from 0 on;
+        // piece 1 starts at 0xE800.
+        let (a, b, c) = (0x2345, 0xE800 + 0x1000 * 5 + 17, 0xE800 + 0x1000 * 15 + 4095);
+        set(a, content[a] ^ 1);
+        set(b, content[b] ^ 1);
+        set(c, content[c] ^ 1);
+        let found = run(&mut warp, 2);
+        assert_eq!(found[0], 1 | (1 << (1 + 2)));
+        assert_eq!(found[1], 1 | (1 << (1 + 5)) | (1 << (1 + 15)));
+        assert_eq!(crate::host::changed_pages(found[1]), (1 << 5) | (1 << 15));
+        assert_eq!(run(&mut warp, 2), [0, 0]);
+        // Changed back, told 1: flagged against the stored hashes, which stay.
+        set(a, content[a]);
+        assert_eq!(run(&mut warp, 1), [1 | (1 << 3), 0]);
+        assert_eq!(run(&mut warp, 1), [1 | (1 << 3), 0]);
+    }
+
     /// The fetch inside flights (`crate::host::CARD_FETCH`), on the software
     /// adapter, as `Host::card_before` records it behind the compare (tickets,
     /// a UAV barrier, copies into a staging buffer in the card's memory) and

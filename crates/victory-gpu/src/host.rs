@@ -3349,6 +3349,10 @@ static CARD_WORK: Mutex<Option<CardWork>> = Mutex::new(None);
 /// Built with `TABLE` ([`card_batch`]), a group takes its piece, its mode
 /// and the dwords of `differs` it answers for from a table, so that one
 /// dispatch holds every piece of a copy that a list hashes or compares.
+///
+/// Built with `PAGES` ([`card_pages`]), four threads take each 4 KiB page of
+/// the piece and every thread keeps its own hash: the dword gets, above the
+/// flag, which of the 16 pages differ, and only those are fetched.
 pub(crate) const CARD_COMPARE: &str = r#"
 #ifdef TABLE
 #define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), UAV(u0), UAV(u1), SRV(t1)"
@@ -3375,10 +3379,21 @@ RWByteAddressBuffer differs : register(u1);
 // dispatch, so its hash is read before it is stored.
 ByteAddressBuffer table : register(t1);
 #endif
+#ifdef PAGES
+// 16 bytes per thread of each piece in `hashes`; bit p: page p differs.
+groupshared uint pages_changed;
+#define STEP 64u
+#else
 groupshared uint4 parts[64];
+#define STEP 1024u
+#endif
 [RootSignature(RS)]
 [numthreads(64, 1, 1)]
 void main(uint3 id : SV_GroupID, uint thread : SV_GroupIndex) {
+#ifdef PAGES
+    if (thread == 0u) pages_changed = 0u;
+    GroupMemoryBarrierWithGroupSync();
+#endif
 #ifdef TABLE
     uint4 entry = table.Load4((first + id.x) * 16u);
     uint piece = entry.x;
@@ -3393,18 +3408,24 @@ void main(uint3 id : SV_GroupID, uint thread : SV_GroupIndex) {
     lo = lo & ~15u;
     hi = (hi + 15u) & ~15u;
     uint4 h = uint4(0x9E3779B9u, 0x85EBCA6Bu, 0xC2B2AE35u, 0x27D4EB2Fu) + thread;
+#ifdef PAGES
+    uint page = thread >> 2u;
+    uint at = lo + page * 4096u + (thread & 3u) * 16u;
+    hi = min(lo + (page + 1u) * 4096u, hi);
+#else
     uint at = lo + thread * 16u;
+#endif
     // Eight loads at once: one after the other, each waits for memory.
     [loop]
-    for (; at + 7168u < hi; at += 8192u) {
+    for (; at + 7u * STEP < hi; at += 8u * STEP) {
         uint4 v0 = now.Load4(at + 0u);
-        uint4 v1 = now.Load4(at + 1024u);
-        uint4 v2 = now.Load4(at + 2048u);
-        uint4 v3 = now.Load4(at + 3072u);
-        uint4 v4 = now.Load4(at + 4096u);
-        uint4 v5 = now.Load4(at + 5120u);
-        uint4 v6 = now.Load4(at + 6144u);
-        uint4 v7 = now.Load4(at + 7168u);
+        uint4 v1 = now.Load4(at + STEP);
+        uint4 v2 = now.Load4(at + 2u * STEP);
+        uint4 v3 = now.Load4(at + 3u * STEP);
+        uint4 v4 = now.Load4(at + 4u * STEP);
+        uint4 v5 = now.Load4(at + 5u * STEP);
+        uint4 v6 = now.Load4(at + 6u * STEP);
+        uint4 v7 = now.Load4(at + 7u * STEP);
         h = (h ^ v0) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
         h = h.yzwx ^ (h >> 15);
         h = (h ^ v1) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
@@ -3423,36 +3444,68 @@ void main(uint3 id : SV_GroupID, uint thread : SV_GroupIndex) {
         h = h.yzwx ^ (h >> 15);
     }
     [loop]
-    for (; at < hi; at += 1024u) {
+    for (; at < hi; at += STEP) {
         h = (h ^ now.Load4(at)) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
         h = h.yzwx ^ (h >> 15);
     }
+#ifdef PAGES
+    uint mine = (piece * 64u + thread) * 16u;
+    if (mode != 0u && any(h != hashes.Load4(mine))) InterlockedOr(pages_changed, 1u << page);
+    if (mode != 1u) hashes.Store4(mine, h);
+#else
     parts[thread] = h;
+#endif
     GroupMemoryBarrierWithGroupSync();
     if (thread != 0u) return;
+#ifdef PAGES
+    if (mode == 0u) return;
+    // The flag, and above it the pages.
+    uint flag = (pages_changed << 1u) | (pages_changed != 0u ? 1u : 0u);
+#else
     h = parts[0];
     [loop]
     for (uint i = 1u; i < 64u; ++i) {
         h = (h ^ parts[i]) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
         h = h.yzwx ^ (h >> 15);
     }
-    if (mode != 0u) {
-        // The flag, and above it 31 bits of the hash (`torn`).
-        uint folded = h.x ^ (h.y * 3u) ^ (h.z * 5u) ^ (h.w * 7u);
-        uint flag = (folded << 1u) | (any(h != hashes.Load4(piece * 16u)) ? 1u : 0u);
-#ifdef TABLE
-        for (uint k = 0u; k < entry.w; ++k) differs.Store(table.Load(out_at + (entry.y + k) * 4u), flag);
-#else
-        differs.Store(out_at + id.x * 4u, flag);
-#endif
-        // With the copy-back on its own thread: the next compare of the
-        // piece finds what is written from here on.
-        if (mode == 2u) hashes.Store4(piece * 16u, h);
-    } else {
+    if (mode == 0u) {
         hashes.Store4(piece * 16u, h);
+        return;
     }
+    // The flag, and above it 31 bits of the hash (`torn`).
+    uint folded = h.x ^ (h.y * 3u) ^ (h.z * 5u) ^ (h.w * 7u);
+    uint flag = (folded << 1u) | (any(h != hashes.Load4(piece * 16u)) ? 1u : 0u);
+    // With the copy-back on its own thread: the next compare of the
+    // piece finds what is written from here on.
+    if (mode == 2u) hashes.Store4(piece * 16u, h);
+#endif
+#ifdef TABLE
+    for (uint k = 0u; k < entry.w; ++k) differs.Store(table.Load(out_at + (entry.y + k) * 4u), flag);
+#else
+    differs.Store(out_at + id.x * 4u, flag);
+#endif
 }
 "#;
+
+/// `VICTORY_CARD_PAGES=1`: the compare tells which 4 KiB pages of a piece
+/// differ and a fetch brings only those, where it brought the whole 64 KiB
+/// for a byte. Its hashes take 64 times the room (1 KiB per piece). Not with
+/// `VICTORY_FETCH_CHECK`, which needs the piece's hash.
+pub(crate) fn card_pages() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_PAGES").is_some_and(|v| v == "1") && !torn::on())
+}
+
+/// [`CARD_COMPARE`] as it is built: with `PAGES` where [`card_pages`].
+fn card_compare_source() -> &'static str {
+    static SOURCE: OnceLock<String> = OnceLock::new();
+    SOURCE.get_or_init(|| if card_pages() { format!("#define PAGES 1\n{CARD_COMPARE}") } else { CARD_COMPARE.to_string() })
+}
+
+/// Of a result of the compare built with `PAGES`: the pages that differ.
+pub(crate) fn changed_pages(result: u32) -> u16 {
+    (result >> 1) as u16
+}
 
 /// The hash [`CARD_COMPARE`] gives of a piece with its flag.
 #[cfg(test)]
@@ -3547,8 +3600,8 @@ fn card_batch_work(device: &ID3D12Device) -> Option<&'static CardBatch> {
         let made = unsafe {
             (|| -> windows::core::Result<CardBatch> {
                 D3DCompile(
-                    CARD_COMPARE.as_ptr().cast(),
-                    CARD_COMPARE.len(),
+                    card_compare_source().as_ptr().cast(),
+                    card_compare_source().len(),
                     windows::core::s!("card compare table"),
                     Some(defines.as_ptr()),
                     None,
@@ -4485,6 +4538,24 @@ mod relay_tests {
         assert!(fetch.contains(&(b, 9)));
         assert_eq!(fetch.len(), 2);
     }
+}
+
+/// With [`card_pages`]: for each piece a range of `plan` flagged, the pages
+/// any of its ranges found changed. A second range over a piece may find
+/// the hashes the first stored and flag nothing; its bytes come down if the
+/// first range's pages hold them.
+fn plan_pages(plan: &CardPlan, differs: &[u32]) -> std::collections::HashMap<(usize, u32), u16> {
+    let mut pages = std::collections::HashMap::new();
+    for r in plan.ranges.iter().filter(|r| !r.picked && r.compared) {
+        let copy = std::sync::Arc::as_ptr(&r.shadow) as usize;
+        for p in 0..r.span.pieces {
+            if let Some(&d) = differs.get((r.at + p) as usize) {
+                *pages.entry((copy, r.span.first + p)).or_insert(0) |= changed_pages(d);
+            }
+        }
+    }
+    pages.retain(|_, m| *m != 0);
+    pages
 }
 
 /// The most host lists in the air before the flights are settled
@@ -6597,8 +6668,8 @@ impl Host {
         // pointer is ours.
         unsafe {
             crate::dxc::d3d_compile(
-                CARD_COMPARE.as_ptr().cast(),
-                CARD_COMPARE.len(),
+                card_compare_source().as_ptr().cast(),
+                card_compare_source().len(),
                 windows::core::s!("card compare"),
                 None,
                 None,
@@ -7366,6 +7437,7 @@ impl Host {
                     })
                     .collect();
                 let fetched = flagged_pieces(&flags);
+                let pages = card_pages().then(|| plan_pages(plan, differs));
                 for r in plan.ranges.iter().filter(|r| !r.picked) {
                     let copy = std::sync::Arc::as_ptr(&r.shadow) as usize;
                     if upcheck::on() {
@@ -7375,7 +7447,8 @@ impl Host {
                         if fetched.binary_search(&(copy, r.span.first + p)).is_err() {
                             continue;
                         }
-                        let (lo, hi) = r.shadow.card_piece(&r.span, p);
+                        let mask = pages.as_ref().map_or(u16::MAX, |m| m.get(&(copy, r.span.first + p)).copied().unwrap_or(u16::MAX));
+                        for (lo, hi) in r.shadow.card_pages(&r.span, p, mask) {
                         if lo < hi && !seen.contains(&(copy, lo, hi)) {
                             let key = (r.shadow.id(), r.shadow.span().0 as usize + lo, hi - lo);
                             if fetch.as_ref().is_some_and(|f| f.had.holds(behind, key)) {
@@ -7391,6 +7464,7 @@ impl Host {
                             seen.insert((copy, lo, hi));
                             pieces.push((r.shadow.clone(), lo, hi, total));
                             total += (hi - lo) as u64;
+                        }
                         }
                     }
                     crate::shadow::CARD_STATS[2].fetch_add(u64::from(r.span.pieces), Ordering::Relaxed);
@@ -8032,15 +8106,23 @@ impl Host {
         let mut total = 0u64;
         plan.picked_found(differs);
         plan.lazy_found(differs);
+        let pages = card_pages().then(|| plan_pages(plan, differs));
         for (i, r) in plan.ranges.iter().enumerate().filter(|(_, r)| !r.picked) {
+            let copy = std::sync::Arc::as_ptr(&r.shadow) as usize;
             for p in 0..r.span.pieces {
                 if r.compared && !torn::flagged(differs[(r.at + p) as usize]) {
                     continue;
                 }
-                let (lo, hi) = r.shadow.card_piece(&r.span, p);
-                if lo < hi && seen.insert((std::sync::Arc::as_ptr(&r.shadow) as usize, lo, hi)) {
-                    pieces.push((i, lo, hi, total));
-                    total += (hi - lo) as u64;
+                let mask = pages.as_ref().map_or(u16::MAX, |m| m.get(&(copy, r.span.first + p)).copied().unwrap_or(u16::MAX));
+                for (lo, hi) in r.shadow.card_pages(&r.span, p, mask) {
+                    if lo < hi && seen.insert((copy, lo, hi)) {
+                        // Pages next to one another come down in one copy.
+                        match pieces.last_mut() {
+                            Some(last) if pages.is_some() && last.0 == i && last.2 == lo => last.2 = hi,
+                            _ => pieces.push((i, lo, hi, total)),
+                        }
+                        total += (hi - lo) as u64;
+                    }
                 }
             }
             crate::shadow::CARD_STATS[2].fetch_add(u64::from(r.span.pieces), Ordering::Relaxed);
