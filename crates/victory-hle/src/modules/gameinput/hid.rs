@@ -1,10 +1,11 @@
 //! Gamepads that XInput does not list, read over HID: Sony's DualShock 4
-//! and DualSense (USB and Bluetooth, with rumble), and any other HID gamepad
-//! or joystick by its usages. XInput devices (paths with `IG_`) are left to
-//! XInput.
+//! and DualSense (USB and Bluetooth, with rumble), the Switch 2 Pro
+//! Controller (USB), and any other HID gamepad or joystick by its usages.
+//! XInput devices (paths with `IG_`) are left to XInput.
 //!
-//! The report layouts are the ones Linux's `hid-playstation` and
-//! `hid-sony` drivers read and write.
+//! The Sony report layouts are the ones Linux's `hid-playstation` and
+//! `hid-sony` drivers read and write; the Switch 2 ones and its setup
+//! commands are SDL's.
 
 use super::{
     A, B, DOWN, LEFT, LEFT_SHOULDER, LEFT_STICK, MENU, PadState, RIGHT, RIGHT_SHOULDER,
@@ -205,6 +206,147 @@ pub(super) fn sony_rumble(
     r
 }
 
+const NINTENDO: u16 = 0x057E;
+
+/// The Switch 2 Pro Controller. Other Switch 2 pads (Joy-Con, the GameCube
+/// pad) have layouts of their own and are not read yet.
+pub(super) fn is_switch2_pro(vendor: u16, product: u16) -> bool {
+    (vendor, product) == (NINTENDO, 0x2069)
+}
+
+/// One stick axis as the pad's flash calibrates it: the value at rest and
+/// how far it travels above and below that.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(super) struct Travel {
+    pub neutral: u16,
+    pub above: u16,
+    pub below: u16,
+}
+
+/// Left x, left y, right x, right y.
+pub(super) type Calibration = [Option<Travel>; 4];
+
+/// Two 12-bit values packed in three bytes.
+fn twelve(d: &[u8]) -> (u16, u16) {
+    (
+        u16::from(d[0]) | u16::from(d[1] & 0x0F) << 8,
+        u16::from(d[1] >> 4) | u16::from(d[2]) << 4,
+    )
+}
+
+/// A stick's calibration block: the rest values, the travel above, the
+/// travel below, each as an x and y pair.
+pub(super) fn stick_calibration(d: &[u8]) -> Option<[Travel; 2]> {
+    let d = d.get(..9)?;
+    let ((nx, ny), (ax, ay), (bx, by)) = (twelve(&d[0..]), twelve(&d[3..]), twelve(&d[6..]));
+    let travel = |neutral, above, below| Travel {
+        neutral,
+        above,
+        below,
+    };
+    Some([travel(nx, ax, bx), travel(ny, ay, by)])
+}
+
+/// A 12-bit stick value to -1..1, larger up and right; without a
+/// calibration, 2048 is the centre.
+fn switch2_axis(value: u16, travel: Option<Travel>) -> f32 {
+    match travel {
+        Some(t) if t.neutral != 0 && t.above != 0 && t.below != 0 => {
+            let v = f32::from(value) - f32::from(t.neutral);
+            let reach = if v < 0.0 { t.below } else { t.above };
+            (v / f32::from(reach)).clamp(-1.0, 1.0)
+        }
+        _ => normalise(i64::from(value), 0, 4096),
+    }
+}
+
+fn held(byte: u8, bits: &[(u8, u32)]) -> u32 {
+    bits.iter()
+        .filter(|(bit, _)| byte & bit != 0)
+        .fold(0, |all, (_, button)| all | button)
+}
+
+/// The Switch 2 Pro Controller's state in an input report: 0x09, the one
+/// it sends once we set it up, or 0x05, the one Steam asks for. Buttons go
+/// by position, as on the Xbox pad: the bottom one (Nintendo's B) is A, the
+/// right one (Nintendo's A) is B, and so on; Plus is Menu, Minus is View.
+/// The triggers are buttons, so 0 or 1.
+pub(super) fn switch2_report(r: &[u8], cal: &Calibration) -> Option<PadState> {
+    let (buttons, triggers, sticks) = match *r.first()? {
+        0x09 => {
+            let r = r.get(..12)?;
+            let buttons = held(
+                r[3],
+                &[
+                    (0x01, A),
+                    (0x02, B),
+                    (0x04, X),
+                    (0x08, Y),
+                    (0x10, RIGHT_SHOULDER),
+                    (0x40, MENU),
+                    (0x80, RIGHT_STICK),
+                ],
+            ) | held(
+                r[4],
+                &[
+                    (0x01, DOWN),
+                    (0x02, RIGHT),
+                    (0x04, LEFT),
+                    (0x08, UP),
+                    (0x10, LEFT_SHOULDER),
+                    (0x40, VIEW),
+                    (0x80, LEFT_STICK),
+                ],
+            );
+            (buttons, (r[4] & 0x20, r[3] & 0x20), &r[6..12])
+        }
+        0x05 => {
+            let r = r.get(..17)?;
+            let buttons = held(
+                r[5],
+                &[
+                    (0x01, X),
+                    (0x02, Y),
+                    (0x04, A),
+                    (0x08, B),
+                    (0x40, RIGHT_SHOULDER),
+                ],
+            ) | held(
+                r[6],
+                &[
+                    (0x01, VIEW),
+                    (0x02, MENU),
+                    (0x04, RIGHT_STICK),
+                    (0x08, LEFT_STICK),
+                ],
+            ) | held(
+                r[7],
+                &[
+                    (0x01, DOWN),
+                    (0x02, UP),
+                    (0x04, RIGHT),
+                    (0x08, LEFT),
+                    (0x40, LEFT_SHOULDER),
+                ],
+            );
+            (buttons, (r[7] & 0x80, r[5] & 0x80), &r[11..17])
+        }
+        _ => return None,
+    };
+    let (lx, ly) = twelve(&sticks[0..]);
+    let (rx, ry) = twelve(&sticks[3..]);
+    let pressed = |bit: u8| if bit != 0 { 1.0 } else { 0.0 };
+    Some(PadState {
+        buttons,
+        left_trigger: pressed(triggers.0),
+        right_trigger: pressed(triggers.1),
+        left_x: switch2_axis(lx, cal[0]),
+        left_y: switch2_axis(ly, cal[1]),
+        right_x: switch2_axis(rx, cal[2]),
+        right_y: switch2_axis(ry, cal[3]),
+    })
+}
+
 /// Generic Desktop usages a gamepad's axes and hat use.
 pub(super) const USAGE_X: u16 = 0x30;
 pub(super) const USAGE_HAT: u16 = 0x39;
@@ -312,20 +454,28 @@ mod host {
     use std::time::Duration;
 
     use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
-        DIGCF_DEVICEINTERFACE, DIGCF_PRESENT, SP_DEVICE_INTERFACE_DATA,
-        SP_DEVICE_INTERFACE_DETAIL_DATA_W, SetupDiDestroyDeviceInfoList,
-        SetupDiEnumDeviceInterfaces, SetupDiGetClassDevsW, SetupDiGetDeviceInterfaceDetailW,
+        CM_GET_DEVICE_INTERFACE_LIST_PRESENT, CM_Get_Device_Interface_List_SizeW,
+        CM_Get_Device_Interface_ListW, CR_SUCCESS, DIGCF_DEVICEINTERFACE, DIGCF_PRESENT,
+        SP_DEVICE_INTERFACE_DATA, SP_DEVICE_INTERFACE_DETAIL_DATA_W,
+        SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInterfaces, SetupDiGetClassDevsW,
+        SetupDiGetDeviceInterfaceDetailW,
     };
     use windows_sys::Win32::Devices::HumanInterfaceDevice::{
         HIDD_ATTRIBUTES, HIDP_CAPS, HIDP_STATUS_SUCCESS, HIDP_VALUE_CAPS, HidD_FreePreparsedData,
         HidD_GetAttributes, HidD_GetFeature, HidD_GetHidGuid, HidD_GetPreparsedData, HidP_GetCaps,
         HidP_GetUsageValue, HidP_GetUsages, HidP_GetValueCaps, HidP_Input, PHIDP_PREPARSED_DATA,
     };
+    use windows_sys::Win32::Devices::Usb::{
+        PIPE_TRANSFER_TIMEOUT, UsbdPipeTypeBulk, WINUSB_INTERFACE_HANDLE, WINUSB_PIPE_INFORMATION,
+        WinUsb_Free, WinUsb_Initialize, WinUsb_QueryPipe, WinUsb_ReadPipe, WinUsb_SetPipePolicy,
+        WinUsb_WritePipe,
+    };
     use windows_sys::Win32::Foundation::{
         CloseHandle, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
     };
     use windows_sys::Win32::Storage::FileSystem::{
-        CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, ReadFile, WriteFile,
+        CreateFileW, FILE_FLAG_OVERLAPPED, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+        ReadFile, WriteFile,
     };
     use windows_sys::core::GUID;
 
@@ -356,6 +506,10 @@ mod host {
 
     impl Handle {
         fn open(path: &[u16], access: u32) -> Option<Handle> {
+            Handle::open_with(path, access, 0)
+        }
+
+        fn open_with(path: &[u16], access: u32, flags: u32) -> Option<Handle> {
             // SAFETY: a NUL-terminated path.
             let h = unsafe {
                 CreateFileW(
@@ -364,7 +518,7 @@ mod host {
                     FILE_SHARE_READ | FILE_SHARE_WRITE,
                     std::ptr::null(),
                     OPEN_EXISTING,
-                    0,
+                    flags,
                     std::ptr::null_mut(),
                 )
             };
@@ -388,6 +542,12 @@ mod host {
     /// How a pad's reports are read.
     enum Reader {
         Sony(Sony),
+        /// The command interface stays open with the pad: it may stop
+        /// reporting once that is let go.
+        Switch2 {
+            cal: Calibration,
+            _commands: Option<Commands>,
+        },
         /// The axes present (index in X..Rz) and their ranges.
         Generic {
             preparsed: Preparsed,
@@ -401,6 +561,7 @@ mod host {
         fn read(&self, report: &mut [u8]) -> Option<PadState> {
             match self {
                 Reader::Sony(pad) => sony_report(*pad, report),
+                Reader::Switch2 { cal, .. } => switch2_report(report, cal),
                 Reader::Generic {
                     preparsed,
                     axes,
@@ -598,6 +759,19 @@ mod host {
         }
         let name = String::from_utf16_lossy(path).to_ascii_lowercase();
         let (reader, output) = match Sony::of(attributes.VendorID, attributes.ProductID) {
+            None if is_switch2_pro(attributes.VendorID, attributes.ProductID) => {
+                let (cal, commands) = match Commands::open() {
+                    Some(c) => (c.set_up(), Some(c)),
+                    None => (Calibration::default(), None),
+                };
+                (
+                    Reader::Switch2 {
+                        cal,
+                        _commands: commands,
+                    },
+                    None,
+                )
+            }
             Some(sony) => {
                 // The Bluetooth HID service's id in the path, or the long
                 // Bluetooth reports.
@@ -660,6 +834,7 @@ mod host {
             product = format_args!("{:04x}", attributes.ProductID),
             kind = match &reader {
                 Reader::Sony(s) => format!("{s:?}"),
+                Reader::Switch2 { .. } => "Switch 2 Pro".into(),
                 Reader::Generic { .. } => "generic".into(),
             },
             "HID pad connected"
@@ -673,6 +848,224 @@ mod host {
             rumble: Mutex::new((0, 0)),
         };
         Some((pad, reader, usize::from(caps.InputReportByteLength), read))
+    }
+
+    /// The Switch 2 pads' command interface (USB interface 1, on WinUSB).
+    const SWITCH2_COMMANDS: GUID = GUID::from_u128(0x6F13725E_EF0E_4FD3_AE5F_B2DE989EC825);
+
+    /// The Switch 2 Pro Controller's command interface, set up the way SDL
+    /// does it: the pad sends no input until it is. Steam does the same
+    /// while it runs and keeps the interface to itself; the pad then
+    /// reports already and only the calibration is missing.
+    struct Commands {
+        usb: WINUSB_INTERFACE_HANDLE,
+        out: u8,
+        input: u8,
+        _file: Handle,
+    }
+
+    // SAFETY: WinUSB handles may be used from any thread.
+    unsafe impl Send for Commands {}
+
+    impl Drop for Commands {
+        fn drop(&mut self) {
+            // SAFETY: our own interface handle, freed once, before its file.
+            unsafe { WinUsb_Free(self.usb) };
+        }
+    }
+
+    impl Commands {
+        /// The first Switch 2 Pro Controller's interface, if no one else
+        /// holds it.
+        fn open() -> Option<Commands> {
+            let path = interface_paths(&SWITCH2_COMMANDS).into_iter().find(|p| {
+                String::from_utf16_lossy(p)
+                    .to_ascii_lowercase()
+                    .contains("vid_057e&pid_2069")
+            })?;
+            let Some(file) =
+                Handle::open_with(&path, GENERIC_READ | GENERIC_WRITE, FILE_FLAG_OVERLAPPED)
+            else {
+                tracing::info!(
+                    error = %std::io::Error::last_os_error(),
+                    "Switch 2 pad: its command interface is in use (Steam?), read uncalibrated"
+                );
+                return None;
+            };
+            let mut usb = std::ptr::null_mut();
+            // SAFETY: an open WinUSB device file.
+            if unsafe { WinUsb_Initialize(file.0, &mut usb) } == 0 {
+                return None;
+            }
+            let mut commands = Commands {
+                usb,
+                out: 0,
+                input: 0,
+                _file: file,
+            };
+            for index in 0..u8::MAX {
+                let mut pipe = WINUSB_PIPE_INFORMATION::default();
+                // SAFETY: an initialised interface; `pipe` is written.
+                if unsafe { WinUsb_QueryPipe(usb, 0, index, &mut pipe) } == 0 {
+                    break;
+                }
+                if pipe.PipeType == UsbdPipeTypeBulk {
+                    if pipe.PipeId & 0x80 != 0 {
+                        commands.input = pipe.PipeId;
+                    } else {
+                        commands.out = pipe.PipeId;
+                    }
+                }
+            }
+            if commands.input == 0 || commands.out == 0 {
+                return None;
+            }
+            for (pipe, ms) in [(commands.out, 1000u32), (commands.input, 100)] {
+                // SAFETY: as above; the value is read during the call.
+                unsafe {
+                    WinUsb_SetPipePolicy(
+                        usb,
+                        pipe,
+                        PIPE_TRANSFER_TIMEOUT,
+                        4,
+                        (&ms as *const u32).cast(),
+                    )
+                };
+            }
+            Some(commands)
+        }
+
+        /// Sends a command and returns the reply, up to `length` bytes.
+        fn send(&self, command: &[u8], length: usize) -> Vec<u8> {
+            let mut written = 0;
+            // SAFETY: an initialised interface; buffers outlive the calls.
+            if unsafe {
+                WinUsb_WritePipe(
+                    self.usb,
+                    self.out,
+                    command.as_ptr(),
+                    command.len() as u32,
+                    &mut written,
+                    std::ptr::null(),
+                )
+            } == 0
+            {
+                return Vec::new();
+            }
+            let mut reply = Vec::new();
+            while reply.len() < length {
+                let mut chunk = [0u8; 64];
+                let mut got = 0;
+                // SAFETY: as above.
+                let ok = unsafe {
+                    WinUsb_ReadPipe(
+                        self.usb,
+                        self.input,
+                        chunk.as_mut_ptr(),
+                        chunk.len() as u32,
+                        &mut got,
+                        std::ptr::null(),
+                    )
+                } != 0;
+                if !ok {
+                    break;
+                }
+                reply.extend_from_slice(&chunk[..got as usize]);
+                if (got as usize) < chunk.len() {
+                    break;
+                }
+            }
+            reply
+        }
+
+        /// 0x40 bytes of the pad's flash from `address`.
+        fn flash(&self, address: u32) -> Option<Vec<u8>> {
+            let mut command = vec![0x02, 0x91, 0x00, 0x01, 0x00, 0x08, 0x00, 0x00, 0, 0, 0, 0];
+            command.extend_from_slice(&address.to_le_bytes());
+            self.send(&command, 0x50).get(0x10..0x50).map(<[u8]>::to_vec)
+        }
+
+        /// Reads the sticks' calibration, then starts the pad's 0x09
+        /// reports.
+        fn set_up(&self) -> Calibration {
+            let mut cal = Calibration::default();
+            let mut stick = |at: usize, block: Option<&[u8]>| {
+                if let Some([x, y]) = block.and_then(stick_calibration) {
+                    cal[at] = Some(x);
+                    cal[at + 1] = Some(y);
+                }
+            };
+            // Factory calibration, then the player's own if they made one.
+            for (at, address) in [(0, 0x13080), (2, 0x130C0)] {
+                let factory = self.flash(address);
+                stick(at, factory.as_deref().and_then(|d| d.get(0x28..)));
+            }
+            for (at, address) in [(0, 0x1FC040), (2, 0x1FC080)] {
+                let user = self.flash(address);
+                let user = user.as_deref().filter(|d| d.starts_with(&[0xB2, 0xA1]));
+                stick(at, user.and_then(|d| d.get(2..)));
+            }
+            let mut report_layout = [0u8; 28];
+            report_layout[..9]
+                .copy_from_slice(&[0x0A, 0x91, 0x00, 0x08, 0x00, 0x14, 0x00, 0x00, 0x01]);
+            report_layout[9..17].fill(0xFF);
+            report_layout[17..21].copy_from_slice(&[0x35, 0x00, 0x46, 0x00]);
+            let sequence: [&[u8]; 10] = [
+                &[0x07, 0x91, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00],
+                &[0x0C, 0x91, 0x00, 0x02, 0x00, 0x04, 0x00, 0x00, 0x27, 0x00, 0x00, 0x00],
+                &[0x11, 0x91, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00],
+                &report_layout,
+                &[0x0C, 0x91, 0x00, 0x04, 0x00, 0x04, 0x00, 0x00, 0x27, 0x00, 0x00, 0x00],
+                &[0x01, 0x91, 0x00, 0x0C, 0x00, 0x00, 0x00, 0x00],
+                &[0x01, 0x91, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00],
+                // Player 1's light.
+                &[0x09, 0x91, 0x00, 0x07, 0x00, 0x08, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0, 0],
+                // Reports as 0x09.
+                &[0x03, 0x91, 0x00, 0x0A, 0x00, 0x04, 0x00, 0x00, 0x09, 0x00, 0x00, 0x00],
+                // Start them.
+                &[
+                    0x03, 0x91, 0x00, 0x0D, 0x00, 0x08, 0x00, 0x00, 0x01, 0x00, 0xFF, 0xFF, 0xFF, 0xFF,
+                    0xFF, 0xFF,
+                ],
+            ];
+            for command in sequence {
+                self.send(command, 0x40);
+            }
+            tracing::info!(calibrated = cal.iter().all(Option::is_some), "Switch 2 pad set up");
+            cal
+        }
+    }
+
+    /// The paths of the present device interfaces of a class, NUL-terminated.
+    fn interface_paths(class: &GUID) -> Vec<Vec<u16>> {
+        let mut size = 0;
+        // SAFETY: the size is written; the list fits in `size` characters.
+        unsafe {
+            if CM_Get_Device_Interface_List_SizeW(
+                &mut size,
+                class,
+                std::ptr::null(),
+                CM_GET_DEVICE_INTERFACE_LIST_PRESENT,
+            ) != CR_SUCCESS
+            {
+                return Vec::new();
+            }
+            let mut list = vec![0u16; size as usize];
+            if CM_Get_Device_Interface_ListW(
+                class,
+                std::ptr::null(),
+                list.as_mut_ptr(),
+                size,
+                CM_GET_DEVICE_INTERFACE_LIST_PRESENT,
+            ) != CR_SUCCESS
+            {
+                return Vec::new();
+            }
+            list.split(|&c| c == 0)
+                .filter(|p| !p.is_empty())
+                .map(|p| p.iter().copied().chain([0]).collect())
+                .collect()
+        }
     }
 
     /// A value's logical range; a range declared unsigned in fewer bits than
@@ -939,6 +1332,67 @@ mod tests {
         assert_eq!(ButtonMap::parse(Some("1,2,3")), ButtonMap::DIRECTINPUT);
         assert_eq!(ButtonMap::parse(Some("a,b")), ButtonMap::DIRECTINPUT);
         assert_eq!(ButtonMap::parse(None), ButtonMap::DIRECTINPUT);
+    }
+
+    #[test]
+    fn a_switch_2_pro_reads_by_button_position() {
+        // A report Steam's set-up gives: nothing held, sticks near rest.
+        let mut steam = vec![0u8; 64];
+        steam[..16].copy_from_slice(&[
+            0x05, 0x19, 0xE4, 0x13, 0, 0, 0, 0, 0, 0, 0, 0x36, 0x48, 0x86, 0x98, 0x68,
+        ]);
+        let none = Calibration::default();
+        let pad = switch2_report(&steam, &none).unwrap();
+        assert_eq!(pad.buttons, 0);
+        assert!((pad.left_x - 54.0 / 2048.0).abs() < 1e-4);
+        assert!((pad.left_y - 100.0 / 2048.0).abs() < 1e-4);
+        // Nintendo's B (bottom), Plus, D-pad up.
+        steam[5] = 0x04;
+        steam[6] = 0x02;
+        steam[7] = 0x02;
+        let pad = switch2_report(&steam, &none).unwrap();
+        assert_eq!(pad.buttons, A | MENU | UP);
+        assert_eq!((pad.left_trigger, pad.right_trigger), (0.0, 0.0));
+        steam[7] = 0x80;
+        steam[5] = 0x80;
+        let pad = switch2_report(&steam, &none).unwrap();
+        assert_eq!((pad.left_trigger, pad.right_trigger), (1.0, 1.0));
+
+        // Our own 0x09 reports: Nintendo's A (right), Y (left), Minus, L,
+        // ZR; left stick fully up against its calibration.
+        let mut own = vec![0u8; 64];
+        own[0] = 0x09;
+        own[3] = 0x02 | 0x20;
+        own[4] = 0x04 | 0x40 | 0x10;
+        own[6..12].copy_from_slice(&[0x00, 0x08, 0xC0, 0x00, 0x08, 0x80]);
+        let travel = Travel {
+            neutral: 2048,
+            above: 1024,
+            below: 1024,
+        };
+        let pad = switch2_report(&own, &[Some(travel); 4]).unwrap();
+        assert_eq!(pad.buttons, B | LEFT | VIEW | LEFT_SHOULDER);
+        assert_eq!((pad.left_trigger, pad.right_trigger), (0.0, 1.0));
+        assert_eq!((pad.left_x, pad.left_y), (0.0, 1.0));
+        assert_eq!((pad.right_x, pad.right_y), (0.0, 0.0));
+        assert_eq!(switch2_report(&own[..11], &none), None);
+        assert_eq!(switch2_report(&[0x30, 0, 0], &none), None);
+    }
+
+    #[test]
+    fn switch_2_calibration_is_packed_in_twelve_bits() {
+        let block = [0x00, 0x88, 0x80, 0x00, 0x05, 0x50, 0x10, 0x05, 0x52];
+        let [x, y] = stick_calibration(&block).unwrap();
+        let travel = |neutral, above, below| Travel {
+            neutral,
+            above,
+            below,
+        };
+        assert_eq!(x, travel(0x800, 0x500, 0x510));
+        assert_eq!(y, travel(0x808, 0x500, 0x520));
+        assert_eq!(stick_calibration(&[0; 8]), None);
+        assert!(is_switch2_pro(0x057E, 0x2069));
+        assert!(!is_switch2_pro(0x057E, 0x2009));
     }
 
     /// With a pad connected: rumbles each HID pad for a second, then prints
