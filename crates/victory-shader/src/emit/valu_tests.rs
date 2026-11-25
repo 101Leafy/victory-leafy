@@ -2312,6 +2312,12 @@ fn v_rndne_f32_ties_to_even_and_specials() {
 /// number. Inline 0 and -1 masks pick src0 and src1 in every lane.
 #[test]
 fn v_cndmask_on_an_untracked_mask_tests_this_lanes_bit() {
+    // WARP cannot pin a wave size, which the lane-aware programs ask for:
+    // skip when there is no hardware device (a machine without a GPU).
+    if Host::new(false).is_err() {
+        eprintln!("no SM 6.6 hardware device; skipped");
+        return;
+    }
     // v_cndmask_b32_e64 v0, v1, v2, <mask> (VOP3 0x101); s3 holds the mask.
     let from_sgpr = build_valu_cs(&vop3(0x101, 0, vgpr(1), vgpr(2), sgpr(3)));
     let hw = &[("hardware", false)];
