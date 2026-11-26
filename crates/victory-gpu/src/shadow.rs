@@ -4932,6 +4932,8 @@ pub(crate) fn peek(address: u64, len: u64) -> Option<Arc<Shadow>> {
 fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
     let quick = quick_find();
     if quick && let Some(shadow) = found(address, len) {
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::LookupQuick, 1);
         return Some(shadow);
     }
     let end = address.checked_add(len.max(1))?;
@@ -4940,6 +4942,8 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         match map.range(..=(address, usize::MAX)).rev().take(64).find(|(_, e)| e.end >= end) {
             // The copy is made already (nearly always).
             Some((_, Entry { shadow: Some(shadow), .. })) => {
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::LookupTables, 1);
                 if quick {
                     // (Nobody changes the map while this lock is held.)
                     remember(address, len, BUFFERS_CHANGED.load(Ordering::SeqCst), shadow);
@@ -4949,6 +4953,8 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
             Some(_) => {}
             None => {
                 drop(map);
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::LookupLoose, 1);
                 return loose(address, end, len <= 1, any);
             }
         }
