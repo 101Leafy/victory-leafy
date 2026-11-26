@@ -1305,20 +1305,47 @@ pub(crate) fn zeros(list: &HostList, host: &crate::host::Host, texture: &ID3D12R
     let layers = if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D { 1 } else { u32::from(d.DepthOrArraySize) };
     let count = u32::from(d.MipLevels) * layers;
     let mut footprints = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); count as usize];
+    let mut rows = vec![0u32; count as usize];
     let mut bytes = 0u64;
     // SAFETY: outputs for `count` subresources.
     unsafe {
-        host.device
-            .GetCopyableFootprints(&d, 0, count, 0, Some(footprints.as_mut_ptr()), None, None, Some(&mut bytes));
+        host.device.GetCopyableFootprints(
+            &d,
+            0,
+            count,
+            0,
+            Some(footprints.as_mut_ptr()),
+            Some(rows.as_mut_ptr()),
+            None,
+            Some(&mut bytes),
+        );
     }
     if bytes == 0 || bytes == u64::MAX {
         return;
     }
-    let Some((buffer, data)) = list.upload(host, bytes) else {
-        return;
+    let most = footprints
+        .iter()
+        .zip(&rows)
+        .map(|(f, &rows)| u64::from(f.Footprint.RowPitch) * u64::from(rows) * u64::from(f.Footprint.Depth))
+        .max()
+        .unwrap_or(0);
+    let buffer = match shared_zeros(host, most) {
+        Some(buffer) => {
+            // Each subresource reads the same zeros from the start.
+            for footprint in &mut footprints {
+                footprint.Offset = 0;
+            }
+            buffer
+        }
+        None => {
+            let Some((buffer, data)) = list.upload(host, bytes) else {
+                return;
+            };
+            // SAFETY: a mapped buffer of `bytes` bytes, just made.
+            unsafe { std::ptr::write_bytes(data, 0, bytes as usize) };
+            buffer
+        }
     };
-    // SAFETY: a mapped buffer of `bytes` bytes, just made.
-    unsafe { std::ptr::write_bytes(data, 0, bytes as usize) };
     for (i, footprint) in footprints.iter().enumerate() {
         let to = D3D12_TEXTURE_COPY_LOCATION {
             // SAFETY: a borrowed pointer the location never releases.
@@ -1327,7 +1354,8 @@ pub(crate) fn zeros(list: &HostList, host: &crate::host::Host, texture: &ID3D12R
             Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: i as u32 },
         };
         let from = D3D12_TEXTURE_COPY_LOCATION {
-            // SAFETY: as above; the list holds the buffer until it is reset.
+            // SAFETY: as above; the list holds an upload buffer until it is
+            // reset, and the shared zeros are never let go.
             pResource: unsafe { std::mem::transmute_copy(&buffer) },
             Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
             Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: *footprint },
@@ -1335,6 +1363,66 @@ pub(crate) fn zeros(list: &HostList, host: &crate::host::Host, texture: &ID3D12R
         // SAFETY: an open list; both locations name live resources.
         unsafe { list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
     }
+}
+
+/// A buffer of at least `size` bytes of zeros in card memory, which every
+/// [`zeros`] copy reads and nothing writes; `None` past 256 MB or with
+/// `VICTORY_SHARED_ZEROS=0`. Before it each texture's zeros were an upload
+/// buffer of the whole texture (a level, for [`card_writes`]), made, waited
+/// resident and cleared while the list was recorded, and sent over the bus
+/// again. The buffer grows by powers of two; one outgrown stays, as a list
+/// recorded with it may not have run.
+fn shared_zeros(host: &crate::host::Host, size: u64) -> Option<ID3D12Resource> {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_SHARED_ZEROS").is_none_or(|v| v != "0")) || size > 256 << 20 {
+        return None;
+    }
+    static ZEROS: Mutex<(Option<(ID3D12Resource, u64)>, Vec<ID3D12Resource>)> = Mutex::new((None, Vec::new()));
+    let mut zeros = ZEROS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((buffer, len)) = &zeros.0
+        && *len >= size
+    {
+        return Some(buffer.clone());
+    }
+    let len = size.next_power_of_two().max(4 << 20);
+    let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
+    let desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+        Width: len,
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+        ..Default::default()
+    };
+    let mut buffer: Option<ID3D12Resource> = None;
+    // SAFETY: plain creation; memory made without CREATE_NOT_ZEROED holds zeros.
+    let made = unsafe {
+        host.device
+            .CreateCommittedResource(
+                &heap,
+                crate::host::not_resident(),
+                &desc,
+                D3D12_RESOURCE_STATE_COMMON,
+                None,
+                &mut buffer,
+            )
+            .and_then(|()| crate::host::resident(&host.device, buffer.as_ref().ok_or_else(windows::core::Error::empty)?))
+    };
+    let buffer = match made {
+        Ok(()) => buffer?,
+        Err(e) => {
+            tracing::warn!(error = %e, len, "no buffer of zeros");
+            return None;
+        }
+    };
+    crate::host::name(&buffer, || format!("zeros {len:#x}"));
+    if let Some((outgrown, _)) = zeros.0.take() {
+        zeros.1.push(outgrown);
+    }
+    zeros.0 = Some((buffer.clone(), len));
+    Some(buffer)
 }
 
 /// Levels on demand (`crate::tiles`): the card itself is about to write
@@ -1380,14 +1468,18 @@ pub(crate) fn card_writes(list: &HostList, resource: This, texture: &ID3D12Resou
                 host.device
                     .GetCopyableFootprints(&d, level, 1, 0, Some(&mut footprint), None, None, Some(&mut bytes));
             }
-            let Some((buffer, data)) = list.upload(host, bytes) else {
+            let made = shared_zeros(host, bytes).or_else(|| {
+                let (buffer, data) = list.upload(host, bytes)?;
+                // SAFETY: a mapped buffer of `bytes` bytes, just made.
+                unsafe { std::ptr::write_bytes(data, 0, bytes as usize) };
+                Some(buffer)
+            });
+            let Some(buffer) = made else {
                 // (With the levels that share its tiles, if it is one of
                 // the small ones.)
                 unzeroed |= tiled.with_level(level);
                 continue;
             };
-            // SAFETY: a mapped buffer of `bytes` bytes, just made.
-            unsafe { std::ptr::write_bytes(data, 0, bytes as usize) };
             let to = D3D12_TEXTURE_COPY_LOCATION {
                 // SAFETY: a borrowed pointer the location never releases.
                 pResource: unsafe { std::mem::transmute_copy(texture) },
@@ -1395,7 +1487,7 @@ pub(crate) fn card_writes(list: &HostList, resource: This, texture: &ID3D12Resou
                 Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: level },
             };
             let from = D3D12_TEXTURE_COPY_LOCATION {
-                // SAFETY: as above; the list holds the buffer until it is reset.
+                // SAFETY: as above; as in [`zeros`].
                 pResource: unsafe { std::mem::transmute_copy(&buffer) },
                 Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
                 Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: footprint },
