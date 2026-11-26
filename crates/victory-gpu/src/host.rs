@@ -5200,6 +5200,13 @@ impl Host {
         let _ = self.submit(runs, &[], false);
     }
 
+    /// [`Host::execute`] of a closed upload-only list of our own, without
+    /// waiting for the title's queues (`queue::before_sync`): safe from
+    /// `VICTORY_THIN=1` recording threads.
+    pub(crate) fn execute_sync_internal(&self, list: &HostList) {
+        let _ = self.submit(&[list], &[], false);
+    }
+
     /// A queue's submission with [`late`]: the host lists `lists`, taken
     /// from the title's, go to the card in `order` and are not waited for.
     /// They join the line of flights and are settled, with the others in
@@ -6392,6 +6399,12 @@ impl HostList {
     /// See [`HostList::changed_something`].
     pub(crate) fn epoch(&self) -> u64 {
         self.epoch.load(Ordering::Relaxed)
+    }
+
+    /// Whether steps or texture state changes were recorded since the list
+    /// was made or last reset.
+    pub(crate) fn has_recorded_work(&self) -> bool {
+        !self.deferred().copies.is_empty() || !self.states.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
     }
 
     /// Moves a title texture's host copy to `wanted` (a host state) in this
