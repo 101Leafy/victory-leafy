@@ -32,6 +32,8 @@ use windows::Win32::Graphics::Direct3D12::*;
 use crate::host::{HostList, host};
 use crate::object::This;
 
+pub(crate) mod prepare;
+
 macro_rules! once {
     ($($arg:tt)*) => {{
         static ONCE: std::sync::Once = std::sync::Once::new();
@@ -961,6 +963,20 @@ impl Drop for Staging {
     }
 }
 
+thread_local! {
+    /// On this thread: staging buffers made, the microseconds that took
+    /// (their upload buffers among them), and of those upload buffers the
+    /// ones made new (not from the pool) and their microseconds.
+    static STAGED_HERE: std::cell::Cell<[u64; 4]> = const { std::cell::Cell::new([0; 4]) };
+}
+
+/// (Neptune) What [`STAGED_HERE`] holds for the calling thread: the pass
+/// over textures picked by index tells by these how much of its time went
+/// into making staging buffers.
+pub(crate) fn staged_here() -> [u64; 4] {
+    STAGED_HERE.with(std::cell::Cell::get)
+}
+
 /// For the memory line: staging buffers alive, their bytes, and how many
 /// of them their texture still has (the others wait for a list's reset).
 #[cfg(feature = "diagnostics")]
@@ -1107,6 +1123,8 @@ pub(crate) fn forget(resource: usize) {
     if let Some(map) = map.as_mut() {
         map.remove(&resource);
     }
+    // (Neptune) And what a prepare thread made ready for it: its memory goes.
+    prepare::forget(resource);
     let mut set = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(set) = set.as_mut() {
         set.remove(&resource);
@@ -2676,6 +2694,13 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
     there
 }
 
+/// (Neptune) The bytes of title memory a staging buffer of `resource` from
+/// mip `first` on reads, as the pass counts them; 0 for what has no console
+/// layout.
+fn staged_bytes(resource: This, first: u32) -> u64 {
+    title_span(resource, first).map_or(0, |(_, bytes)| bytes)
+}
+
 /// The staging state of a title texture, made on first use.
 fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> Option<Arc<Staging>> {
     let texture = &copy.texture;
@@ -2690,6 +2715,56 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
     {
         return Some(s.clone());
     }
+    // (Neptune) One a prepare thread made and detiled (`prepare`): taken as
+    // it is (`VICTORY_TEXTURE_PREPARE_THREADS`; none without), unless the
+    // host copy was made anew since.
+    let s = match prepare::take_ready(resource, first, on_demand).filter(|s| s.serial == copy.serial) {
+        Some(s) => s,
+        None => build_staging(resource, copy, first, on_demand)?,
+    };
+    map.insert(resource as usize, s.clone());
+    add_to_address_index(&s);
+    Some(s)
+}
+
+/// (Neptune) For a prepare thread (`prepare`): the staging state of title
+/// texture `resource` from mip `first` on, made as [`staging`] makes it but
+/// not put in the table (the pass that records its upload puts it there).
+/// `None` if the table has one that serves already, or none can be made.
+fn prepared_staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> Option<Arc<Staging>> {
+    let on_demand = crate::resource::host_tiled(resource).is_some();
+    let first = if on_demand { 0 } else { first };
+    {
+        let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+        if map
+            .as_ref()
+            .and_then(|map| map.get(&(resource as usize)))
+            .is_some_and(|s| s.first <= first.max(copy.base) && s.serial == copy.serial)
+        {
+            return None;
+        }
+    }
+    build_staging(resource, copy, first, on_demand)
+}
+
+/// A staging state for title texture `resource` from mip `first` on (as
+/// [`staging`] decided it), its upload buffer made or taken from the pool;
+/// nothing is detiled into it yet. Timed into [`STAGED_HERE`].
+fn build_staging(resource: This, copy: &crate::resource::HostTexture, first: u32, on_demand: bool) -> Option<Arc<Staging>> {
+    let started = std::time::Instant::now();
+    let made = build_staging_untimed(resource, copy, first, on_demand);
+    let us = started.elapsed().as_micros() as u64;
+    STAGED_HERE.with(|s| {
+        let mut now = s.get();
+        now[0] += 1;
+        now[1] += us;
+        s.set(now);
+    });
+    made
+}
+
+fn build_staging_untimed(resource: This, copy: &crate::resource::HostTexture, first: u32, on_demand: bool) -> Option<Arc<Staging>> {
+    let texture = &copy.texture;
     let (memory, desc) = crate::resource::texture_memory(resource)?;
     let Some(layout) = crate::resource::texture_layout(&desc).map(|t| t.planes[0].layout.clone())
     else {
@@ -2736,7 +2811,16 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
     let (piece, buffer, base, data) = match crate::pool::staging(host, total) {
         Some((piece, buffer, base, data)) => (Some(piece), buffer, base, data),
         None => {
-            let (buffer, data) = host.upload_buffer(total)?;
+            let started = std::time::Instant::now();
+            let made = host.upload_buffer(total);
+            let us = started.elapsed().as_micros() as u64;
+            STAGED_HERE.with(|s| {
+                let mut now = s.get();
+                now[2] += 1;
+                now[3] += us;
+                s.set(now);
+            });
+            let (buffer, data) = made?;
             crate::host::name(&buffer, || {
                 format!(
                     "staging of {resource:?} {}x{}x{} f{}",
@@ -2782,8 +2866,6 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
         waiting: std::sync::atomic::AtomicU64::new(0),
         exact: std::sync::atomic::AtomicBool::new(BAKING.get() && crate::draw::bake_sync()),
     });
-    map.insert(resource as usize, s.clone());
-    add_to_address_index(&s);
     Some(s)
 }
 

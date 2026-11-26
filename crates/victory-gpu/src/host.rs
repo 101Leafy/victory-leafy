@@ -11686,6 +11686,37 @@ impl Meter {
         tracing::info!(
             "indirect mesh dispatches: the largest group count asked for {mesh_largest} (run: at most 65535), {mesh_groups:.0} groups asked per frame; {refused:.2} indirect records a frame ran empty for want of their list's budget (2^27), the largest cost of one {biggest} (0: under 2^22); {empty:.0} indirect records a frame ran empty as asked (no work, or a slot the title had not filled)"
         );
+        {
+            let texture_us = crate::draw::HEAP_TEXTURE_MICROS.swap(0, Ordering::Relaxed);
+            // (Neptune) Where that time went (`draw::HEAP_TEXTURE_PARTS`).
+            let p = crate::draw::HEAP_TEXTURE_PARTS.each_ref().map(|c| c.swap(0, Ordering::Relaxed) as f64 / frames);
+            let ms = |us: f64| us / 1e3;
+            if texture_us > 0 {
+                tracing::info!(
+                    "the pass over textures picked by index per frame: {:.1} ms; {:.0} slots looked at, {:.0} uploads recorded; \
+                     {:.1} ms before the slots; {:.1} ms looking at slots (views, mapping, room, handing out), \
+                     {:.1} ms making host slots and copies ({:.1} host copies made in {:.1} ms), \
+                     {:.1} ms staging and recording uploads ({:.1} staging buffers made in {:.1} ms, \
+                     {:.1} of their upload buffers made new in {:.1} ms), {:.1} ms the rest (mapped whole, fingerprint, queue); \
+                     {:.1} slots handed to the prepare threads, {:.1} passed over waiting for them",
+                    texture_us as f64 / 1e3 / frames,
+                    p[0], p[1], ms(p[14]), ms(p[2]), ms(p[3]), p[6], ms(p[7]), ms(p[4]), p[8], ms(p[9]), p[10], ms(p[11]),
+                    ms(p[5]), p[12], p[13]
+                );
+            }
+            if crate::texture::prepare::threads() > 0 {
+                let s = crate::texture::prepare::STATS.each_ref().map(|c| c.swap(0, Ordering::Relaxed) as f64 / frames);
+                let [pending, ready, out] = crate::texture::prepare::census();
+                tracing::info!(
+                    "texture prepare threads per frame (VICTORY_TEXTURE_PREPARE_THREADS={}): {:.1} textures made ready ({:.1} MB), \
+                     {:.1} host copies made; {:.1} ms of the threads' time ({:.1} ms making host copies, {:.1} ms making staging buffers, \
+                     {:.1} ms reading and detiling); {:.1} found the card without room, {:.1} made ready and let go untaken; \
+                     now {pending} handed out, {ready} ready, {} MB out",
+                    crate::texture::prepare::threads(),
+                    s[0], s[2] / 1e6, s[1], ms(s[3]), ms(s[4]), ms(s[5]), ms(s[6]), s[7], s[8], out >> 20
+                );
+            }
+        }
         crate::shadow::exact_line(frames);
         crate::descriptor::sync_line(frames);
         late_line(frames);
