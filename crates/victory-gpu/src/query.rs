@@ -1,5 +1,6 @@
-//! Query heaps. Nothing runs on a GPU yet, so no query ever produces a
-//! result; the heap only remembers its description.
+//! Query heaps. With `VICTORY_HOST_QUERIES=1` their queries run on the
+//! host GPU (`crate::list`); otherwise no query ever produces a result and
+//! the heap only remembers its description.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use crate::object::{self, E_INVALIDARG, HRESULT, Iid, Object, QUERY_HEAP, Table, This, guid};
@@ -29,6 +30,14 @@ pub(crate) struct Desc {
 struct Heap {
     object: Object,
     desc: Desc,
+    /// The host heap the queries run in, made on first use (none without
+    /// the switch, a host GPU, or a kind the host has).
+    #[cfg(windows)]
+    host: std::sync::OnceLock<Option<windows::Win32::Graphics::Direct3D12::ID3D12QueryHeap>>,
+    /// Queries a cut of the list they ran in ended early (`crate::list`):
+    /// they counted only part of what the title measures.
+    #[cfg(windows)]
+    cut: std::sync::Mutex<Vec<u32>>,
 }
 
 /// Device method.
@@ -46,8 +55,52 @@ pub(crate) extern "system" fn create(
     let heap = Box::new(Heap {
         object: Object::new(&FUNCTIONS),
         desc,
+        #[cfg(windows)]
+        host: std::sync::OnceLock::new(),
+        #[cfg(windows)]
+        cut: std::sync::Mutex::new(Vec::new()),
     });
     object::hand_out(QUERY_HEAP, heap, iid, &HEAP_IIDS, out)
+}
+
+/// The host heap console heap `this`'s queries run in.
+/// shortcut: off unless `VICTORY_HOST_QUERIES=1`, until a run shows that
+/// measured occlusion culls nothing our dropped draws should have drawn.
+#[cfg(windows)]
+pub(crate) fn host_heap(this: This) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12QueryHeap> {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if this.is_null() || !*ON.get_or_init(|| crate::switch::on("VICTORY_HOST_QUERIES")) {
+        return None;
+    }
+    // SAFETY: the title passes one of our query heaps.
+    let heap = unsafe { &*this.cast::<Heap>() };
+    heap.host.get_or_init(|| crate::host::host()?.query_heap(heap.desc.kind, heap.desc.count)).clone()
+}
+
+/// Notes that query `index` of heap `this` was ended early by a cut.
+#[cfg(windows)]
+pub(crate) fn cut_short(this: This, index: u32) {
+    if this.is_null() {
+        return;
+    }
+    // SAFETY: one of our query heaps (one `host_heap` answered for).
+    let heap = unsafe { &*this.cast::<Heap>() };
+    heap.cut.lock().unwrap_or_else(|e| e.into_inner()).push(index);
+}
+
+/// Whether any of `count` queries from `first` of heap `this` was ended
+/// early by a cut, forgetting them.
+#[cfg(windows)]
+pub(crate) fn take_cut_short(this: This, first: u32, count: u32) -> bool {
+    if this.is_null() {
+        return false;
+    }
+    // SAFETY: the title passes one of our query heaps.
+    let heap = unsafe { &*this.cast::<Heap>() };
+    let mut cut = heap.cut.lock().unwrap_or_else(|e| e.into_inner());
+    let before = cut.len();
+    cut.retain(|index| !(first..first.saturating_add(count)).contains(index));
+    cut.len() != before
 }
 
 extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
