@@ -2047,6 +2047,12 @@ fn null_sampler(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 }
 
 impl HostHeap {
+    /// Which heap this is ([`NEXT_ID`]): dynamic slots go back only to the
+    /// heap that took them, never to one made later at the same address.
+    pub(crate) fn id(&self) -> u64 {
+        self.id
+    }
+
     /// `n` consecutive free dynamic slots (view heaps only), taken until
     /// [`HostHeap::release`]: the first's index.
     pub(crate) fn dynamic(&self, n: u32) -> Option<u32> {
@@ -3012,10 +3018,16 @@ impl HostHeap {
     }
 
     /// Gives back `n` dynamic slots from `first` (an index [`dynamic`]
-    /// returned).
+    /// returned), if this heap took them: `id` is [`HostHeap::id`]'s. The
+    /// title can release the heap a list's slots came from and make another
+    /// at the same address; the list's reset then names the old heap, and
+    /// must not free the new one's slots.
     ///
     /// [`dynamic`]: HostHeap::dynamic
-    pub(crate) fn release(&self, first: u32, n: u32) {
+    pub(crate) fn release(&self, id: u64, first: u32, n: u32) {
+        if id != self.id {
+            return;
+        }
         let Some(at) = first.checked_sub(self.count) else {
             return;
         };
@@ -6212,9 +6224,27 @@ mod tests {
         assert_eq!((a, b), (4, 4 + heap.dynamic - 100));
         // 40 left at the end: 50 do not fit until something is given back.
         assert_eq!(heap.dynamic(50), None);
-        heap.release(a, 50);
+        heap.release(heap.id, a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
+    }
+
+    /// A run of dynamic slots goes back only to the heap that took it: the
+    /// title can release a heap while a list still holds slots of it, and
+    /// make another at the same address before that list is reset.
+    #[test]
+    fn dynamic_slots_are_given_back_only_to_the_heap_that_took_them() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let (Some(a), Some(b)) = (HostHeap::new(false, 4), HostHeap::new(false, 4)) else {
+            return; // no host GPU
+        };
+        assert_ne!(a.id(), b.id());
+        let first = a.dynamic(2).expect("two dynamic slots");
+        let free = a.free.load(Relaxed);
+        a.release(b.id(), first, 2);
+        assert_eq!(a.free.load(Relaxed), free, "another heap's id gave the run back");
+        a.release(a.id(), first, 2);
+        assert_eq!(a.free.load(Relaxed), free + 2, "the heap that took the run did not get it back");
     }
 
     /// The cursor moves on: a shard with no run that fits is passed over
