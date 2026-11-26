@@ -5399,6 +5399,16 @@ impl Host {
     /// ([`joins`]): those go to the queue in calls of their own, one after the
     /// other, as they would have.
     fn submit<'a>(&'a self, runs: &[&HostList], parts: &[usize], late: bool) -> Option<(std::sync::MutexGuard<'a, u64>, Sent)> {
+        // What the heap pass beside the recording finds is waited for here,
+        // ahead of the submission lock, and no longer at the list's close:
+        // the close waited 15-30 ms a frame for it on a recording thread in
+        // the prof runs of 2026-11-25 (17 ms a frame on the Intel run), with
+        // the title's Close call held that long. Nothing reads a list's
+        // refreshes before this (`joinable` and `will_meet` pass them over),
+        // and its descriptors are only read once it runs.
+        for list in runs {
+            list.take_coming();
+        }
         #[cfg(feature = "diagnostics")]
         let called = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
@@ -6125,15 +6135,24 @@ impl HostList {
 
     pub(crate) fn close(&self) {
         let _closing = crate::timeline::span("closing a host list");
+        let mut lap = Lap::begin();
         self.twins_to_depth();
+        lap.to(0);
         self.textures_back();
+        lap.to(1);
         let scratch = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner()).clone();
         if let Some((scratch, _)) = scratch {
             self.indirect_common(&scratch);
         }
+        lap.to(2);
         self.batches_common();
+        lap.to(3);
         self.card_budget_out();
-        self.take_coming();
+        lap.to(4);
+        if coming_at_close() {
+            self.take_coming();
+        }
+        lap.to(5);
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
             let count = (self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32).min(STAMPS - 1);
@@ -6143,12 +6162,14 @@ impl HostList {
                 self.list.ResolveQueryData(heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, count + 1, back, 0);
             }
         }
+        lap.to(6);
         // SAFETY: our list.
         if let Err(e) = unsafe { self.list.Close() } {
             fail(format_args!(
                 "a host command list did not close ({e}): a command recorded into it was invalid"
             ));
         }
+        lap.to(7);
     }
 
     /// `work` finds, on a thread of ours, refreshes that belong at this
@@ -6160,7 +6181,8 @@ impl HostList {
         *self.coming.lock().unwrap_or_else(|e| e.into_inner()) = Some((at, coming));
     }
 
-    /// The refreshes that were still to come are put among the steps.
+    /// The refreshes that were still to come are put among the steps: when
+    /// the list is submitted, or at its close with `VICTORY_COMING_AT_CLOSE=1`.
     fn take_coming(&self) {
         let Some((at, coming)) = self.coming.lock().unwrap_or_else(|e| e.into_inner()).take() else {
             return;
@@ -6181,7 +6203,11 @@ impl HostList {
         let started = std::time::Instant::now();
         let _resetting = crate::timeline::span("resetting a host list");
         self._alive.used();
-        *self.coming.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        // A list closed and never submitted: the pass may still be writing
+        // its descriptors.
+        if let Some((_, coming)) = self.coming.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            coming.wait();
+        }
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -7345,6 +7371,64 @@ impl Split {
     }
 }
 
+/// Whether a list's close waits for the heap pass beside its recording
+/// (`VICTORY_COMING_AT_CLOSE=1`, as before) instead of its submission.
+fn coming_at_close() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_COMING_AT_CLOSE").is_some_and(|v| v == "1"))
+}
+
+/// Since the last frame line: the nanoseconds of each step of the lists'
+/// closes, in the order of `copystat::C::CloseTwinsNs` and on, and the
+/// number of closes. dup-record measured 195 closes a frame of 295-538 us
+/// each (2026-11-25): about 60-100 ms a frame on the recording threads.
+#[cfg(feature = "diagnostics")]
+static CLOSE_NS: [std::sync::atomic::AtomicU64; 9] = [const { std::sync::atomic::AtomicU64::new(0) }; 9];
+
+/// Times the steps of a list's close ([`HostList::close`]); nothing without
+/// diagnostics.
+struct Lap {
+    #[cfg(feature = "diagnostics")]
+    at: std::time::Instant,
+}
+
+impl Lap {
+    fn begin() -> Self {
+        #[cfg(feature = "diagnostics")]
+        {
+            crate::copystat::add(crate::copystat::C::Closes, 1);
+            CLOSE_NS[8].fetch_add(1, Ordering::Relaxed);
+        }
+        Lap {
+            #[cfg(feature = "diagnostics")]
+            at: std::time::Instant::now(),
+        }
+    }
+
+    /// Step `i` of the close ended now.
+    #[cfg_attr(not(feature = "diagnostics"), allow(unused_variables))]
+    fn to(&mut self, i: usize) {
+        #[cfg(feature = "diagnostics")]
+        {
+            use crate::copystat::C;
+            let now = std::time::Instant::now();
+            let ns = (now - std::mem::replace(&mut self.at, now)).as_nanos() as u64;
+            let c = match i {
+                0 => C::CloseTwinsNs,
+                1 => C::CloseTexBackNs,
+                2 => C::CloseIndirectNs,
+                3 => C::CloseBatchesNs,
+                4 => C::CloseBudgetNs,
+                5 => C::CloseComingNs,
+                6 => C::CloseQueryNs,
+                _ => C::CloseDriverNs,
+            };
+            crate::copystat::add(c, ns);
+            CLOSE_NS[i.min(7)].fetch_add(ns, Ordering::Relaxed);
+        }
+    }
+}
+
 /// The split of the preparing, per frame, for the frame-rate line.
 #[cfg(feature = "diagnostics")]
 fn split_line(frames: f64) {
@@ -7411,11 +7495,28 @@ fn split_line(frames: f64) {
     );
     tracing::info!(
         "the pass over the heap's views per frame: {:.1} ms looking at slots, {:.1} their copies' spans and refreshes, {:.1} textures; the \
-         first two beside the recording (VICTORY_HEAP_PASS_ASIDE), {:.1} ms waited for at the lists' close",
+         first two beside the recording (VICTORY_HEAP_PASS_ASIDE), {:.1} ms waited for at the lists' submission",
         h[0],
         h[1],
         h[2],
         aside::WAITED.swap(0, Ordering::Relaxed) as f64 / 1e3 / frames,
+    );
+    let c: Vec<f64> = CLOSE_NS.iter().map(|n| n.swap(0, Ordering::Relaxed) as f64).collect();
+    let each = c[..8].iter().sum::<f64>() / 1e3 / c[8].max(1.0);
+    let c: Vec<f64> = c.iter().map(|n| n / frames).collect();
+    tracing::info!(
+        "host lists closed per frame: {:.0}, {:.0} us each; {:.1} ms copying depth twins back, {:.1} textures read back, {:.1} the          indirect clamps, {:.1} the batched clamps, {:.1} the card budget's notes, {:.1} waiting for the heap pass ({}), {:.1}          timestamps, {:.1} the driver's Close",
+        c[8],
+        each,
+        c[0] / 1e6,
+        c[1] / 1e6,
+        c[2] / 1e6,
+        c[3] / 1e6,
+        c[4] / 1e6,
+        c[5] / 1e6,
+        if coming_at_close() { "VICTORY_COMING_AT_CLOSE=1" } else { "at the submission instead" },
+        c[6] / 1e6,
+        c[7] / 1e6,
     );
 }
 
