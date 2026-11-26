@@ -220,6 +220,22 @@ fn first_once() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_FIRST_ONCE").is_none_or(|v| v != "0"))
 }
 
+/// Every how many frames a guarded texture that was never found changing
+/// again is hashed on its turn (`VICTORY_TEXTURE_TURN`). One that was keeps
+/// every eighth frame. 8 as before when bit 1 of `VICTORY_PAGE_WRITES` is
+/// off; 64 when it is on, since DirectStorage's writes then open the
+/// texture's blocks and the guard sees them: in runs play-d to play-f
+/// (`all`) the turns hashed 4.5-6 MB a frame in the open world and found
+/// no change there, one in each run in the menus. A texture is hashed once
+/// a frame in its first frames anyway ([`HOT_FRAMES`]).
+fn turn_every() -> u64 {
+    static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *EVERY.get_or_init(|| {
+        let set = std::env::var("VICTORY_TEXTURE_TURN").ok().and_then(|v| v.parse().ok());
+        set.unwrap_or(if crate::watch::page_writes() & 1 != 0 { 64 } else { 8 }).max(1)
+    })
+}
+
 // SAFETY: the staging mapping is written only at submission, under
 // `last`'s lock; the title memory is only read.
 unsafe impl Send for Staging {}
@@ -314,7 +330,7 @@ fn staged_under(at: usize, end: usize) -> Vec<Arc<Staging>> {
 /// Such a texture keeps its staging buffer and is checked at every
 /// submission that samples it ([`Staging::refresh`]). That check skips the
 /// read while the guards saw no write to the texture's blocks, unless it is
-/// the texture's turn (one frame in eight) or the texture changed lately. A
+/// the texture's turn ([`turn_every`]) or the texture changed lately. A
 /// write into the physical pages through the runtime's own view does not
 /// fault at the guard: the check sees it only if bit 1 of
 /// `VICTORY_PAGE_WRITES` opened the blocks, or at the texture's turn. The
@@ -1687,7 +1703,7 @@ impl Staging {
         // is noted, a mapping is announced by the runtime. While neither
         // happened the texture is as it was. What the guard cannot see (a
         // write to the same pages through another view) is still found by
-        // the hash, which is taken every eighth frame only, by the
+        // the hash, which is taken on turns only ([`turn_every`]), by the
         // texture's address, so the textures take turns.
         // `VICTORY_TEXTURE_GUARD=0` hashes at every check, as before.
         static GUARD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -1700,13 +1716,11 @@ impl Staging {
             && *GUARD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD").is_none_or(|v| v != "0"))
             && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, true))
         {
-            const HASH_EVERY: u64 = 8;
             let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
             last.asked = now;
             let frame = crate::frame::current();
-            let turn = frame
-                .wrapping_add((start >> 16) as u64)
-                .is_multiple_of(HASH_EVERY);
+            let every = if last.hot_until == 0 { turn_every() } else { 8 };
+            let turn = frame.wrapping_add((start >> 16) as u64).is_multiple_of(every);
             // A texture starts hot: one written that way from its first
             // frames on changes before the hash has ever caught it.
             if last.started == 0 {
