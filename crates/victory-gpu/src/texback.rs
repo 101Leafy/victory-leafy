@@ -123,6 +123,10 @@ impl Target {
     }
 
     pub(crate) fn owner(&self) -> usize { self.ticket.owner }
+
+    /// Whether the ticket still holds: the texture's memory was not reused or
+    /// remapped since it was registered.
+    pub(crate) fn fresh(&self) -> bool { self.ticket.valid.load(Ordering::Acquire) }
 }
 
 /// The readback resources and the allocation the pixels belong to.
