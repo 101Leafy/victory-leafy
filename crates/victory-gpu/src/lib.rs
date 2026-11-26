@@ -23,6 +23,8 @@ pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
 #[cfg(all(windows, feature = "diagnostics"))]
+mod sidetime;
+#[cfg(all(windows, feature = "diagnostics"))]
 mod faultbook;
 #[cfg(windows)]
 mod cores;
