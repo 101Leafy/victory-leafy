@@ -1039,6 +1039,13 @@ fn create() -> windows::core::Result<Host> {
 }
 
 impl Host {
+    /// Ticks per second of the queue's timestamps.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn timestamp_frequency(&self) -> u64 {
+        // SAFETY: a plain query.
+        unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1)
+    }
+
     /// The driver's version, as the system counts it (0: not known).
     pub(crate) fn driver(&self) -> i64 {
         let adapter = self.adapter.as_ref();
@@ -1171,6 +1178,150 @@ mod tests {
 
     use super::*;
 
+    /// Read backs of one list share 512-byte-aligned chunks instead of
+    /// taking a read-back buffer each, and the chunks are reused after a
+    /// reset.
+    #[test]
+    fn readback_spaces_share_chunks_and_are_reused() {
+        let Some(host) = host() else { return };
+        let list = host.new_list().unwrap();
+        let (first, at, ptr) = list.readback_space(4 << 10).unwrap();
+        let (second, at2, ptr2) = list.readback_space(4 << 10).unwrap();
+        assert_eq!(first.as_raw(), second.as_raw(), "one chunk for the list's read backs");
+        assert_eq!(at % 512, 0);
+        assert_eq!(at2, at + (4 << 10));
+        assert_eq!(ptr2 as usize - ptr as usize, 4 << 10);
+        assert!(list.readback_space(SCRATCH_CHUNK + 1).is_none(), "a copy larger than a chunk");
+        list.close();
+        host.execute(&[&list]);
+        list.reset();
+        let (again, at3, _) = list.readback_space(4 << 10).unwrap();
+        assert_eq!((again.as_raw(), at3), (first.as_raw(), at), "reused after reset");
+        list.close();
+        host.execute(&[&list]);
+        list.reset();
+    }
+
+    /// A texture read back through the shared chunk: the texels put in the
+    /// texture come back at the chunk's 512-byte-aligned offset, which
+    /// D3D12 requires of a placed texture footprint.
+    #[test]
+    fn texture_readback_through_shared_chunks_round_trips_texels() {
+        let Some(host) = host() else { return };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Alignment: 0,
+            Width: 4,
+            Height: 4,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
+            Flags: D3D12_RESOURCE_FLAG_NONE,
+        };
+        let mut texture: Option<ID3D12Resource> = None;
+        // SAFETY: plain creation into our out pointer.
+        unsafe {
+            host.device.CreateCommittedResource(
+                &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+                D3D12_HEAP_FLAG_NONE,
+                &desc,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                None,
+                &mut texture,
+            )
+        }
+        .expect("texture");
+        let texture = texture.expect("texture");
+        let mut footprint = [D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); 1];
+        let mut rows = [0u32; 1];
+        let mut total = 0u64;
+        // SAFETY: arrays for one subresource.
+        unsafe {
+            host.device.GetCopyableFootprints(&desc, 0, 1, 0, Some(footprint.as_mut_ptr()), Some(rows.as_mut_ptr()), None, Some(&mut total));
+        }
+        let f = footprint[0];
+        let pitch = f.Footprint.RowPitch as usize;
+        let (upload, udata) = host.upload_buffer(total).expect("upload buffer");
+        let mut pattern = [0u8; 64];
+        for y in 0..4 {
+            for x in 0..16 {
+                let v = (1 + y * 16 + x) as u8;
+                pattern[y * 16 + x] = v;
+                // SAFETY: inside the upload buffer.
+                unsafe { *udata.add(y * pitch + x) = v };
+            }
+        }
+        let list = host.new_list().unwrap();
+        let sub = |r: &ID3D12Resource, i: u32| D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: a borrowed pointer the copy does not release.
+            pResource: unsafe { std::mem::transmute_copy(r) },
+            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: i },
+        };
+        let placed = |r: &ID3D12Resource, mut p: D3D12_PLACED_SUBRESOURCE_FOOTPRINT, offset: u64| {
+            p.Offset = offset;
+            D3D12_TEXTURE_COPY_LOCATION {
+                // SAFETY: as above.
+                pResource: unsafe { std::mem::transmute_copy(r) },
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: p },
+            }
+        };
+        // SAFETY: an open list; the texture is COPY_DEST, the upload buffer
+        // is upload memory.
+        unsafe {
+            list.list.CopyTextureRegion(&sub(&texture, 0), 0, 0, 0, &placed(&upload, f, 0), None);
+            list.list.ResourceBarrier(&[transition(&texture, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+        }
+        // Something ahead of it in the chunk, so the offset is not 0.
+        let _ = list.readback_space(100).expect("read-back space");
+        let (readback, at, rdata) = list.readback_space(total).expect("read-back space");
+        assert_eq!(at, 512);
+        // SAFETY: the texture is COPY_SOURCE; the chunk is COPY_DEST memory.
+        unsafe {
+            list.list.CopyTextureRegion(&placed(&readback, f, at), 0, 0, 0, &sub(&texture, 0), None);
+        }
+        list.close();
+        host.execute(&[&list]);
+        for y in 0..4 {
+            for x in 0..16 {
+                // SAFETY: inside the chunk, the card is done with it.
+                let got = unsafe { *rdata.add(y * pitch + x) };
+                assert_eq!(got, pattern[y * 16 + x], "texel row {y} byte {x}");
+            }
+        }
+        list.reset();
+    }
+
+    /// `cargo test --release -p victory-gpu benchmark_readback_spaces -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "benchmark: a read-back buffer per copy against the shared chunks"]
+    fn benchmark_readback_spaces() {
+        let Some(host) = host() else { return };
+        const N: u32 = 2_000;
+        const BYTES: u64 = 4 << 10;
+        let started = std::time::Instant::now();
+        for _ in 0..N {
+            let buffer = host.new_read_back(BYTES).unwrap().unwrap();
+            let mut data = std::ptr::null_mut();
+            // SAFETY: a new read-back buffer.
+            unsafe { buffer.Map(0, None, Some(&mut data)) }.unwrap();
+        }
+        let one_each = started.elapsed();
+        let list = host.new_list().unwrap();
+        let started = std::time::Instant::now();
+        for _ in 0..N {
+            let _ = list.readback_space(BYTES).unwrap();
+        }
+        let shared = started.elapsed();
+        println!("{N} x {BYTES} B read-back spaces: one buffer each {one_each:?}, shared chunks {shared:?}");
+        list.close();
+        host.execute(&[&list]);
+        list.reset();
+    }
+
     #[test]
     fn warp_adapter_accepts_only_software() {
         // This probes DXGI without creating a D3D12 device or running a title.
@@ -1210,6 +1361,9 @@ pub(crate) struct HostList {
     /// Upload memory for data the list's draws make (expanded vertices),
     /// reused after a reset.
     scratch: Mutex<Scratch>,
+    /// Read-back memory for texture-to-buffer copies: chunks the list's
+    /// read backs share, reused after a reset.
+    readbacks: Mutex<Readbacks>,
     /// Host texture states the list assumes, by host copy: at its start and
     /// at its end. Lists are recorded on many threads and run in submission
     /// order, so the transitions from a texture's real state are made at
@@ -1259,6 +1413,9 @@ pub(crate) struct HostList {
     /// and at the end, and where they are read back.
     #[cfg(feature = "diagnostics")]
     stamps: OnceLock<Option<(ID3D12QueryHeap, ID3D12Resource)>>,
+    /// The batched clamps' passes on the card.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) clamp_stamps: crate::indirect::batch::Stamps,
 }
 
 /// A list's prelude: an allocator and a closed list.
@@ -1894,6 +2051,69 @@ impl Drop for Scratch {
 }
 
 const SCRATCH_CHUNK: u64 = 4 << 20;
+
+/// Read-back chunks for texture-to-buffer copies, front to back: the
+/// chunks, the one in use and the bytes used in it. A list's read backs
+/// share them, and they are reused after a reset (upstream #2818: a
+/// read-back buffer for every copy cost CreateCommittedResource and Map).
+#[derive(Default)]
+struct Readbacks {
+    chunks: Vec<ReadbackChunk>,
+    current: usize,
+    used: u64,
+}
+
+// SAFETY: the chunk pointers are persistent mappings of read-back buffers.
+unsafe impl Send for Readbacks {}
+
+struct ReadbackChunk {
+    buffer: ID3D12Resource,
+    mapped: usize,
+    capacity: u64,
+}
+
+/// A list's first read-back chunk; the next ones double, up to
+/// `SCRATCH_CHUNK`.
+const READBACK_FIRST: u64 = 64 << 10;
+
+impl Readbacks {
+    /// `len` bytes (a multiple of 512, at most one chunk) in a read-back
+    /// chunk, made on demand: the chunk and the offset in it.
+    fn allocate(&mut self, host: &Host, len: u64) -> Option<(usize, u64)> {
+        while let Some(chunk) = self.chunks.get(self.current) {
+            if len <= chunk.capacity - self.used {
+                break;
+            }
+            (self.current, self.used) = (self.current + 1, 0);
+        }
+        if self.current == self.chunks.len() {
+            let next = self.chunks.last().map_or(READBACK_FIRST, |c| 2 * c.capacity);
+            let capacity = len.next_multiple_of(READBACK_FIRST).max(next).min(SCRATCH_CHUNK);
+            #[cfg(feature = "diagnostics")]
+            let making = std::time::Instant::now();
+            let buffer = host.new_read_back(capacity).ok()??;
+            let mut data = std::ptr::null_mut();
+            // SAFETY: a read-back buffer of ours, mapped once for good; the
+            // CPU reads it only after the list that wrote it has run.
+            unsafe { buffer.Map(0, None, Some(&mut data)) }.ok()?;
+            if data.is_null() {
+                return None;
+            }
+            #[cfg(feature = "diagnostics")]
+            {
+                crate::copystat::add(crate::copystat::C::ReadBacksMadeNs, making.elapsed().as_nanos() as u64);
+                crate::copystat::add(crate::copystat::C::ReadBacksMade, 1);
+                crate::copystat::add(crate::copystat::C::ReadBacksMadeBytes, capacity);
+            }
+            name(&buffer, || format!("list read-back chunk {capacity:#x}"));
+            self.chunks.push(ReadbackChunk { buffer, mapped: data as usize, capacity });
+            self.used = 0;
+        }
+        let at = self.used;
+        self.used += len;
+        Some((self.current, at))
+    }
+}
 /// A list's first chunk when the chunks are shared ([`scratch_pool`]): most
 /// lists put a few constants or a rectangle's corners there, and every
 /// list that did took 4 MiB of the PC's memory for it.
@@ -2323,10 +2543,11 @@ struct Deferred {
     /// bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
     /// Textures read back (texture to buffer copies), done once the list
-    /// has run: the host buffer the list copies the texels into, the title
-    /// memory they go to, the bytes of a row, the rows, the title's row
-    /// pitch.
-    backs: Vec<(ID3D12Resource, usize, [usize; 3])>,
+    /// has run: the host buffer the list copies the texels into, where they
+    /// are in a read-back chunk mapped for good (0: map the buffer, from its
+    /// start), the title memory they go to, the bytes of a row, the rows,
+    /// the title's row pitch.
+    backs: Vec<(ID3D12Resource, usize, usize, [usize; 3])>,
     /// Title textures of the kinds copied back ([`crate::texback`]) that
     /// the list's shaders write, copied when the list closes.
     back_wanted: Vec<crate::texback::Target>,
@@ -3159,7 +3380,7 @@ pub(crate) fn joinable<'a>(ahead: impl Iterator<Item = &'a HostList>, next: &[&H
     for list in &ahead {
         let deferred = list.deferred();
         written.extend(deferred.writes.iter().map(|&(at, _, bytes)| (at, at + bytes)));
-        written.extend(deferred.backs.iter().map(|&(_, at, [row, rows, pitch])| (at, at + rows.saturating_sub(1) * pitch + row)));
+        written.extend(deferred.backs.iter().map(|&(_, _, at, [row, rows, pitch])| (at, at + rows.saturating_sub(1) * pitch + row)));
     }
     let mut joined = Vec::new();
     join_ranges(&mut joined, written);
@@ -3932,13 +4153,13 @@ fn read_backs(list: &HostList) {
     for back in &list.deferred().texture_backs {
         crate::texback::land(back);
     }
-    for (buffer, at, [row, rows, pitch]) in &list.deferred().backs {
-        let mut data = std::ptr::null_mut();
-        // SAFETY: a read-back buffer of ours, written by the list that has
-        // run; the title's destination holds every row (checked when the
-        // copy was recorded).
+    for (buffer, mapped, at, [row, rows, pitch]) in &list.deferred().backs {
+        let mut data = *mapped as *mut std::ffi::c_void;
+        // SAFETY: a read-back buffer of ours (or a chunk of one, mapped for
+        // good), written by the list that has run; the title's destination
+        // holds every row (checked when the copy was recorded).
         unsafe {
-            if buffer.Map(0, None, Some(&mut data)).is_ok() && !data.is_null() {
+            if (*mapped != 0 || buffer.Map(0, None, Some(&mut data)).is_ok()) && !data.is_null() {
                 let from = data.cast::<u8>().cast_const();
                 for line in 0..*rows {
                     std::ptr::copy_nonoverlapping(from.add(line * row.next_multiple_of(256)), (*at as *mut u8).add(line * pitch), *row);
@@ -3956,7 +4177,9 @@ fn read_backs(list: &HostList) {
                         "walls trace: a read-back lands in title memory"
                     );
                 }
-                buffer.Unmap(0, None);
+                if *mapped == 0 {
+                    buffer.Unmap(0, None);
+                }
             }
         }
     }
@@ -4177,6 +4400,7 @@ impl Host {
                 list,
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
+                readbacks: Mutex::default(),
                 states: Mutex::default(),
                 twins: Mutex::default(),
                 prelude,
@@ -4194,6 +4418,8 @@ impl Host {
                 notes,
                 #[cfg(feature = "diagnostics")]
                 stamps: OnceLock::new(),
+                #[cfg(feature = "diagnostics")]
+                clamp_stamps: Default::default(),
             })
         }
     }
@@ -6329,6 +6555,8 @@ impl HostList {
                 self.list.ResolveQueryData(heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, count + 1, back, 0);
             }
         }
+        #[cfg(feature = "diagnostics")]
+        self.clamp_stamps.resolve(&self.list);
         lap.to(6);
         // SAFETY: our list.
         if let Err(e) = unsafe { self.list.Close() } {
@@ -6383,6 +6611,8 @@ impl HostList {
         self.indirects.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        #[cfg(feature = "diagnostics")]
+        self.clamp_stamps.read();
         {
             let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
             (scratch.current, scratch.used) = (0, 0);
@@ -6391,6 +6621,10 @@ impl HostList {
             if scratch_pool() {
                 give_chunks(std::mem::take(&mut scratch.chunks));
             }
+        }
+        {
+            let mut readbacks = self.readbacks.lock().unwrap_or_else(|e| e.into_inner());
+            (readbacks.current, readbacks.used) = (0, 0);
         }
         // SAFETY: the list is not executing.
         let reset = unsafe {
@@ -6982,10 +7216,30 @@ impl HostList {
 
     /// A read back: once the list has run, `rows` rows of `row` bytes go
     /// from `buffer` (rows 256-byte pitched, see `PlacedFootprint::host_rows`)
-    /// to title memory at `dst`, pitched `pitch`. The buffer lives until
-    /// the list is reset.
-    pub(crate) fn defer_read_back(&self, buffer: ID3D12Resource, dst: *mut u8, [row, rows, pitch]: [usize; 3]) {
-        self.deferred().backs.push((buffer, dst as usize, [row, rows, pitch]));
+    /// to title memory at `dst`, pitched `pitch`. `mapped` is where they are
+    /// when the buffer is a read-back chunk ([`HostList::readback_space`]),
+    /// else null and they start the buffer. The buffer lives until the list
+    /// is reset.
+    pub(crate) fn defer_read_back(&self, buffer: ID3D12Resource, mapped: *const u8, dst: *mut u8, [row, rows, pitch]: [usize; 3]) {
+        self.deferred().backs.push((buffer, mapped as usize, dst as usize, [row, rows, pitch]));
+    }
+
+    /// `len` bytes of read-back memory for a texture-to-buffer copy, at an
+    /// offset that is a multiple of 512 (a placed footprint's alignment):
+    /// the buffer, the offset in it and the CPU pointer there. The list's
+    /// read backs share chunks of up to 4 MiB, reused after a reset; `None`
+    /// for a larger copy (it takes a buffer of its own) or with
+    /// `VICTORY_READ_BACK_CHUNKS=0`.
+    pub(crate) fn readback_space(&self, len: u64) -> Option<(ID3D12Resource, u64, *const u8)> {
+        let len = len.max(1).checked_next_multiple_of(512)?;
+        if len > SCRATCH_CHUNK || !crate::toggled!("VICTORY_READ_BACK_CHUNKS") {
+            return None;
+        }
+        let host = host()?;
+        let mut s = self.readbacks.lock().unwrap_or_else(|e| e.into_inner());
+        let (chunk, at) = s.allocate(host, len)?;
+        let chunk = &s.chunks[chunk];
+        Some((chunk.buffer.clone(), at, (chunk.mapped + at as usize) as *const u8))
     }
 
     /// Stores `what` (`bytes` of it) at `dst` once the list has run.
@@ -8721,39 +8975,11 @@ impl Host {
         };
         #[cfg(feature = "diagnostics")]
         let making = std::time::Instant::now();
-        let heap = D3D12_HEAP_PROPERTIES {
-            Type: D3D12_HEAP_TYPE_READBACK,
-            ..Default::default()
-        };
-        let desc = D3D12_RESOURCE_DESC {
-            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-            Width: size.max(1),
-            Height: 1,
-            DepthOrArraySize: 1,
-            MipLevels: 1,
-            SampleDesc: DXGI_SAMPLE_DESC {
-                Count: 1,
-                Quality: 0,
-            },
-            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
-            ..Default::default()
-        };
-        let mut buffer: Option<ID3D12Resource> = None;
-        // SAFETY: plain creation of a read-back buffer.
-        let made = unsafe {
-            self.device.CreateCommittedResource(
-                &heap,
-                D3D12_HEAP_FLAG_NONE,
-                &desc,
-                D3D12_RESOURCE_STATE_COPY_DEST,
-                None,
-                &mut buffer,
-            )
-        };
+        let made = self.new_read_back(size);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::ReadBacksMadeNs, making.elapsed().as_nanos() as u64);
         match made {
-            Ok(()) => {
+            Ok(buffer) => {
                 if pooled && let Some(buffer) = &buffer {
                     let mut pool = pool.take().unwrap_or_else(|| POOL.lock().unwrap_or_else(|e| e.into_inner()));
                     let full = |pool: &Vec<(u64, ID3D12Resource)>| {
@@ -8776,6 +9002,41 @@ impl Host {
                 None
             }
         }
+    }
+
+    /// A new buffer of `size` bytes in the read-back heap, in the state
+    /// copies into it need.
+    fn new_read_back(&self, size: u64) -> windows::core::Result<Option<ID3D12Resource>> {
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_READBACK,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: size.max(1),
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let mut buffer: Option<ID3D12Resource> = None;
+        // SAFETY: plain creation of a read-back buffer.
+        unsafe {
+            self.device.CreateCommittedResource(
+                &heap,
+                D3D12_HEAP_FLAG_NONE,
+                &desc,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                None,
+                &mut buffer,
+            )
+        }?;
+        Ok(buffer)
     }
 
     pub(crate) fn upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
