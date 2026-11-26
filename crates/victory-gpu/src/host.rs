@@ -827,7 +827,25 @@ pub(crate) fn host() -> Option<&'static Host> {
     .as_ref()
 }
 
+/// Makes the host GPU on its own thread while the title loads, so its first
+/// device call does not wait for the driver (5.4 s of play-g's 8.1 s to the
+/// first frame). `VICTORY_HOST_EARLY=0`: made on first use, as before.
+pub fn start_host() {
+    if std::env::var_os("VICTORY_HOST_EARLY").is_some_and(|v| v == "0") {
+        return;
+    }
+    let spawned = std::thread::Builder::new().name("host device".into()).spawn(|| {
+        let started = std::time::Instant::now();
+        let made = host().is_some();
+        tracing::info!(made, ms = started.elapsed().as_millis() as u64, "host device made ahead of the title");
+    });
+    if let Err(e) = spawned {
+        tracing::warn!(error = %e, "host device thread not started; made on first use");
+    }
+}
+
 fn create() -> windows::core::Result<Host> {
+    let started = std::time::Instant::now();
     // SAFETY: plain D3D12 object creation with valid descriptions.
     unsafe {
         // The debug layer only in builds with diagnostics.
@@ -885,7 +903,9 @@ fn create() -> windows::core::Result<Host> {
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");
         } else {
+            let driver = std::time::Instant::now();
             D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            tracing::info!(ms = driver.elapsed().as_millis() as u64, "D3D12CreateDevice done");
             // Whether a GPU hang ends the run or freezes the PC (#1054).
             crate::tdr::log();
         }
@@ -951,7 +971,7 @@ fn create() -> windows::core::Result<Host> {
         let adapter = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
             .and_then(|factory| factory.EnumAdapterByLuid::<IDXGIAdapter3>(device.GetAdapterLuid()))
             .ok();
-        tracing::info!("host D3D12 device ready");
+        tracing::info!(ms = started.elapsed().as_millis() as u64, "host D3D12 device ready");
         Ok(Host {
             device,
             queue,
@@ -8491,39 +8511,49 @@ impl Host {
     /// a buffer only the pool holds is not in use. dup-record saw about two
     /// CreateCommittedResource calls a frame here (2026-11-25).
     /// `VICTORY_READ_BACK_POOL=0`: a new buffer each time, as before.
+    ///
+    /// Buffers up to 16 MiB were kept, 32 at most, never let go: in run
+    /// play-f's open world 12 a frame were still made against 6 given
+    /// again, and the textures-read-back step of the lists' close took
+    /// 74 ms a frame (all threads), about 6 ms a buffer. Now buffers up to
+    /// `LARGEST` are kept, up to `KEPT_BYTES` in all, and one nobody holds
+    /// makes room for a new size when the pool is full.
     pub(crate) fn read_back_buffer(&self, size: u64) -> Option<ID3D12Resource> {
-        /// Buffers up to this size are kept, rounded up to a power of two
-        /// from 64 KiB, at most `KEPT` of them.
-        const LARGEST: u64 = 16 << 20;
-        const KEPT: usize = 32;
+        /// Buffers up to this size are kept: up to 16 MiB rounded up to a
+        /// power of two from 64 KiB, larger ones to a multiple of 8 MiB.
+        const LARGEST: u64 = 256 << 20;
+        const KEPT: usize = 48;
+        const KEPT_BYTES: u64 = 1 << 30;
         static POOL: Mutex<Vec<(u64, ID3D12Resource)>> = Mutex::new(Vec::new());
         static ON: OnceLock<bool> = OnceLock::new();
+        // SAFETY: a live buffer of the pool's; the count before the
+        // reference taken here tells whether anyone else holds it, and only
+        // the pool hands it out, under its lock.
+        let idle = |buffer: &ID3D12Resource| unsafe {
+            let vtable = Interface::vtable(buffer);
+            let count = (vtable.base__.base__.base__.base__.AddRef)(buffer.as_raw());
+            (vtable.base__.base__.base__.base__.Release)(buffer.as_raw());
+            count == 2
+        };
         let pooled = size <= LARGEST && *ON.get_or_init(|| std::env::var_os("VICTORY_READ_BACK_POOL").is_none_or(|v| v != "0"));
-        let size = if pooled { size.max(64 << 10).next_power_of_two() } else { size };
+        let size = match size {
+            _ if !pooled => size,
+            0..=0x100_0000 => size.max(64 << 10).next_power_of_two(),
+            _ => size.next_multiple_of(8 << 20),
+        };
         let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
-        if pooled {
-            for (kept, buffer) in pool.iter() {
-                if *kept != size {
-                    continue;
-                }
-                // SAFETY: a live buffer of the pool's; the count before the
-                // reference taken here tells whether anyone else holds it,
-                // and only the pool hands it out, under this lock.
-                let count = unsafe {
-                    let vtable = Interface::vtable(buffer);
-                    let count = (vtable.base__.base__.base__.base__.AddRef)(buffer.as_raw());
-                    (vtable.base__.base__.base__.base__.Release)(buffer.as_raw());
-                    count
-                };
-                if count == 2 {
-                    #[cfg(feature = "diagnostics")]
-                    crate::copystat::add(crate::copystat::C::ReadBacksReused, 1);
-                    return Some(buffer.clone());
-                }
-            }
+        if pooled
+            && let Some((_, buffer)) = pool.iter().find(|(kept, buffer)| *kept == size && idle(buffer))
+        {
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::ReadBacksReused, 1);
+            return Some(buffer.clone());
         }
         #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::ReadBacksMade, 1);
+        {
+            crate::copystat::add(crate::copystat::C::ReadBacksMade, 1);
+            crate::copystat::add(crate::copystat::C::ReadBacksMadeBytes, size);
+        }
         let heap = D3D12_HEAP_PROPERTIES {
             Type: D3D12_HEAP_TYPE_READBACK,
             ..Default::default()
@@ -8555,10 +8585,19 @@ impl Host {
         };
         match made {
             Ok(()) => {
-                if pooled && pool.len() < KEPT
-                    && let Some(buffer) = &buffer
-                {
-                    pool.push((size, buffer.clone()));
+                if pooled && let Some(buffer) = &buffer {
+                    let full = |pool: &Vec<(u64, ID3D12Resource)>| {
+                        pool.len() >= KEPT || pool.iter().map(|(kept, _)| kept).sum::<u64>() + size > KEPT_BYTES
+                    };
+                    while full(&pool) {
+                        let Some(i) = pool.iter().position(|(_, b)| idle(b)) else {
+                            break;
+                        };
+                        pool.swap_remove(i);
+                    }
+                    if !full(&pool) {
+                        pool.push((size, buffer.clone()));
+                    }
                 }
                 buffer
             }
