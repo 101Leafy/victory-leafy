@@ -10,8 +10,13 @@
 //! which cannot be watched, a content hash of the whole memory at every
 //! submission that samples it.
 //!
-//! shortcut: a change detiles the whole texture, not the pages written.
-//! Only textures read through descriptor tables are brought up to date
+//! A watched change detiles, of each subresource, only the rows whose
+//! tiled bytes the pages written touch; the staging buffer holds the rest
+//! from before.
+//!
+//! shortcut: the whole staging buffer is still copied to the host texture.
+//! A change to an unwatched texture, a first detiling, and a texture with
+//! levels on demand detile the whole texture. Only textures read through descriptor tables are brought up to date
 //! (directly indexed views are not known per draw); plane 0 is uploaded
 //! (every mip and array slice), depth and stencil planes are not.
 
@@ -1815,16 +1820,20 @@ impl Staging {
             if !exact && last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
                 return 0;
             }
-            last.asked = now;
+            let since = std::mem::replace(&mut last.asked, now);
             // Read through the copy, which stands unmapped pages: memory of
             // big pools is too slow to ask page by page.
-            with_read(size, |read| {
+            let read = with_read(size, |read| {
+                if !exact && since != 0 && !self.on_demand && let Some(bytes) = self.detile_written(read, &written, since) {
+                    return bytes;
+                }
                 crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
                 self.detile(read);
+                size
             });
             #[cfg(feature = "diagnostics")]
-            crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
-            return size;
+            crate::copystat::add(crate::copystat::C::TexWatched, read as u64);
+            return read;
         }
         // View memory has no write-watch, and a texture there was hashed
         // whole at every check: 229 MB and 51 ms a frame in a gameplay view
@@ -2039,6 +2048,67 @@ impl Staging {
             crate::descriptor::host::read_all(start);
         }
         size
+    }
+
+    /// Of each part, reads into `read` and detiles only the rows whose tiled
+    /// bytes the pages in `written` written after `since` touch (one page
+    /// written into mip 0 of a 4K texture re-read and detiled all 16 MiB of
+    /// it). Returns the bytes read, or `None` if the layout cannot say which
+    /// rows or a part was not detiled (then it is detiled whole).
+    fn detile_written(&self, read: &mut [u8], written: &[(usize, u64)], since: u64) -> Option<usize> {
+        let (start, size) = (self.memory as usize, self.read);
+        let page = crate::watch::PAGE;
+        let mut changed: Vec<(usize, usize)> = Vec::new();
+        for &(p, _) in written.iter().filter(|&&(_, w)| w > since) {
+            let (a, b) = ((p * page).max(start) - start, ((p + 1) * page).min(start + size) - start);
+            match changed.last_mut() {
+                Some(last) if last.1 >= a => last.1 = last.1.max(b),
+                _ if a < b => changed.push((a, b)),
+                _ => {}
+            }
+        }
+        let bands = (0..self.footprints.len())
+            .map(|i| {
+                let (mip, slice) = self.part(i);
+                self.layout.touched_rows(mip, slice, &changed)
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let mut bytes = 0;
+        let mut done: Vec<(usize, usize)> = Vec::new();
+        for (rows, tiled) in &bands {
+            let (a, b) = (tiled.start, tiled.end.min(size));
+            if !rows.is_empty() && a < b && !done.contains(&(a, b)) {
+                // SAFETY: inside the read buffer of the texture's size.
+                crate::host::copy_mapped(unsafe { read.as_mut_ptr().add(a) }, self.memory.wrapping_add(a), b - a, false);
+                (bytes, _) = (bytes + b - a, done.push((a, b)));
+            }
+        }
+        if bands.iter().all(|(rows, _)| rows.is_empty()) {
+            return Some(bytes);
+        }
+        self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+        for (i, (band, _)) in bands.into_iter().enumerate() {
+            if band.is_empty() {
+                continue;
+            }
+            let (mip, slice) = self.part(i);
+            let (footprint, rows) = (&self.footprints[i], self.rows[i]);
+            let f = footprint.Footprint;
+            let pitch = f.RowPitch as usize;
+            let len = (pitch * rows as usize * f.Depth as usize)
+                .min(self.bytes.saturating_sub(footprint.Offset) as usize);
+            // SAFETY: the part's piece of the mapped staging buffer.
+            let linear = unsafe {
+                std::slice::from_raw_parts_mut(self.data.add(footprint.Offset as usize), len)
+            };
+            if let Err(e) = self.layout.detile_rows(read, mip, slice, linear, pitch, pitch * rows as usize, band) {
+                tracing::warn!(?e, mip, slice, "texture rows not detiled");
+                return None;
+            }
+        }
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::TexRowsDetiled, bytes as u64);
+        Some(bytes)
     }
 
     /// Detiles `tiled` (the texture's memory) into the staging buffer.
