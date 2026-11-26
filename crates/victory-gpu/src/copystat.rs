@@ -154,11 +154,15 @@ pub(crate) enum C {
     /// Bytes of copies compared after a submission that were compared after
     /// another submission of the same frame.
     BackAgainBytes,
+    /// Bytes a submission's pending refresh of a copy took in between the
+    /// ranges asked for, when a range was added apart from the one before:
+    /// the range that covers both is refreshed, not the two.
+    RefreshGapBytes,
 }
 const COUNTERS: usize = 96;
 
 /// The counters' names, in the order of [`C`], for the frame recorder's columns.
-pub(crate) const NAMES: [&str; 84] = [
+pub(crate) const NAMES: [&str; 85] = [
     "Submissions", "Copies", "CopyBytes", "Refreshes", "RefreshBytes", "Skipped", "SkippedBytes", "Runs",
     "RunUs", "Queries", "QueryUs", "MoveUs", "Unmapped", "Watches", "WatchUs", "Checked", "Unchanged",
     "Fallbacks", "GuardFaults", "TexWatched", "TexHashed", "TexChanged", "TexHot", "Frames", "RecordCalls",
@@ -171,6 +175,7 @@ pub(crate) const NAMES: [&str; 84] = [
     "NothingBackUs", "WaitsForGroups", "WaitsForBuffers", "IndirectBounded", "RefreshUpdates",
     "RefreshEmpty", "RefreshEmptyUs", "RefreshAgain", "RefreshAgainBytes", "AskRefused", "AskRefusedUs",
     "AskRefusedAgain", "AskSkipped", "AskAgain", "AskAgainBytes", "GuardAgain", "BackAgainBytes",
+    "RefreshGapBytes",
 ];
 /// One of some sets of counters, each in lines of the processor's memory of
 /// its own: a set for all threads had them wait for each other's lines at
@@ -481,7 +486,7 @@ mod command_tests {
     #[test]
     fn every_counter_is_named() {
         use super::{C, COUNTERS, NAMES};
-        assert_eq!(C::BackAgainBytes as usize + 1, NAMES.len());
+        assert_eq!(C::RefreshGapBytes as usize + 1, NAMES.len());
         assert_eq!(NAMES[C::Frames as usize], "Frames");
         assert!(NAMES.len() <= COUNTERS);
     }
