@@ -2,6 +2,7 @@ use std::fs::File;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
 
@@ -38,6 +39,7 @@ impl Cache {
         let root = root.into();
         victory_core::ensure_outside_repo(&root)?;
         std::fs::create_dir_all(&root).with_context(|| format!("creating {}", root.display()))?;
+        let _ = File::create_new(root.join(TOUCHED_SINCE));
         Ok(Cache { root })
     }
 
@@ -50,8 +52,11 @@ impl Cache {
     pub fn get_or_convert(&self, converter: &dyn Converter, input: &[u8]) -> Result<PathBuf> {
         let key = CacheKey::new(converter, input);
         let path = self.path_for(&key);
-        if path.is_file() {
+        if let Ok(meta) = std::fs::metadata(&path)
+            && meta.is_file()
+        {
             tracing::trace!(converter = converter.id(), key = %key.to_hex(), "cache hit");
+            touch(&path, &meta);
             return Ok(path);
         }
         let output = converter
@@ -69,6 +74,68 @@ impl Cache {
         }
         published?;
         Ok(path)
+    }
+
+    /// Removes the entries not used for `max_age`, and returns how many
+    /// were kept and removed. Hits mark an entry used ([`touch`]) only since
+    /// [`TOUCHED_SINCE`] was made, so nothing goes before that is `max_age`
+    /// old. An entry whose age is not known, a staging file, and one that
+    /// cannot be removed are kept.
+    pub fn prune(&self, max_age: Duration) -> (u64, u64) {
+        let (mut kept, mut pruned) = (0, 0);
+        let since = self.root.join(TOUCHED_SINCE);
+        let age = |path: &Path| {
+            std::fs::metadata(path)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+        };
+        if age(&since).is_none() {
+            let _ = File::create_new(&since);
+        }
+        let ready = age(&since).is_some_and(|a| a >= max_age);
+        for dir in std::fs::read_dir(&self.root)
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            if !dir.file_type().is_ok_and(|t| t.is_dir()) {
+                continue;
+            }
+            for entry in std::fs::read_dir(dir.path())
+                .into_iter()
+                .flatten()
+                .flatten()
+            {
+                let staging = entry.file_name().to_string_lossy().starts_with(".tmp-");
+                let old = !staging && ready && age(&entry.path()).is_some_and(|a| a > max_age);
+                if old && std::fs::remove_file(entry.path()).is_ok() {
+                    pruned += 1;
+                } else {
+                    kept += 1;
+                }
+            }
+        }
+        tracing::info!(cache = "<path>", kept, pruned, "cache pruned");
+        (kept, pruned)
+    }
+}
+
+/// Made in a cache's folder when a build that marks hits ([`touch`]) first
+/// opens it.
+const TOUCHED_SINCE: &str = "touched-since";
+
+/// Marks a hit entry used, for [`Cache::prune`]. Once a day at most.
+fn touch(path: &Path, meta: &std::fs::Metadata) {
+    const DAY: Duration = Duration::from_secs(24 * 60 * 60);
+    if meta
+        .modified()
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .is_some_and(|a| a > DAY)
+        && let Ok(file) = File::options().write(true).open(path)
+    {
+        let _ = file.set_modified(SystemTime::now());
     }
 }
 
@@ -213,6 +280,65 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::NotFound);
         assert_eq!(counter.load(Ordering::Relaxed), 1);
         assert!(!missing.exists());
+    }
+
+    #[test]
+    fn prune_removes_old_entries_only_once_hits_are_marked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = Cache::open(tmp.path()).unwrap();
+        let conv = Upper {
+            version: 1,
+            runs: AtomicUsize::new(0),
+        };
+        let entry = cache.get_or_convert(&conv, b"old").unwrap();
+        let staging = entry.with_file_name(".tmp-1-0");
+        std::fs::write(&staging, b"").unwrap();
+        let hour = Duration::from_secs(3600);
+        let past = SystemTime::now() - 2 * hour;
+        for path in [&entry, &staging] {
+            File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(past)
+                .unwrap();
+        }
+        assert_eq!(cache.prune(hour), (2, 0), "hits not marked for an hour yet");
+        let since = tmp.path().join(TOUCHED_SINCE);
+        File::options()
+            .write(true)
+            .open(&since)
+            .unwrap()
+            .set_modified(past)
+            .unwrap();
+        assert_eq!(cache.prune(hour), (1, 1));
+        assert!(!entry.exists() && staging.exists());
+    }
+
+    #[test]
+    fn a_hit_marks_an_old_entry_used() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = Cache::open(tmp.path()).unwrap();
+        let conv = Upper {
+            version: 1,
+            runs: AtomicUsize::new(0),
+        };
+        let entry = cache.get_or_convert(&conv, b"used").unwrap();
+        let past = SystemTime::now() - Duration::from_secs(3 * 24 * 3600);
+        File::options()
+            .write(true)
+            .open(&entry)
+            .unwrap()
+            .set_modified(past)
+            .unwrap();
+        cache.get_or_convert(&conv, b"used").unwrap();
+        let age = std::fs::metadata(&entry)
+            .unwrap()
+            .modified()
+            .unwrap()
+            .elapsed()
+            .unwrap();
+        assert!(age < Duration::from_secs(3600));
     }
 
     #[test]
