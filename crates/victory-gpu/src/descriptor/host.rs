@@ -1883,9 +1883,13 @@ impl HostHeap {
             ONCE.call_once(|| tracing::warn!(n, "no free dynamic descriptor slots: a table is not made"));
             #[cfg(feature = "diagnostics")]
             {
-                use crate::copystat::{C, add};
+                use crate::copystat::{C, add, most, peek};
+                let free = u64::from(self.free.load(std::sync::atomic::Ordering::Relaxed));
                 add(C::DynamicRefused, 1);
                 add(C::DynamicFull, u64::from(!enough));
+                add(C::DynamicRefusedSlots, n as u64);
+                add(C::DynamicShortOfFree, u64::from(free < n as u64));
+                most(C::DynamicWantedMost, u64::from(self.dynamic) - free + peek(C::DynamicRefusedSlots));
                 add(C::DynamicNs, started.elapsed().as_nanos() as u64);
             }
             return None;
@@ -1893,7 +1897,11 @@ impl HostHeap {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::DynamicNs, started.elapsed().as_nanos() as u64);
         taken.fill(first, first + n, true);
-        self.free.fetch_sub(n as u32, std::sync::atomic::Ordering::Relaxed);
+        let free = self.free.fetch_sub(n as u32, std::sync::atomic::Ordering::Relaxed) - n as u32;
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::most(crate::copystat::C::DynamicHeldMost, u64::from(self.dynamic - free));
+        #[cfg(not(feature = "diagnostics"))]
+        let _ = free;
         *next = ((first + n) % end) as u32;
         Some(self.count + first as u32)
     }
