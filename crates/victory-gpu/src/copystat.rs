@@ -995,6 +995,16 @@ fn log_memory() {
         targets[8],
         mb(targets[9]),
     );
+    {
+        use std::sync::atomic::Ordering::Relaxed;
+        let gone = &crate::resource::UNMAPPED_GONE;
+        tracing::info!(
+            "host copies of placed textures let go 1.5 s after their title memory was not mapped (VICTORY_SWEEP_UNMAPPED=0: as the rest), since the start: {} of {:.0} MB, {} title textures asked about",
+            gone[0].load(Relaxed),
+            mb(gone[1].load(Relaxed)),
+            gone[2].load(Relaxed)
+        );
+    }
     tracing::info!(
         "memory let go since the start: {} windows outside buffers {:.0} MB, {} staging buffers \
          {:.0} MB; of the windows alive, {:.0} MB lie between the lowest and highest address \
