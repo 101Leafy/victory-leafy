@@ -24,6 +24,10 @@ pub const ROOT_CBV_SPACE: u32 = 1;
 /// root SRV also tells the host that the buffer views of the whole heap
 /// must be ready when it runs, not only those its tables name.
 pub const SLOT_STRIDES: u8 = 255;
+/// The same table as [`SLOT_STRIDES`], for a shader that reads the words of
+/// views in its tables only (`RootType::Table`): the host binds it without
+/// making the buffer views of the whole heap ready.
+pub const SLOT_TABLE_STRIDES: u8 = 252;
 /// The bits of a [`SLOT_STRIDES`] dword that hold the stride.
 pub const VIEW_STRIDE_BITS: u32 = (1 << 30) - 1;
 /// In a [`SLOT_STRIDES`] dword: a typed buffer view of an integer format

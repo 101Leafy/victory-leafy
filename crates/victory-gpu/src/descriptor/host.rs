@@ -1447,6 +1447,12 @@ pub(crate) fn device_removed() -> Option<String> {
 pub(crate) static PLACED_TEXTURE_SLOTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub(crate) static OBJECT_TEXTURE_SLOTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// The word the table of strides holds for `view`: [`view_stride`] and
+/// [`view_kind`].
+fn view_stride_word(view: &View) -> u32 {
+    view_stride(view).unwrap_or(0) | view_kind(view)
+}
+
 /// Bytes per element of a buffer view, as the console's descriptor holds
 /// them for indexed reads (structured: the stride; raw: 1, the index is the
 /// byte; typed: the format's); `None` if `view` is not a buffer view.
@@ -3002,13 +3008,7 @@ impl HostHeap {
         }
         let stride = view.and_then(view_stride);
         let kind = view.map_or(0, view_kind);
-        if let Some((_, _, data)) = &self.strides
-            && index < victory_shader::emit::SLOT_STRIDES_COUNT
-        {
-            // SAFETY: inside the mapping; shaders read it while we write (a
-            // dword, either value is one the slot had).
-            unsafe { (*data as *mut u32).add(index as usize).write_volatile(stride.unwrap_or(0) | kind) };
-        }
+        self.write_stride(index, stride.unwrap_or(0) | kind);
         let was = if stride.is_some() {
             self.buffers.put(index);
             true
@@ -3024,6 +3024,26 @@ impl HostHeap {
             }
         }
         stale
+    }
+
+    /// Writes `word` for slot `index` in the table of strides.
+    fn write_stride(&self, index: u32, word: u32) {
+        if let Some((_, _, data)) = &self.strides
+            && index < victory_shader::emit::SLOT_STRIDES_COUNT
+        {
+            // SAFETY: inside the mapping; shaders read it while we write (a
+            // dword, either value is one the slot had).
+            unsafe { (*data as *mut u32).add(index as usize).write_volatile(word) };
+        }
+    }
+
+    /// [`HostHeap::write_stride`] for a dynamic slot, which a shader reads
+    /// through its tables (`victory_shader::emit::SLOT_TABLE_STRIDES`); the
+    /// title's own slots have theirs from [`HostHeap::note_buffer`].
+    fn dynamic_stride(&self, index: u32, word: u32) {
+        if index >= self.count {
+            self.write_stride(index, word);
+        }
     }
 
     /// Gives back `n` dynamic slots from `first` (an index [`dynamic`]
@@ -3056,6 +3076,7 @@ impl HostHeap {
         }
         self.put(index);
         self.twin_made(index, kept.is_some() && twinned(view));
+        self.dynamic_stride(index, if kept.is_some() { view_stride_word(view) } else { 0 });
         self.keep(index, kept.flatten());
     }
 
@@ -3088,13 +3109,14 @@ impl HostHeap {
                 }
                 let twin = twinned(&view);
                 let kept = make_twinned(&view, views.slot(at), Some(views.slot(at + 1)))?;
+                let stride = view_stride_word(&view);
                 let listed = Listed {
                     kind: crate::draw::view_kind(&view),
                     texture: is_texture_view(&view),
                     ready: (0, 0, false),
                     tabled: None,
                 };
-                views.made.insert(words, ListView { view, at, twin, kept, listed });
+                views.made.insert(words, ListView { view, at, twin, stride, kept, listed });
             }
             let made = &views.made[&words];
             self.copy_from(index, views.slot(made.at));
@@ -3104,6 +3126,7 @@ impl HostHeap {
             } else {
                 self.clear_twin(index);
             }
+            self.dynamic_stride(index, made.stride);
             self.keep(index, made.kept.clone());
             Some(made.listed)
         })
@@ -3128,6 +3151,7 @@ impl HostHeap {
         } else {
             null_view(self.at(index));
             self.put(index);
+            self.dynamic_stride(index, 0);
         }
         self.clear_twin(index);
         self.keep(index, None);
@@ -3218,6 +3242,7 @@ impl HostHeap {
         self.put(index);
         // (Bound by its handle, not read by index.)
         self.clear_twin(index);
+        self.dynamic_stride(index, 1);
         self.keep(index, Some(buffer.clone()));
     }
 
@@ -3227,6 +3252,7 @@ impl HostHeap {
         null_buffer_view(self.at(index));
         self.put(index);
         self.clear_twin(index);
+        self.dynamic_stride(index, 0);
         self.keep(index, None);
     }
 
@@ -3261,6 +3287,7 @@ impl HostHeap {
         };
         self.put(index);
         self.clear_twin(index);
+        self.dynamic_stride(index, 1);
         self.keep(index, Some(buffer.clone()));
     }
 
@@ -3290,6 +3317,7 @@ impl HostHeap {
         };
         self.put(index);
         self.clear_twin(index);
+        self.dynamic_stride(index, 0);
         self.keep(index, None);
     }
 
@@ -3349,6 +3377,7 @@ impl HostHeap {
         self.twin_made(index, twin.is_some());
         // After the descriptor: what it showed is let go when nothing shows
         // it any more.
+        self.dynamic_stride(index, 0);
         self.keep(index, holds.then(|| buffer.clone()));
     }
 
@@ -6311,6 +6340,8 @@ struct ListView {
     /// Its descriptor's slot in [`ListViews`]; its raw twin's is the next.
     at: u32,
     twin: bool,
+    /// Its word in the table of strides ([`view_stride_word`]).
+    stride: u32,
     kept: Kept,
     listed: Listed,
 }
