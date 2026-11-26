@@ -1292,6 +1292,27 @@ fn log_memory() {
         mb(crate::shadow::window_cover()),
         lists[3],
     );
+    // Round 4: what makes new shapes of placed views, and what became of
+    // the views past the last shape a record can number.
+    let (past, collided, varied) = crate::descriptor::shapes_new();
+    let words: Vec<String> = varied
+        .iter()
+        .enumerate()
+        .filter(|&(_, &n)| n > 0)
+        .map(|(k, n)| match k {
+            0..14 => format!("r{k} {n}"),
+            14..24 => format!("v{} {n}", k - 14),
+            _ => format!("v{} {n}", k - 12),
+        })
+        .collect();
+    tracing::info!(
+        "memory, shapes: placed views made table entries because the shapes were full: {}; views \
+         and shapes kept by themselves because another had their digest: {}; words of new shapes \
+         that differed from the last new shape of their kind (r: resource description, v: view): {}",
+        past,
+        collided,
+        if words.is_empty() { "none".to_string() } else { words.join(", ") },
+    );
 }
 
 /// Microseconds since the first call.
