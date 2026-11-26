@@ -1459,6 +1459,13 @@ pub(crate) fn log(frames: f64) {
          {runs} runs, {blocks} blocks; {reopened} blocks opened meanwhile and made writable again; \
          {failed} runs guarded under the lock after"
     );
+    let [blocks, bytes, freed] =
+        [0, 1, 2].map(|n| crate::watch::GRAPHICS_BLOCKS[n].load(std::sync::atomic::Ordering::Relaxed));
+    tracing::info!(
+        "graphics blocks given write-watched memory of their own (VICTORY_XMEM_WATCHED=0 for none), since the start: \
+         {blocks} blocks, {} MB; {freed} given back",
+        bytes >> 20
+    );
     tracing::info!(
         "waits for the write trackers' locks per frame, all threads (number, time): {}",
         crate::watch::lock_waits(frames as f64)
