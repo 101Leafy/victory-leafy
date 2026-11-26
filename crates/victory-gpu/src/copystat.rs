@@ -216,11 +216,15 @@ pub(crate) enum C {
     CloseComingNs,
     CloseQueryNs,
     CloseDriverNs,
+    /// Read-back buffers made, and given again from the pool
+    /// (`Host::read_back_buffer`).
+    ReadBacksMade,
+    ReadBacksReused,
 }
 const COUNTERS: usize = 120;
 
 /// The counters' names, in the order of [`C`], for the frame recorder's columns.
-pub(crate) const NAMES: [&str; 114] = [
+pub(crate) const NAMES: [&str; 116] = [
     "Submissions", "Copies", "CopyBytes", "Refreshes", "RefreshBytes", "Skipped", "SkippedBytes", "Runs",
     "RunUs", "Queries", "QueryUs", "MoveUs", "Unmapped", "Watches", "WatchUs", "Checked", "Unchanged",
     "Fallbacks", "GuardFaults", "TexWatched", "TexHashed", "TexChanged", "TexHot", "Frames", "RecordCalls",
@@ -237,7 +241,7 @@ pub(crate) const NAMES: [&str; 114] = [
     "BackAgainBytes", "RefreshGapBytes", "LookupQuick", "LookupTables", "LookupLoose", "ThinDrawNs",
     "ThinDraws", "ThinSetNs", "ThinBarrierNs", "ThinCopyNs", "ThinOtherNs", "TexHashedTurn", "TexHashedHot",
     "TexTurnSkipped", "Closes", "CloseTwinsNs", "CloseTexBackNs", "CloseIndirectNs", "CloseBatchesNs",
-    "CloseBudgetNs", "CloseComingNs", "CloseQueryNs", "CloseDriverNs",
+    "CloseBudgetNs", "CloseComingNs", "CloseQueryNs", "CloseDriverNs", "ReadBacksMade", "ReadBacksReused",
 ];
 /// One of some sets of counters, each in lines of the processor's memory of
 /// its own: a set for all threads had them wait for each other's lines at
@@ -548,7 +552,7 @@ mod command_tests {
     #[test]
     fn every_counter_is_named() {
         use super::{C, COUNTERS, NAMES};
-        assert_eq!(C::CloseDriverNs as usize + 1, NAMES.len());
+        assert_eq!(C::ReadBacksReused as usize + 1, NAMES.len());
         assert_eq!(NAMES[C::Frames as usize], "Frames");
         assert!(NAMES.len() <= COUNTERS);
     }

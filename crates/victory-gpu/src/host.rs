@@ -8479,8 +8479,45 @@ impl Host {
 
     /// A buffer in the upload heap, mapped for writing.
     /// A buffer of `size` bytes the card writes and we read (a read back),
-    /// in the state copies into it need.
+    /// in the state copies into it need. One made before is given again when
+    /// nobody else holds it: every holder keeps its buffer until the list
+    /// that copies into it has run (`defer_read_back`, `texback::Back`), so
+    /// a buffer only the pool holds is not in use. dup-record saw about two
+    /// CreateCommittedResource calls a frame here (2026-11-25).
+    /// `VICTORY_READ_BACK_POOL=0`: a new buffer each time, as before.
     pub(crate) fn read_back_buffer(&self, size: u64) -> Option<ID3D12Resource> {
+        /// Buffers up to this size are kept, rounded up to a power of two
+        /// from 64 KiB, at most `KEPT` of them.
+        const LARGEST: u64 = 16 << 20;
+        const KEPT: usize = 32;
+        static POOL: Mutex<Vec<(u64, ID3D12Resource)>> = Mutex::new(Vec::new());
+        static ON: OnceLock<bool> = OnceLock::new();
+        let pooled = size <= LARGEST && *ON.get_or_init(|| std::env::var_os("VICTORY_READ_BACK_POOL").is_none_or(|v| v != "0"));
+        let size = if pooled { size.max(64 << 10).next_power_of_two() } else { size };
+        let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+        if pooled {
+            for (kept, buffer) in pool.iter() {
+                if *kept != size {
+                    continue;
+                }
+                // SAFETY: a live buffer of the pool's; the count before the
+                // reference taken here tells whether anyone else holds it,
+                // and only the pool hands it out, under this lock.
+                let count = unsafe {
+                    let vtable = Interface::vtable(buffer);
+                    let count = (vtable.base__.base__.base__.base__.AddRef)(buffer.as_raw());
+                    (vtable.base__.base__.base__.base__.Release)(buffer.as_raw());
+                    count
+                };
+                if count == 2 {
+                    #[cfg(feature = "diagnostics")]
+                    crate::copystat::add(crate::copystat::C::ReadBacksReused, 1);
+                    return Some(buffer.clone());
+                }
+            }
+        }
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::ReadBacksMade, 1);
         let heap = D3D12_HEAP_PROPERTIES {
             Type: D3D12_HEAP_TYPE_READBACK,
             ..Default::default()
@@ -8511,7 +8548,14 @@ impl Host {
             )
         };
         match made {
-            Ok(()) => buffer,
+            Ok(()) => {
+                if pooled && pool.len() < KEPT
+                    && let Some(buffer) = &buffer
+                {
+                    pool.push((size, buffer.clone()));
+                }
+                buffer
+            }
             Err(e) => {
                 tracing::warn!(error = %e, size, "no read-back buffer");
                 None
