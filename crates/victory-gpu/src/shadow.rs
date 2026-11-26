@@ -3961,11 +3961,6 @@ impl Shadow {
         if crate::watch::light() && !busy.is_empty() { joined(busy) } else { busy }
     }
 
-    /// Whether the copy's memory is known not to be write-watched.
-    pub(crate) fn unwatched(&self) -> bool {
-        self.watched.load(Ordering::Relaxed) == NOT_WATCHED
-    }
-
     /// [`Shadow::merge_under_writes`] of one copy, with an asking of its own.
     #[cfg(test)]
     pub(crate) fn merge_alone(&self, address: usize, len: usize, runs_left: &mut usize) -> bool {
