@@ -501,14 +501,27 @@ pub fn fspx_program(part: &[u8]) -> Result<NativeProgram, ShaderError> {
     let granules = (u32_at(packet, PACKET_RSRC1)? & 0x3F) + 1;
     let vgprs = (granules * if wave64 { 4 } else { 8 }).min(256) as u16;
     let threads = |i: usize| u16_at(packet, PACKET_THREADS + 2 * i).map(u32::from);
+    let (layout, used) = records(meta, FSPX_RECORDS)?;
+    Ok(NativeProgram {
+        stage: HwStage::Cs,
+        wave64,
+        vgprs,
+        layout,
+        used,
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: u32_at(packet, PACKET_RSRC2)?,
+            threads: [threads(0)?, threads(1)?, threads(2)?],
+        }),
+        code: code.to_vec(),
+    })
+}
+
+/// The 0x41 records of program metadata from `from` on, as root parameters
+/// and the descriptors read; 0x42 records are skipped, a 0x43 record ends them.
+fn records(meta: &[u8], from: usize) -> Result<(Vec<RootParam>, Vec<UsedResource>), ShaderError> {
     let mut layout: Vec<RootParam> = Vec::new();
     let mut used = Vec::new();
-    for e in meta
-        .get(FSPX_RECORDS..)
-        .unwrap_or(&[])
-        .as_chunks::<FSPX_RECORD>()
-        .0
-    {
+    for e in meta.get(from..).unwrap_or(&[]).as_chunks::<FSPX_RECORD>().0 {
         match e[0] {
             0x41 => {}
             0x42 => continue,
@@ -551,18 +564,105 @@ pub fn fspx_program(part: &[u8]) -> Result<NativeProgram, ShaderError> {
         }
         used.push(u);
     }
-    Ok(NativeProgram {
-        stage: HwStage::Cs,
-        wave64,
-        vgprs,
+    Ok((layout, used))
+}
+
+/// Program metadata handed over on its own, outside a container (device
+/// methods 0x1c8 and 0x218). The records are FSPX kind 7's; the header is
+/// shorter, as observed in one title:
+///
+/// ```text
+/// version 2  u32 2, u32 size - 0xc, u32 code dwords, u8 0x40, u8 first
+///            user-data dword, u8 count of 0x41 records, u8 0; records
+///            from +0x10 (graphics stages)
+/// version 3  u32 3, u32 size - 0x14, u32 code dwords (0 seen), u32 0,
+///            16 bytes not decoded, u32 x6 not decoded; records from +0x38
+///            (the compute stage)
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LooseMetadata {
+    pub version: u32,
+    /// 0 when the metadata does not say.
+    pub code_dwords: u32,
+    pub layout: Vec<RootParam>,
+    pub used: Vec<UsedResource>,
+    /// Where the records start.
+    records: usize,
+}
+
+pub fn loose_metadata(meta: &[u8]) -> Result<LooseMetadata, ShaderError> {
+    let version = u32_at(meta, 0)?;
+    let (head, from) = match version {
+        2 => (0xc, 0x10),
+        3 => (0x14, 0x38),
+        _ => return Err(Malformed("unknown loose metadata version")),
+    };
+    if u32_at(meta, 4)? as usize + head != meta.len() {
+        return Err(Malformed("loose metadata size disagrees"));
+    }
+    let (layout, used) = records(meta, from)?;
+    Ok(LooseMetadata {
+        version,
+        code_dwords: u32_at(meta, 8)?,
         layout,
         used,
-        io: StageIo::Cs(ComputeIo {
-            rsrc2: u32_at(packet, PACKET_RSRC2)?,
-            threads: [threads(0)?, threads(1)?, threads(2)?],
-        }),
-        code: code.to_vec(),
+        records: from,
     })
+}
+
+/// A container holding a compute program handed over as loose parts: the
+/// pipeline registers (FSPX kind 0's 0x1c bytes), the code, and the program
+/// metadata ([`loose_metadata`]). The parts go into an `ACCC` part as the
+/// FSPX layout [`fspx_program`] reads, so the program takes the path a
+/// container's does. Refused unless the registers name a thread group of
+/// at most 1024 threads and the SGPRs it starts with, since a guessed one
+/// would run the code wrong.
+pub fn loose_compute(packet: &[u8], code: &[u8], meta: &[u8]) -> Result<Vec<u8>, ShaderError> {
+    if packet.len() != 0x1c {
+        return Err(Malformed("loose pipeline registers of an unknown size"));
+    }
+    let threads: u32 = (0..3)
+        .map(|i| u16_at(packet, PACKET_THREADS + 2 * i).map(u32::from))
+        .product::<Result<u32, _>>()?;
+    if threads == 0 || threads > 1024 || u32_at(packet, PACKET_RSRC2)? == 0 {
+        return Err(Malformed("loose pipeline registers without a thread group"));
+    }
+    let m = loose_metadata(meta)?;
+    // Code blobs are padded with s_code_end to 0x40 bytes.
+    let dwords = match m.code_dwords {
+        0 => code.len() / 4,
+        n => n as usize,
+    };
+    let code = code.get(..dwords * 4).ok_or(Malformed("loose code shorter than its metadata"))?;
+    let records = &meta[m.records..];
+    let mut kind7 = Vec::with_capacity(FSPX_RECORDS + records.len());
+    kind7.extend(0x403u32.to_le_bytes());
+    kind7.extend(((FSPX_RECORDS + records.len() - 0x14) as u32).to_le_bytes());
+    kind7.extend((dwords as u32).to_le_bytes());
+    kind7.extend([0; 8]);
+    kind7.extend([0x40, 0, 0, 0]);
+    kind7.extend(records);
+    let parts: [(u32, &[u8]); 3] = [(FSPX_PACKET, packet), (FSPX_CODE, code), (FSPX_METADATA, &kind7)];
+    let mut fspx = Vec::new();
+    fspx.extend(b"FSPX");
+    fspx.extend(FSPX_VERSION.to_le_bytes());
+    fspx.extend((parts.len() as u32).to_le_bytes());
+    fspx.extend([0; 4]);
+    let mut offset = FSPX_HEADER + 16 * parts.len();
+    for (kind, data) in parts {
+        for v in [kind, offset as u32, data.len() as u32, 0] {
+            fspx.extend(v.to_le_bytes());
+        }
+        offset += data.len().next_multiple_of(4);
+    }
+    for (_, data) in parts {
+        fspx.extend(data);
+        fspx.resize(fspx.len().next_multiple_of(4), 0);
+    }
+    let size = fspx.len() as u32;
+    fspx[12..16].copy_from_slice(&size.to_le_bytes());
+    fspx_program(&fspx)?;
+    Ok(crate::dxbc::build(&[(crate::FourCC::ACCC, &fspx)]))
 }
 
 fn u16_at(data: &[u8], at: usize) -> Result<u16, ShaderError> {
@@ -1250,5 +1350,80 @@ mod tests {
         let mut bad_adler = good.clone();
         *bad_adler.last_mut().unwrap() ^= 1;
         assert!(unpack(&bad_adler).is_err());
+    }
+
+    /// A 32-byte metadata record.
+    fn record(tag: u8, kind: u8, root: u8, offset: u32, register: u32, dwords: u8, user: u8, slot: u8) -> [u8; 32] {
+        let mut r = [0u8; 32];
+        r[0] = tag;
+        r[4] = kind;
+        r[5] = root;
+        r[8..12].copy_from_slice(&offset.to_le_bytes());
+        r[12..16].copy_from_slice(&register.to_le_bytes());
+        r[16..20].copy_from_slice(&4u32.to_le_bytes());
+        r[20] = dwords;
+        r[21] = user;
+        r[22] = slot;
+        r[24..28].copy_from_slice(&u32::MAX.to_le_bytes());
+        r
+    }
+
+    /// Version 3 metadata shaped as the title's: an SRV table, a UAV table,
+    /// a declaration, the hash.
+    fn loose_v3() -> Vec<u8> {
+        let mut m = vec![0u8; 0x38];
+        m[0] = 3;
+        m.extend(record(0x41, 0, 3, 0, 266, 8, 4, 0));
+        m.extend(record(0x41, 3, 3, 8, 25, 8, 4, 0));
+        m.extend(record(0x42, 0, 0, 0, 266, 0, 0, 0));
+        m.extend(record(0x43, 0, 0, 0, 0, 0, 0, 0));
+        let size = (m.len() - 0x14) as u32;
+        m[4..8].copy_from_slice(&size.to_le_bytes());
+        m
+    }
+
+    fn packet(threads: [u16; 3], rsrc2: u32) -> Vec<u8> {
+        let mut p = vec![0u8; 0x1c];
+        for (i, t) in threads.iter().enumerate() {
+            p[PACKET_THREADS + 2 * i..][..2].copy_from_slice(&t.to_le_bytes());
+        }
+        p[PACKET_RSRC1..][..4].copy_from_slice(&0x402c_0345u32.to_le_bytes());
+        p[PACKET_RSRC2..][..4].copy_from_slice(&rsrc2.to_le_bytes());
+        p
+    }
+
+    #[test]
+    fn loose_metadata_reads_both_versions() {
+        let m = loose_metadata(&loose_v3()).unwrap();
+        assert_eq!((m.version, m.code_dwords), (3, 0));
+        assert_eq!(m.layout.len(), 1);
+        assert_eq!(m.used.iter().map(|u| (u.kind, u.lower_bound)).collect::<Vec<_>>(),
+            [(ResourceType::Srv, 266), (ResourceType::Uav, 25)]);
+        let mut v2 = vec![2, 0, 0, 0, 0, 0, 0, 0, 0x66, 0, 0, 0, 0x40, 8, 1, 0];
+        v2.extend(record(0x41, 2, 3, 0x10, 2, 4, 8, 2));
+        v2.extend(record(0x43, 0, 0, 0, 0, 0, 0, 0));
+        let size = (v2.len() - 0xc) as u32;
+        v2[4..8].copy_from_slice(&size.to_le_bytes());
+        let m = loose_metadata(&v2).unwrap();
+        assert_eq!((m.version, m.code_dwords, m.used[0].kind), (2, 0x66, ResourceType::Cbv));
+        v2.push(0);
+        assert!(loose_metadata(&v2).is_err());
+    }
+
+    #[test]
+    fn loose_compute_parts_make_a_container() {
+        let mut code = vec![0u8; 0x40];
+        code[0x3c..].copy_from_slice(&0xbf81_0000u32.to_le_bytes());
+        let c = loose_compute(&packet([8, 8, 1], 0x8c), &code, &loose_v3()).unwrap();
+        let c = crate::Container::parse(&c).unwrap();
+        let p = native_programs(c.part(crate::FourCC::ACCC).unwrap().data).unwrap().remove(0);
+        assert_eq!(p.stage, HwStage::Cs);
+        assert_eq!(p.code, code);
+        assert_eq!(p.io, StageIo::Cs(ComputeIo { rsrc2: 0x8c, threads: [8, 8, 1] }));
+        assert_eq!(p.used.len(), 2);
+        // The registers as read back after the title reused them: no thread
+        // group, no RSRC2.
+        assert!(loose_compute(&packet([0x49ef, 0, 1], 0), &code, &loose_v3()).is_err());
+        assert!(loose_compute(&packet([64, 32, 1], 0x8c), &code, &loose_v3()).is_err());
     }
 }
