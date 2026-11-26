@@ -1,6 +1,6 @@
 //! How the frame recorder and replayer do at the size of a title's frame
 //! (not run by default: `cargo test --release ... -- --ignored --nocapture`):
-//! thousands of textures and buffers, a view heap of 1.5 million slots, 30
+//! thousands of textures and buffers, a view heap of 1 million slots, 30
 //! submissions of 40,000 calls.
 //!
 //! `BIG_TEXTURES` (17000), `BIG_CARD` (600 buffers of 1 MB in the card's
