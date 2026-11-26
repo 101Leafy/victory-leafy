@@ -133,11 +133,76 @@ pub fn precompile(container: &[u8]) -> Result<bool, String> {
 /// The translation of a console shader container, from the cache when
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
-    let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
+    let hash = blake3::hash(container).to_hex();
+    let (wide, own) = (wave_wide(&hash), firstlane_own(&hash));
+    let translate = move |c: &[u8]| {
+        victory_shader::emit::with_wave_wide(wide, || {
+            victory_shader::emit::with_firstlane_own(own, || victory_shader::emit::translate(c))
+        })
+        .map_err(|e| e.to_string())
+    };
     match CACHE.get() {
-        Some(cache) => cached(cache, &build(), container, translate),
+        // The forms a list allows are part of what the entry was made from. A
+        // container on no list keeps the key it had, so a change to the lists
+        // translates only the containers it names again.
+        Some(cache) => {
+            let mut build = build();
+            if wide {
+                build[0] ^= 0x57;
+            }
+            if own {
+                build[1] ^= 0x4f;
+            }
+            cached(cache, &build, container, translate)
+        }
         None => translate(container),
     }
+}
+
+/// Console wave64 compute programs (by the 16-digit hash the log names
+/// shaders with) that a 32-lane host refuses as translated (they ask for
+/// 64-lane waves) and that run in the wave-wide branches form: the water's
+/// transmission volumetrics (`_VolumePortalsOnly`, `Submerged`) and
+/// `sr_tracing`'s `CS_Tiling_Generate_Opaque`. Left out: the particles'
+/// `CS_Visibility` (369cbe906ea72764); with it on, a run on an RTX 5060 Ti
+/// stopped as the first world frame was made. Also left out: the
+/// volumetrics' `_Tiled` and `_Tiled_LocalLights` (5dc3b25986622949,
+/// 6f225b641c5b0708); with them on, black patches lay on the water around
+/// the boat in the first boat mission (2026-11-25).
+/// `VICTORY_WAVE_WIDE_ONLY` adds hashes (comma-separated, read by
+/// `victory_shader::emit::wave_wide_only`), `VICTORY_WAVE_WIDE_SEEN=0` leaves
+/// these three out.
+const WAVE_WIDE_SEEN: [&str; 3] = ["a10179ab7eda0dc3", "926c46bab3b86bd6", "2cc4c197ee29e291"];
+
+/// Whether the container whose hash (in hex) is `hash` takes the wave-wide
+/// form ([`WAVE_WIDE_SEEN`]).
+fn wave_wide(hash: &str) -> bool {
+    static SEEN_ON: OnceLock<bool> = OnceLock::new();
+    let seen_on = *SEEN_ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_WIDE_SEEN").is_none_or(|v| v != "0"));
+    victory_shader::emit::wave_wide_only(&hash[..16]) || (seen_on && WAVE_WIDE_SEEN.iter().any(|h| hash.starts_with(h)))
+}
+
+/// Whether the container whose hash (in hex) is `hash` reads a first lane
+/// where not every lane runs from the host wave's own first lane
+/// (`victory_shader::emit::with_firstlane_own`): `VICTORY_FIRSTLANE_OWN_ONLY`,
+/// hash prefixes separated by commas. The ray-tracing structure builder
+/// (`XboxBvhBuilder.dll`) needs it for three programs to translate for
+/// 32-lane waves (39321a95223001ed, 77360df21e12ea43, 9fc111d3be79364f as
+/// the title passes them; dc78c5de69c7c155, 322ed4ad832bdea6,
+/// d441b097704ab616 as `victory translate` finds them in the DLL), and its
+/// other programs run only with them. Not on by default until a run shows
+/// the builder working on this card.
+fn firstlane_own(hash: &str) -> bool {
+    static ONLY: OnceLock<Vec<String>> = OnceLock::new();
+    let only = ONLY.get_or_init(|| {
+        std::env::var("VICTORY_FIRSTLANE_OWN_ONLY")
+            .unwrap_or_default()
+            .split(',')
+            .map(|h| h.trim().to_lowercase())
+            .filter(|h| !h.is_empty())
+            .collect()
+    });
+    only.iter().any(|h| hash.starts_with(h.as_str()))
 }
 
 /// The cache entry's converter: the build and the container in, the
