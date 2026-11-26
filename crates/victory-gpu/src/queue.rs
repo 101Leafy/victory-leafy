@@ -808,6 +808,7 @@ impl Written {
                 at.cast::<u64>().write_unaligned(value);
             }
         }
+        crate::watch::told(&[(at as usize, bytes)]);
     }
 }
 
