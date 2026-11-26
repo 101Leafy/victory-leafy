@@ -212,11 +212,22 @@ pub(crate) enum C {
     HeapAheadLooked,
     HeapAheadNs,
     HeapCarried,
+    /// Draws dropped in `State::bind` or `State::prepare_for`, by why: a
+    /// descriptor table found no free slots, a shader reads memory by
+    /// address with no view heap, or with one whose host could not hold the
+    /// memory, an index buffer with no host copy, a pipeline of another
+    /// kind, and a root view table with no slot or view heap.
+    RefusedNoSlots,
+    RefusedNoHeap,
+    RefusedNotHeld,
+    RefusedNoIndex,
+    RefusedKind,
+    RefusedRootTable,
 }
 const COUNTERS: usize = 128;
 
 /// The counters' names, in the order of [`C`], for the frame recorder's columns.
-pub(crate) const NAMES: [&str; 111] = [
+pub(crate) const NAMES: [&str; 117] = [
     "Submissions", "Copies", "CopyBytes", "Refreshes", "RefreshBytes", "Skipped", "SkippedBytes", "Runs",
     "RunUs", "Queries", "QueryUs", "MoveUs", "Unmapped", "Watches", "WatchUs", "Checked", "Unchanged",
     "Fallbacks", "GuardFaults", "TexWatched", "TexHashed", "TexChanged", "TexHot", "Frames", "RecordCalls",
@@ -233,7 +244,8 @@ pub(crate) const NAMES: [&str; 111] = [
     "BackAgainBytes", "RefreshGapBytes", "LookupQuick", "LookupTables", "LookupLoose", "ThinDrawNs",
     "ThinDraws", "ThinSetNs", "ThinBarrierNs", "ThinCopyNs", "ThinOtherNs", "TexHashedTurn", "TexHashedHot",
     "TexTurnSkipped", "TexHashedFirst", "TexFirstSkipped", "HeapAheadRounds", "HeapAheadLooked",
-    "HeapAheadNs", "HeapCarried",
+    "HeapAheadNs", "HeapCarried", "RefusedNoSlots", "RefusedNoHeap", "RefusedNotHeld", "RefusedNoIndex",
+    "RefusedKind", "RefusedRootTable",
 ];
 /// One of some sets of counters, each in lines of the processor's memory of
 /// its own: a set for all threads had them wait for each other's lines at
@@ -544,7 +556,7 @@ mod command_tests {
     #[test]
     fn every_counter_is_named() {
         use super::{C, COUNTERS, NAMES};
-        assert_eq!(C::HeapCarried as usize + 1, NAMES.len());
+        assert_eq!(C::RefusedRootTable as usize + 1, NAMES.len());
         assert_eq!(NAMES[C::Frames as usize], "Frames");
         assert!(NAMES.len() <= COUNTERS);
     }
