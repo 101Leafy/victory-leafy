@@ -1752,10 +1752,39 @@ impl Staging {
         *self.holds.lock().unwrap_or_else(|e| e.into_inner()) = hash.map(|hash| (self.first, hash));
     }
 
+    /// `VICTORY_TEXTURE_REFRESH_EVERY`: a texture is read once every N frames
+    /// at most, round-robin by its own address, instead of every frame (0, 1 or
+    /// unset: every frame, as before). A title whose world is a frame a second
+    /// spends most of that frame reading title memory for textures; spreading
+    /// the reads costs at most N frames of staleness per texture and divides
+    /// the cost. A texture skipped keeps its `exact` mark for its next turn.
+    /// Only in builds with diagnostics: it trades the picture for frame time,
+    /// which no build that ships should do.
+    fn due(&self) -> bool {
+        #[cfg(feature = "diagnostics")]
+        {
+            static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+            let every = *EVERY.get_or_init(|| {
+                std::env::var("VICTORY_TEXTURE_REFRESH_EVERY")
+                    .ok()
+                    .and_then(|v| v.trim().parse::<u64>().ok())
+                    .filter(|&n| n > 0)
+                    .unwrap_or(1)
+            });
+            if every > 1 {
+                return (crate::frame::current() + ((self.memory as usize >> 16) as u64)).is_multiple_of(every);
+            }
+        }
+        true
+    }
+
     /// Detiles the texture memory into the staging buffer if it changed
     /// since the last time (and is mapped at all).
     pub(crate) fn refresh(&self) {
         use std::sync::atomic::Ordering::Relaxed;
+        if !self.due() {
+            return;
+        }
         let started = std::time::Instant::now();
         let _texture = crate::timeline::span("a texture's refresh");
         let read = self.refresh_now();
