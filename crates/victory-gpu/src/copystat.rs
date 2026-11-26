@@ -1252,6 +1252,18 @@ fn log_memory() {
         mb(crate::shadow::window_cover()),
         lists[3],
     );
+    let [taken, not_made, below, below_unsized, above] = crate::shadow::window_trim();
+    tracing::info!(
+        "memory, windows cut nearer: {taken} asks of draws took a longer window of their cell instead of \
+         making the cell's own ({:.0} MB not made, since the start); of the windows alive, {:.0} MB lie \
+         below the lowest ask's 256 KiB step ({:.0} MB of them in windows asked for without a length: \
+         VICTORY_WINDOW_TAILS=1) and {:.0} MB past the highest ask's 1 MiB line in windows only asked for \
+         with a length (VICTORY_WINDOW_KB=1024)",
+        mb(not_made),
+        mb(below),
+        mb(below_unsized),
+        mb(above),
+    );
 }
 
 /// Microseconds since the first call.
