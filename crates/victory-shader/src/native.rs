@@ -546,6 +546,8 @@ fn records(meta: &[u8], from: usize) -> Result<(Vec<RootParam>, Vec<UsedResource
             slot: e[22],
         };
         let sgprs = match root {
+            // Root constants (graphics stages), their words in user data.
+            RootType::Constants => u.dwords.into(),
             RootType::Table => 1,
             RootType::Descriptor => 2,
             // The code holds its words; no user data.
@@ -568,16 +570,15 @@ fn records(meta: &[u8], from: usize) -> Result<(Vec<RootParam>, Vec<UsedResource
 }
 
 /// Program metadata handed over on its own, outside a container (device
-/// methods 0x1c8 and 0x218). The records are FSPX kind 7's; the header is
-/// shorter, as observed in one title:
+/// methods 0x1c8 and 0x218). The records are FSPX kind 7's, behind one of
+/// two headers, as observed in one title:
 ///
 /// ```text
-/// version 2  u32 2, u32 size - 0xc, u32 code dwords, u8 0x40, u8 first
-///            user-data dword, u8 count of 0x41 records, u8 0; records
-///            from +0x10 (graphics stages)
-/// version 3  u32 3, u32 size - 0x14, u32 code dwords (0 seen), u32 0,
-///            16 bytes not decoded, u32 x6 not decoded; records from +0x38
-///            (the compute stage)
+/// version 2      u32 2, u32 size - 0xc, u32 code dwords, u8 0x40, u8 first
+///                user-data dword, u8 count of 0x41 records, u8 0; records
+///                from +0x10 (graphics stages)
+/// version 0x403  FSPX kind 7 itself, records from +0x18 (the compute
+///                stage)
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LooseMetadata {
@@ -594,7 +595,7 @@ pub fn loose_metadata(meta: &[u8]) -> Result<LooseMetadata, ShaderError> {
     let version = u32_at(meta, 0)?;
     let (head, from) = match version {
         2 => (0xc, 0x10),
-        3 => (0x14, 0x38),
+        0x403 => (0x14, FSPX_RECORDS),
         _ => return Err(Malformed("unknown loose metadata version")),
     };
     if u32_at(meta, 4)? as usize + head != meta.len() {
@@ -634,13 +635,13 @@ pub fn loose_compute(packet: &[u8], code: &[u8], meta: &[u8]) -> Result<Vec<u8>,
         n => n as usize,
     };
     let code = code.get(..dwords * 4).ok_or(Malformed("loose code shorter than its metadata"))?;
-    let records = &meta[m.records..];
+    // Both headers end in the same word (0x40, user data, record count).
+    let records = &meta[m.records - 4..];
     let mut kind7 = Vec::with_capacity(FSPX_RECORDS + records.len());
     kind7.extend(0x403u32.to_le_bytes());
-    kind7.extend(((FSPX_RECORDS + records.len() - 0x14) as u32).to_le_bytes());
+    kind7.extend(((FSPX_RECORDS - 4 + records.len() - 0x14) as u32).to_le_bytes());
     kind7.extend((dwords as u32).to_le_bytes());
     kind7.extend([0; 8]);
-    kind7.extend([0x40, 0, 0, 0]);
     kind7.extend(records);
     let parts: [(u32, &[u8]); 3] = [(FSPX_PACKET, packet), (FSPX_CODE, code), (FSPX_METADATA, &kind7)];
     let mut fspx = Vec::new();
@@ -1368,11 +1369,12 @@ mod tests {
         r
     }
 
-    /// Version 3 metadata shaped as the title's: an SRV table, a UAV table,
+    /// Compute metadata shaped as the title's: an SRV table, a UAV table,
     /// a declaration, the hash.
-    fn loose_v3() -> Vec<u8> {
-        let mut m = vec![0u8; 0x38];
-        m[0] = 3;
+    fn compute_meta() -> Vec<u8> {
+        let mut m = vec![0u8; FSPX_RECORDS];
+        m[0..4].copy_from_slice(&0x403u32.to_le_bytes());
+        m[0x14..0x18].copy_from_slice(&[0x40, 4, 2, 0]);
         m.extend(record(0x41, 0, 3, 0, 266, 8, 4, 0));
         m.extend(record(0x41, 3, 3, 8, 25, 8, 4, 0));
         m.extend(record(0x42, 0, 0, 0, 266, 0, 0, 0));
@@ -1394,8 +1396,8 @@ mod tests {
 
     #[test]
     fn loose_metadata_reads_both_versions() {
-        let m = loose_metadata(&loose_v3()).unwrap();
-        assert_eq!((m.version, m.code_dwords), (3, 0));
+        let m = loose_metadata(&compute_meta()).unwrap();
+        assert_eq!((m.version, m.code_dwords), (0x403, 0));
         assert_eq!(m.layout.len(), 1);
         assert_eq!(m.used.iter().map(|u| (u.kind, u.lower_bound)).collect::<Vec<_>>(),
             [(ResourceType::Srv, 266), (ResourceType::Uav, 25)]);
@@ -1410,11 +1412,26 @@ mod tests {
         assert!(loose_metadata(&v2).is_err());
     }
 
+    /// A pixel stage's 4 root constants at b500, user data 9, as in the
+    /// title's 0x1c8 calls.
+    #[test]
+    fn loose_metadata_takes_root_constants() {
+        let mut v2 = vec![2, 0, 0, 0, 0, 0, 0, 0, 0x20, 0, 0, 0, 0x40, 8, 1, 0];
+        v2.extend(record(0x41, 2, 0, 0, 0x1f4, 4, 9, 1));
+        v2.extend(record(0x43, 0, 0, 0, 0, 0, 0, 0));
+        let size = (v2.len() - 0xc) as u32;
+        v2[4..8].copy_from_slice(&size.to_le_bytes());
+        let m = loose_metadata(&v2).unwrap();
+        assert_eq!(m.layout.len(), 1);
+        let p = &m.layout[0];
+        assert_eq!((p.root, p.sgprs, p.base_register, p.user_data), (RootType::Constants, 4, 0x1f4, 9));
+    }
+
     #[test]
     fn loose_compute_parts_make_a_container() {
         let mut code = vec![0u8; 0x40];
         code[0x3c..].copy_from_slice(&0xbf81_0000u32.to_le_bytes());
-        let c = loose_compute(&packet([8, 8, 1], 0x8c), &code, &loose_v3()).unwrap();
+        let c = loose_compute(&packet([8, 8, 1], 0x8c), &code, &compute_meta()).unwrap();
         let c = crate::Container::parse(&c).unwrap();
         let p = native_programs(c.part(crate::FourCC::ACCC).unwrap().data).unwrap().remove(0);
         assert_eq!(p.stage, HwStage::Cs);
@@ -1423,7 +1440,44 @@ mod tests {
         assert_eq!(p.used.len(), 2);
         // The registers as read back after the title reused them: no thread
         // group, no RSRC2.
-        assert!(loose_compute(&packet([0x49ef, 0, 1], 0), &code, &loose_v3()).is_err());
-        assert!(loose_compute(&packet([64, 32, 1], 0x8c), &code, &loose_v3()).is_err());
+        assert!(loose_compute(&packet([0x49ef, 0, 1], 0), &code, &compute_meta()).is_err());
+        assert!(loose_compute(&packet([64, 32, 1], 0x8c), &code, &compute_meta()).is_err());
+    }
+
+    /// The parts of the title's first 0x218 call, the code left out.
+    #[test]
+    fn loose_compute_takes_the_titles_parts() {
+        let packet = [
+            0x00, 0xcf, 0x05, 0x40, 0x02, 0x01, 0x09, 0x6c, 0x00, 0x00, 0x00, 0x00, 0x08, 0x00, 0x08, 0x00,
+            0x01, 0x00, 0x00, 0x00, 0x43, 0x03, 0x2c, 0x40, 0x8a, 0x0b, 0x00, 0x00,
+        ];
+        let meta = [
+            0x03, 0x04, 0x00, 0x00, 0x04, 0x01, 0x00, 0x00, 0x60, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x40, 0x04, 0x04, 0x00, 0x41, 0x00, 0x00, 0x00, 0x01, 0x04, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x0b, 0x00,
+            0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x41, 0x00, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x0a, 0x01, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x08, 0x04, 0x00, 0x00,
+            0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x41, 0x00, 0x00, 0x00, 0x03, 0x03, 0x00, 0x00,
+            0x08, 0x00, 0x00, 0x00, 0x17, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x08, 0x04, 0x00, 0x00,
+            0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x41, 0x00, 0x00, 0x00, 0x02, 0x03, 0x00, 0x00,
+            0x10, 0x00, 0x00, 0x00, 0x1b, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x04, 0x00, 0x00,
+            0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x42, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x01, 0x00, 0x07, 0x00, 0x0a, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x42, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x01, 0x01, 0x07, 0x00, 0x17, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x42, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x01, 0x02, 0x0d, 0x00, 0x1b, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x43, 0x00, 0x00, 0x00, 0xbf, 0xce, 0x41, 0x6a,
+            0xe6, 0x48, 0x53, 0x7f, 0x86, 0x7a, 0xdc, 0x1f, 0x5a, 0xf0, 0xb6, 0xfd, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        let m = loose_metadata(&meta).unwrap();
+        assert_eq!((m.version, m.code_dwords, m.used.len()), (0x403, 0x60, 4));
+        let code = vec![0u8; 0x180];
+        let c = loose_compute(&packet, &code, &meta).unwrap();
+        let c = crate::Container::parse(&c).unwrap();
+        let p = native_programs(c.part(crate::FourCC::ACCC).unwrap().data).unwrap().remove(0);
+        assert_eq!(p.io, StageIo::Cs(ComputeIo { rsrc2: 0xb8a, threads: [8, 8, 1] }));
+        assert_eq!(p.used.len(), 4);
     }
 }
