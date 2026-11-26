@@ -4768,8 +4768,13 @@ pub fn title_memory_unmapping(at: usize, len: usize) {
 /// was noted of its blocks (guarded, clean, absent) would be taken for true
 /// of the next memory at the address.
 pub fn title_memory_freed(at: usize, len: usize) {
-    let mut g = guards();
     let first = at / BLOCK;
+    if len != 0 {
+        forget_beside(first, at.saturating_add(len).div_ceil(BLOCK));
+    } else if BESIDE.any(first, first + Bits::WORDS * 64) {
+        forget_beside(first, allocation_end(at, at).div_ceil(BLOCK).max(first + 1));
+    }
+    let mut g = guards();
     let noted = [g.protected.range(first..).next(), g.absent.range(first..).next(), g.foreign.range(first..).next().copied()];
     let Some(noted) = noted.into_iter().flatten().min() else {
         return;
@@ -4796,6 +4801,28 @@ pub fn title_memory_freed(at: usize, len: usize) {
     // (Memory that is still a view is not freed by that call, which fails:
     // it must not stay read-only.)
     open(&mut g, at, end * BLOCK);
+}
+
+/// What was put in beside the guards of `[first, last)` ([`BESIDE`], and the
+/// blocks' share of it) is forgotten: it was for memory no longer there, and
+/// the next memory at the address would take the bit as its own and be told
+/// as written by an asking that comes before any write.
+fn forget_beside(first: usize, last: usize) {
+    if !BESIDE.any(first, last) {
+        return;
+    }
+    let mut block = first;
+    while block < last {
+        let until = ((block / 64 + 1) * 64).min(last);
+        if BESIDE.any(block, until) {
+            for block in block..until {
+                if BESIDE.take(block) {
+                    put_count(block).store(0, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        }
+        block = until;
+    }
 }
 
 /// The end of the allocation at `at`, if `inside` lies in it; else `at`.
@@ -4830,6 +4857,7 @@ fn title_memory_changed(at: usize, len: usize) -> std::sync::MutexGuard<'static,
     crate::inplace::title_memory_freeing(at, len);
     let mut g = guards();
     let range = at / BLOCK..at.saturating_add(len).div_ceil(BLOCK);
+    forget_beside(range.start, range.end);
     let absent: Vec<usize> = g.absent.range(range.clone()).collect();
     for block in absent {
         g.absent.remove(block);
@@ -6418,6 +6446,38 @@ mod tests {
         assert_eq!(guard(one, one + BLOCK), Some(vec![page(one)]));
         assert_eq!(guard(one, one + BLOCK), Some(Vec::new()));
         drop_views(section, &[one, two], BLOCK);
+        crate::title_memory_section_gone(section);
+    }
+
+    /// Bytes put in beside a guard leave no mark at the address once the
+    /// memory is freed or no longer mapped there: the next memory at it would
+    /// be told as written before anything is.
+    #[test]
+    fn what_was_put_beside_goes_with_the_memory() {
+        let (section, one, two) = two_views(BLOCK);
+        crate::title_memory_section(section, BLOCK as u64, true);
+        for view in [one, two] {
+            assert_eq!(guard(view, view + BLOCK), Some(vec![view / PAGE]));
+        }
+        assert!(writes(one, one + BLOCK, true).is_some() && writes(two, two + BLOCK, true).is_some());
+        put_count(one / BLOCK).store(0, std::sync::atomic::Ordering::Relaxed);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            // SAFETY: a byte of the section's only page.
+            match put_beside(one / BLOCK, 1, |delta| unsafe { ((one + 100).wrapping_add(delta) as *mut u8).write(7) }) {
+                Beside::Done => break,
+                // (Other tests hold changes of mapping.)
+                Beside::Cannot if std::time::Instant::now() < deadline => std::hint::spin_loop(),
+                other => panic!("put_beside: {other:?}"),
+            }
+        }
+        let beside = |view: usize| BESIDE.any(view / BLOCK, view / BLOCK + 1);
+        assert!(beside(one) && beside(two));
+        title_memory_freed(two, BLOCK);
+        assert!(!beside(two), "the freed view keeps its mark");
+        assert!(beside(one), "the other view lost its mark");
+        drop_views(section, &[one, two], BLOCK);
+        assert!(!beside(one));
         crate::title_memory_section_gone(section);
     }
 
