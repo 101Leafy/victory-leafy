@@ -4,6 +4,8 @@
 //! a present's second plane is put over its first; else only the first is
 //! shown.
 
+use std::sync::OnceLock;
+
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
@@ -11,6 +13,12 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::core::{PCSTR, s};
 
 use crate::host::Host;
+
+/// Whether a present's second plane is shown (`VICTORY_TWO_PLANES=1`).
+pub(crate) fn on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_TWO_PLANES").is_ok_and(|v| v.trim() == "1"))
+}
 
 const SOURCE: &str = r#"
 #define RS "DescriptorTable(SRV(t0, numDescriptors=2), visibility=SHADER_VISIBILITY_PIXEL), StaticSampler(s0, filter=FILTER_MIN_MAG_MIP_LINEAR, addressU=TEXTURE_ADDRESS_CLAMP, addressV=TEXTURE_ADDRESS_CLAMP)"
