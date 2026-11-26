@@ -1976,7 +1976,13 @@ fn guard_parts(start: usize, end: usize) -> Option<Vec<(usize, u16)>> {
             if cover(&mut g, block, block + 1) {
                 g.clean.insert(block);
             }
-        } else if !g.foreign.contains(&block) && !g.left_alone(block) && !g.rests(block, rest) {
+        } else if !g.foreign.contains(&block)
+            && !g.left_alone(block)
+            && !g.rests(block, rest)
+            // Opened since another asking's run took it, which is not done
+            // with it: written still, and guarded at the next asking.
+            && !PENDING.any(block, block + 1)
+        {
             run = Some((run.map_or(block, |r| r.0), block + 1));
         } else if let Some((from, to)) = run.take() {
             pend(&mut g, from, to, &mut later);
@@ -2065,7 +2071,9 @@ fn taken(from: usize, to: usize) {
 /// Blocks [`guard_parts`] has noted guarded and clean but not made
 /// read-only yet ([`pend`]). Another asking tells them as written: a write
 /// can still land there unseen until then, and it is that asking's caller
-/// that reads it.
+/// that reads it. One opened meanwhile can be read-only with no note
+/// until [`protected_later`] opens it again: a write fault there waits for
+/// that, and so does [`kernel_writing`].
 static PENDING: Bits = Bits::new();
 
 /// Whether [`guard_parts`] makes its blocks read-only with the guards' lock
@@ -2139,15 +2147,21 @@ fn protected_later(g: &mut Guards, from: usize, to: usize, done: bool) {
         LATER[1].fetch_add((to - from) as u64, Relaxed);
     }
     if !done {
-        for block in from..to {
-            g.protected.remove(block);
-            g.clean.remove(block);
-            PROTECTED.clear(block);
+        // Those opened or let go meanwhile stay as that left them (a range
+        // the kernel writes now among them).
+        let ours: Vec<usize> = (from..to).filter(|&b| PROTECTED.any(b, b + 1) && g.protected.contains(b)).collect();
+        for run in ours.chunk_by(|a, b| a + 1 == *b) {
+            let (from, to) = (run[0], run[run.len() - 1] + 1);
+            for block in from..to {
+                g.protected.remove(block);
+                g.clean.remove(block);
+                PROTECTED.clear(block);
+            }
+            protect_here(g, from, to);
+            cover(g, from, to);
         }
         #[cfg(feature = "diagnostics")]
         LATER[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        protect_here(g, from, to);
-        cover(g, from, to);
         return;
     }
     for block in from..to {
@@ -2617,6 +2631,11 @@ pub fn kernel_writing(at: usize, len: usize) -> KernelWrite {
             }
             g.kernel.push((first, last));
         }
+    }
+    // A block opened above may be made read-only yet by an asking that took
+    // it before (`pend`): opened again when that one has the lock.
+    while PENDING.any(first, last) {
+        std::thread::yield_now();
     }
     crate::descriptor::host::remapped(at, len);
     KernelWrite(first, if len == 0 { first } else { last })
@@ -3147,6 +3166,12 @@ pub(crate) fn install() {
         // again since that (then it is ours again, not read-only for some
         // other reason).
         for _ in 0..3 {
+            // Read-only by an asking's late protection after it was opened
+            // (`pend`), with no note: opened again when that one has the
+            // lock.
+            while PENDING.any(block, block + 1) && !PROTECTED.any(block, block + 1) {
+                std::thread::yield_now();
+            }
             if !PROTECTED.any(block, block + 1) && writable(at) {
                 #[cfg(feature = "diagnostics")]
                 crate::faultbook::note(crate::faultbook::What::Open, block, 0, 0);
@@ -4207,6 +4232,58 @@ mod tests {
         assert!(writable(at), "opened in between");
         assert!(!PENDING.any(block, block + 1));
         assert!(!PROTECTED.any(block, block + 1));
+        title_memory_unmapping(at, BLOCK);
+        // SAFETY: our view.
+        unsafe { UnmapViewOfFile(view) };
+    }
+
+    /// A write to a block opened and then made read-only by a late
+    /// protection, before that one has the lock again, waits for it and
+    /// lands.
+    #[test]
+    fn a_write_between_a_late_protection_and_its_notes_waits() {
+        use windows_sys::Win32::System::Memory::{CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, UnmapViewOfFile};
+        if !protect_later() {
+            return;
+        }
+        // SAFETY: a pagefile section of a block, mapped read-write.
+        let view = unsafe {
+            let section =
+                CreateFileMappingW(-1isize as _, std::ptr::null(), PAGE_READWRITE, 0, BLOCK as u32, std::ptr::null());
+            assert!(!section.is_null());
+            MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, BLOCK)
+        };
+        let at = view.Value as usize;
+        assert_ne!(at, 0);
+        let block = at / BLOCK;
+        install();
+        let mut later = Vec::new();
+        pend(&mut guards(), block, block + 1, &mut later);
+        open(&mut guards(), at, at + 1);
+        assert!(!PROTECTED.any(block, block + 1));
+        assert!(read_only(block, block + 1));
+        let (sent, came) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            // SAFETY: inside the view; the handler waits for it to open.
+            unsafe { ((at + 8) as *mut u8).write_volatile(7) };
+            sent.send(()).unwrap();
+        });
+        let early = came.recv_timeout(std::time::Duration::from_millis(100)).is_ok();
+        protected_later(&mut guards(), block, block + 1, true);
+        let landed = came.recv_timeout(std::time::Duration::from_secs(10)).is_ok();
+        writer.join().unwrap();
+        assert!(!early, "the write waited");
+        assert!(landed, "and landed after");
+        // SAFETY: inside the view.
+        assert_eq!(unsafe { ((at + 8) as *const u8).read_volatile() }, 7);
+        // A block opened while a run has it is not taken into another.
+        pend(&mut guards(), block, block + 1, &mut later);
+        open(&mut guards(), at, at + 1);
+        assert_eq!(guard(at, at + BLOCK), Some(vec![block]));
+        assert!(writable(at), "not guarded again while the first run has it");
+        assert!(read_only(block, block + 1));
+        protected_later(&mut guards(), block, block + 1, true);
+        assert!(writable(at));
         title_memory_unmapping(at, BLOCK);
         // SAFETY: our view.
         unsafe { UnmapViewOfFile(view) };
