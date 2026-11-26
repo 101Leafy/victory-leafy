@@ -73,8 +73,10 @@ opt-level = 2
 debug = "line-tables-only"
 # Thin LTO inlines across the workspace crates (the translator, the host GPU
 # layer and the runtime call each other in hot paths) for far less build time
-# than fat LTO. The `diag` profile inherits it.
+# than fat LTO. The `diag` profile inherits it. One codegen unit lets the
+# last unit inline across the whole crate.
 lto = "thin"
+codegen-units = 1
 
 # The development build: release code generation plus the `diagnostics`
 # feature (`cargo build --profile diag -p victory --features diagnostics`),
