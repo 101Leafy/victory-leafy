@@ -6,6 +6,7 @@
 //! emitter cannot express is `Missing` with a reason, and only fails the
 //! program when something with an effect (an export, a branch) needs it.
 
+use std::cell::OnceCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use super::UserData;
@@ -377,6 +378,11 @@ struct Lower<'a> {
     samplers: Vec<[u32; 4]>,
     descriptors: HashMap<(Site, bool), &'a Source>,
     scalar: HashMap<Site, Address>,
+    /// Values a scalar or vector instruction or a phi reads, made on first use
+    /// ([`Self::read_as_number`]).
+    numbers: OnceCell<HashSet<Value>>,
+    /// The instructions reading each value, made on first use ([`Self::computed_with`]).
+    readers: OnceCell<HashMap<Value, Vec<&'a Inst>>>,
     exports: HashMap<Site, &'a Export>,
     interps: HashMap<Site, &'a Interp>,
     handles: HashMap<(usize, Site, u8, bool, (u32, u32)), V>,
@@ -1934,6 +1940,8 @@ impl<'a> Lower<'a> {
                 .map(|d| ((d.site, d.role == Role::Sampler), &d.source))
                 .collect(),
             scalar: x.res.scalar.iter().copied().collect(),
+            numbers: OnceCell::new(),
+            readers: OnceCell::new(),
             exports: x.io.exports.iter().map(|e| (e.site, e)).collect(),
             interps: {
                 let mut m: HashMap<Site, &Interp> = x.io.interps.iter().map(|(s, i)| (*s, i)).collect();
@@ -3432,13 +3440,19 @@ impl<'a> Lower<'a> {
     /// Whether some instruction reads `v` as a number (or may, through a
     /// join), rather than in a descriptor operand.
     fn read_as_number(&self, v: Value) -> bool {
-        self.x.p.blocks.iter().any(|b| {
-            b.phis.iter().any(|p| p.args.contains(&v))
-                || b.insts.iter().any(|i| {
-                    matches!(i.fields, Fields::Sop { .. } | Fields::Valu(_))
-                        && i.reads.iter().any(|r| r.1 == v)
-                })
-        })
+        let numbers = self.numbers.get_or_init(|| {
+            let mut read = HashSet::new();
+            for b in &self.x.p.blocks {
+                read.extend(b.phis.iter().flat_map(|p| p.args.iter().copied()));
+                for i in &b.insts {
+                    if matches!(i.fields, Fields::Sop { .. } | Fields::Valu(_)) {
+                        read.extend(i.reads.iter().map(|r| r.1));
+                    }
+                }
+            }
+            read
+        });
+        numbers.contains(&v)
     }
 
     /// Whether some instruction computes with `v` (scalar or vector
@@ -3447,10 +3461,21 @@ impl<'a> Lower<'a> {
     /// waterfall loop keeps a descriptor's dwords per lane, reads the first
     /// lane's back and compares the lanes' with them.
     fn computed_with(&self, v: Value, depth: u32) -> bool {
-        self.x.p.blocks.iter().flat_map(|b| &b.insts).any(|i| {
-            if !i.reads.iter().any(|r| r.1 == v) {
-                return false;
+        // Indexed: a scan of the whole program per call, again for each move it follows,
+        // took 39f0e9aeb156a61c (13890 blocks, 2453 descriptor loads) 25-45 s.
+        let readers = self.readers.get_or_init(|| {
+            let mut readers: HashMap<Value, Vec<&'a Inst>> = HashMap::new();
+            for i in self.x.p.blocks.iter().flat_map(|b| &b.insts) {
+                for r in &i.reads {
+                    let at = readers.entry(r.1).or_default();
+                    if !at.last().is_some_and(|&l| std::ptr::eq(l, i)) {
+                        at.push(i);
+                    }
+                }
             }
+            readers
+        });
+        readers.get(&v).into_iter().flatten().any(|i| {
             let name = i.name();
             let moves = matches!(
                 name,
