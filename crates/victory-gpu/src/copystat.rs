@@ -651,7 +651,7 @@ mod own_tests {
     /// and only for at least this block).
     #[test]
     fn a_block_is_counted_while_it_lives() {
-        let block = vec![1u8; 8 << 20];
+        let block = std::hint::black_box(vec![1u8; 8 << 20]);
         assert!(owned(3) >= 8 << 20);
         assert!(owned(7) >= 1);
         drop(block);
