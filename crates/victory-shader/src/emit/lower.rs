@@ -40,6 +40,11 @@ mod descriptor_data;
 #[path = "float64.rs"]
 mod float64;
 
+/// Lane masks a join takes the same bits of on every way in (`joined_dword`), a child module
+/// so it shares the emitter's state.
+#[path = "lane_join.rs"]
+mod lane_join;
+
 type Why = &'static str;
 
 /// How an interpolation evaluates an input channel.
@@ -114,14 +119,28 @@ pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
 /// where two host waves of 32 stand for a console wave (they exchange, which
 /// takes all lanes).
 fn counted_in_threads(parts: &Parts) -> bool {
+    counted_dispatch(parts)
+        && (!parts.native.wave64 || host_max_wave() >= 64)
+        && !parts.p.blocks.iter().flat_map(|b| &b.insts).any(|i| i.name() == "s_barrier")
+}
+
+fn counted_dispatch(parts: &Parts) -> bool {
     let crate::native::StageIo::Cs(cs) = &parts.native.io else {
         return false;
     };
-    cs.threads[0] > 1
-        && cs.threads[1..] == [1, 1]
-        && crate::spill::is_spilled(parts.native)
-        && (!parts.native.wave64 || host_max_wave() >= 64)
-        && !parts.p.blocks.iter().flat_map(|b| &b.insts).any(|i| i.name() == "s_barrier")
+    cs.threads[0] > 1 && cs.threads[1..] == [1, 1] && crate::spill::is_spilled(parts.native)
+}
+
+/// A program [`counted_in_threads`] leaves uncounted only because it is wave64 on a host of
+/// 32-lane waves, whose EXEC on entry it reads (both dwords): it may run counted with EXEC on
+/// entry the launched lanes ([`crate::structure::with_launched_exec`]).
+pub(super) fn counted_in_launched_lanes(parts: &Parts) -> bool {
+    use crate::ir::EXEC;
+    counted_dispatch(parts)
+        && parts.native.wave64
+        && host_max_wave() == 32
+        && !parts.st.launched
+        && [EXEC, EXEC + 1].iter().all(|&r| parts.p.inputs.iter().any(|i| i.0 == Reg::S(r)))
 }
 
 /// [`lower`]; `counted`: the lanes past a dispatch's count of threads leave
@@ -380,6 +399,11 @@ struct Lower<'a> {
     /// handed to host waves (`wave_base`), and the base made in the entry block.
     halves: Option<u32>,
     wave_base: Option<V>,
+    /// A dispatch whose last group may be short, with EXEC on entry the launched lanes
+    /// ([`Structured::launched`]): whether this thread was launched (made in the entry block),
+    /// and the console wave's EXEC on entry as two dwords once asked for.
+    launched: Option<V>,
+    launched_exec: Option<(V, V)>,
     /// Vertex and mesh outputs holding 16-bit values: row, whether two per
     /// dword, and the row packed after it.
     half_outputs: HashMap<u8, (bool, Option<u8>)>,
@@ -683,14 +707,167 @@ fn lane_regions(st: &Structured) -> Option<Vec<(usize, Vec<bool>)>> {
 
 /// The per-lane branches (by block) whose regions hold a block of `needs` (blocks where two
 /// host waves must meet, [`take_needs`]): the ones to take wave-wide
-/// ([`crate::structure::structure_wide`]) so that every lane runs those blocks. None if one
-/// of them is a branch whose wave-wide meaning is not known ([`Structured::wave_any`]).
-pub(super) fn branches_around(st: &Structured, needs: &[usize]) -> Option<Vec<usize>> {
+/// ([`crate::structure::structure_wide`]) so that every lane runs those blocks; and the
+/// branches that leave the loops holding one, because two host waves keep a barrier only if
+/// they leave those loops together. None if one of them is a branch whose wave-wide meaning
+/// is not known ([`Structured::wave_any`]).
+pub(super) fn branches_around(st: &Structured, needs: &[usize]) -> Option<(Vec<usize>, bool)> {
     let mut out = Vec::new();
     for (d, region) in lane_regions(st)? {
         if needs.iter().any(|&b| region.get(b).copied().unwrap_or(false)) {
             st.wave_any.get(d).copied().flatten()?;
             out.push(d);
+        }
+    }
+    // A branch that leaves a loop holding a need: where its test is scalar (`wave_any`
+    // None) both host waves already take it the same way, so nothing is needed; where it is
+    // a lane's own bits (`Some`), the wave-wide form is what keeps the halves leaving
+    // together, and it is added to be widened.
+    let mut unsafe_loop = false;
+    for d in loop_exits_around(st, needs)? {
+        match st.wave_any.get(d).copied().flatten() {
+            None => {}
+            Some(_) => {
+                if !out.contains(&d) {
+                    out.push(d);
+                }
+            }
+        }
+    }
+    Some((out, unsafe_loop))
+}
+
+/// Diagnostics (`VICTORY_WAVE_WHY`): whether a block lies in a loop, whether every branch
+/// that leaves that loop is taken wave-wide, and whether their wave-wide meaning is known.
+fn barrier_loop_state(st: &Structured, b: usize) -> (bool, bool, bool) {
+    let n = st.exits.len();
+    if b >= n {
+        return (false, true, true);
+    }
+    let succ = |x: usize| -> Vec<usize> {
+        match st.exits[x] {
+            LaneExit::Jump(t) => vec![t],
+            LaneExit::Branch { taken, not_taken, .. } => vec![taken, not_taken],
+            LaneExit::End | LaneExit::Indirect => Vec::new(),
+        }
+    };
+    let mut reach: Vec<Vec<bool>> = vec![vec![false; n]; n];
+    for x in 0..n {
+        let mut stack = succ(x);
+        reach[x][x] = true;
+        while let Some(t) = stack.pop() {
+            if t >= n || reach[x][t] {
+                continue;
+            }
+            reach[x][t] = true;
+            stack.extend(succ(t));
+        }
+    }
+    let same = |t: usize| t < n && reach[t][b] && reach[b][t];
+    let (mut in_loop, mut exits_wide, mut exits_known) = (false, true, true);
+    for t in 0..n {
+        if t == b || !same(t) {
+            continue;
+        }
+        in_loop = true;
+        let leaves = succ(t).into_iter().any(|u| u < n && !same(u));
+        if leaves {
+            if !st.wide.contains(&t) {
+                exits_wide = false;
+            }
+            if st.wave_any.get(t).copied().flatten().is_none() {
+                exits_known = false;
+            }
+        }
+    }
+    (in_loop, exits_wide, exits_known)
+}
+
+/// Diagnostics (`VICTORY_WAVE_WHY`): whether the loop holding `b` is entered under a branch
+/// that is taken wave-wide (every block outside it that jumps into it).
+fn loop_entry_wide(st: &Structured, b: usize) -> bool {
+    let n = st.exits.len();
+    if b >= n {
+        return true;
+    }
+    let succ = |x: usize| -> Vec<usize> {
+        match st.exits[x] {
+            LaneExit::Jump(t) => vec![t],
+            LaneExit::Branch { taken, not_taken, .. } => vec![taken, not_taken],
+            LaneExit::End | LaneExit::Indirect => Vec::new(),
+        }
+    };
+    let mut reach: Vec<Vec<bool>> = vec![vec![false; n]; n];
+    for x in 0..n {
+        let mut stack = succ(x);
+        reach[x][x] = true;
+        while let Some(t) = stack.pop() {
+            if t >= n || reach[x][t] {
+                continue;
+            }
+            reach[x][t] = true;
+            stack.extend(succ(t));
+        }
+    }
+    let same = |t: usize| t < n && reach[t][b] && reach[b][t];
+    for from in 0..n {
+        for to in succ(from) {
+            if to < n && same(to) && !same(from) && !st.wide.contains(&from) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// The branches (by block) that leave the loops holding a block of `needs`, in the order
+/// found: the blocks that are in the same cycle as one of them and have an edge out of it.
+///
+/// A console wave runs its lanes in step, so a loop's lanes leave it together however their
+/// tests differ. Two host waves keep that only where the test that leaves the loop is the
+/// wave's own ([`crate::structure::structure_wide`]); a barrier inside a loop whose halves
+/// leave on different iterations waits for threads that are not there, which is what lost
+/// the card when `VICTORY_WAVE_WIDE=1` was turned on (`devices removed` after 21-253 frames,
+/// measured 2026-11-26). None with an indirect exit (not followed).
+fn loop_exits_around(st: &Structured, needs: &[usize]) -> Option<Vec<usize>> {
+    let n = st.exits.len();
+    if needs.iter().all(|&b| b >= n) {
+        return Some(Vec::new());
+    }
+    let succ = |b: usize| -> Vec<usize> {
+        match st.exits[b] {
+            LaneExit::Jump(t) => vec![t],
+            LaneExit::Branch { taken, not_taken, .. } => vec![taken, not_taken],
+            LaneExit::End => Vec::new(),
+            LaneExit::Indirect => Vec::new(),
+        }
+    };
+    if st.exits.iter().any(|e| matches!(e, LaneExit::Indirect)) {
+        return None;
+    }
+    // Who reaches whom: a block is in the same cycle as another when each reaches the other.
+    let mut reach: Vec<Vec<bool>> = vec![vec![false; n]; n];
+    for b in 0..n {
+        let mut stack = succ(b);
+        reach[b][b] = true;
+        while let Some(t) = stack.pop() {
+            if reach[b][t] {
+                continue;
+            }
+            reach[b][t] = true;
+            stack.extend(succ(t));
+        }
+    }
+    let mut out: Vec<usize> = Vec::new();
+    for &need in needs.iter().filter(|&&b| b < n) {
+        for b in 0..n {
+            if b == need || !reach[b][need] || !reach[need][b] {
+                continue;
+            }
+            let leaves = succ(b).into_iter().any(|t| t < n && !(reach[t][need] && reach[need][t]));
+            if leaves && !out.contains(&b) {
+                out.push(b);
+            }
         }
     }
     Some(out)
@@ -1310,7 +1487,7 @@ fn barrier_mode(
 
 /// `s_setreg*` of `HW_REG_POPS_PACKER` (hardware register 25): how a pixel program takes part
 /// in POPS, the console's ordering of the view accesses of overlapping pixels by primitive.
-fn sets_pops_packer(i: &Inst) -> bool {
+pub(super) fn sets_pops_packer(i: &Inst) -> bool {
     matches!(i.name(), "s_setreg_b32" | "s_setreg_imm32_b32")
         && matches!(i.fields, Fields::Sop { imm: Some(imm), .. } if imm & 0x3F == 25)
 }
@@ -1678,6 +1855,8 @@ impl<'a> Lower<'a> {
             pair: None,
             halves,
             wave_base: None,
+            launched: None,
+            launched_exec: None,
             flat: None,
             sums64: HashMap::new(),
             no_barrier,
@@ -2423,10 +2602,20 @@ impl<'a> Lower<'a> {
             let all = self.s.m.cmp(original, pred::EQ, limit, zero);
             let inside = self.s.m.cmp(original, pred::IULT, x, limit);
             let runs = self.s.m.bin(original, Bin::Or, all, inside);
-            let (body, done) = (self.s.m.new_block(), self.s.m.new_block());
-            self.s.m.terminate(original, Term::CondBr(runs, body, done));
-            self.s.m.terminate(done, Term::Ret);
-            self.s.entry = body;
+            if self.x.st.launched {
+                // The threads past the count run on with their EXEC bit clear, as the
+                // console's lanes past it do ([`Structured::launched`]): the input EXEC is
+                // the launched lanes ([`Self::launched_exec`]).
+                if self.twin.is_some() {
+                    return Err(unsupported(0, "a launched-lanes mask in paired lanes"));
+                }
+                self.launched = Some(runs);
+            } else {
+                let (body, done) = (self.s.m.new_block(), self.s.m.new_block());
+                self.s.m.terminate(original, Term::CondBr(runs, body, done));
+                self.s.m.terminate(done, Term::Ret);
+                self.s.entry = body;
+            }
         }
         self.find_coherent();
         let order = crate::ir::reverse_postorder(&p.blocks);
@@ -2629,6 +2818,13 @@ impl<'a> Lower<'a> {
                 // use as a value (`get`).
                 Reg::V(_) if matches!(io_inputs.get(&v), Some(Input::Barycentric { .. })) => {
                     continue;
+                }
+                // EXEC on entry, of a dispatch whose last group may be short
+                Reg::S(n) if (n == EXEC || n == EXEC + 1) && self.launched.is_some() => {
+                    match self.launched_exec() {
+                        Ok((lo, hi)) => Val::I32(if n == EXEC { lo } else { hi }),
+                        Err(why) => Val::Missing(why),
+                    }
                 }
                 Reg::S(n) => match io_inputs.get(&v) {
                     Some(&input) => self.input(input),
@@ -3656,16 +3852,9 @@ impl<'a> Lower<'a> {
             None => (v, false),
         };
         let &m = self.x.st.masks.get(&lo).ok_or(LANE_MASK)?;
-        // A mask that holds lanes outside EXEC where it is written (the complement of one,
-        // say) is the ballot of the lanes that are there: all of them, where two exchanging
-        // host waves know every lane runs that block, and in the paired form, whose host wave
-        // runs every block with all its lanes.
-        let made = self.def_block.get(&lo).copied();
-        let whole = self.twin.is_some()
-            || self.exchange.is_some() && !self.local && made.is_none_or(|b| self.all_lanes(b));
-        if !self.x.st.active.contains(&lo) && !whole {
+        if self.elsewhere(lo) {
             if self.exchange.is_some() && !self.local {
-                need(made.unwrap_or(0));
+                need(self.def_block.get(&lo).copied().unwrap_or(0));
             }
             return Err(MASK_ELSEWHERE);
         }
@@ -3718,6 +3907,18 @@ impl<'a> Lower<'a> {
             }
         };
         Ok(if high { y } else { x })
+    }
+
+    /// Whether the mask with low dword `lo` holds lanes that do not run where it is written, so
+    /// that no ballot there is its number ([`MASK_ELSEWHERE`]). A mask that holds lanes outside
+    /// EXEC where it is written (the complement of one, say) is the ballot of the lanes that are
+    /// there: all of them, where two exchanging host waves know every lane runs that block, and
+    /// in the paired form, whose host wave runs every block with all its lanes.
+    fn elsewhere(&self, lo: Value) -> bool {
+        let made = self.def_block.get(&lo).copied();
+        let whole = self.twin.is_some()
+            || self.exchange.is_some() && !self.local && made.is_none_or(|b| self.all_lanes(b));
+        !self.x.st.active.contains(&lo) && !whole
     }
 
     // ---- operands ----
@@ -4410,9 +4611,58 @@ impl<'a> Lower<'a> {
 
     /// A group barrier with an LDS fence in `block`.
     fn group_sync(&mut self, block: usize) {
+        if !self.all_lanes(block) {
+            // A group barrier is run by every thread of the group or the group hangs. Where
+            // the block holding this one is a block not every lane runs, the widening has to
+            // take the branches around it wave-wide (`need`), and the program is refused if
+            // that cannot be done - which is what `widen` decides from these needs.
+            need(block);
+        }
+        if std::env::var_os("VICTORY_WAVE_WHY").is_some() {
+            let st = self.x.st;
+            let (in_loop, exits_wide, exits_known) = barrier_loop_state(st, block);
+            let entries = loop_entry_wide(st, block);
+            eprintln!(
+                "BARRIER block={block} all_lanes={} in_loop={in_loop} exits_wide={exits_wide} exits_known={exits_known} entry_wide={entries} wide_block={}",
+                self.all_lanes(block),
+                st.wide.contains(&block)
+            );
+        }
         let mode = self.s.m.i32(meeting_mode());
         let void = self.s.t.void;
         self.s.op(block, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+    }
+
+    /// With [`Self::launched`]: the console wave's EXEC on entry, (lanes 0..31, lanes 32..63),
+    /// the bits of its launched threads. Made in the entry block, which every thread runs:
+    /// each host wave's ballot of its own lanes, which are a 32-aligned run of console lanes
+    /// in order (`console_lane`), and the two exchanged.
+    fn launched_exec(&mut self) -> Result<(V, V), Why> {
+        if let Some(w) = self.launched_exec {
+            return Ok(w);
+        }
+        let active = self.launched.ok_or("a launched-lanes mask without the count")?;
+        let e = self.s.entry;
+        let i32t = self.s.t.i32;
+        let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+        self.s.flags |= flags::WAVE_OPS;
+        let words = match (&self.exchange, self.s.wave_size) {
+            // two host waves of 32 per console wave, which exchange
+            (Some(_), _) if self.local => return Err("a launched-lanes mask in a half-wave"),
+            (Some(_), _) => {
+                let r = self.s.op(e, "waveActiveBallot", Attr::NoUnwind, four, 116, &[active]);
+                let mine = self.s.m.extract(e, r, 0);
+                self.exchange_halves(e, mine)
+            }
+            // the console waves (64 lanes): the host wave ballot is the console one
+            (None, Some(64)) if self.halves.is_none() => {
+                let r = self.s.op(e, "waveActiveBallot", Attr::NoUnwind, four, 116, &[active]);
+                (self.s.m.extract(e, r, 0), self.s.m.extract(e, r, 1))
+            }
+            _ => return Err("a launched-lanes mask in waves other than the console's"),
+        };
+        self.launched_exec = Some(words);
+        Ok(words)
     }
 
     /// `exchange`: each host wave gives `mine` (the same in all its lanes) for its half; both get
@@ -4574,14 +4824,45 @@ impl<'a> Lower<'a> {
         let some = self.s.m.cast(c, Cast::ZExt, some, i32t);
         let (lo, hi) = self.exchange_halves(c, some);
         let c = self.cur;
-        let both = self.s.m.bin(c, Bin::Or, lo, hi);
+        let mut both = self.s.m.bin(c, Bin::Or, lo, hi);
+        // A thread group of several console waves: each of them wrote its own pair of dwords
+        // into this program's exchange slots (`exchange_pair`: `slot + 2 * (thread >> 6)`), and
+        // the barrier at the end of `exchange_halves` has every one of them in place. ORing the
+        // other waves' pairs in makes the decision the whole group's, so the branch is taken by
+        // every thread and the barriers inside it are reached by all of them - which is what a
+        // group of several console waves needs to be widened at all (`widen`).
+        let slot = self.exchange.as_ref().map(|(s, _, _)| *s);
+        if let Some(slot) = slot {
+            let waves = match &self.x.native.io {
+                crate::native::StageIo::Cs(cs) => cs.threads.iter().product::<u32>().div_ceil(64),
+                _ => 1,
+            };
+            if waves > 1 {
+                let lds = self.s.lds();
+                for w in 0..waves {
+                    let a = self.s.m.i32(slot + 2 * w);
+                    let b = self.s.m.i32(slot + 2 * w + 1);
+                    let pa = self.s.m.element(c, lds, a);
+                    let pb = self.s.m.element(c, lds, b);
+                    let va = self.s.m.load(c, pa);
+                    let vb = self.s.m.load(c, pb);
+                    let pair = self.s.m.bin(c, Bin::Or, va, vb);
+                    both = self.s.m.bin(c, Bin::Or, both, pair);
+                }
+            }
+        }
         let z = self.s.m.i32(0);
         Ok(self.s.m.cmp(c, if any { pred::NE } else { pred::EQ }, both, z))
     }
 
     /// Whether every lane runs IR block `b` (always true without `exchange`).
     fn all_lanes(&self, b: usize) -> bool {
-        self.exchange.as_ref().is_none_or(|(_, _, all)| all.get(b).copied().unwrap_or(false))
+        // A block index the structure does not know is not a block some lanes leave out:
+        // `false` here said "not every lane runs it" about blocks the analysis never saw, and
+        // the widening was then asked for branches around a block no region holds
+        // ("WAVE64-WIDE stopped ... a branch around it cannot be", measured on
+        // water_shading:CS_TransmissionVolumetrics_VolumePortalsOnly 2026-11-26).
+        self.exchange.as_ref().is_none_or(|(_, _, all)| all.get(b).copied().unwrap_or(true))
     }
 
     /// This lane's bit of the mask `lo`, `hi` (wave64).
@@ -8945,7 +9226,9 @@ impl<'a> Lower<'a> {
                         // the console wave (the ray-tracing builder's scans read a sum of
                         // scalars this way, inside a loop whose exit is per console wave).
                         static OWN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-                        if *OWN.get_or_init(|| std::env::var_os("VICTORY_FIRSTLANE_OWN").is_some_and(|v| v == "1")) {
+                        if *OWN.get_or_init(|| std::env::var_os("VICTORY_FIRSTLANE_OWN").is_some_and(|v| v == "1"))
+                            || super::firstlane_own_here()
+                        {
                             return int(self, mine);
                         }
                         need(self.cur_ir);
@@ -12601,13 +12884,14 @@ impl<'a> Lower<'a> {
                     }
                     // A lane mask joined with numbers (a traversal that keeps its lanes' masks on
                     // a stack with its node numbers): the mask comes as the number it is, the
-                    // ballot of its lanes where it is written.
+                    // ballot of its lanes where it is written (or, where the join takes one mask's
+                    // bits on every way in, that mask's: `joined_dword`).
                     (Some(Val::Missing(_)) | None, false)
                         if self.read_phis.contains(&phi.value)
                             && self.mask_data == MaskData::Console
                             && (st.masks.contains_key(&arg) || st.highs.contains_key(&arg)) =>
                     {
-                        match self.mask_dword(arg) {
+                        match self.joined_dword(phi.value, arg) {
                             Ok(x) => x,
                             Err(why) => return Err(Stop::Retry(phi.value, why)),
                         }
