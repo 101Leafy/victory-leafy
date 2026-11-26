@@ -2001,7 +2001,9 @@ pub(crate) fn card_accounting(room: bool, due: [u64; 5], never: Vec<(u64, u64)>,
 /// - only the host copy holds the host texture: no descriptor slot views
 ///   it (a slot keeps what it views, `HostHeap::kept`), so no shader can
 ///   read it through a slot made earlier, by a table or by an index;
-/// - nothing asked for it for `IDLE_MS` and `IDLE_FRAMES` frames.
+/// - nothing asked for it for `IDLE_MS` and `IDLE_FRAMES` frames, or, for
+///   a placed texture whose title memory is not mapped now (its first
+///   page), for [`UNMAPPED_MS`] ([`unmapped_first`]).
 ///
 /// The next use makes the host copy anew and uploads the title's memory
 /// again (its staging state goes with it). The title resource stays: its
@@ -2077,6 +2079,7 @@ pub(crate) fn let_go_idle() {
     };
     let from = if part == PART { FROM.load(Relaxed) } else { 0 };
     let mut looked = 0;
+    let mut asked = 0;
     let began = std::time::Instant::now();
     for at in all.range(from..).take(part).copied().chain(by_age.iter().map(|&(_, at)| at)) {
         if bytes >= most {
@@ -2091,13 +2094,32 @@ pub(crate) fn let_go_idle() {
         let r = unsafe { &*(at as *const Resource) };
         // (Without its lock first: most were used lately or have none.)
         let used = r.host.used.load(Relaxed);
-        if used == 0 || !fills(&r.desc) || !crate::host::long_ago(used, idle_ms, IDLE_FRAMES) || crate::texture::host_wrote(at) {
+        if used == 0 || !fills(&r.desc) || crate::texture::host_wrote(at) {
             continue;
+        }
+        let mut wait = idle_ms;
+        if !crate::host::long_ago(used, idle_ms, IDLE_FRAMES) {
+            // Sooner when the title gave its memory up: only a slot or a
+            // list keeps such a copy of use.
+            if idle_ms <= UNMAPPED_MS
+                || asked >= UNMAPPED_ASKED
+                || !unmapped_first()
+                || !r.host.placed.load(Relaxed)
+                || !crate::host::long_ago(used, UNMAPPED_MS, IDLE_FRAMES)
+            {
+                continue;
+            }
+            asked += 1;
+            UNMAPPED_GONE[2].fetch_add(1, Relaxed);
+            if crate::texture::committed(r.data().cast_const(), 1) {
+                continue;
+            }
+            wait = UNMAPPED_MS;
         }
         let gone = {
             let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
             let idle = made.as_ref().is_some_and(|(host, _)| {
-                crate::host::long_ago(r.host.used.load(Relaxed), idle_ms, IDLE_FRAMES)
+                crate::host::long_ago(r.host.used.load(Relaxed), wait, IDLE_FRAMES)
                     && std::sync::Arc::strong_count(host) == 1
                     && crate::host::references(&host.texture) == 1
             });
@@ -2115,6 +2137,10 @@ pub(crate) fn let_go_idle() {
             r.host.gone.store(true, Relaxed);
             KINDS[2].fetch_add(1, Relaxed);
             KINDS[3].fetch_add(host.bytes, Relaxed);
+            if wait != idle_ms {
+                UNMAPPED_GONE[0].fetch_add(1, Relaxed);
+                UNMAPPED_GONE[1].fetch_add(host.bytes, Relaxed);
+            }
             went += 1;
             bytes += host.bytes;
             if first.is_none() {
@@ -2136,6 +2162,36 @@ pub(crate) fn let_go_idle() {
         });
     }
 }
+
+/// Milliseconds a host copy of a placed texture whose title memory is not
+/// mapped waits before [`let_go_idle`] lets it go, when the wait for the
+/// rest is longer.
+///
+/// While the card has room the rest wait ten minutes ([`crate::host::vram_keep`]),
+/// and those copies stayed: about 1,755 MB of copies of placed textures
+/// whose first page was not mapped, shown by no slot, in the play-master
+/// run of 2026-11-25 (`census`). Should the title map the memory again
+/// and use the texture, that use makes the copy anew and uploads it.
+#[cfg(windows)]
+const UNMAPPED_MS: u64 = 1_500;
+
+/// Of those, how many title textures one look asks Windows about.
+#[cfg(windows)]
+const UNMAPPED_ASKED: usize = 512;
+
+/// Whether [`UNMAPPED_MS`] holds (`VICTORY_SWEEP_UNMAPPED`, on; 0: those
+/// wait as long as the rest, as before).
+#[cfg(windows)]
+fn unmapped_first() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SWEEP_UNMAPPED").is_none_or(|v| v != "0"))
+}
+
+/// Since the start: host copies let go by [`UNMAPPED_MS`], their bytes, and
+/// the title textures asked about.
+#[cfg(windows)]
+pub(crate) static UNMAPPED_GONE: [std::sync::atomic::AtomicU64; 3] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
 /// Since the start: looks of [`let_go_idle`], their microseconds, and the
 /// longest one's.
