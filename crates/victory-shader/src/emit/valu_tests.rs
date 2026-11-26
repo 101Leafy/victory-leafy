@@ -589,6 +589,53 @@ fn v_permlane16_and_x16_read_the_lanes_their_selectors_pick() {
     }
 }
 
+/// VOP2 `op vdst, vsrc0, vsrc1` with a DPP16 dword (all rows and banks on).
+const fn vop2_dpp16(op: u8, vdst: u8, vsrc0: u8, vsrc1: u8, ctrl: u16) -> [u32; 2] {
+    [
+        (op as u32) << 25 | (vdst as u32) << 17 | (vsrc1 as u32) << 9 | 0xFA,
+        0xF << 28 | 0xF << 24 | (ctrl as u32 & 0x1FF) << 8 | vsrc0 as u32,
+    ]
+}
+
+#[test]
+fn dpp16_reverse_integer_ops_shuffle_the_second_source() {
+    // Before GFX11 the reverse subtract and shifts take the lane DPP picks
+    // as src1 and their own lane's src0 (LLVM `isSrc1DPPRevOpcode`, Mesa
+    // README-ISA.md). v1 = 0x1000_0001 + lane, v3 = 0x0001_0000 + lane,
+    // quad pairs swapped (0xB1); v_sub_nc_u32 is the control, shuffling src0.
+    let v1 = |lane: u32| 0x1000_0001 + lane;
+    let v3 = |lane: u32| 0x0001_0000 + lane;
+    for (op, name) in [
+        (0x27u8, "v_subrev_nc_u32"),
+        (0x1A, "v_lshlrev_b32"),
+        (0x16, "v_lshrrev_b32"),
+        (0x18, "v_ashrrev_i32"),
+        (0x26, "v_sub_nc_u32"),
+    ] {
+        for read in [0u8, 1, 6, 17, 30, 31] {
+            let mut body = Vec::new();
+            body.push(0x25 << 25 | 1 << 17 | 1 << 9 | 256); // v_add_nc_u32 v1, v0, v1
+            body.push(0x25 << 25 | 3 << 17 | 3 << 9 | 256); // v_add_nc_u32 v3, v0, v3
+            body.extend_from_slice(&vop2_dpp16(op, 2, 1, 3, 0xB1));
+            body.extend_from_slice(&vop3(0x360, 12, vgpr(2), 128 + u16::from(read), 0));
+            body.push(vop1(0x001, 0, sgpr(12)));
+            let shader = build_cs(&body, 32, 0);
+            let (lane, src) = (u32::from(read), u32::from(read) ^ 1);
+            let want = match op {
+                0x27 => v3(src).wrapping_sub(v1(lane)),
+                0x1A => v3(src) << (v1(lane) & 31),
+                0x16 => v3(src) >> (v1(lane) & 31),
+                0x18 => ((v3(src) as i32) >> (v1(lane) & 31)) as u32,
+                _ => v1(src).wrapping_sub(v3(lane)),
+            };
+            let inputs = [[0x1000_0001, 0, 0x0001_0000, 0]];
+            run_cases_on(&shader, &inputs, &[("hardware", false)], |backend, _, _, got| {
+                assert_eq!(got, want, "{backend}: {name}, lane {read}");
+            });
+        }
+    }
+}
+
 #[test]
 fn v_med3_f32_matches_rdna2_with_nan() {
     // v_med3_f32 v0, v1, v2, v3 (VOP3 opcode 0x157)

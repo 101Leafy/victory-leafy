@@ -379,8 +379,8 @@ struct Lower<'a> {
     tail: Vec<Option<usize>>,
     /// The program writes UAVs: barriers fence them too.
     writes_uavs: bool,
-    /// src0 of the current instruction as DPP fetched it.
-    src0: Option<V>,
+    /// The source DPP fetched for the current instruction, and its index.
+    src0: Option<(V, usize)>,
     /// Compute code that reads other lanes: thread ids follow the host
     /// lanes, so lane n is console lane n.
     console_lanes: bool,
@@ -4168,8 +4168,8 @@ impl<'a> Lower<'a> {
                 let x = self.select_bits(x, sel, sext);
                 self.as_float(x)
             }
-            _ if k == 0 && self.src0.is_some() => {
-                let x = self.src0.expect("checked");
+            _ if self.src0.is_some_and(|(_, k1)| k == k1) => {
+                let (x, _) = self.src0.expect("checked");
                 self.as_float(x)
             }
             Operand::Vector { reg, .. } | Operand::Scalar { code: reg, .. }
@@ -4213,7 +4213,7 @@ impl<'a> Lower<'a> {
             return Err("integer operand modifiers");
         }
         match self.src0 {
-            Some(x) if k == 0 => Ok(x),
+            Some((x, k1)) if k == k1 => Ok(x),
             _ => {
                 let x = self.operand(inst, &op)?;
                 Ok(match Self::sdwa_src(inst, k) {
@@ -8427,12 +8427,18 @@ impl<'a> Lower<'a> {
         }
         let mut guard = self.guard(b, i)?;
         if let Some(d) = v.dpp {
-            let (x, enable) = self.dpp(inst, d)?;
+            // These apply DPP to src1 (LLVM `isSrc1DPPRevOpcode`).
+            let k1 = usize::from(matches!(
+                name,
+                "v_subrev_nc_u32" | "v_subrev_co_ci_u32" | "v_lshlrev_b32" | "v_lshrrev_b32"
+                | "v_ashrrev_i32"
+            ));
+            let (x, enable) = self.dpp(inst, d, k1)?;
             guard = match (guard, enable) {
                 (Some(g), Some(e)) => Some(self.s.m.bin(self.cur, Bin::And, g, e)),
                 (g, e) => g.or(e),
             };
-            self.src0 = Some(x);
+            self.src0 = Some((x, k1));
         }
         let r = self.valu_op(inst, guard);
         self.src0 = None;
@@ -8441,11 +8447,11 @@ impl<'a> Lower<'a> {
 
     /// DPP: src0 as read from another lane, and which lanes write their
     /// result (none: all).
-    fn dpp(&mut self, inst: &Inst, dpp: Dpp) -> Result<(V, Option<V>), Why> {
+    fn dpp(&mut self, inst: &Inst, dpp: Dpp, k1: usize) -> Result<(V, Option<V>), Why> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
         };
-        let Some(&Operand::Vector { reg, .. }) = v.src.first() else {
+        let Some(&Operand::Vector { reg, .. }) = v.src.get(k1) else {
             return Err("a DPP operand");
         };
         let x = self.i32_of(inst.read(Reg::V(reg)).ok_or("a DPP operand")?)?;
@@ -9633,7 +9639,7 @@ impl<'a> Lower<'a> {
             }
         }
         let x = match self.src0 {
-            Some(x) if k == 0 => x,
+            Some((x, k1)) if k == k1 => x,
             _ => self.f16_operand(inst, &op)?,
         };
         let c = self.cur;
