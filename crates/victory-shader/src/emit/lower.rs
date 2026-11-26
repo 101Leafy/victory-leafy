@@ -57,6 +57,13 @@ mod wave_prefix_tests;
 #[path = "guard_run_tests.rs"]
 mod guard_run_tests;
 
+#[cfg(test)]
+thread_local! {
+    /// The instructions of each run [`Lower::guarded_run`] lowers on this thread, while a test
+    /// keeps a list here.
+    static RUNS_SEEN: std::cell::RefCell<Option<Vec<Vec<Inst>>>> = const { std::cell::RefCell::new(None) };
+}
+
 type Why = &'static str;
 
 /// How an interpolation evaluates an input channel.
@@ -5296,6 +5303,12 @@ impl<'a> Lower<'a> {
         self.spec = Some((b, start, end));
         #[cfg(test)]
         self.runs_taken.push((b, start, end));
+        #[cfg(test)]
+        RUNS_SEEN.with_borrow_mut(|seen| {
+            if let Some(seen) = seen {
+                seen.push(p.blocks[b].insts[start..end].to_vec());
+            }
+        });
         let r = (start..end).try_for_each(|i| self.inst(b, i));
         self.spec = None;
         r?;
