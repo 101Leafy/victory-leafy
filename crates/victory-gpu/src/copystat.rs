@@ -1005,6 +1005,22 @@ fn log_memory() {
             gone[2].load(Relaxed)
         );
     }
+    {
+        let sides = crate::shadow::card_sides_census();
+        tracing::info!(
+            "the CPU's sides of copies in the card's memory, as big as their card sides: {} written by shaders {:.0} MB, {} sending changed dwords only {:.0} MB, {} passing title memory on {:.0} MB, of them nothing sent for 10 s {} {:.0} MB, for 60 s {} {:.0} MB",
+            sides[0],
+            mb(sides[1]),
+            sides[2],
+            mb(sides[3]),
+            sides[4],
+            mb(sides[5]),
+            sides[6],
+            mb(sides[7]),
+            sides[8],
+            mb(sides[9])
+        );
+    }
     tracing::info!(
         "memory let go since the start: {} windows outside buffers {:.0} MB, {} staging buffers \
          {:.0} MB; of the windows alive, {:.0} MB lie between the lowest and highest address \
