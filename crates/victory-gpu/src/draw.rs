@@ -52,6 +52,59 @@ pub(crate) struct IndexView {
     format: u32,
 }
 
+/// Why a draw that reached [`State::bind`] or [`State::prepare_for`] is
+/// dropped.
+#[derive(Clone, Copy)]
+enum Refused {
+    /// A descriptor table found no free slots.
+    NoSlots,
+    /// A shader reads title memory by address and the list has no view heap
+    /// for its views.
+    NoHeap,
+    /// The same with a view heap: the host could not hold the memory.
+    NotHeld,
+    /// Its index buffer is in no title buffer the host has a copy of.
+    NoIndex,
+    /// A draw with a mesh pipeline, or the other way round, or a compute one.
+    Kind,
+    /// A root view bound as a one-view table found no slot or no view heap.
+    RootTable,
+}
+
+impl Refused {
+    fn text(self) -> &'static str {
+        match self {
+            Refused::NoSlots => "prepare failed: descriptor table found no free slots",
+            Refused::NoHeap => "prepare failed: reads by address without a view heap",
+            Refused::NotHeld => "prepare failed: memory read by address not held",
+            Refused::NoIndex => "prepare failed: index buffer with no host copy",
+            Refused::Kind => "prepare failed: pipeline kind mismatch",
+            Refused::RootTable => "prepare failed: root view table without a slot or view heap",
+        }
+    }
+}
+
+/// Notes why the draw is dropped ([`REFUSED`], and its counter): false.
+fn refuse(why: Refused) -> bool {
+    REFUSED.set(Some(why));
+    #[cfg(feature = "diagnostics")]
+    {
+        use crate::copystat::{C, add};
+        add(
+            match why {
+                Refused::NoSlots => C::RefusedNoSlots,
+                Refused::NoHeap => C::RefusedNoHeap,
+                Refused::NotHeld => C::RefusedNotHeld,
+                Refused::NoIndex => C::RefusedNoIndex,
+                Refused::Kind => C::RefusedKind,
+                Refused::RootTable => C::RefusedRootTable,
+            },
+            1,
+        );
+    }
+    false
+}
+
 /// Host states of a depth target, and of a texture shaders read.
 const DEPTH_WRITE: u32 = 0x10;
 const DEPTH_READ: u32 = 0x20;
@@ -66,6 +119,10 @@ thread_local! {
     /// While a stage's tables are walked (`State::tables`): whether that
     /// stage's shader can store to buffers (`Translated::stores`).
     static STORES: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    /// Why the last [`State::bind`] or [`State::prepare_for`] refused its
+    /// draw, for the indirect drop reasons (None: it did not, or for a
+    /// reason checked before).
+    static REFUSED: std::cell::Cell<Option<Refused>> = const { std::cell::Cell::new(None) };
     /// While `State::early_textures` runs the texture pass: the
     /// milliseconds and the bytes that run may take, in place of the
     /// pass's own per frame.
@@ -1382,7 +1439,7 @@ impl State {
         };
         if p.compute || p.mesh != mesh {
             once!(mesh, "a draw or mesh dispatch with another kind of pipeline");
-            return false;
+            return refuse(Refused::Kind);
         }
         if p.rects && self.topology != RECTANGLES {
             // Its geometry stage would turn each triangle into a rectangle.
@@ -1422,7 +1479,7 @@ impl State {
         if indexed {
             let v = self.index;
             let Some(shadow) = crate::shadow::find_any(v.address, u64::from(v.size)) else {
-                return false;
+                return refuse(Refused::NoIndex);
             };
             shadow.refresh(list, v.address, u64::from(v.size));
             let view = D3D12_INDEX_BUFFER_VIEW {
@@ -1538,7 +1595,7 @@ impl State {
             STORES.set(true);
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
-                return false;
+                return refuse(Refused::NoSlots);
             }
             if stage.shader.ambient.is_some() {
                 self.ambient_tables.clear();
@@ -1558,8 +1615,13 @@ impl State {
                     crate::memory::Use::Reads
                 };
                 let Some(ready) = self.memory_ready(list, &t, compute, use_) else {
-                    once!("a shader that reads title memory by address without a view heap to hold its views: the draw is dropped");
-                    return false;
+                    let heap = self.heaps[0] != 0 && crate::descriptor::heap(self.heaps[0] as This).host().is_some();
+                    if !heap {
+                        once!("a shader that reads title memory by address without a view heap to hold its views: the draw is dropped");
+                        return refuse(Refused::NoHeap);
+                    }
+                    once!("a shader that reads title memory by address whose memory the host could not hold: the draw is dropped");
+                    return refuse(Refused::NotHeld);
                 };
                 Some(ready)
             } else {
@@ -1644,7 +1706,7 @@ impl State {
                         once!(slot, "a shader reads a root view the title did not set");
                         // A table left unset is undefined: a null view.
                         if tabled && !self.root_srv_table(list, None, param, compute, false) {
-                            return false;
+                            return refuse(Refused::RootTable);
                         }
                         continue;
                     };
@@ -1656,7 +1718,7 @@ impl State {
                         });
                     if tabled {
                         if !self.root_srv_table(list, Some(address), param, compute, biased) {
-                            return false;
+                            return refuse(Refused::RootTable);
                         }
                         continue;
                     }
@@ -3937,6 +3999,7 @@ impl State {
                 (bounded, 0)
             }
         };
+        REFUSED.set(None);
         let ran = match kind {
             DRAW | INDEXED => self.prepare(list, kind == INDEXED),
             MESH => self.prepare_for(list, false, true),
@@ -3944,7 +4007,7 @@ impl State {
             _ => false,
         };
         if !ran {
-            why("prepare failed");
+            why(REFUSED.get().map_or("prepare failed", Refused::text));
             return false;
         }
         #[cfg(feature = "diagnostics")]
