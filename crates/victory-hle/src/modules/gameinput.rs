@@ -151,7 +151,7 @@ fn fallback(keys: &[KeyState]) -> PadState {
     }
 }
 
-/// The debug overlay (Alt+Z, `victory_gpu::overlay`) shows the pad the
+/// The debug overlay (Ctrl+F10, `victory_gpu::overlay`) shows the pad the
 /// title reads on `values[target]` (the first connected pad, with the
 /// keyboard and mouse when `[controls]` is on, else the keyboard's
 /// stand-in). The title keeps its input while it shows.

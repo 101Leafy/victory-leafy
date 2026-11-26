@@ -1,6 +1,7 @@
-//! A debug overlay drawn into each presented frame. Alt+Z, while our
-//! window has focus, shows and hides it (`VICTORY_OVERLAY=0` turns it off,
-//! `VICTORY_OVERLAY=1` shows it from the start).
+//! A debug overlay drawn into each presented frame. It is off unless
+//! `VICTORY_OVERLAY` is set: `VICTORY_OVERLAY=1` turns it on, and Ctrl+F10,
+//! while our window has focus, shows and hides it. `VICTORY_OVERLAY=show`
+//! also shows it from the start.
 //!
 //! It shows the frame rate and frame times (with a graph of the last
 //! frames and the 1% low), the presenter's last second (draws per frame,
@@ -275,7 +276,7 @@ fn scale_for(height: u32) -> f32 {
 /// The presenter's overlay state.
 pub(crate) struct Overlay {
     enabled: bool,
-    /// Alt+Z was down at the last frame (only without the key thread,
+    /// Ctrl+F10 was down at the last frame (only without the key thread,
     /// [`watch_keys`]).
     down: bool,
     last: Option<Instant>,
@@ -299,11 +300,11 @@ pub(crate) struct Overlay {
 impl Default for Overlay {
     fn default() -> Self {
         let switch = std::env::var_os("VICTORY_OVERLAY");
-        if switch.as_deref().is_some_and(|v| v == "1") {
+        if switch.as_deref().is_some_and(|v| v == "show") {
             VISIBLE.store(true, Relaxed);
         }
         Overlay {
-            enabled: switch.as_deref().is_none_or(|v| v != "0"),
+            enabled: switch.as_deref().is_some_and(|v| v != "0"),
             down: false,
             last: None,
             times: VecDeque::with_capacity(HISTORY),
@@ -352,7 +353,7 @@ fn watch_keys(hwnd: HWND) -> bool {
     KEY_THREAD.load(Relaxed)
 }
 
-/// Alt+Z shows and hides the panel, only while `hwnd` has focus, when it
+/// Ctrl+F10 shows and hides the panel, only while `hwnd` has focus, when it
 /// goes down: `before` is whether it was down at the last look, and
 /// whether it is down now is returned for the next.
 fn poll_keys(before: bool, hwnd: HWND) -> bool {
@@ -360,7 +361,7 @@ fn poll_keys(before: bool, hwnd: HWND) -> bool {
     // SAFETY: a plain query.
     let focused = !hwnd.is_invalid() && unsafe { GetForegroundWindow() } == hwnd;
     // SAFETY: a plain query.
-    let down = alt_z_down(|vk| focused && unsafe { GetAsyncKeyState(vk) } < 0);
+    let down = toggle_down(|vk| focused && unsafe { GetAsyncKeyState(vk) } < 0);
     if down && !before {
         let shown = !VISIBLE.fetch_xor(true, Relaxed);
         tracing::info!(shown, "overlay");
@@ -368,10 +369,11 @@ fn poll_keys(before: bool, hwnd: HWND) -> bool {
     down
 }
 
-/// Whether Alt+Z is held.
-fn alt_z_down(held: impl Fn(i32) -> bool) -> bool {
-    const ALT: i32 = 0x12;
-    held(ALT) && held(i32::from(b'Z'))
+/// Whether Ctrl+F10 is held.
+fn toggle_down(held: impl Fn(i32) -> bool) -> bool {
+    const CTRL: i32 = 0x11;
+    const F10: i32 = 0x79;
+    held(CTRL) && held(F10)
 }
 
 /// What is sampled once a second.
@@ -385,7 +387,8 @@ struct System {
 }
 
 impl Overlay {
-    /// Counts the frame, polls the keys and, if the panel shows and fits,
+    /// Counts the frame, polls the keys and, if the panel shows (`showing`,
+    /// as the present read it, so both agree for the frame) and fits,
     /// records its copy into `back` (`width` x `height` of `format`, in
     /// `state`) on `list`, moving `back` to the copy destination state
     /// first. Returns the state `back` is left in.
@@ -397,6 +400,7 @@ impl Overlay {
         (width, height, format): (u32, u32, DXGI_FORMAT),
         hwnd: HWND,
         state: D3D12_RESOURCE_STATES,
+        showing: bool,
     ) -> D3D12_RESOURCE_STATES {
         if !self.enabled {
             return state;
@@ -415,7 +419,7 @@ impl Overlay {
                 self.times.pop_front();
             }
             self.times.push_back((now - last).as_secs_f32() * 1000.0);
-            let gpu = (shown() && gpu_ns > 0).then(|| gpu_ns as f32 / 1e6);
+            let gpu = (showing && gpu_ns > 0).then(|| gpu_ns as f32 / 1e6);
             push(&mut self.gpu, gpu);
             let latency = (read > 0).then(|| {
                 let at = epoch() + Duration::from_nanos(read);
@@ -426,7 +430,7 @@ impl Overlay {
         if !watch_keys(hwnd) {
             self.down = poll_keys(self.down, hwnd);
         }
-        if !shown() {
+        if !showing {
             self.drawn = None;
             return state;
         }
@@ -1125,7 +1129,7 @@ fn draw_panel(fonts: &Fonts, scale: f32, f: &Facts) -> Image {
     p.text(
         right,
         y + p.px(2.0),
-        "Alt+Z hides",
+        "Ctrl+F10 hides",
         (12.0, false),
         colour::LABEL,
         Align::Right,
@@ -1647,14 +1651,14 @@ fn glyph(c: char) -> [u8; 7] {
 mod tests {
     use super::*;
 
-    /// Alt+Z only with Alt held.
+    /// Ctrl+F10 only with Ctrl held.
     #[test]
-    fn alt_z_needs_alt() {
-        let with = |keys: &'static [u8]| alt_z_down(move |vk| keys.contains(&(vk as u8)));
-        assert!(!with(b"Z"));
-        assert!(!with(&[0x12]));
-        assert!(with(&[0x12, b'Z']));
-        assert!(with(&[0x12, b'Z', b'1']));
+    fn the_toggle_needs_ctrl() {
+        let with = |keys: &'static [u8]| toggle_down(move |vk| keys.contains(&(vk as u8)));
+        assert!(!with(&[0x79]));
+        assert!(!with(&[0x11]));
+        assert!(with(&[0x11, 0x79]));
+        assert!(with(&[0x11, 0x79, b'1']));
     }
 
     /// The key thread starts once and stays pointed at the latest window;
@@ -1866,6 +1870,7 @@ mod tests {
             (width, height, DXGI_FORMAT_R8G8B8A8_UNORM),
             HWND::default(),
             D3D12_RESOURCE_STATE_COPY_DEST,
+            true,
         );
         // SAFETY: an open list and live resources; footprint in the buffer.
         unsafe {

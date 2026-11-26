@@ -8661,7 +8661,7 @@ struct Presenter {
     panel: panel::Panel,
     #[cfg(feature = "diagnostics")]
     frames: frames::Frames,
-    /// The debug overlay (Alt+Z), drawn into each frame it shows.
+    /// The debug overlay (Ctrl+F10), drawn into each frame it shows.
     overlay: crate::overlay::Overlay,
 }
 
@@ -9077,7 +9077,8 @@ impl Host {
             let read_now = false;
             // The overlay rewrites its upload buffer between presents, so
             // while it shows each present is waited for.
-            let read_now = read_now || crate::overlay::shown();
+            let overlay_shown = crate::overlay::shown();
+            let read_now = read_now || overlay_shown;
             let slot = if late_free_present() && !read_now {
                 let finished = FINISHED.load(Ordering::Acquire);
                 p.ahead.iter().position(|(_, flown)| *flown <= finished).or_else(|| {
@@ -9105,7 +9106,7 @@ impl Host {
             ]);
             list.CopyResource(&back, texture);
             let shape = (width, height, format);
-            p.overlay.record(self, list, &back, shape, p.hwnd, D3D12_RESOURCE_STATE_COPY_DEST);
+            p.overlay.record(self, list, &back, shape, p.hwnd, D3D12_RESOURCE_STATE_COPY_DEST, overlay_shown);
             #[cfg(feature = "diagnostics")]
             let capture = crate::capture::wanted(frame)
                 .then(|| crate::capture::read_back(&self.device, list, texture))
