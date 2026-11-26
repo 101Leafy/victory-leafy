@@ -441,6 +441,28 @@ fn section_pages() -> usize {
     *PAGES
 }
 
+/// `VICTORY_KEEP_PAGES=1`: every page a view commits is read once through
+/// its section's kept view of all of it ([`Section::window`], never
+/// unmapped while the section lives). Without that, a page the title writes
+/// and then unmaps from its last view (it remaps all the time) leaves our
+/// working set dirty, goes to the modified list and is written to the
+/// pagefile, though the title still holds it and nothing needs the copy.
+/// Measured on a SATA SSD (RX 7600 XT, 48 GB, nowhere near short of
+/// memory): the modified list jumping from 0.4 to 2.2 GB in a second, 175
+/// to 300 MB/s of pagefile writes, and the drive then busy 100% at 2 MB/s
+/// for a minute and more, while DirectStorage reads waited behind it. A
+/// page still shown by the kept view stays in the working set instead (in
+/// a test, 256 MB written and unmapped: +256 MB on the modified list
+/// without it, +0 with it); it leaves only when Windows trims us. Costs
+/// address space only (the view commits nothing) and one read per 4 KiB at
+/// each mapping. Not under Wine, whose sections are sparse files.
+fn keeping() -> bool {
+    static KEEP: LazyLock<bool> = LazyLock::new(|| {
+        !on_wine() && std::env::var("VICTORY_KEEP_PAGES").is_ok_and(|v| v.trim() == "1")
+    });
+    *KEEP
+}
+
 struct Section {
     handle: HANDLE,
     pages: usize,
@@ -464,16 +486,12 @@ impl Section {
     /// `VICTORY_SECTION_WINDOW=0`: a view for each write, as before.
     fn window(&self, index: usize, n: usize) -> Option<usize> {
         use std::sync::atomic::Ordering;
-        use windows_sys::Win32::System::Memory::{FILE_MAP_WRITE, MapViewOfFile};
         static ON: LazyLock<bool> =
             LazyLock::new(|| std::env::var_os("VICTORY_SECTION_WINDOW").is_none_or(|v| v != "0"));
         if !*ON || index + n > self.pages {
             return None;
         }
-        let base = *self.window.get_or_init(|| {
-            // SAFETY: the whole of a section we own.
-            unsafe { MapViewOfFile(self.handle, FILE_MAP_WRITE, 0, 0, self.pages * PAGE) }.Value as usize
-        });
+        let base = self.window_base();
         if base == 0 {
             return None;
         }
@@ -497,6 +515,34 @@ impl Section {
             page += run;
         }
         Some(base + index * PAGE)
+    }
+
+    /// The kept view of the whole section, mapped on first use; 0 if the
+    /// host gave none.
+    fn window_base(&self) -> usize {
+        use windows_sys::Win32::System::Memory::{FILE_MAP_WRITE, MapViewOfFile};
+        *self.window.get_or_init(|| {
+            // SAFETY: the whole of a section we own.
+            unsafe { MapViewOfFile(self.handle, FILE_MAP_WRITE, 0, 0, self.pages * PAGE) }.Value as usize
+        })
+    }
+
+    /// With [`keeping`], reads the `n` pages from `index` on once through
+    /// the kept view, which holds them in our working set there. They must
+    /// be committed.
+    fn keep(&self, index: usize, n: usize) {
+        if !keeping() || index + n > self.pages {
+            return;
+        }
+        let base = self.window_base();
+        if base == 0 {
+            return;
+        }
+        let start = base + index * PAGE;
+        for at in (start..start + n * PAGE).step_by(4096) {
+            // SAFETY: inside the kept view, at a committed page.
+            unsafe { std::ptr::read_volatile(at as *const u8) };
+        }
     }
 }
 
@@ -830,6 +876,7 @@ impl View {
             tracing::warn!(error = %std::io::Error::last_os_error(), n, "physical pages not committed for a write");
             return None;
         }
+        slice.section.keep(slice.index, n);
         Some(view)
     }
 
@@ -1739,6 +1786,7 @@ fn show(base: usize, len: usize, slice: &Slice, own: bool) -> bool {
         unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER) };
         return false;
     }
+    slice.section.keep(slice.index, len.div_ceil(PAGE));
     true
 }
 
