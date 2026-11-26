@@ -243,11 +243,21 @@ pub(crate) enum C {
     RefusedNoIndex,
     RefusedKind,
     RefusedRootTable,
+    /// Watch: write faults in the descriptor heaps' guarded blocks that
+    /// opened one 4 KiB part, ones that opened the whole block because
+    /// enough parts were open or because the block has other views, and,
+    /// as guards made them read-only again, the blocks with parts open and
+    /// those parts (`VICTORY_GUARD_PARTS`).
+    GuardPartFaults,
+    GuardPartWhole,
+    GuardPartAliased,
+    GuardPartBlocks,
+    GuardPartParts,
 }
-const COUNTERS: usize = 128;
+const COUNTERS: usize = 133;
 
 /// The counters' names, in the order of [`C`], for the frame recorder's columns.
-pub(crate) const NAMES: [&str; 128] = [
+pub(crate) const NAMES: [&str; 133] = [
     "Submissions", "Copies", "CopyBytes", "Refreshes", "RefreshBytes", "Skipped", "SkippedBytes", "Runs",
     "RunUs", "Queries", "QueryUs", "MoveUs", "Unmapped", "Watches", "WatchUs", "Checked", "Unchanged",
     "Fallbacks", "GuardFaults", "TexWatched", "TexHashed", "TexChanged", "TexHot", "Frames", "RecordCalls",
@@ -268,6 +278,7 @@ pub(crate) const NAMES: [&str; 128] = [
     "Closes", "CloseTwinsNs", "CloseTexBackNs", "CloseIndirectNs", "CloseBatchesNs",
     "CloseBudgetNs", "CloseComingNs", "CloseQueryNs", "CloseDriverNs", "ReadBacksMade", "ReadBacksReused",
     "RefusedNoSlots", "RefusedNoHeap", "RefusedNotHeld", "RefusedNoIndex", "RefusedKind", "RefusedRootTable",
+    "GuardPartFaults", "GuardPartWhole", "GuardPartAliased", "GuardPartBlocks", "GuardPartParts",
 ];
 /// One of some sets of counters, each in lines of the processor's memory of
 /// its own: a set for all threads had them wait for each other's lines at
@@ -578,7 +589,7 @@ mod command_tests {
     #[test]
     fn every_counter_is_named() {
         use super::{C, COUNTERS, NAMES};
-        assert_eq!(C::RefusedRootTable as usize + 1, NAMES.len());
+        assert_eq!(C::GuardPartParts as usize + 1, NAMES.len());
         assert_eq!(NAMES[C::Frames as usize], "Frames");
         assert!(NAMES.len() <= COUNTERS);
     }

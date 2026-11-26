@@ -111,6 +111,9 @@ pub(crate) fn track(start: usize, len: usize, views: bool) -> Option<Tracked> {
     if len == 0 || writes(start, end, views).is_none() {
         return None;
     }
+    if views {
+        (start / BLOCK..end.div_ceil(BLOCK)).for_each(|block| FINE.set(block));
+    }
     Some(Tracked {
         start,
         end,
@@ -761,7 +764,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
             }
             #[cfg(feature = "diagnostics")]
             let guarding = std::time::Instant::now();
-            let written = guard(first * PAGE, last * PAGE).map(|pages| pages.into_iter().map(|p| (p, WHOLE)).collect::<Vec<_>>());
+            let written = guard_parts(first * PAGE, last * PAGE);
             #[cfg(feature = "diagnostics")]
             {
                 use crate::copystat::{C, add};
@@ -1038,6 +1041,11 @@ static BESIDE: Bits = Bits::new();
 /// How much was put into a block beside its guard since it was last told as
 /// written (`crate::titlewrite::MOST`), by a few bits of its number.
 static PUT: [std::sync::atomic::AtomicU32; 1 << 13] = [const { std::sync::atomic::AtomicU32::new(0) }; 1 << 13];
+
+/// The blocks of memory tracked with its views ([`track`]), the descriptor
+/// heaps: a write fault in one opens the 4 KiB part it is in, not the block
+/// ([`part_open`]).
+static FINE: Bits = Bits::new();
 
 fn put_count(block: usize) -> &'static std::sync::atomic::AtomicU32 {
     &PUT[block % PUT.len()]
@@ -1444,7 +1452,7 @@ struct Guards {
     /// Blocks (first, past the last) the kernel writes now
     /// ([`kernel_writing`]), and blocks the runtime has unmapped in a change
     /// not yet done ([`title_memory_unmapping`]). Not in the sets above, and
-    /// left as they are by [`guard`], which reports them written.
+    /// left as they are by [`guard_parts`], which reports them written.
     kernel: Vec<(usize, usize)>,
     changing: Vec<(usize, usize)>,
     /// Blocks whose page is shown at other addresses too and that were made
@@ -1454,6 +1462,11 @@ struct Guards {
     aliased: Blocks,
     /// Blocks opened by a write fault, and when ([`rest`]).
     opened: std::collections::HashMap<usize, std::time::Instant, std::hash::BuildHasherDefault<PageHash>>,
+    /// Guarded blocks with parts opened by write faults ([`part_open`]): the
+    /// parts, a bit each. The rest of such a block is read-only, and it is
+    /// not clean. `WHOLE`: told as written whole at the next asking, whatever
+    /// parts are open.
+    parted: std::collections::HashMap<usize, u16, std::hash::BuildHasherDefault<PageHash>>,
 }
 
 impl Guards {
@@ -1490,6 +1503,7 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     changing: Vec::new(),
     aliased: Blocks::new(),
     opened: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()),
+    parted: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()),
 });
 
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
@@ -1700,7 +1714,14 @@ pub(crate) fn written_since_taken(at: usize, len: usize) -> bool {
 /// For view memory: the pages of `[start, end)`'s blocks written since
 /// they were last guarded (all of a block's pages), guarding them again
 /// before the caller copies them. `None` if the memory is not a view.
+#[cfg(test)]
 fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
+    guard_parts(start, end).map(|told| told.into_iter().map(|(block, _)| block).collect())
+}
+
+/// [`guard`], with the parts of each block written (a bit for each 4 KiB):
+/// those a write fault opened ([`part_open`]), else all of them.
+fn guard_parts(start: usize, end: usize) -> Option<Vec<(usize, u16)>> {
     // A range whose first block the guards hold already (read-only by our
     // hand, or noted absent) is a view: no question to Windows. The
     // question walks the page tables to the end of the pages that share the
@@ -1765,8 +1786,9 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
         let known = g.clean.word(word) & !BESIDE.word(word) | g.absent.word(word);
         written.extend(BitsOf(!known & in_word(word * 64, first, last)).map(|bit| word * 64 + bit));
     }
+    let mut parts = vec![WHOLE; written.len()];
     let mut run: Option<(usize, usize)> = None;
-    for &block in &written {
+    for (i, &block) in written.iter().enumerate() {
         if let Some((from, to)) = run
             && to != block
         {
@@ -1778,7 +1800,8 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
             g = guards_timed();
         }
         // Told as written by this, and read by the caller after.
-        if BESIDE.take(block) {
+        let beside = BESIDE.take(block);
+        if beside {
             put_count(block).store(0, std::sync::atomic::Ordering::Relaxed);
         }
         if g.protected.contains(block) {
@@ -1790,6 +1813,22 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
             }
             if g.clean.contains(block) {
                 continue;
+            }
+            if let Some(open) = g.parted.remove(&block) {
+                // Read-only again before the caller reads the parts.
+                if !close(block) {
+                    g.parted.insert(block, WHOLE);
+                    continue;
+                }
+                if !beside {
+                    parts[i] = open;
+                }
+                #[cfg(feature = "diagnostics")]
+                if open != WHOLE {
+                    use crate::copystat::{C, add};
+                    add(C::GuardPartBlocks, 1);
+                    add(C::GuardPartParts, u64::from(open.count_ones()));
+                }
             }
             if cover(&mut g, block, block + 1) {
                 g.clean.insert(block);
@@ -1806,7 +1845,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     drop(g);
     #[cfg(feature = "diagnostics")]
     crate::faultbook::note(crate::faultbook::What::Asked, first, last, written.len() as u64);
-    Some(written)
+    Some(written.into_iter().zip(parts).collect())
 }
 
 /// Whether `[start, end)` is view memory. The title's views lie in
@@ -1916,13 +1955,20 @@ fn cover(g: &mut Guards, from: usize, to: usize) -> bool {
 /// Makes `block` read-only: another view of a page a copy is about to take
 /// through its own, so that a write through this one faults too. It is not
 /// noted clean: the copies of title memory at this view have not taken the
-/// page ([`guard`] tells such a block as written, then notes it clean).
+/// page ([`guard_parts`] tells such a block as written, then notes it clean).
 /// One that is clean stays so: had the page been written since its copies
 /// took it, [`open`] would have opened it. Whether it is read-only now.
 fn protect_alias(g: &mut Guards, block: usize) -> bool {
     use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE, VirtualProtect};
     g.aliased.insert(block);
     if g.protected.contains(block) {
+        // With parts open, a write through those would not be seen here.
+        if g.parted.contains_key(&block) {
+            if !close(block) {
+                return false;
+            }
+            g.parted.insert(block, WHOLE);
+        }
         return true;
     }
     if g.left_alone(block) || g.rests(block, rest()) {
@@ -2057,6 +2103,9 @@ fn open(g: &mut Guards, start: usize, end: usize) -> usize {
                     // Before the first can be written.
                     g.clean.remove(other);
                     PUBLISHED.clear(other);
+                    if let Some(open) = g.parted.get_mut(&other) {
+                        *open = WHOLE;
+                    }
                     continue;
                 }
                 g.aliased.remove(other);
@@ -2082,6 +2131,7 @@ fn unguard(g: &mut Guards, blocks: &[usize]) {
     for &block in blocks {
         g.protected.remove(block);
         g.clean.remove(block);
+        g.parted.remove(&block);
         PUBLISHED.clear(block);
     }
     for &block in blocks {
@@ -2102,6 +2152,87 @@ fn unguard(g: &mut Guards, blocks: &[usize]) {
     if !blocks.is_empty() {
         tally(8, started.elapsed().as_nanos() as u64);
     }
+}
+
+/// How many 4 KiB parts of a block of the descriptor heaps ([`FINE`]) write
+/// faults open one by one; the next opens the whole block
+/// (`VICTORY_GUARD_PARTS`, 4; 0 opens whole blocks, as before).
+///
+/// An opened block was told as written whole, and the heap copy read and
+/// compared all of it: 399,360 descriptor slots looked at a frame for about
+/// 57,000 changed, 18.4 MB read, 9.7 ms reading and comparing, and 17 ms
+/// asking (play-master, 2026-11-26 04:42). The title writes a few
+/// descriptors at a time.
+fn part_faults() -> u32 {
+    static MOST: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| {
+        std::env::var("VICTORY_GUARD_PARTS").ok().and_then(|v| v.parse().ok()).unwrap_or(4).min(PARTS as u32)
+    })
+}
+
+/// A write fault at `at`: opens only the 4 KiB part it is in, if the block
+/// is a guarded one of the descriptor heaps ([`FINE`]), and notes the part
+/// ([`Guards::parted`]); [`guard_parts`] tells those parts as written.
+/// Whether it did, or the part was open already. `false`: open the whole
+/// block. So too for a block with other views (a write through one of those
+/// would not fault at this one's parts), or with [`part_faults`] parts open.
+fn part_open(g: &mut Guards, at: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE, VirtualProtect};
+    let block = at / BLOCK;
+    let most = part_faults();
+    if most == 0 || !FINE.any(block, block + 1) || !g.protected.contains(block) {
+        return false;
+    }
+    if g.aliased.contains(block) {
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::GuardPartAliased, 1);
+        return false;
+    }
+    let part = 1u16 << (at % BLOCK / KERNEL_PAGE);
+    let open = g.parted.get(&block).copied().unwrap_or(0);
+    if open & part != 0 {
+        return true;
+    }
+    if open.count_ones() >= most {
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::GuardPartWhole, 1);
+        return false;
+    }
+    // Told as written before the part can be.
+    g.clean.remove(block);
+    PUBLISHED.clear(block);
+    let page = at & !(KERNEL_PAGE - 1);
+    let mut old = 0;
+    // SAFETY: a block we made read-only; one kernel page of it.
+    if unsafe { VirtualProtect(page as *const _, KERNEL_PAGE, PAGE_READWRITE, &mut old) } == 0 {
+        return false;
+    }
+    if !matches!(old, PAGE_READONLY | PAGE_READWRITE) {
+        // SAFETY: as above.
+        unsafe { VirtualProtect(page as *const _, KERNEL_PAGE, old, &mut old) };
+        return false;
+    }
+    g.parted.insert(block, open | part);
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(crate::copystat::C::GuardPartFaults, 1);
+    true
+}
+
+/// Makes all of a guarded `block` read-only again, the parts [`part_open`]
+/// opened too.
+fn close(block: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
+    let mut old = 0;
+    #[cfg(feature = "diagnostics")]
+    let started = std::time::Instant::now();
+    // SAFETY: title view memory; only its protection changes.
+    let done = unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READONLY, &mut old) } != 0;
+    #[cfg(feature = "diagnostics")]
+    {
+        tally(5, 1);
+        tally(8, started.elapsed().as_nanos() as u64);
+    }
+    done
 }
 
 /// Before our own write into title memory `[at, at + len)` through the
@@ -2535,6 +2666,7 @@ pub fn title_memory_unmapping(at: usize, len: usize) {
     for block in blocks {
         g.protected.remove(block);
         g.clean.remove(block);
+        g.parted.remove(&block);
         PUBLISHED.clear(block);
         PROTECTED.clear(block);
     }
@@ -2691,6 +2823,9 @@ pub(crate) fn install() {
             let mut g = guards();
             #[cfg(feature = "diagnostics")]
             let waited = began.elapsed();
+            if part_open(&mut g, at) {
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
             let opened = open(&mut g, at, at + 1);
             if opened != 0 {
                 g.opened(block);
@@ -2860,6 +2995,55 @@ mod tests {
         // Before the view goes, as the runtime does: the address may be
         // another test's the moment it is free.
         title_memory_unmapping(view, 2 * BLOCK);
+        // SAFETY: our view.
+        unsafe {
+            UnmapViewOfFile(
+                windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS {
+                    Value: view as *mut _,
+                },
+            )
+        };
+    }
+
+    /// A write in a guarded block of the descriptor heaps opens its 4 KiB
+    /// part only, and the guard tells that part; past `part_faults` parts the
+    /// block opens whole.
+    #[test]
+    fn heap_blocks_open_by_the_part() {
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, UnmapViewOfFile,
+        };
+        // SAFETY: a pagefile section of two blocks, mapped read-write.
+        let view = unsafe {
+            let section = CreateFileMappingW(
+                -1isize as _,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                (2 * BLOCK) as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 2 * BLOCK).Value as usize
+        };
+        assert_ne!(view, 0);
+        let block = view / BLOCK;
+        (block..block + 2).for_each(|b| FINE.set(b));
+        assert!(guard(view, view + 2 * BLOCK).is_some()); // now read-only
+        // SAFETY: our view; a write to a guarded part faults into the handler.
+        let poke = |part: usize| unsafe { ((view + part * KERNEL_PAGE + 8) as *mut u8).write_volatile(1) };
+        poke(3);
+        assert!(writable(view + 3 * KERNEL_PAGE));
+        assert!(!writable(view + 4 * KERNEL_PAGE));
+        poke(3);
+        assert_eq!(guard_parts(view, view + 2 * BLOCK), Some(vec![(block, 1 << 3)]));
+        assert!(!writable(view + 3 * KERNEL_PAGE));
+        assert_eq!(guard_parts(view, view + 2 * BLOCK), Some(Vec::new()));
+        (0..=part_faults() as usize).for_each(poke);
+        assert!(writable(view + 15 * KERNEL_PAGE));
+        assert_eq!(guard_parts(view, view + 2 * BLOCK), Some(vec![(block, WHOLE)]));
+        title_memory_unmapping(view, 2 * BLOCK);
+        (block..block + 2).for_each(|b| FINE.clear(b));
         // SAFETY: our view.
         unsafe {
             UnmapViewOfFile(
