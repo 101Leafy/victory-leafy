@@ -60,10 +60,6 @@ fn target_format(e: &SigElement) -> DXGI_FORMAT {
     }
 }
 
-fn err(e: windows::core::Error) -> String {
-    e.message().to_string()
-}
-
 /// Tests on Windows 10, whose own D3D12 stops at shader model 6.5: the
 /// Agility SDK in `VICTORY_D3D12_DIR` is made the process's runtime, as
 /// victory.exe does with its `D3D12\` folder.
@@ -96,6 +92,10 @@ fn agility() {
             std::mem::forget(factory);
         }
     });
+}
+
+fn err(e: windows::core::Error) -> String {
+    e.message().to_string()
 }
 
 impl Host {
