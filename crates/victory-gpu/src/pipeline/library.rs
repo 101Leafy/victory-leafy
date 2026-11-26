@@ -15,8 +15,9 @@
 //! Library calls overlap: the host documents the library as safe to use
 //! from several threads ("The pipeline library is thread-safe to use, and
 //! will internally synchronize as necessary", `CreatePipelineLibrary`,
-//! Thread Safety), with one exception kept here: two loads of the same
-//! pipeline are made one after the other ([`same_name`]). Under one lock of
+//! Thread Safety). Each name is held across load, creation and store
+//! ([`same_name`]), so another request for the same pipeline can load it
+//! after a successful store. Different names can overlap. Under one lock of
 //! ours for every call, the eight workers made pipelines one at a time:
 //! 87 to 96 of 110 looks at each worker found it waiting for that lock
 //! (run 49), and an earlier run's 2,300 pipelines, all in the library, were
@@ -50,7 +51,7 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard, OnceLock, RwLock};
+use std::sync::{Condvar, LazyLock, Mutex, MutexGuard, OnceLock, RwLock};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::{HSTRING, Interface, PCWSTR};
@@ -178,10 +179,13 @@ impl Mapped {
     /// As [`Mapped::open`]; `hold` says whether the file stays open with
     /// the mapping.
     fn open_holding(path: &std::path::Path, hold: bool) -> Option<Mapped> {
-        // Opened as the standard library opens a file to read: others may
-        // read, write, rename and delete it meanwhile, so a save still
-        // renames the new library over this one.
-        let file = std::fs::File::open(path).ok()?;
+        // Others may read, rename and delete it meanwhile, so a save still
+        // renames the new library over this one, but not write it: a
+        // write or truncation would change the pages under the mapping.
+        use std::os::windows::fs::OpenOptionsExt;
+        // FILE_SHARE_READ | FILE_SHARE_DELETE
+        const READ_DELETE: u32 = 0x1 | 0x4;
+        let file = std::fs::OpenOptions::new().read(true).share_mode(READ_DELETE).open(path).ok()?;
         let len = usize::try_from(file.metadata().ok()?.len()).ok()?;
         let mut mapped = Mapped::map(&file, len, false)?;
         if hold {
@@ -448,14 +452,29 @@ unsafe impl Send for Library {}
 // SAFETY: as above; the other fields are an atomic and a lock.
 unsafe impl Sync for Library {}
 
-/// Held by a load of the pipeline named `name`: loads of the same name
-/// wait for each other (the host's one exception to the library's thread
-/// safety: such a load may change that pipeline's entry). Names share 64
-/// locks, so two different names seldom wait.
-fn same_name(name: &str) -> MutexGuard<'static, ()> {
-    static LOADING: [Mutex<()>; 64] = [const { Mutex::new(()) }; 64];
-    let at = name.bytes().fold(0usize, |h, b| h.wrapping_mul(31).wrapping_add(usize::from(b)));
-    LOADING[at % LOADING.len()].lock().unwrap_or_else(|e| e.into_inner())
+static HELD_NAMES: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
+static NAME_RELEASED: Condvar = Condvar::new();
+
+struct HeldName<'a>(&'a str);
+
+/// Holds the exact library name until the load succeeds or creation and
+/// storage finish. The mutex only protects the set of names in flight.
+fn same_name(name: &str) -> HeldName<'_> {
+    let mut held = HELD_NAMES.lock().unwrap_or_else(|e| e.into_inner());
+    while held.contains(name) {
+        #[cfg(test)]
+        concurrency_tests::waiting_for_name();
+        held = NAME_RELEASED.wait(held).unwrap_or_else(|e| e.into_inner());
+    }
+    held.insert(name.to_owned());
+    HeldName(name)
+}
+
+impl Drop for HeldName<'_> {
+    fn drop(&mut self) {
+        HELD_NAMES.lock().unwrap_or_else(|e| e.into_inner()).remove(self.0);
+        NAME_RELEASED.notify_all();
+    }
 }
 
 /// With `VICTORY_LIBRARY_LOCK=1`: held by every library call, as before.
@@ -477,8 +496,9 @@ const EARLY_FILE: &str = "early-pipelines.txt";
 /// Title pipelines listed for an early start, at most.
 const EARLY_MAX: usize = 100_000;
 
+static LIBRARY: OnceLock<Option<Library>> = OnceLock::new();
+
 fn library() -> Option<&'static Library> {
-    static LIBRARY: OnceLock<Option<Library>> = OnceLock::new();
     LIBRARY
         .get_or_init(|| {
             let device = crate::host::host()?.device.cast::<ID3D12Device1>().ok()?;
@@ -566,9 +586,9 @@ pub(crate) fn pipeline(
         return pso;
     };
     let began = std::time::Instant::now();
+    let _one = same_name(name);
     let loaded = {
         let _all = one_call();
-        let _one = same_name(name);
         let _call = call("load", name);
         load(&library.library, PCWSTR(wide.as_ptr()))
     };
@@ -589,7 +609,7 @@ pub(crate) fn pipeline(
         }
         Err(e) => e,
     };
-    // Compiled outside any lock: compiles take up to seconds.
+    // Compiles take up to seconds. Keep only this name held.
     let pso = {
         let _call = call("make", name);
         let creating = std::time::Instant::now();
@@ -670,7 +690,11 @@ fn store_later(library: &Library) {
 pub(crate) fn save(now: bool) {
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
     const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
-    let (Some(dir), Some(library)) = (DIR.get(), library()) else { return };
+    let Some(dir) = DIR.get() else { return };
+    if LIBRARY.get().is_none() && !USED_CHANGED.load(Ordering::Relaxed) {
+        return;
+    }
+    let Some(library) = library() else { return };
     {
         let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
         if !now && last.is_some_and(|t| t.elapsed() < SAVE_EVERY) {
@@ -800,10 +824,14 @@ fn zeroed(n: usize) -> Option<Vec<u8>> {
 /// run may have that file mapped: Windows 11 replaces a mapped file, and
 /// the mapping goes on reading the old one for as long as a handle on it
 /// is open ([`holds`]; with none, only the pages in memory at that moment
-/// stay: the rest read as zeros). Where a system refuses, the new library
-/// is left beside it as [`NEXT_FILE`] for the next start.
+/// stay: the rest read as zeros). It goes through [`NEXT_FILE`]: where a
+/// system refuses, the new library waits there for the next start, and an
+/// older one an earlier save left there cannot take the newer one's place.
 fn replace_library(dir: &std::path::Path, tmp: &std::path::Path) -> std::io::Result<()> {
-    std::fs::rename(tmp, dir.join(LIBRARY_FILE)).or_else(|_| std::fs::rename(tmp, dir.join(NEXT_FILE)))
+    let next = dir.join(NEXT_FILE);
+    std::fs::rename(tmp, &next)?;
+    let _ = std::fs::rename(&next, dir.join(LIBRARY_FILE));
+    Ok(())
 }
 
 /// Writes `bytes` to a temporary file beside `path`, then renames it over
@@ -964,6 +992,8 @@ mod tests {
             file.bytes_mut().copy_from_slice(&new);
         }
         assert_eq!(std::fs::read(&tmp).unwrap(), new);
+        // An older library an earlier save left beside it does not win.
+        std::fs::write(dir.path().join(NEXT_FILE), b"stale").unwrap();
         replace_library(dir.path(), &tmp).unwrap();
         assert!(!tmp.exists());
         // The mapping still reads the old library.
@@ -1066,3 +1096,6 @@ mod tests {
         assert!(final_bytes.iter().all(|&b| b == final_bytes[0]));
     }
 }
+
+#[cfg(test)]
+mod concurrency_tests;
