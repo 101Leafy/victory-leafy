@@ -115,8 +115,10 @@ pub(crate) struct Lowered {
 }
 
 /// `DB_SHADER_CONTROL.DEPTH_BEFORE_SHADER` (AMD's register headers, as in
-/// Linux's `gc_10_3_0_sh_mask.h`).
+/// Linux's `gc_10_3_0_sh_mask.h`), and `Z_EXPORT_ENABLE`: the program
+/// exports depth.
 const DEPTH_BEFORE_SHADER: u32 = 1 << 12;
+const Z_EXPORT: u32 = 1;
 
 pub(crate) struct Parts<'a> {
     pub native: &'a NativeProgram,
@@ -1784,6 +1786,7 @@ impl<'a> Lower<'a> {
             db_shader_control, ..
         } = &x.native.io
             && db_shader_control & DEPTH_BEFORE_SHADER != 0
+            && db_shader_control & Z_EXPORT == 0
         {
             s.flags |= flags::EARLY_DEPTH;
         }
@@ -13516,6 +13519,8 @@ mod tests {
         // (early Z then late Z, bits 4-5).
         assert!(lowered(1 << 12 | 1 << 4).early_depth);
         assert!(!lowered(1 << 4).early_depth);
+        // A program that exports depth keeps it.
+        assert!(!lowered(1 << 12 | 1 << 4 | 1).early_depth);
     }
 
     #[test]
