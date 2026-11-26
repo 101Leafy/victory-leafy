@@ -2085,6 +2085,24 @@ fn protect_later() -> bool {
 #[cfg(feature = "diagnostics")]
 pub(crate) static LATER: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
+/// Graphics blocks of the title's allocator that got write-watched memory of
+/// their own (`XMemAllocDefault`), since the start: blocks, bytes, and
+/// blocks given back.
+pub(crate) static GRAPHICS_BLOCKS: [std::sync::atomic::AtomicU64; 3] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// Told by the title's allocator of a graphics block given write-watched
+/// memory of its own, `len` bytes, or of one given back.
+pub fn title_graphics_block(len: usize, freed: bool) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if freed {
+        GRAPHICS_BLOCKS[2].fetch_add(1, Relaxed);
+    } else {
+        GRAPHICS_BLOCKS[0].fetch_add(1, Relaxed);
+        GRAPHICS_BLOCKS[1].fetch_add(len as u64, Relaxed);
+    }
+}
+
 /// [`protect`] for [`guard_parts`], with the `VirtualProtect` left for when
 /// the lock is let go ([`protect_later`]): `[from, to)` is noted guarded,
 /// clean and [`PENDING`] now, and goes in `later` for [`read_only`] and
