@@ -99,6 +99,7 @@ fn build(translator: &str) -> [u8; 32] {
             "VICTORY_BVH_BOUNDS",
             "VICTORY_WAVE_PAIRS",
             "VICTORY_LAUNCHED_EXEC",
+            "VICTORY_WAVE32_LOWERING",
         ] {
             bytes.extend_from_slice(name.as_bytes());
             bytes.push(b'=');
@@ -131,7 +132,11 @@ fn check() -> &'static Arc<Check> {
 }
 
 /// The file in the cache folder that keeps what [`Check`] found, a line
-/// per translator: `v<VERSION> <dependencies> <source> same|differs`.
+/// per translator: `v<VERSION> <dependencies> <source> same|differs|unchecked`.
+/// `unchecked` is the first build seen with its number: it owns the
+/// number's entries and was compared with nothing, so its output may differ
+/// from an earlier build's on another number (play-g's `same` read as
+/// proof that its translations matched play-f's).
 const RECORD: &str = "translator-checked.txt";
 
 /// How many hits a translator whose source changed without a new
@@ -172,7 +177,7 @@ impl Check {
         let noted = |what: &str| lines.contains(&format!("{line} {what}").as_str());
         let state = if noted("differs") {
             DIFFERS
-        } else if noted("same") || record.is_none() || !lines.iter().any(|l| l.starts_with(&format!("{kept} "))) {
+        } else if noted("same") || noted("unchecked") || record.is_none() || !lines.iter().any(|l| l.starts_with(&format!("{kept} "))) {
             SAME
         } else {
             PENDING
@@ -185,8 +190,8 @@ impl Check {
             left: AtomicU32::new(CHECKED),
             queue: Mutex::new(None),
         });
-        if state == SAME && !noted("same") {
-            check.note("same");
+        if state == SAME && !noted("same") && !noted("unchecked") {
+            check.note("unchecked");
         }
         match state {
             DIFFERS => tracing::info!("shader cache keyed by the translator's source: its output differed from its number's"),
@@ -790,7 +795,8 @@ mod tests {
         assert_eq!(open("d").state(), DIFFERS, "and so does its next run");
 
         let text = std::fs::read_to_string(&record).unwrap();
-        assert_eq!(text, "v1 deps a same\nv1 deps b same\nv1 deps d differs\n");
+        assert_eq!(text, "v1 deps a unchecked\nv1 deps b same\nv1 deps d differs\n");
+        assert_eq!(open("a").state(), SAME, "the owner does not check itself");
 
         // A new number (or new dependencies) owns its entries again.
         let raised = Check::open(Some(record.clone()), "v2 deps".into(), "d".into());
