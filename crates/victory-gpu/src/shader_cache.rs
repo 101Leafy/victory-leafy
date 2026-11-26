@@ -267,10 +267,10 @@ impl Check {
 /// can do decides the form of some programs.
 pub fn precompile(container: &[u8]) -> Result<bool, String> {
     let _ = crate::host::host();
-    let misses = MISSES.load(Ordering::Relaxed);
-    host_shader(container)?;
-    // (Counts other threads' misses too: the caller only adds them up.)
-    Ok(MISSES.load(Ordering::Relaxed) == misses)
+    // Told by this call, not by `MISSES` around it: with more than one
+    // worker another thread's miss would count here.
+    let (_, translated) = host_shader_by(container, 0)?;
+    Ok(!translated)
 }
 
 /// Translations the pipeline workers run at once: the host's processors
@@ -350,6 +350,12 @@ fn append_switch(bytes: &mut Vec<u8>, name: &str, value: Option<&std::ffi::OsStr
 /// held finite (`emit::with_finite_targets`), cached apart from the plain
 /// translation; a mask of 0 is the plain one.
 pub(crate) fn host_shader_finite(container: &[u8], mask: u8) -> Result<HostShader, String> {
+    host_shader_by(container, mask).map(|(shader, _)| shader)
+}
+
+/// [`host_shader_finite`], and whether this call translated it (rather than
+/// read it from the cache).
+fn host_shader_by(container: &[u8], mask: u8) -> Result<(HostShader, bool), String> {
     let hash = blake3::hash(container).to_hex();
     let (wide, own) = (wave_wide(&hash), firstlane_own(&hash));
     let translate = move |c: &[u8]| {
@@ -385,7 +391,7 @@ pub(crate) fn host_shader_finite(container: &[u8], mask: u8) -> Result<HostShade
             };
             keyed(cache, check(), salted, &hash[..16], container, translate)
         }
-        None => translate(container).map_err(|e| e.to_string()),
+        None => translate(container).map(|shader| (shader, true)).map_err(|e| e.to_string()),
     }
 }
 
@@ -398,16 +404,16 @@ fn keyed(
     shader: &str,
     container: &[u8],
     translate: impl Fn(&[u8]) -> Result<HostShader, ShaderError> + Send + Sync + 'static,
-) -> Result<HostShader, String> {
+) -> Result<(HostShader, bool), String> {
     if check.state() == PENDING {
         if let Some((found, entry)) = lookup(cache, &build(&check.kept), container) {
             let container = container.to_vec();
             check.offer(shader, move || translate(&container).is_ok_and(|s| encode(&s) == entry));
-            return Ok(found);
+            return Ok((found, false));
         }
-        return cached(cache, &build(&check.source), container, translate);
+        return cached_by(cache, &build(&check.source), container, translate);
     }
-    cached(cache, &build(check.key()), container, translate)
+    cached_by(cache, &build(check.key()), container, translate)
 }
 
 /// Console wave64 compute programs (by the 16-digit hash the log names
@@ -501,6 +507,17 @@ fn cached(
     container: &[u8],
     translate: impl Fn(&[u8]) -> Result<HostShader, ShaderError> + Send + Sync,
 ) -> Result<HostShader, String> {
+    cached_by(cache, build, container, translate).map(|(shader, _)| shader)
+}
+
+/// [`cached`], and whether this call translated it (rather than read it
+/// from the cache).
+fn cached_by(
+    cache: &Cache,
+    build: &[u8; 32],
+    container: &[u8],
+    translate: impl Fn(&[u8]) -> Result<HostShader, ShaderError> + Send + Sync,
+) -> Result<(HostShader, bool), String> {
     let input = [&build[..], container].concat();
     let converter = Translate {
         translate,
@@ -516,29 +533,32 @@ fn cached(
             Err(e) => {
                 let made = made().ok_or_else(|| format!("{e:#}"))?;
                 MISSES.fetch_add(1, Ordering::Relaxed);
-                return made;
+                return made.map(|shader| (shader, true));
             }
         };
         if let Some(made) = made() {
             MISSES.fetch_add(1, Ordering::Relaxed);
             tracing::debug!(entry = %entry_name(&path), "shader translated and cached");
-            return made;
+            return made.map(|shader| (shader, true));
         }
         if let Some(entry) = std::fs::read(&path).ok().and_then(|b| decode_entry(&b)) {
-            let (counter, what) = if converter.ran.load(Ordering::Relaxed) {
+            let ran = converter.ran.load(Ordering::Relaxed);
+            let (counter, what) = if ran {
                 (&MISSES, "translated and cached")
             } else {
                 (&HITS, "from the cache")
             };
             counter.fetch_add(1, Ordering::Relaxed);
             tracing::debug!(entry = %entry_name(&path), "shader {what}");
-            return entry;
+            return entry.map(|shader| (shader, ran));
         }
         tracing::debug!(entry = %entry_name(&path), "unreadable shader cache entry; translating again");
         let _ = std::fs::remove_file(&path);
     }
     MISSES.fetch_add(1, Ordering::Relaxed);
-    made().unwrap_or_else(|| (converter.translate)(container).map_err(|e| e.to_string()))
+    made()
+        .unwrap_or_else(|| (converter.translate)(container).map_err(|e| e.to_string()))
+        .map(|shader| (shader, true))
 }
 
 /// The entry for `container` under `build`, read and not translated: its
@@ -934,6 +954,29 @@ mod tests {
         assert_eq!(Turns::new(0).limit, 1);
     }
 
+    /// Whether a call translated is its own, not read off `MISSES`: the
+    /// warm-up (`precompile`) runs several workers at once.
+    #[test]
+    fn each_call_tells_its_own_hit_from_its_miss() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = &Cache::open(dir.path()).unwrap();
+        let build = [11u8; 32];
+        let translate = |_: &[u8]| Ok(shader());
+        let hit = b"a container already in the cache".as_slice();
+        assert_eq!(cached_by(cache, &build, hit, translate), Ok((shader(), true)));
+        let misses: Vec<Vec<u8>> = (0..64).map(|i| format!("miss {i}").into_bytes()).collect();
+        std::thread::scope(|s| {
+            for c in &misses {
+                s.spawn(move || {
+                    assert_eq!(cached_by(cache, &build, c, translate), Ok((shader(), true)));
+                });
+            }
+            for _ in 0..64 {
+                assert_eq!(cached_by(cache, &build, hit, translate), Ok((shader(), false)));
+            }
+        });
+    }
+
     fn walk(dir: &std::path::Path) -> Vec<PathBuf> {
         let mut files = Vec::new();
         for e in std::fs::read_dir(dir).unwrap().flatten() {
@@ -981,7 +1024,7 @@ mod tests {
         let first = open("a");
         assert_eq!(first.state(), SAME);
         for c in &containers {
-            assert_eq!(keyed(&cache, &first, key, "0123456789abcdef", c, same), Ok(shader()));
+            assert_eq!(keyed(&cache, &first, key, "0123456789abcdef", c, same).map(|(s, _)| s), Ok(shader()));
         }
         assert_eq!(RUNS.load(Ordering::Relaxed), u64::from(CHECKED) + 4);
 
@@ -991,7 +1034,7 @@ mod tests {
         assert_eq!(second.state(), PENDING);
         RUNS.store(0, Ordering::Relaxed);
         for c in &containers {
-            assert_eq!(keyed(&cache, &second, key, "0123456789abcdef", c, same), Ok(shader()));
+            assert_eq!(keyed(&cache, &second, key, "0123456789abcdef", c, same).map(|(s, _)| s), Ok(shader()));
         }
         assert_eq!(settled(&second), SAME);
         assert_eq!(RUNS.load(Ordering::Relaxed), u64::from(CHECKED), "only the samples ran");
@@ -999,7 +1042,7 @@ mod tests {
 
         // A miss while the check runs is kept under the source, not the number.
         let third = open("c");
-        assert_eq!(keyed(&cache, &third, key, "0123456789abcdef", b"new", same), Ok(shader()));
+        assert_eq!(keyed(&cache, &third, key, "0123456789abcdef", b"new", same).map(|(s, _)| s), Ok(shader()));
         assert!(lookup(&cache, &key("v1 deps"), b"new").is_none());
         assert!(lookup(&cache, &key("c"), b"new").is_some());
 
@@ -1007,12 +1050,12 @@ mod tests {
         // from then on it translates under its source.
         let fourth = open("d");
         RUNS.store(0, Ordering::Relaxed);
-        assert_eq!(keyed(&cache, &fourth, key, "0123456789abcdef", &containers[0], changed), Ok(shader()));
+        assert_eq!(keyed(&cache, &fourth, key, "0123456789abcdef", &containers[0], changed).map(|(s, _)| s), Ok(shader()));
         assert_eq!(settled(&fourth), DIFFERS);
         assert_eq!(fourth.key(), "d");
         let mut want = shader();
         want.dxil.push(0);
-        assert_eq!(keyed(&cache, &fourth, key, "0123456789abcdef", &containers[0], changed), Ok(want));
+        assert_eq!(keyed(&cache, &fourth, key, "0123456789abcdef", &containers[0], changed).map(|(s, _)| s), Ok(want));
         assert_eq!(RUNS.load(Ordering::Relaxed), 2);
         assert_eq!(open("d").state(), DIFFERS, "and so does its next run");
 
