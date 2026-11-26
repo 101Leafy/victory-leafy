@@ -1605,10 +1605,11 @@ impl Guards {
 
     /// A write fault opened `block`.
     fn opened(&mut self, block: usize) {
-        const MANY: usize = 1 << 13;
-        if self.opened.len() >= MANY {
+        // (Mapped views rest too with `map_rest`: thousands of blocks a frame.)
+        let many: usize = if map_rest() { 1 << 16 } else { 1 << 13 };
+        if self.opened.len() >= many {
             self.opened.retain(|_, at| at.elapsed().as_millis() < 50);
-            if self.opened.len() >= MANY {
+            if self.opened.len() >= many {
                 self.opened.clear();
             }
         }
@@ -1922,6 +1923,7 @@ fn guard_parts(start: usize, end: usize) -> Option<Vec<(usize, u16)>> {
     let mut parts = vec![WHOLE; written.len()];
     let mut run: Option<(usize, usize)> = None;
     let mut later = Vec::new();
+    let mut aliases = Aliases::default();
     for (i, &block) in written.iter().enumerate() {
         if let Some((from, to)) = run
             && to != block
@@ -1957,6 +1959,10 @@ fn guard_parts(start: usize, end: usize) -> Option<Vec<(usize, u16)>> {
             if g.clean.contains(block) {
                 continue;
             }
+            if alias_later() && PENDING.any(block, block + 1) {
+                // Another asking's: another view of it is not read-only yet.
+                continue;
+            }
             if let Some(open) = g.parted.remove(&block) {
                 // Read-only again before the caller reads the parts.
                 if !close(block) {
@@ -1973,8 +1979,19 @@ fn guard_parts(start: usize, end: usize) -> Option<Vec<(usize, u16)>> {
                     add(C::GuardPartParts, u64::from(open.count_ones()));
                 }
             }
-            if cover(&mut g, block, block + 1) {
-                g.clean.insert(block);
+            if !alias_later() {
+                if cover(&mut g, block, block + 1) {
+                    g.clean.insert(block);
+                }
+                continue;
+            }
+            let relied = aliases.relies.len();
+            if cover_as(&mut g, block, block + 1, Some(&mut aliases)) {
+                if aliases.relies.len() == relied {
+                    g.clean.insert(block);
+                } else {
+                    aliases.clean.push(block);
+                }
             }
         } else if !g.foreign.contains(&block)
             && !g.left_alone(block)
@@ -1992,11 +2009,27 @@ fn guard_parts(start: usize, end: usize) -> Option<Vec<(usize, u16)>> {
         pend(&mut g, from, to, &mut later);
     }
     drop(g);
-    if !later.is_empty() {
-        let done: Vec<bool> = later.iter().map(|&(from, to)| read_only(from, to)).collect();
+    if !later.is_empty() || !aliases.blocks.is_empty() {
+        let fared: Vec<Fared> = later
+            .iter()
+            .map(|&(from, to)| {
+                if read_only(from, to) {
+                    Fared::Whole
+                } else if fallback_later() {
+                    Fared::Blocks(read_only_blocks(from, to))
+                } else {
+                    Fared::Not
+                }
+            })
+            .collect();
         let mut g = guards_timed();
-        for (&(from, to), done) in later.iter().zip(done) {
-            protected_later(&mut g, from, to, done);
+        for (&(from, to), fared) in later.iter().zip(fared) {
+            protected_later_as(&mut g, from, to, fared, alias_later().then_some(&mut aliases));
+        }
+        if !aliases.blocks.is_empty() {
+            drop(g);
+            let done: Vec<bool> = aliases.blocks.iter().map(|&block| read_only(block, block + 1)).collect();
+            aliases_done(&mut guards_timed(), &aliases, done);
         }
     }
     #[cfg(feature = "diagnostics")]
@@ -2086,6 +2119,40 @@ fn protect_later() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_PROTECT_LATER").is_none_or(|v| v != "0"))
 }
 
+/// Whether a run of [`pend`]'s that [`read_only`] could not make read-only
+/// in one call (it spans views) is done block by block with the lock let
+/// go too (`VICTORY_GUARD_FALLBACK_LATER=1`; off: under the lock, as
+/// before).
+///
+/// 32% of these runs failed, some 210 `VirtualProtect` calls a frame made
+/// under the lock after, 11.5 us each (a5c442eec).
+fn fallback_later() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_GUARD_FALLBACK_LATER"))
+}
+
+/// Whether [`guard_parts`] makes the other views of its pages read-only
+/// with the lock let go too (`VICTORY_ALIAS_LATER=1`; off: one
+/// `VirtualProtect` each under the lock, [`protect_alias`], as before).
+///
+/// Some 1000 such calls a frame were made under the lock (a5c442eec).
+fn alias_later() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_ALIAS_LATER"))
+}
+
+/// Whether the blocks a mapped view opens rest as those a write fault
+/// opened do ([`Guards::rests`], `VICTORY_MAP_REST=1`; off: guarded again at
+/// the next asking, as before).
+///
+/// The spikes follow `views_mapped` storms: about 1967 blocks made
+/// read-only again a frame, most of them opened by a mapping just before
+/// (a5c442eec).
+fn map_rest() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_MAP_REST"))
+}
+
 /// Diagnostics: runs of guarded blocks made read-only with the guards' lock
 /// let go ([`pend`]), the blocks in them, blocks opened meanwhile and made
 /// writable again, and runs that failed and were guarded under the lock
@@ -2132,11 +2199,60 @@ fn pend(g: &mut Guards, from: usize, to: usize, later: &mut Vec<(usize, usize)>)
     later.push((from, to));
 }
 
+/// How [`read_only`] fared with a run of [`pend`]'s.
+enum Fared {
+    Whole,
+    /// Failed, nothing changed: guarded block by block under the lock.
+    Not,
+    /// Failed, and done block by block with the lock let go
+    /// ([`fallback_later`]).
+    Blocks(Vec<Took>),
+}
+
+/// How [`read_only_blocks`] fared with one block.
+enum Took {
+    ReadOnly,
+    /// Not committed (unmapped); `held` if a placeholder holds it.
+    Absent { held: bool },
+    Not,
+}
+
+/// [`protect_here`]'s block by block part for a run, with no notes: those
+/// are made under the lock after ([`protected_later_as`]).
+fn read_only_blocks(from: usize, to: usize) -> Vec<Took> {
+    let mut took = Vec::with_capacity(to - from);
+    let mut uncommitted_until = from;
+    for block in from..to {
+        if block >= uncommitted_until && read_only(block, block + 1) {
+            took.push(Took::ReadOnly);
+            continue;
+        }
+        if block >= uncommitted_until {
+            uncommitted_until = uncommitted_end(block);
+            #[cfg(feature = "diagnostics")]
+            tally(9, 1);
+        }
+        took.push(if block < uncommitted_until {
+            Took::Absent { held: known_holes() && placeholder(block) }
+        } else {
+            Took::Not
+        });
+    }
+    took
+}
+
 /// After [`read_only`] of [`pend`]'s run `[from, to)`, under the lock again.
 /// A block [`open`] opened in between (notes gone, `PROTECTED` cleared) is
 /// made writable again; a run that failed (`!done`, nothing changed) is
 /// guarded block by block as before. Then the other views of its pages.
 fn protected_later(g: &mut Guards, from: usize, to: usize, done: bool) {
+    protected_later_as(g, from, to, if done { Fared::Whole } else { Fared::Not }, None);
+}
+
+/// [`protected_later`], with the run done block by block already if it
+/// failed ([`Fared::Blocks`]), and the other views of its pages left in
+/// `plan` to make read-only with the lock let go ([`alias_later`]).
+fn protected_later_as(g: &mut Guards, from: usize, to: usize, fared: Fared, mut plan: Option<&mut Aliases>) {
     for block in from..to {
         PENDING.clear(block);
     }
@@ -2146,6 +2262,42 @@ fn protected_later(g: &mut Guards, from: usize, to: usize, done: bool) {
         LATER[0].fetch_add(1, Relaxed);
         LATER[1].fetch_add((to - from) as u64, Relaxed);
     }
+    let done = match fared {
+        Fared::Whole => true,
+        Fared::Not => false,
+        Fared::Blocks(took) => {
+            for (block, took) in (from..to).zip(took) {
+                let ours = PROTECTED.any(block, block + 1) && g.protected.contains(block);
+                match took {
+                    Took::ReadOnly => {
+                        // (As below, for a run done whole.)
+                        if !PROTECTED.any(block, block + 1) && !g.protected.contains(block) {
+                            open_block(block);
+                            #[cfg(feature = "diagnostics")]
+                            LATER[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                    // Those opened or let go meanwhile stay as that left them.
+                    _ if !ours => {}
+                    took => {
+                        g.protected.remove(block);
+                        g.clean.remove(block);
+                        PROTECTED.clear(block);
+                        if let Took::Absent { held } = took {
+                            g.absent.insert(block);
+                            if held {
+                                g.held.insert(block);
+                            }
+                        }
+                    }
+                }
+            }
+            cover_as(g, from, to, plan);
+            #[cfg(feature = "diagnostics")]
+            LATER[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return;
+        }
+    };
     if !done {
         // Those opened or let go meanwhile stay as that left them (a range
         // the kernel writes now among them).
@@ -2158,7 +2310,7 @@ fn protected_later(g: &mut Guards, from: usize, to: usize, done: bool) {
                 PROTECTED.clear(block);
             }
             protect_here(g, from, to);
-            cover(g, from, to);
+            cover_as(g, from, to, plan.as_deref_mut());
         }
         #[cfg(feature = "diagnostics")]
         LATER[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2172,7 +2324,78 @@ fn protected_later(g: &mut Guards, from: usize, to: usize, done: bool) {
             LATER[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
     }
-    cover(g, from, to);
+    cover_as(g, from, to, plan);
+}
+
+/// Other views of guarded pages left by [`cover_as`] for [`guard_parts`] to
+/// make read-only with the lock let go ([`alias_later`]), and
+/// [`aliases_done`] to note after. Each is noted guarded and [`PENDING`]
+/// meanwhile, and so is each block that relies on one (in `relies`): who
+/// asks about those tells them as written until then.
+#[derive(Default)]
+struct Aliases {
+    blocks: Vec<usize>,
+    planned: std::collections::HashSet<usize>,
+    /// (block, other view of its page)
+    relies: Vec<(usize, usize)>,
+    /// Blocks to note clean if all they rely on is made read-only.
+    clean: Vec<usize>,
+}
+
+/// Diagnostics: other views of guarded pages made read-only with the
+/// guards' lock let go ([`alias_later`]), and those that failed or were
+/// opened meanwhile; since the start.
+#[cfg(feature = "diagnostics")]
+pub(crate) static ALIAS_LATER: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// After [`read_only`] of each of `aliases.blocks` (`done`), under the lock
+/// again. One opened in between is made writable again, as in
+/// [`protected_later`]; one that failed is not guarded. A block that relied
+/// on either is not clean.
+fn aliases_done(g: &mut Guards, aliases: &Aliases, done: Vec<bool>) {
+    let mut failed = std::collections::HashSet::new();
+    for (&block, done) in aliases.blocks.iter().zip(done) {
+        PENDING.clear(block);
+        let ours = PROTECTED.any(block, block + 1) && g.protected.contains(block);
+        if done && ours {
+            #[cfg(feature = "diagnostics")]
+            crate::faultbook::note(crate::faultbook::What::Alias, block, 0, 0);
+            continue;
+        }
+        if done {
+            // (One a fault opened with no lock is still in the notes.)
+            if !PROTECTED.any(block, block + 1) && !g.protected.contains(block) {
+                open_block(block);
+            }
+        } else if ours {
+            g.protected.remove(block);
+            PROTECTED.clear(block);
+        }
+        failed.insert(block);
+    }
+    #[cfg(feature = "diagnostics")]
+    {
+        use std::sync::atomic::Ordering::Relaxed;
+        ALIAS_LATER[0].fetch_add(aliases.blocks.len() as u64, Relaxed);
+        ALIAS_LATER[1].fetch_add(failed.len() as u64, Relaxed);
+    }
+    let mut short = std::collections::HashSet::new();
+    for &(block, other) in &aliases.relies {
+        PENDING.clear(block);
+        if failed.contains(&other) {
+            short.insert(block);
+            g.clean.remove(block);
+        }
+    }
+    for &block in &aliases.clean {
+        if !short.contains(&block)
+            && g.protected.contains(block)
+            && PROTECTED.any(block, block + 1)
+            && !LOOSE.any(block, block + 1)
+        {
+            g.clean.insert(block);
+        }
+    }
 }
 
 /// Views of one page past which its views are not guarded together.
@@ -2202,6 +2425,13 @@ pub(crate) static OPENS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync:
 /// it), a write through it would not be seen: that block is not clean, and
 /// told as written at every asking, until it can. Whether all are covered.
 fn cover(g: &mut Guards, from: usize, to: usize) -> bool {
+    cover_as(g, from, to, None)
+}
+
+/// [`cover`], with the views to make read-only left in `plan`
+/// ([`alias_later`]): they count as covered, and the block is
+/// [`PENDING`] until they are done.
+fn cover_as(g: &mut Guards, from: usize, to: usize, mut plan: Option<&mut Aliases>) -> bool {
     let mut all = true;
     for (page, others) in elsewhere(from * BLOCK, (to - from) * BLOCK) {
         let block = page / BLOCK;
@@ -2219,8 +2449,12 @@ fn cover(g: &mut Guards, from: usize, to: usize) -> bool {
             continue;
         }
         let mut covered = true;
+        let relied = plan.as_ref().map_or(0, |a| a.relies.len());
         for other in others {
-            covered &= protect_alias(g, other / BLOCK);
+            covered &= protect_alias(g, other / BLOCK, plan.as_deref_mut().map(|a| (a, block)));
+        }
+        if plan.as_ref().is_some_and(|a| a.relies.len() != relied) {
+            PENDING.set(block);
         }
         if !covered {
             all = false;
@@ -2236,10 +2470,25 @@ fn cover(g: &mut Guards, from: usize, to: usize) -> bool {
 /// page ([`guard_parts`] tells such a block as written, then notes it clean).
 /// One that is clean stays so: had the page been written since its copies
 /// took it, [`open`] would have opened it. Whether it is read-only now.
-fn protect_alias(g: &mut Guards, block: usize) -> bool {
+///
+/// With `plan` ([`alias_later`]) the `VirtualProtect` is left there for
+/// [`guard_parts`] to make with the lock let go: `block` is noted guarded
+/// and [`PENDING`] now, the block whose page it is a view of relies on it,
+/// and it counts as read-only.
+fn protect_alias(g: &mut Guards, block: usize, plan: Option<(&mut Aliases, usize)>) -> bool {
     use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE, VirtualProtect};
     g.aliased.insert(block);
     ALIASED.set(block);
+    if alias_later() && PENDING.any(block, block + 1) {
+        // Not read-only yet: covered only once this asking makes it so.
+        return match plan {
+            Some((aliases, of)) if aliases.planned.contains(&block) => {
+                aliases.relies.push((of, block));
+                true
+            }
+            _ => false,
+        };
+    }
     if loose(g, block) && g.protected.contains(block) {
         // A fault is opening it.
         return false;
@@ -2259,6 +2508,16 @@ fn protect_alias(g: &mut Guards, block: usize) -> bool {
     }
     // Ahead of the protection.
     PROTECTED.set(block);
+    if let Some((aliases, of)) = plan {
+        // Noted guarded now, so that one who opens it meanwhile opens it
+        // as any other (`aliases_done` makes it writable again after).
+        PENDING.set(block);
+        g.protected.insert(block);
+        aliases.planned.insert(block);
+        aliases.blocks.push(block);
+        aliases.relies.push((of, block));
+        return true;
+    }
     let mut old = 0;
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
@@ -2754,6 +3013,11 @@ pub(crate) fn views_mapped(section: usize, offset: u64, len: usize) {
     #[cfg(feature = "diagnostics")]
     ALIASES[2].fetch_add(blocks.len() as u64, std::sync::atomic::Ordering::Relaxed);
     unguard(&mut g, &blocks);
+    if map_rest() {
+        for block in blocks {
+            g.opened(block);
+        }
+    }
 }
 
 /// The runtime is about to unmap a view of which it maps a part again at
@@ -2776,6 +3040,9 @@ pub fn title_memory_splitting(at: usize, len: usize) {
     open(&mut g, at, at.saturating_add(len));
     for other in others {
         open(&mut g, other, other + BLOCK);
+        if map_rest() {
+            g.opened(other / BLOCK);
+        }
         if CHANGING.get().0 {
             CHANGING.set((true, true));
             g.changing.push((other / BLOCK, other / BLOCK + 1));
