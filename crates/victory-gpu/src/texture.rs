@@ -18,7 +18,7 @@
 pub(crate) mod ahead;
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use windows::Win32::Graphics::Direct3D12::*;
 
@@ -75,6 +75,10 @@ pub(crate) struct Staging {
     uploaded: std::sync::atomic::AtomicBool,
     /// When a list last recorded a use of it (`crate::host::moment`).
     used: std::sync::atomic::AtomicU64,
+    /// The frame until which the next check may hash the texture again
+    /// ([`Last::due_until`]), for [`upload`], which runs on the recording
+    /// threads and does not take `last`.
+    hot: std::sync::atomic::AtomicU64,
     /// How many bytes of the texture's memory were mapped when a list last
     /// recorded an upload of it ([`fill_unlocked`]; 0: not asked).
     expected: std::sync::atomic::AtomicU64,
@@ -101,31 +105,83 @@ struct Last {
     asked: u64,
     /// The frame a partly mapped texture was last read in.
     partial: Option<u64>,
-    /// Until this frame a guarded texture is hashed at every check: its
-    /// first checks, and after the hash found a change the guard had not
-    /// seen ([`hot_textures`]). 0: not checked under the guard yet.
+    /// Until this frame a guarded texture is hashed at every check from its
+    /// first check on, for the ones written behind the guard from the start
+    /// (the six-star screen of the first seconds, which the hash never
+    /// caught changing). 0: not checked under the guard yet.
+    started: u64,
+    /// Until this frame the texture is hashed at every check: its memory
+    /// changed behind the guard's back (a write through another view of
+    /// the same pages, as a video decoder's planes get) when last hashed.
     hot_until: u64,
+    /// The frame the hash last found the texture changed in. The texture's
+    /// next check hashes it once more (`verify`): if it changed again it is
+    /// hot. A texture that streams in changes once and is not hashed on. A
+    /// video's planes cycle through a ring of textures, each sampled only
+    /// every third frame, so "again" cannot mean "the next frame".
+    changed_at: u64,
+    verify: bool,
 }
 
-/// Frames a guarded texture is hashed at every check from its first check,
-/// and after the hash found a change the guard did not see.
+/// How many frames a texture that keeps changing stays hashed at every
+/// check after its last change, and a guarded texture from its first check.
 const HOT_FRAMES: u64 = 64;
+/// How long after a change the next check still counts as "again".
+const VERIFY_FRAMES: u64 = 24;
 
-/// Whether a guarded texture whose memory the hash found changed although
-/// the guard saw no write is hashed at every check for a while
-/// ([`HOT_FRAMES`]), not every eighth frame. A title that writes such a
-/// texture through another view of its pages (the guard sees none of it)
-/// every frame, a video's frames in a ring of three, showed each one up
-/// to eight frames late and in turns: the boot logo video and the loading
-/// animation flickered between old and new pictures (fx-flicker run 1441:
-/// the presented picture cycled through three, a new one every eight
-/// frames). A texture also starts hot, for the ones written that way from
-/// the start (the six-star screen of the first seconds, which the hash
-/// never caught changing). `VICTORY_TEXTURE_HOT=0`: every eighth frame
-/// only, as before.
-fn hot_textures() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_HOT").is_none_or(|v| v != "0"))
+impl Last {
+    /// The hash found the texture changed in `frame`.
+    fn changed(&mut self, frame: u64) {
+        if (self.verify && frame <= self.changed_at + VERIFY_FRAMES) || frame < self.hot_until {
+            self.hot_until = frame + HOT_FRAMES;
+        }
+        self.changed_at = frame;
+        self.verify = true;
+    }
+
+    /// The hash found the texture as it was in `frame`. With `repeat`, a
+    /// check in the frame right after the change leaves the verifying on:
+    /// the frame may sample the same video frame again.
+    fn unchanged(&mut self, frame: u64, repeat: bool) {
+        if repeat && frame <= self.changed_at + 1 {
+            return;
+        }
+        self.verify = false;
+    }
+
+    /// Whether the hash is due at `frame` whatever the turns say.
+    fn hash_due(&self, frame: u64) -> bool {
+        frame < self.hot_until || (self.verify && frame > self.changed_at && frame <= self.changed_at + VERIFY_FRAMES)
+    }
+
+    /// The frame until which the next check may hash the texture again
+    /// ([`hash_due`](Self::hash_due)). The first frames' hashing is left
+    /// out: every texture has them.
+    fn due_until(&self) -> u64 {
+        let verifying = if self.verify { self.changed_at + VERIFY_FRAMES + 1 } else { 0 };
+        self.hot_until.max(verifying)
+    }
+}
+
+/// How a guarded texture that changes behind the guard's back is followed
+/// (`VICTORY_TEXTURE_HOT`). A title that writes such a texture through
+/// another view of its pages (the guard sees none of it) every frame, a
+/// video's frames in a ring of three, showed each one up to eight frames
+/// late and in turns: the boot logo video and the loading animation
+/// flickered between old and new pictures (fx-flicker run 1441). 0: on its
+/// turns only (every eighth frame), as before; 1: hashed at every check
+/// for its first frames ([`HOT_FRAMES`]), after a change the guard did not
+/// see, and while it keeps changing ([`Last::hash_due`]); 2 (default): as
+/// 1, a check in the frame right after a change does not end the
+/// verifying, and while the next check may hash the texture every list
+/// that samples it records the copy into its host texture.
+fn hot_level() -> u8 {
+    static LEVEL: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *LEVEL.get_or_init(|| match std::env::var_os("VICTORY_TEXTURE_HOT") {
+        Some(v) if v == "0" => 0,
+        Some(v) if v == "1" => 1,
+        _ => 2,
+    })
 }
 
 // SAFETY: the staging mapping is written only at submission, under
@@ -135,6 +191,267 @@ unsafe impl Send for Staging {}
 unsafe impl Sync for Staging {}
 
 static STAGING: Mutex<Option<HashMap<usize, Arc<Staging>>>> = Mutex::new(None);
+
+/// Every staging state, grouped by the address where its texture's title
+/// memory starts. [`STAGING`] is keyed by resource, which cannot answer
+/// "which textures lie in this memory range?"; this index can, so a remap
+/// does not have to scan every staged texture.
+///
+/// Several textures can start at the same address (for example two
+/// formats viewing the same memory), hence the `Vec`. Entries are `Weak`
+/// so the index never keeps a staging buffer alive on its own; entries
+/// whose staging state is gone are removed by [`prune_address_index`].
+static STAGED_BY_ADDRESS: Mutex<std::collections::BTreeMap<usize, Vec<Weak<Staging>>>> =
+    Mutex::new(std::collections::BTreeMap::new());
+
+/// The size in bytes of the largest texture ever staged. A texture that
+/// overlaps some memory range cannot start more than this many bytes
+/// before the range, which bounds the search in [`remapped`].
+static LARGEST_STAGED_BYTES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Adds a newly made staging state to [`STAGED_BY_ADDRESS`].
+fn add_to_address_index(staging: &Arc<Staging>) {
+    let (start, bytes) = staging.memory();
+    LARGEST_STAGED_BYTES.fetch_max(bytes, std::sync::atomic::Ordering::Relaxed);
+    let mut index = STAGED_BY_ADDRESS.lock().unwrap_or_else(|e| e.into_inner());
+    let entries = index.entry(start).or_default();
+    // A texture staged here before may have been let go since.
+    entries.retain(|entry| entry.strong_count() > 0);
+    entries.push(Arc::downgrade(staging));
+}
+
+/// Removes entries of [`STAGED_BY_ADDRESS`] whose staging state was let go.
+fn prune_address_index() {
+    let mut index = STAGED_BY_ADDRESS.lock().unwrap_or_else(|e| e.into_inner());
+    index.retain(|_, entries| {
+        entries.retain(|entry| entry.strong_count() > 0);
+        !entries.is_empty()
+    });
+}
+
+/// Called when the runtime maps or unmaps title memory `[at, at + len)`.
+///
+/// A texture in that range may now show completely different bytes, but
+/// its staging state still says "uploaded and unchanged". In that state
+/// [`upload`] skips the copy and only schedules a check, so the first list
+/// that samples the texture after the remap reads the old texels, and the
+/// new ones only arrive one list later (#574).
+///
+/// Marking the texture dirty makes its next [`upload`] record the copy.
+/// The check that runs when that list is submitted reads the new memory
+/// into the staging buffer before the copy executes, so the very first
+/// list after the remap sees the new texels.
+pub(crate) fn remapped(at: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    for staging in staged_under(at, at.saturating_add(len)) {
+        staging.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// The staging states whose texture memory overlaps `[at, end)`.
+fn staged_under(at: usize, end: usize) -> Vec<Arc<Staging>> {
+    if end <= at {
+        return Vec::new();
+    }
+    let earliest_start = at.saturating_sub(LARGEST_STAGED_BYTES.load(std::sync::atomic::Ordering::Relaxed));
+    let index = STAGED_BY_ADDRESS.lock().unwrap_or_else(|e| e.into_inner());
+    // Textures that start before `end`, and are not so far below `at` that
+    // they cannot reach it...
+    index
+        .range(earliest_start..end)
+        .flat_map(|(_, entries)| entries.iter().filter_map(Weak::upgrade))
+        // ...of which only those whose memory reaches past `at` overlap the
+        // range.
+        .filter(|staging| {
+            let (start, bytes) = staging.memory();
+            start.saturating_add(bytes) > at
+        })
+        .collect()
+}
+
+/// `VICTORY_TABLED_REREAD`: whether a texture draws read through a table
+/// is read again whole once a write the guards do not see (DirectStorage's
+/// reads into physical pages) has settled in its memory after its upload.
+///
+/// Such a texture keeps its staging buffer and is checked at every
+/// submission that samples it ([`Staging::refresh`]). That check skips the
+/// read while the guards saw no write to the texture's blocks, unless it is
+/// the texture's turn (one frame in eight) or the texture changed lately. A
+/// write into the physical pages through the runtime's own view does not
+/// fault at the guard: the check sees it only if bit 1 of
+/// `VICTORY_PAGE_WRITES` opened the blocks, or at the texture's turn. The
+/// texture pass, which makes slots of textures picked by index due again
+/// after such writes, leaves out the slots draws read through tables
+/// (`crate::descriptor::host` `slots_written_under`, `tabled_lately`), and
+/// drops a table's slot from its rechecks (`crate::draw` `heap_textures`).
+///
+/// On (default): a staged texture that was uploaded when such a write
+/// landed in its memory settles as those slots do
+/// (`crate::descriptor::host::page_settle`) and is then read again whole:
+/// what its staging buffer was filled from is forgotten, so the check at
+/// the next submission that samples it reads and detiles the memory, and
+/// the list uploads it. A texture uploaded while its memory was all zero,
+/// before DirectStorage brought its texels, is one of these. At most
+/// [`REREAD_MOST`] textures and [`REREAD_MOST_BYTES`] of their memory a
+/// frame; the rest wait for the next frame. `0`: left to their own checks,
+/// as before.
+pub(crate) fn tabled_reread() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TABLED_REREAD").is_none_or(|v| v != "0"))
+}
+
+/// Staged textures one frame reads again at most ([`tabled_reread`]).
+/// shortcut: not a measured value; the same as the slots one pass makes due
+/// (`crate::descriptor::host` `SETTLE_MOST`).
+const REREAD_MOST: usize = 64;
+
+/// The bytes of title memory of the staged textures one frame reads again
+/// at most ([`tabled_reread`]); the first is taken whatever its size.
+/// shortcut: not a measured value. In the owner's session a slow frame
+/// spent 193 ms preparing 198 MB of textures; 16 MB is a share of that size.
+const REREAD_MOST_BYTES: u64 = 16 << 20;
+
+/// Since the start ([`tabled_reread`]): staged textures found uploaded
+/// under a write the guards do not see (once per written range); of those,
+/// ones that were settling already; settled ones read again and their bytes
+/// of title memory; settled ones let go of, or not uploaded, by then; and
+/// how many are settling now.
+pub(crate) static TABLED_REREAD: [std::sync::atomic::AtomicU64; 6] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 6];
+
+/// Things settling under writes the guards do not see, by key: the moments
+/// (ms) of the first and of the last write noted under each, the bytes of
+/// its memory, and what the pass acts on once its writes settled.
+struct Settling<V> {
+    map: std::collections::BTreeMap<usize, (u64, u64, u64, V)>,
+}
+
+impl<V> Settling<V> {
+    const fn new() -> Self {
+        Self {
+            map: std::collections::BTreeMap::new(),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    /// A write under `key` at `now`; `value` for a key not settling yet.
+    /// Whether it was settling already.
+    fn note(&mut self, key: usize, now: u64, bytes: u64, value: impl FnOnce() -> V) -> bool {
+        if let Some(entry) = self.map.get_mut(&key) {
+            entry.1 = now;
+            return true;
+        }
+        self.map.insert(key, (now, now, bytes, value()));
+        false
+    }
+
+    /// Takes the ones whose writes settled by `now`: no write for `quiet`
+    /// ms, or `longest` ms since the first. Oldest first, at most `most` of
+    /// them and `most_bytes` of their memory (the first whatever its size);
+    /// the rest stay for the next call.
+    fn settled(&mut self, now: u64, quiet: u64, longest: u64, most: usize, most_bytes: u64) -> Vec<V> {
+        let mut ready: Vec<(u64, usize, u64)> = self
+            .map
+            .iter()
+            .filter(|(_, e)| now.saturating_sub(e.1) >= quiet || now.saturating_sub(e.0) >= longest)
+            .map(|(&key, e)| (e.0, key, e.2))
+            .collect();
+        ready.sort_unstable();
+        let mut taken = Vec::new();
+        let mut bytes = 0u64;
+        for (_, key, size) in ready {
+            if taken.len() >= most || (!taken.is_empty() && bytes.saturating_add(size) > most_bytes) {
+                break;
+            }
+            bytes = bytes.saturating_add(size);
+            if let Some((.., value)) = self.map.remove(&key) {
+                taken.push(value);
+            }
+        }
+        taken
+    }
+}
+
+/// Staged textures settling under writes the guards do not see
+/// ([`tabled_reread`]), by the address of their staging state; the `Weak`
+/// keeps that allocation, so no other state takes the key meanwhile.
+static SETTLING_STAGED: Mutex<Settling<Weak<Staging>>> = Mutex::new(Settling::new());
+
+/// The frame [`page_settled`] last ran in.
+static SETTLED_FRAME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// Title memory `ranges` (start, end) was written behind the guards' back
+/// (taken by the texture pass from `crate::descriptor::host::page_written`)
+/// at `now` (ms): the staged textures there that were uploaded settle
+/// ([`tabled_reread`]). One not uploaded yet takes the bytes that are there
+/// by its upload.
+pub(crate) fn page_written(ranges: &[(u64, u64)], now: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let found: Vec<Arc<Staging>> = ranges
+        .iter()
+        .flat_map(|&(start, end)| staged_under(start as usize, end as usize))
+        .filter(|staging| staging.uploaded.load(Relaxed))
+        .collect();
+    if found.is_empty() {
+        return;
+    }
+    let mut settling = SETTLING_STAGED.lock().unwrap_or_else(|e| e.into_inner());
+    let mut again = 0;
+    for staging in &found {
+        let bytes = staging.memory().1 as u64;
+        if settling.note(Arc::as_ptr(staging) as usize, now, bytes, || Arc::downgrade(staging)) {
+            again += 1;
+        }
+    }
+    TABLED_REREAD[0].fetch_add(found.len() as u64, Relaxed);
+    TABLED_REREAD[1].fetch_add(again, Relaxed);
+    TABLED_REREAD[5].store(settling.len() as u64, Relaxed);
+}
+
+/// Once in `frame`: the staged textures whose writes settled by `now` (ms;
+/// no write for `quiet` ms, or `longest` since the first; at most
+/// [`REREAD_MOST`] and [`REREAD_MOST_BYTES`]) and that are still uploaded
+/// are read again whole at the next submission that samples them, and that
+/// submission's list uploads them ([`tabled_reread`]). Returns how many.
+pub(crate) fn page_settled(frame: u64, now: u64, quiet: u64, longest: u64) -> usize {
+    use std::sync::atomic::Ordering::Relaxed;
+    if SETTLED_FRAME.swap(frame, Relaxed) == frame {
+        return 0;
+    }
+    let settled = {
+        let mut settling = SETTLING_STAGED.lock().unwrap_or_else(|e| e.into_inner());
+        if settling.map.is_empty() {
+            return 0;
+        }
+        let settled = settling.settled(now, quiet, longest, REREAD_MOST, REREAD_MOST_BYTES);
+        TABLED_REREAD[5].store(settling.len() as u64, Relaxed);
+        settled
+    };
+    let (mut read, mut bytes, mut gone) = (0, 0, 0);
+    for staging in settled {
+        match staging.upgrade() {
+            Some(staging) if staging.uploaded.load(Relaxed) => {
+                // Forgotten, the next check reads and detiles the memory
+                // whatever the guards say; dirty, the next list that
+                // samples the texture records its upload.
+                staging.forget();
+                staging.dirty.store(true, Relaxed);
+                read += 1;
+                bytes += staging.memory().1 as u64;
+            }
+            _ => gone += 1,
+        }
+    }
+    TABLED_REREAD[2].fetch_add(read, Relaxed);
+    TABLED_REREAD[3].fetch_add(bytes, Relaxed);
+    TABLED_REREAD[4].fetch_add(gone, Relaxed);
+    read as usize
+}
 
 /// The buffer a texture the host writes is copied through into the texture
 /// of a view the title placed in its memory in another format
@@ -532,6 +849,7 @@ pub(crate) fn let_go_idle() {
         keep
     });
     if went > 0 {
+        prune_address_index();
         crate::host::trail(|| format!("sweep: {went} staging buffers of textures let go ({} KiB), held by no list", bytes >> 10));
     }
 }
@@ -788,7 +1106,10 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
     // at submission is left, and what it finds changed the next list that
     // samples the texture uploads (a frame late where every list of the
     // frame was recorded before that check).
-    if staging.uploaded.load(Relaxed) && !staging.dirty.load(Relaxed) {
+    // A hot texture is copied by every list that samples it: its check
+    // finds it changed, and the copy, which runs after the check, takes
+    // what the check detiled.
+    if staging.uploaded.load(Relaxed) && !staging.dirty.load(Relaxed) && !staging.hot_at(crate::frame::current()) {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexSkipped, 1);
         list.defer_texture(staging);
@@ -1128,6 +1449,40 @@ impl Staging {
         held
     }
 
+    /// Whether a list that samples the texture at `frame` records the copy
+    /// into its host texture even if the check found nothing new: the
+    /// check may hash it again ([`hot_level`] 2).
+    fn hot_at(&self, frame: u64) -> bool {
+        hot_level() >= 2 && frame < self.hot.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The hash found the memory changed; `first`: it was hashed for the
+    /// first time, which is no change for the hot textures; `blind`: the
+    /// guard saw no write, so the change came another way and the texture
+    /// is hashed at every check for a while.
+    fn found_changed(&self, last: &mut Last, first: bool, blind: bool) {
+        if first || hot_level() == 0 {
+            return;
+        }
+        let frame = crate::frame::current();
+        last.changed(frame);
+        if blind {
+            last.hot_until = last.hot_until.max(frame + HOT_FRAMES);
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::TexHot, 1);
+        }
+        self.hot.store(last.due_until(), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The hash found the memory as it was.
+    fn found_unchanged(&self, last: &mut Last) {
+        if hot_level() == 0 {
+            return;
+        }
+        last.unchanged(crate::frame::current(), hot_level() >= 2);
+        self.hot.store(last.due_until(), std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Forgets what the staging buffer was last filled from: the next
     /// refresh detiles anew, whether the memory changed or not.
     fn forget(&self) {
@@ -1223,23 +1578,15 @@ impl Staging {
                 .is_multiple_of(HASH_EVERY);
             // A texture starts hot: one written that way from its first
             // frames on changes before the hash has ever caught it.
-            if last.hot_until == 0 {
-                last.hot_until = frame + HOT_FRAMES;
+            if last.started == 0 {
+                last.started = frame + HOT_FRAMES;
             }
-            let hot = hot_textures() && frame < last.hot_until;
-            if unwritten && !turn && !hot {
+            let due = hot_level() >= 1 && (frame < last.started || last.hash_due(frame));
+            if unwritten && !turn && !due {
                 return 0;
             }
             blind = unwritten;
         }
-        // A change the guard did not see: hashed at every check for a while.
-        let found_blind = |last: &mut Last| {
-            if blind && hot_textures() {
-                last.hot_until = crate::frame::current() + HOT_FRAMES;
-                #[cfg(feature = "diagnostics")]
-                crate::copystat::add(crate::copystat::C::TexHot, 1);
-            }
-        };
         // From here on the texture's memory may be read in place. Held until
         // that read is done: the runtime changes what title memory shows
         // only with this taken alone, so what `committed` finds mapped
@@ -1290,7 +1637,7 @@ impl Staging {
                 crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
             }
             if changed {
-                found_blind(last);
+                self.found_changed(last, false, blind);
             }
             return size;
         }
@@ -1300,10 +1647,11 @@ impl Staging {
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
                 if last.hash == Some(hash) {
+                    self.found_unchanged(last);
                     return size;
                 }
+                self.found_changed(last, last.hash.is_none(), blind);
                 last.hash = Some(hash);
-                found_blind(last);
                 self.detile(tiled);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
@@ -1317,10 +1665,11 @@ impl Staging {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
         if last.hash == Some(hash) {
+            self.found_unchanged(last);
             return size;
         }
+        self.found_changed(last, last.hash.is_none(), blind);
         last.hash = Some(hash);
-        found_blind(last);
         self.detile(tiled);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
@@ -1838,6 +2187,7 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
         dirty: std::sync::atomic::AtomicBool::new(true),
         uploaded: std::sync::atomic::AtomicBool::new(false),
         used: std::sync::atomic::AtomicU64::new(crate::host::moment()),
+        hot: std::sync::atomic::AtomicU64::new(0),
         expected: std::sync::atomic::AtomicU64::new(0),
         on_demand,
         detiled: std::sync::atomic::AtomicU32::new(0),
@@ -1845,7 +2195,119 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
         waiting: std::sync::atomic::AtomicU64::new(0),
     });
     map.insert(resource as usize, s.clone());
+    add_to_address_index(&s);
     Some(s)
+}
+
+#[cfg(test)]
+mod remap_tests {
+    use std::sync::atomic::Ordering::Relaxed;
+
+    /// After a remap of the memory under a texture that was already
+    /// uploaded, the texture must be uploaded again (#574). A remap of
+    /// unrelated memory, or of an empty range, must leave it alone.
+    #[test]
+    fn a_remap_under_a_staged_texture_makes_it_upload_again() {
+        use windows_sys::Win32::System::Memory::*;
+        const PAGE_RUN: usize = 0x1_0000;
+        // Two 64 KiB runs: the texture lives in the first, the second is
+        // memory next to it that no texture uses.
+        // SAFETY: a private allocation of our own, released at the end.
+        let base = unsafe {
+            VirtualAlloc(std::ptr::null(), 2 * PAGE_RUN, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)
+        };
+        assert!(!base.is_null());
+        let texture_start = base as usize;
+        // Resource description words of a linear 4x4 RGBA8 texture with one
+        // mip level, the shape the issue used to reproduce the bug.
+        let description = [3, 0, 0, 0, 4, 0, 4, 0x1_0001, 28, 1, 0, 1, 0, 0];
+        let staged = crate::resource::texture_at(texture_start as u64, &description).and_then(|resource| {
+            let copy = crate::resource::host_copy(resource)?;
+            super::staging(resource, &copy, 0)
+        });
+        // `None` means there is no GPU to make the host texture on: nothing
+        // to check then.
+        if let Some(staging) = staged {
+            // The state after a submitted list uploaded the texture.
+            staging.uploaded.store(true, Relaxed);
+            staging.dirty.store(false, Relaxed);
+
+            super::remapped(texture_start + PAGE_RUN, PAGE_RUN);
+            super::remapped(texture_start, 0);
+            assert!(!staging.dirty.load(Relaxed), "a remap elsewhere marked the texture");
+
+            super::remapped(texture_start + 0x10, 0x10);
+            assert!(staging.dirty.load(Relaxed), "a remap under the texture did not mark it");
+        }
+        // SAFETY: the allocation above, released once.
+        assert_ne!(unsafe { VirtualFree(base, 0, MEM_RELEASE) }, 0);
+    }
+
+    /// A write the guards do not see under a staged texture that was
+    /// uploaded (a texture draws read through a table) has it read again
+    /// once the write settled: before that it is left alone, and a write
+    /// elsewhere does nothing.
+    #[test]
+    fn a_page_write_under_an_uploaded_staged_texture_reads_it_again_once_settled() {
+        use windows_sys::Win32::System::Memory::*;
+        const PAGE_RUN: usize = 0x1_0000;
+        // SAFETY: a private allocation of our own, released at the end.
+        let base = unsafe {
+            VirtualAlloc(std::ptr::null(), 2 * PAGE_RUN, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)
+        };
+        assert!(!base.is_null());
+        let texture_start = base as usize;
+        let description = [3, 0, 0, 0, 4, 0, 4, 0x1_0001, 28, 1, 0, 1, 0, 0];
+        let staged = crate::resource::texture_at(texture_start as u64, &description).and_then(|resource| {
+            let copy = crate::resource::host_copy(resource)?;
+            super::staging(resource, &copy, 0)
+        });
+        // `None`: no GPU to make the host texture on.
+        if let Some(staging) = staged {
+            staging.uploaded.store(true, Relaxed);
+            staging.dirty.store(false, Relaxed);
+            staging.last.lock().unwrap().asked = 7;
+            let at = texture_start as u64;
+            // Frames far from any other test's, so the once-a-frame gate is ours.
+            super::page_written(&[(at + PAGE_RUN as u64, at + 2 * PAGE_RUN as u64)], 1_000);
+            super::page_written(&[(at + 0x10, at + 0x20)], 1_000);
+            super::page_written(&[(at + 0x20, at + 0x30)], 1_100);
+            assert_eq!(super::page_settled(1 << 40, 1_200, 200, 2_000), 0, "read again before its writes settled");
+            assert!(!staging.dirty.load(Relaxed));
+            assert_eq!(staging.last.lock().unwrap().asked, 7);
+            assert_eq!(super::page_settled((1 << 40) + 1, 1_300, 200, 2_000), 1, "not read again once settled");
+            assert!(staging.dirty.load(Relaxed), "not marked for the next list's upload");
+            assert_eq!(staging.last.lock().unwrap().asked, 0, "what the staging buffer holds was not forgotten");
+        }
+        // SAFETY: the allocation above, released once.
+        assert_ne!(unsafe { VirtualFree(base, 0, MEM_RELEASE) }, 0);
+    }
+
+    /// Settling: a write again under a settling key moves its last write
+    /// on; keys are taken once quiet or after the longest wait, oldest
+    /// first, within the count and byte bounds (the first whatever its size).
+    #[test]
+    fn settling_takes_quiet_or_old_keys_oldest_first_within_bounds() {
+        let mut s = super::Settling::<usize>::new();
+        assert!(!s.note(1, 100, 10, || 1));
+        assert!(!s.note(2, 150, 10, || 2));
+        assert!(s.note(1, 250, 10, || 99));
+        // Key 1 was written at 250: not quiet at 400; key 2 is.
+        assert_eq!(s.settled(400, 200, 2_000, 64, 1 << 20), vec![2]);
+        // Written again and again, key 1 is taken 2 s after its first write.
+        assert!(s.note(1, 2_050, 10, || 99));
+        assert_eq!(s.settled(2_099, 200, 2_000, 64, 1 << 20), Vec::<usize>::new());
+        assert_eq!(s.settled(2_100, 200, 2_000, 64, 1 << 20), vec![1]);
+        assert_eq!(s.len(), 0);
+        // Bounds: two a call, then bytes; the oldest go first.
+        for (key, first) in [(5, 30), (6, 10), (7, 20)] {
+            s.note(key, first, 100, || key);
+        }
+        assert_eq!(s.settled(1_000, 200, 2_000, 2, 1 << 20), vec![6, 7]);
+        assert!(!s.note(8, 40, 1_000, || 8));
+        assert_eq!(s.settled(1_000, 200, 2_000, 64, 150), vec![5]);
+        assert_eq!(s.settled(1_000, 200, 2_000, 64, 150), vec![8]);
+    }
 }
 
 #[cfg(test)]
@@ -2197,5 +2659,86 @@ mod allocation_costs {
             timed("texture placed in 64 MB heaps", N, 1, &place);
             timed("texture placed in 64 MB heaps", N, 8, &place);
         }
+    }
+}
+
+#[cfg(test)]
+mod hot_texture_tests {
+    use super::{HOT_FRAMES, Last, VERIFY_FRAMES};
+
+    /// A video's planes cycle through a ring of three textures, each sampled
+    /// and checked every third frame, and each found changed at every check:
+    /// from the second change on the texture is hot, and stays so.
+    #[test]
+    fn a_texture_changing_at_every_check_goes_hot() {
+        let mut last = Last::default();
+        last.changed(10);
+        assert!(!last.hash_due(10), "the check that found the change is done");
+        assert!(last.hash_due(13), "the next check verifies it");
+        last.changed(13);
+        assert!(last.hash_due(14), "changed twice: hot");
+        last.changed(16);
+        assert!(last.hash_due(16 + HOT_FRAMES - 1));
+    }
+
+    /// A texture that streams in changes once: it is hashed once more at its
+    /// next checks, found as it was, and not hashed again between turns.
+    #[test]
+    fn a_texture_that_changed_once_is_not_hot() {
+        let mut last = Last::default();
+        last.changed(100);
+        assert!(last.hash_due(101), "verified at the next check");
+        last.unchanged(101, true);
+        assert!(last.hash_due(102), "the frame after the change proves nothing");
+        last.unchanged(102, true);
+        assert!(!last.hash_due(103));
+        assert!(!last.hash_due(100 + VERIFY_FRAMES));
+        // A change long after the first is a first change again.
+        last.changed(500);
+        assert!(!last.hash_due(500));
+        assert!(last.hash_due(501));
+    }
+
+    /// At the start of the intro movie a plane of the ring was found
+    /// changed in frame 1008, as it was at a check in frame 1009, and its
+    /// next changes were passed over until its turn (run intro-t1): the
+    /// check in the next frame does not end the verifying any more.
+    #[test]
+    fn a_check_in_the_next_frame_keeps_the_verifying() {
+        let mut last = Last::default();
+        last.changed(1008);
+        last.unchanged(1009, true);
+        assert!(last.hash_due(1011));
+        last.changed(1011);
+        assert!(last.hash_due(1012), "changed again: hot");
+        // As before (`VICTORY_TEXTURE_HOT=1`): the check ended it.
+        let mut old = Last::default();
+        old.changed(1008);
+        old.unchanged(1009, false);
+        assert!(!old.hash_due(1011));
+    }
+
+    /// Lists record the copy while the next check may hash the texture.
+    #[test]
+    fn due_until_covers_the_verifying_and_the_hot_frames() {
+        let mut last = Last::default();
+        assert_eq!(last.due_until(), 0);
+        last.changed(10);
+        assert_eq!(last.due_until(), 10 + VERIFY_FRAMES + 1);
+        last.changed(13);
+        assert_eq!(last.due_until(), (13 + HOT_FRAMES).max(13 + VERIFY_FRAMES + 1));
+        last.unchanged(20, true);
+        assert_eq!(last.due_until(), 13 + HOT_FRAMES);
+    }
+
+    /// A hot texture that stops changing falls back to the turns.
+    #[test]
+    fn a_hot_texture_cools_down() {
+        let mut last = Last::default();
+        last.changed(1);
+        last.changed(4);
+        assert!(last.hash_due(4 + HOT_FRAMES - 1));
+        last.unchanged(10, true);
+        assert!(!last.hash_due(4 + HOT_FRAMES + 1));
     }
 }
