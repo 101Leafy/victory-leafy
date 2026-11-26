@@ -200,11 +200,27 @@ pub(crate) enum C {
     TexHashedTurn,
     TexHashedHot,
     TexTurnSkipped,
+    /// Host lists closed, and the nanoseconds of each step of the close:
+    /// depth twins copied back, textures read back, the indirect and
+    /// batched clamps' common work, the card budget's notes copied out, the
+    /// wait for refreshes still to come from the heap pass beside the
+    /// recording (here only with `VICTORY_COMING_AT_CLOSE=1`; otherwise the
+    /// submission waits), the timestamp
+    /// query's end and resolve, and the driver's Close.
+    Closes,
+    CloseTwinsNs,
+    CloseTexBackNs,
+    CloseIndirectNs,
+    CloseBatchesNs,
+    CloseBudgetNs,
+    CloseComingNs,
+    CloseQueryNs,
+    CloseDriverNs,
 }
-const COUNTERS: usize = 112;
+const COUNTERS: usize = 120;
 
 /// The counters' names, in the order of [`C`], for the frame recorder's columns.
-pub(crate) const NAMES: [&str; 105] = [
+pub(crate) const NAMES: [&str; 114] = [
     "Submissions", "Copies", "CopyBytes", "Refreshes", "RefreshBytes", "Skipped", "SkippedBytes", "Runs",
     "RunUs", "Queries", "QueryUs", "MoveUs", "Unmapped", "Watches", "WatchUs", "Checked", "Unchanged",
     "Fallbacks", "GuardFaults", "TexWatched", "TexHashed", "TexChanged", "TexHot", "Frames", "RecordCalls",
@@ -220,7 +236,8 @@ pub(crate) const NAMES: [&str; 105] = [
     "AskRefused", "AskRefusedUs", "AskRefusedAgain", "AskSkipped", "AskAgain", "AskAgainBytes", "GuardAgain",
     "BackAgainBytes", "RefreshGapBytes", "LookupQuick", "LookupTables", "LookupLoose", "ThinDrawNs",
     "ThinDraws", "ThinSetNs", "ThinBarrierNs", "ThinCopyNs", "ThinOtherNs", "TexHashedTurn", "TexHashedHot",
-    "TexTurnSkipped",
+    "TexTurnSkipped", "Closes", "CloseTwinsNs", "CloseTexBackNs", "CloseIndirectNs", "CloseBatchesNs",
+    "CloseBudgetNs", "CloseComingNs", "CloseQueryNs", "CloseDriverNs",
 ];
 /// One of some sets of counters, each in lines of the processor's memory of
 /// its own: a set for all threads had them wait for each other's lines at
@@ -531,7 +548,7 @@ mod command_tests {
     #[test]
     fn every_counter_is_named() {
         use super::{C, COUNTERS, NAMES};
-        assert_eq!(C::TexTurnSkipped as usize + 1, NAMES.len());
+        assert_eq!(C::CloseDriverNs as usize + 1, NAMES.len());
         assert_eq!(NAMES[C::Frames as usize], "Frames");
         assert!(NAMES.len() <= COUNTERS);
     }
