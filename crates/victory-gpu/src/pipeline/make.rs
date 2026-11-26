@@ -57,6 +57,9 @@ pub(crate) struct Pending {
     given_up: AtomicBool,
     /// What draws waited for it in vain so far, in microseconds.
     waited_us: AtomicU64,
+    /// The title frame in which draws first waited for it (`u64::MAX`: none
+    /// yet). Draws of later frames do not wait for it ([`claim_wait`]).
+    waited_frame: AtomicU64,
 }
 
 fn named(shaders: &[Arc<Shader>], name: &[u8]) -> bool {
@@ -146,6 +149,7 @@ impl Pending {
             used: AtomicBool::new(false),
             given_up: AtomicBool::new(false),
             waited_us: AtomicU64::new(0),
+            waited_frame: AtomicU64::new(u64::MAX),
         }
     }
 
@@ -390,8 +394,34 @@ fn give_up() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_GIVE_UP").is_none_or(|v| v != "0"))
 }
 
+/// Whether a pipeline is waited for in one frame only: one the worker has
+/// not made within that frame's budget (a slow or stuck driver compile) has
+/// its draws dropped in later frames until it is made, instead of taking
+/// what is left of the budget again in every frame that draws with it
+/// (fxceless/victory-fork #1234, for its #1181: 500 ms waited in every world
+/// frame, felt as a freeze while the player moves). [`GIVE_UP`] stops the
+/// waits once they add up to 100 ms; this stops them after the first frame,
+/// however short its wait. Passes over the screen keep waiting.
+/// `VICTORY_PIPELINE_WAIT_EVERY_FRAME=1`: as before.
+fn wait_every_frame() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_WAIT_EVERY_FRAME").is_some_and(|v| v == "1"))
+}
+
+/// Claims `frame` as the one in which draws wait for `p`: whether it is (or
+/// already was) that frame.
+fn claim_wait(p: &Pending, frame: u64) -> bool {
+    if wait_every_frame() {
+        return true;
+    }
+    match p.waited_frame.compare_exchange(u64::MAX, frame, Ordering::Relaxed, Ordering::Relaxed) {
+        Ok(_) => true,
+        Err(first) => first == frame,
+    }
+}
+
 /// Waits for `p` while frame `frame` has budget left, unless an earlier
-/// wait for it gave up.
+/// wait for it gave up or an earlier frame waited for it.
 fn wait(p: &Pending, frame: u64) {
     let screen = p.screen && screens_first();
     if !screen && p.given_up.load(Ordering::Relaxed) {
@@ -412,14 +442,16 @@ fn wait(p: &Pending, frame: u64) {
             *spent = (frame, Duration::ZERO);
         }
         let left = budget.saturating_sub(spent.1);
+        // Claimed only with time left, so a pipeline first drawn with once
+        // the frame's budget is spent keeps its one wait for a later frame.
+        if left.is_zero() || (!screen && !claim_wait(p, frame)) {
+            return;
+        }
         if shared {
             spent.1 += left;
         }
         left
     };
-    if left.is_zero() {
-        return;
-    }
     let started = Instant::now();
     let (lock, done) = &DONE;
     let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -880,6 +912,29 @@ mod tests {
         let again = Instant::now();
         wait(&p, frame - 1);
         assert!(again.elapsed() < GIVE_UP / 10, "{:?}", again.elapsed());
+    }
+
+    /// A pipeline an earlier frame waited for is not waited for again, even
+    /// if that wait was short (fxceless/victory-fork #1234).
+    #[test]
+    fn a_pipeline_is_waited_for_in_one_frame_only() {
+        let p = Pending::new(Vec::new(), None);
+        let frame = u64::MAX - 17;
+        p.waited_frame.store(frame - 1, Ordering::Relaxed);
+        let started = Instant::now();
+        wait(&p, frame);
+        assert!(started.elapsed() < GIVE_UP / 10, "{:?}", started.elapsed());
+        assert!(!p.given_up.load(Ordering::Relaxed));
+    }
+
+    /// The first frame keeps the claim, and its other draws may wait too.
+    #[test]
+    fn the_first_frame_claims_the_wait() {
+        let p = Pending::new(Vec::new(), None);
+        assert!(claim_wait(&p, 7));
+        assert!(claim_wait(&p, 7));
+        assert!(!claim_wait(&p, 8));
+        assert_eq!(p.waited_frame.load(Ordering::Relaxed), 7);
     }
 
     /// Short waits in vain add up over frames until draws stop waiting.
