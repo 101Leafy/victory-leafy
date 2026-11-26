@@ -377,11 +377,17 @@ pub(crate) enum C {
     HolesNs,
     HolesWaitNs,
     HolesHoldNs,
+    /// Tables that found no dynamic slots and read instead a run another
+    /// list made this frame from the same records at another table
+    /// (`VICTORY_SAME_TABLES`), and their slots: draws that would have
+    /// been dropped.
+    FreshSameUsed,
+    FreshSameUsedSlots,
 }
 const COUNTERS: usize = 256;
 
 /// The counters' names, in the order of [`C`], for the frame recorder's columns.
-pub(crate) const NAMES: [&str; 202] = [
+pub(crate) const NAMES: [&str; 204] = [
     "Submissions", "Copies", "CopyBytes", "Refreshes", "RefreshBytes", "Skipped", "SkippedBytes", "Runs",
     "RunUs", "Queries", "QueryUs", "MoveUs", "Unmapped", "Watches", "WatchUs", "Checked", "Unchanged",
     "Fallbacks", "GuardFaults", "TexWatched", "TexHashed", "TexChanged", "TexHot", "Frames", "RecordCalls",
@@ -421,6 +427,7 @@ pub(crate) const NAMES: [&str; 202] = [
     "FreshRevived", "FreshRevivedSlots",
     "DynamicHeldMost", "DynamicWantedMost", "DynamicRefusedSlots", "DynamicShortOfFree",
     "HolesNs", "HolesWaitNs", "HolesHoldNs",
+    "FreshSameUsed", "FreshSameUsedSlots",
 ];
 /// One of some sets of counters, each in lines of the processor's memory of
 /// its own: a set for all threads had them wait for each other's lines at
@@ -742,7 +749,7 @@ mod command_tests {
     #[test]
     fn every_counter_is_named() {
         use super::{C, COUNTERS, NAMES};
-        assert_eq!(C::HolesHoldNs as usize + 1, NAMES.len());
+        assert_eq!(C::FreshSameUsedSlots as usize + 1, NAMES.len());
         assert_eq!(NAMES[C::Frames as usize], "Frames");
         assert!(NAMES.len() <= COUNTERS);
     }
