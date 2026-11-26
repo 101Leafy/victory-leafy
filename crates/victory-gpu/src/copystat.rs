@@ -1452,6 +1452,13 @@ pub(crate) fn log(frames: f64) {
         "write faults that opened their block with no lock (VICTORY_LOOSE_FAULTS=0 for none), since the start: {loose}; \
          {to_lock} went on to the lock; {taken} taken into the notes after"
     );
+    let [runs, blocks, reopened, failed] =
+        [0, 1, 2, 3].map(|n| crate::watch::LATER[n].load(std::sync::atomic::Ordering::Relaxed));
+    tracing::info!(
+        "guarded runs made read-only with the guards' lock let go (VICTORY_PROTECT_LATER=0 for none), since the start: \
+         {runs} runs, {blocks} blocks; {reopened} blocks opened meanwhile and made writable again; \
+         {failed} runs guarded under the lock after"
+    );
     tracing::info!(
         "waits for the write trackers' locks per frame, all threads (number, time): {}",
         crate::watch::lock_waits(frames as f64)

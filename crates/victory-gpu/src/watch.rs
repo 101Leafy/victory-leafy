@@ -1234,7 +1234,7 @@ fn publish(pages: &[usize]) {
             PUBLISHED.set(page);
             // (Put there or opened by a fault since: whoever did clears the
             // bit after this is set, or its own bit is found here.)
-            if BESIDE.any(page, page + 1) || LOOSE.any(page, page + 1) {
+            if BESIDE.any(page, page + 1) || LOOSE.any(page, page + 1) || PENDING.any(page, page + 1) {
                 PUBLISHED.clear(page);
             }
         }
@@ -1817,7 +1817,11 @@ pub(crate) fn written_since_taken(at: usize, len: usize) -> bool {
     }
     let g = guards();
     (at / BLOCK..=(at + len - 1) / BLOCK)
-        .all(|b| LOOSE.any(b, b + 1) || !g.clean.contains(b) && !g.absent.contains(b) && !g.protected.contains(b))
+        .all(|b| {
+            LOOSE.any(b, b + 1)
+                || PENDING.any(b, b + 1)
+                || !g.clean.contains(b) && !g.absent.contains(b) && !g.protected.contains(b)
+        })
 }
 
 /// For view memory: the pages of `[start, end)`'s blocks written since
@@ -1859,7 +1863,7 @@ fn guard_parts(start: usize, end: usize) -> Option<Vec<(usize, u16)>> {
             let these = in_word(word * 64, first, last);
             g.clean.word(word) & these == these
         });
-        if clean && !BESIDE.any(first, last) && !LOOSE.any(first, last) {
+        if clean && !BESIDE.any(first, last) && !LOOSE.any(first, last) && !PENDING.any(first, last) {
             // Nothing written, mapped or new since the range was last taken.
             #[cfg(feature = "diagnostics")]
             tally(3, 1);
@@ -1896,21 +1900,25 @@ fn guard_parts(start: usize, end: usize) -> Option<Vec<(usize, u16)>> {
     // clean.
     let mut written = Vec::new();
     for word in first / 64..last.div_ceil(64) {
-        let known = g.clean.word(word) & !BESIDE.word(word) & !LOOSE.word(word) | g.absent.word(word);
+        let known =
+            g.clean.word(word) & !BESIDE.word(word) & !LOOSE.word(word) & !PENDING.word(word) | g.absent.word(word);
         written.extend(BitsOf(!known & in_word(word * 64, first, last)).map(|bit| word * 64 + bit));
     }
     let mut parts = vec![WHOLE; written.len()];
     let mut run: Option<(usize, usize)> = None;
+    let mut later = Vec::new();
     for (i, &block) in written.iter().enumerate() {
         if let Some((from, to)) = run
             && to != block
         {
-            protect(&mut g, from, to);
+            pend(&mut g, from, to, &mut later);
             run = None;
-            // Faults of the title's wait for the lock: each block is done on
-            // its own, and looked at anew below.
-            drop(g);
-            g = guards_timed();
+            if !protect_later() {
+                // Faults of the title's wait for the lock: each block is done
+                // on its own, and looked at anew below.
+                drop(g);
+                g = guards_timed();
+            }
         }
         // Told as written by this, and read by the caller after.
         let beside = BESIDE.take(block);
@@ -1920,7 +1928,7 @@ fn guard_parts(start: usize, end: usize) -> Option<Vec<(usize, u16)>> {
         if loose(&mut g, block) && g.protected.contains(block) {
             // A fault is opening it right now: guarded at the next asking.
             if let Some((from, to)) = run.take() {
-                protect(&mut g, from, to);
+                pend(&mut g, from, to, &mut later);
             }
             continue;
         }
@@ -1929,7 +1937,7 @@ fn guard_parts(start: usize, end: usize) -> Option<Vec<(usize, u16)>> {
             // because one could not be made so. (Or clean, and bytes were put
             // in beside the guard: it stays.)
             if let Some((from, to)) = run.take() {
-                protect(&mut g, from, to);
+                pend(&mut g, from, to, &mut later);
             }
             if g.clean.contains(block) {
                 continue;
@@ -1956,13 +1964,20 @@ fn guard_parts(start: usize, end: usize) -> Option<Vec<(usize, u16)>> {
         } else if !g.foreign.contains(&block) && !g.left_alone(block) && !g.rests(block, rest) {
             run = Some((run.map_or(block, |r| r.0), block + 1));
         } else if let Some((from, to)) = run.take() {
-            protect(&mut g, from, to);
+            pend(&mut g, from, to, &mut later);
         }
     }
     if let Some((from, to)) = run {
-        protect(&mut g, from, to);
+        pend(&mut g, from, to, &mut later);
     }
     drop(g);
+    if !later.is_empty() {
+        let done: Vec<bool> = later.iter().map(|&(from, to)| read_only(from, to)).collect();
+        let mut g = guards_timed();
+        for (&(from, to), done) in later.iter().zip(done) {
+            protected_later(&mut g, from, to, done);
+        }
+    }
     #[cfg(feature = "diagnostics")]
     crate::faultbook::note(crate::faultbook::What::Asked, first, last, written.len() as u64);
     Some(written.into_iter().zip(parts).collect())
@@ -2020,12 +2035,96 @@ fn is_view(start: usize, end: usize) -> bool {
 /// `VICTORY_VIEW_GUARD=0` leaves the other views as they are, as before.
 fn protect(g: &mut Guards, from: usize, to: usize) {
     #[cfg(feature = "diagnostics")]
-    {
-        crate::faultbook::note(crate::faultbook::What::Taken, from, to, 0);
-        let again = (from..to).filter(|&block| crate::copystat::again(4, (block, 0, 0))).count();
-        crate::copystat::add(crate::copystat::C::GuardAgain, again as u64);
-    }
+    taken(from, to);
     protect_here(g, from, to);
+    cover(g, from, to);
+}
+
+#[cfg(feature = "diagnostics")]
+fn taken(from: usize, to: usize) {
+    crate::faultbook::note(crate::faultbook::What::Taken, from, to, 0);
+    let again = (from..to).filter(|&block| crate::copystat::again(4, (block, 0, 0))).count();
+    crate::copystat::add(crate::copystat::C::GuardAgain, again as u64);
+}
+
+/// Blocks [`guard_parts`] has noted guarded and clean but not made
+/// read-only yet ([`pend`]). Another asking tells them as written: a write
+/// can still land there unseen until then, and it is that asking's caller
+/// that reads it.
+static PENDING: Bits = Bits::new();
+
+/// Whether [`guard_parts`] makes its blocks read-only with the guards' lock
+/// let go (`VICTORY_PROTECT_LATER=0`: under it, as before).
+///
+/// The lock was held 105-149 ms a frame over all threads, much of it over
+/// the `VirtualProtect` calls of these askings (play-g, 2026-11-26).
+fn protect_later() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PROTECT_LATER").is_none_or(|v| v != "0"))
+}
+
+/// Diagnostics: runs of guarded blocks made read-only with the guards' lock
+/// let go ([`pend`]), the blocks in them, blocks opened meanwhile and made
+/// writable again, and runs that failed and were guarded under the lock
+/// after; since the start.
+#[cfg(feature = "diagnostics")]
+pub(crate) static LATER: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// [`protect`] for [`guard_parts`], with the `VirtualProtect` left for when
+/// the lock is let go ([`protect_later`]): `[from, to)` is noted guarded,
+/// clean and [`PENDING`] now, and goes in `later` for [`read_only`] and
+/// [`protected_later`].
+fn pend(g: &mut Guards, from: usize, to: usize, later: &mut Vec<(usize, usize)>) {
+    if !protect_later() {
+        protect(g, from, to);
+        return;
+    }
+    #[cfg(feature = "diagnostics")]
+    taken(from, to);
+    for block in from..to {
+        // Ahead of the protection, as in `protect_here`.
+        PROTECTED.set(block);
+        PENDING.set(block);
+    }
+    g.protected.insert_all(from..to);
+    g.clean.insert_all(from..to);
+    later.push((from, to));
+}
+
+/// After [`read_only`] of [`pend`]'s run `[from, to)`, under the lock again.
+/// A block [`open`] opened in between (notes gone, `PROTECTED` cleared) is
+/// made writable again; a run that failed (`!done`, nothing changed) is
+/// guarded block by block as before. Then the other views of its pages.
+fn protected_later(g: &mut Guards, from: usize, to: usize, done: bool) {
+    for block in from..to {
+        PENDING.clear(block);
+    }
+    #[cfg(feature = "diagnostics")]
+    {
+        use std::sync::atomic::Ordering::Relaxed;
+        LATER[0].fetch_add(1, Relaxed);
+        LATER[1].fetch_add((to - from) as u64, Relaxed);
+    }
+    if !done {
+        for block in from..to {
+            g.protected.remove(block);
+            g.clean.remove(block);
+            PROTECTED.clear(block);
+        }
+        #[cfg(feature = "diagnostics")]
+        LATER[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        protect_here(g, from, to);
+        cover(g, from, to);
+        return;
+    }
+    for block in from..to {
+        // (One a fault opened with no lock is still in the notes.)
+        if !PROTECTED.any(block, block + 1) && !g.protected.contains(block) {
+            open_block(block);
+            #[cfg(feature = "diagnostics")]
+            LATER[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
     cover(g, from, to);
 }
 
@@ -2138,36 +2237,40 @@ fn protect_alias(g: &mut Guards, block: usize) -> bool {
     false
 }
 
+/// Makes blocks `[from, to)` read-only in one call: whether it was done.
+/// Memory that was neither read-write nor read-only stays as it was.
+fn read_only(from: usize, to: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE, VirtualProtect};
+    let mut old = 0;
+    #[cfg(feature = "diagnostics")]
+    let started = std::time::Instant::now();
+    // SAFETY: title view memory; only its protection changes.
+    let mut done = unsafe {
+        VirtualProtect(
+            (from * BLOCK) as *const _,
+            (to - from) * BLOCK,
+            PAGE_READONLY,
+            &mut old,
+        ) != 0
+    };
+    if done && !matches!(old, PAGE_READWRITE | PAGE_READONLY) {
+        // What is there is not for us to guard (code, or memory the
+        // title protects itself): as it was.
+        // SAFETY: as above.
+        unsafe { VirtualProtect((from * BLOCK) as *const _, (to - from) * BLOCK, old, &mut old) };
+        done = false;
+    }
+    #[cfg(feature = "diagnostics")]
+    {
+        tally(5, (to - from) as u64);
+        tally(8, started.elapsed().as_nanos() as u64);
+    }
+    done
+}
+
 /// [`protect`] for one range, without the other views of its pages.
 fn protect_here(g: &mut Guards, from: usize, to: usize) {
-    use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE, VirtualProtect};
-    let set = |from: usize, to: usize| {
-        let mut old = 0;
-        #[cfg(feature = "diagnostics")]
-        let started = std::time::Instant::now();
-        // SAFETY: title view memory; only its protection changes.
-        let mut done = unsafe {
-            VirtualProtect(
-                (from * BLOCK) as *const _,
-                (to - from) * BLOCK,
-                PAGE_READONLY,
-                &mut old,
-            ) != 0
-        };
-        if done && !matches!(old, PAGE_READWRITE | PAGE_READONLY) {
-            // What is there is not for us to guard (code, or memory the
-            // title protects itself): as it was.
-            // SAFETY: as above.
-            unsafe { VirtualProtect((from * BLOCK) as *const _, (to - from) * BLOCK, old, &mut old) };
-            done = false;
-        }
-        #[cfg(feature = "diagnostics")]
-        {
-            tally(5, (to - from) as u64);
-            tally(8, started.elapsed().as_nanos() as u64);
-        }
-        done
-    };
+    let set = read_only;
     let note = |g: &mut Guards, from: usize, to: usize| {
         g.protected.insert_all(from..to);
         g.clean.insert_all(from..to);
@@ -4028,6 +4131,52 @@ mod tests {
         unsafe {
             UnmapViewOfFile(windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS { Value: view as *mut _ })
         };
+    }
+
+    /// A block noted guarded but not made read-only yet is told as written,
+    /// and one opened before its protection is made is writable after.
+    #[test]
+    fn a_block_opened_before_its_late_protection_is_writable_after() {
+        use windows_sys::Win32::System::Memory::{CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, UnmapViewOfFile};
+        if !protect_later() {
+            return;
+        }
+        // SAFETY: a pagefile section of a block, mapped read-write.
+        let view = unsafe {
+            let section =
+                CreateFileMappingW(-1isize as _, std::ptr::null(), PAGE_READWRITE, 0, BLOCK as u32, std::ptr::null());
+            assert!(!section.is_null());
+            MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, BLOCK)
+        };
+        let at = view.Value as usize;
+        assert_ne!(at, 0);
+        let block = at / BLOCK;
+        assert!(guard(at, at + BLOCK).is_some());
+        assert!(!writable(at), "guarded");
+        assert!(!PENDING.any(block, block + 1));
+        // SAFETY: inside the view; the handler opens it.
+        unsafe { ((at + 8) as *mut u8).write_volatile(1) };
+        let mut later = Vec::new();
+        {
+            let mut g = guards();
+            loose(&mut g, block);
+            g.protected.remove(block);
+            g.clean.remove(block);
+            PROTECTED.clear(block);
+            pend(&mut g, block, block + 1, &mut later);
+        }
+        assert_eq!(later, [(block, block + 1)]);
+        assert!(writable(at), "not read-only yet");
+        assert!(written_since_taken(at, BLOCK));
+        open(&mut guards(), at, at + 1);
+        assert!(read_only(block, block + 1));
+        protected_later(&mut guards(), block, block + 1, true);
+        assert!(writable(at), "opened in between");
+        assert!(!PENDING.any(block, block + 1));
+        assert!(!PROTECTED.any(block, block + 1));
+        title_memory_unmapping(at, BLOCK);
+        // SAFETY: our view.
+        unsafe { UnmapViewOfFile(view) };
     }
 
     /// A write fault opens a guarded block while another thread holds the
