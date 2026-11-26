@@ -139,11 +139,18 @@ pub(crate) enum C {
     ThinBarrierNs,
     ThinCopyNs,
     ThinOtherNs,
+    /// Texture bytes hashed though the guard saw no write: on the texture's
+    /// turn, and while it was due (new, verifying a change, or hot); and
+    /// the bytes of turns passed over as the texture was hashed on its turn
+    /// earlier in the frame.
+    TexHashedTurn,
+    TexHashedHot,
+    TexTurnSkipped,
 }
 const COUNTERS: usize = 80;
 
 /// The counters' names, in the order of [`C`], for the frame recorder's columns.
-pub(crate) const NAMES: [&str; 77] = [
+pub(crate) const NAMES: [&str; 80] = [
     "Submissions", "Copies", "CopyBytes", "Refreshes", "RefreshBytes", "Skipped", "SkippedBytes", "Runs",
     "RunUs", "Queries", "QueryUs", "MoveUs", "Unmapped", "Watches", "WatchUs", "Checked", "Unchanged",
     "Fallbacks", "GuardFaults", "TexWatched", "TexHashed", "TexChanged", "TexHot", "Frames", "RecordCalls",
@@ -154,7 +161,8 @@ pub(crate) const NAMES: [&str; 77] = [
     "WaitCheckNs", "HostLists", "HostListNs", "PartsTogether", "WholeUs", "CardUnder2", "Card2To8",
     "Card8To32", "CardOver32", "CardUnder2Us", "Card2To8Us", "Card8To32Us", "CardOver32Us", "NothingBack",
     "NothingBackUs", "WaitsForGroups", "WaitsForBuffers", "IndirectBounded", "ThinDrawNs", "ThinDraws",
-    "ThinSetNs", "ThinBarrierNs", "ThinCopyNs", "ThinOtherNs",
+    "ThinSetNs", "ThinBarrierNs", "ThinCopyNs", "ThinOtherNs", "TexHashedTurn", "TexHashedHot",
+    "TexTurnSkipped",
 ];
 /// One of some sets of counters, each in lines of the processor's memory of
 /// its own: a set for all threads had them wait for each other's lines at
@@ -465,7 +473,7 @@ mod command_tests {
     #[test]
     fn every_counter_is_named() {
         use super::{C, COUNTERS, NAMES};
-        assert_eq!(C::ThinOtherNs as usize + 1, NAMES.len());
+        assert_eq!(C::TexTurnSkipped as usize + 1, NAMES.len());
         assert_eq!(NAMES[C::Frames as usize], "Frames");
         assert!(NAMES.len() <= COUNTERS);
     }
