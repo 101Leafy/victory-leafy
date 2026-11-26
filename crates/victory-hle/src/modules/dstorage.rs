@@ -21,7 +21,6 @@
 #![allow(non_snake_case)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
-use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ffi::{CStr, c_char, c_void};
 use std::os::windows::fs::FileExt;
@@ -644,7 +643,19 @@ fn scheduler() -> Option<&'static Scheduler> {
             .filter(|i| {
                 std::thread::Builder::new()
                     .name(format!("dstorage {i}"))
-                    .spawn(|| work(scheduler))
+                    .spawn(|| {
+                        // Below the title's threads that record frames: a
+                        // worker per logical processor at normal priority
+                        // took the processor from them while it decoded.
+                        #[cfg(windows)]
+                        // SAFETY: a plain call on our own thread.
+                        unsafe {
+                            use windows_sys::Win32::System::Threading::*;
+                            let _ =
+                                SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+                        }
+                        work(scheduler)
+                    })
                     .is_ok()
             })
             .count();
@@ -784,6 +795,7 @@ pub(crate) mod stream_log {
 
 /// A worker: runs the next read of the most deserving queue.
 fn work(scheduler: &'static Scheduler) {
+    let mut scratch = WorkerScratch::new();
     let mut lanes = scheduler.lock();
     loop {
         let Some(job) = lanes.start() else {
@@ -794,8 +806,9 @@ fn work(scheduler: &'static Scheduler) {
         let started = std::time::Instant::now();
         let traced = Traced::start(&job);
         let reading = victory_gpu::timeline::span("streaming: a request");
-        let result = execute(&job.request);
+        let result = execute(&job.request, &mut scratch);
         reading.end();
+        scratch.trim();
         walls_request(&job.request, &result, started);
         stream_log::request(&job, started, &result);
         if let Some(traced) = traced {
@@ -1383,8 +1396,38 @@ extern "system" fn close(this: QueueRef) {
     close_lane(unsafe { &*this }.state.id);
 }
 
+/// Maximum capacity retained per scratch buffer on an idle worker after a
+/// request finishes, preventing a single oversized read from pinning memory.
+const SCRATCH_RETAIN_CAP: usize = 8 * 1024 * 1024;
+
+/// Per-worker source and intermediate buffers. Each worker in [`work`] runs
+/// one request at a time, so the buffers are reused instead of allocated and
+/// zero-filled for every request.
+struct WorkerScratch {
+    source: Vec<u8>,
+    intermediate: Vec<u8>,
+}
+
+impl WorkerScratch {
+    fn new() -> Self {
+        Self {
+            source: Vec::new(),
+            intermediate: Vec::new(),
+        }
+    }
+
+    fn trim(&mut self) {
+        if self.source.capacity() > SCRATCH_RETAIN_CAP {
+            self.source = Vec::new();
+        }
+        if self.intermediate.capacity() > SCRATCH_RETAIN_CAP {
+            self.intermediate = Vec::new();
+        }
+    }
+}
+
 /// Reads, inflates and/or unpacks, and writes one request.
-fn execute(request: &Request) -> Result<(), HRESULT> {
+fn execute(request: &Request, scratch: &mut WorkerScratch) -> Result<(), HRESULT> {
     let options = request.options;
     let fail = |hr: HRESULT, why: &str| {
         tracing::warn!(
@@ -1414,24 +1457,32 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
         }
         let size = request.source_size as usize;
         return into_destination(request, size, |out| read_into(request, out).map(|()| size))
+            .or_else(|hr| copy_through_buffer(request, size, hr))
             .map_err(|hr| fail(hr, "copying"));
     }
     let tables = if bc != 0 { Some(bcpack_tables()?) } else { None };
-    let source = read_source(request).map_err(|hr| fail(hr, "reading the source"))?;
+    let WorkerScratch {
+        source: source_buf,
+        intermediate,
+    } = scratch;
+    let source = read_source(request, source_buf).map_err(|hr| fail(hr, "reading the source"))?;
     // The console's order: zlib first, then BCPack.
     let source = if bc != 0 && options & ZLIB != 0 {
-        let mut packed = vec![0; request.intermediate_size as usize];
-        let n = inflate(&source, &mut packed).map_err(|hr| fail(hr, "zlib"))?;
-        packed.truncate(n);
-        Cow::Owned(packed)
+        let inter_size = request.intermediate_size as usize;
+        if intermediate.len() < inter_size {
+            intermediate.resize(inter_size, 0);
+        }
+        let n = inflate(source, &mut intermediate[..inter_size])
+            .map_err(|hr| fail(hr, "zlib"))?;
+        &intermediate[..n]
     } else {
         source
     };
     into_destination(request, size, |out| match tables {
-        Some(tables) => bcpack::decode(bc, &source, out, tables)
+        Some(tables) => bcpack::decode(bc, source, out, tables)
             .map(|()| out.len())
             .map_err(|e| fail(INVALID_DATA, &e.to_string())),
-        None => inflate(&source, out).map_err(|hr| fail(hr, "zlib")),
+        None => inflate(source, out).map_err(|hr| fail(hr, "zlib")),
     })?;
     tracing::trace!(
         options = format_args!("{options:#x}"),
@@ -1530,17 +1581,18 @@ fn load_bcpack_tables() -> Result<Tables, String> {
 }
 
 /// A compressed request's source: borrowed from memory, or read from the
-/// file.
-fn read_source(request: &Request) -> Result<Cow<'static, [u8]>, HRESULT> {
+/// file into the worker's reusable `scratch` buffer.
+fn read_source<'a>(request: &Request, scratch: &'a mut Vec<u8>) -> Result<&'a [u8], HRESULT> {
     let size = request.source_size as usize;
     if request.options & MEMORY_SOURCE != 0 {
         // SAFETY: the title's source holds `size` bytes until completion.
-        let bytes = unsafe { std::slice::from_raw_parts(request.source.cast(), size) };
-        return Ok(Cow::Borrowed(bytes));
+        return Ok(unsafe { std::slice::from_raw_parts(request.source.cast(), size) });
     }
-    let mut bytes = vec![0; size];
-    read_into(request, &mut bytes)?;
-    Ok(Cow::Owned(bytes))
+    if scratch.len() < size {
+        scratch.resize(size, 0);
+    }
+    read_into(request, &mut scratch[..size])?;
+    Ok(&scratch[..size])
 }
 
 /// Nanoseconds workers spent reading files, for the debug summary.
@@ -1548,6 +1600,73 @@ static READING: AtomicU64 = AtomicU64::new(0);
 
 /// How often a read the host refuses is tried again (about 0.25 s in all).
 const READ_RETRIES: u32 = 8;
+
+/// A plain read into a title address that the kernel refused because the
+/// destination was read-only when it wrote (`ERROR_INVALID_USER_BUFFER` or
+/// `ERROR_NOACCESS`): the GPU side's write guard can protect a block again
+/// between `kernel_will_write` opening it and the read landing. Read into
+/// our own buffer instead and store the bytes with plain writes, which
+/// fault into the guard's handler like the title's own. Only for committed,
+/// accessible destinations; anything else keeps the kernel's error.
+fn copy_through_buffer(request: &Request, size: usize, hr: HRESULT) -> Result<(), HRESULT> {
+    const INVALID_USER_BUFFER: u32 = 0x8007_06F8;
+    const NOACCESS: u32 = 0x8007_03E6;
+    if request.options & (PAGE_DESTINATION | MEMORY_SOURCE) != 0
+        || !matches!(hr as u32, INVALID_USER_BUFFER | NOACCESS)
+        || !committed(request.destination as usize, size)
+    {
+        return Err(hr);
+    }
+    let mut data = vec![0u8; size];
+    read_into(request, &mut data)?;
+    // SAFETY: the title's destination holds `destination_size` bytes, at
+    // least `size`, committed (checked above) and written by nothing else
+    // until completion; a guarded block faults into the guard's handler.
+    unsafe {
+        std::ptr::copy_nonoverlapping(data.as_ptr(), request.destination.cast::<u8>(), size);
+    }
+    static RETRIED: AtomicU32 = AtomicU32::new(0);
+    let n = RETRIED.fetch_add(1, Ordering::Relaxed);
+    if n.is_power_of_two() || n == 0 {
+        tracing::info!(
+            retried = n + 1,
+            offset = request.offset,
+            size,
+            hr = format_args!("{:#010x}", hr as u32),
+            "dstorage: a read the kernel refused into guarded title memory was copied through a buffer"
+        );
+    }
+    Ok(())
+}
+
+/// Whether `[at, at + len)` is committed memory that is not `PAGE_NOACCESS`
+/// or a guard page.
+fn committed(at: usize, len: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery,
+    };
+    let end = at.saturating_add(len);
+    let mut next = at;
+    while next < end {
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        let n = unsafe { VirtualQuery(next as *const _, &mut info, size_of_val(&info)) };
+        if n == 0
+            || info.State != MEM_COMMIT
+            || info.Protect & (PAGE_NOACCESS | PAGE_GUARD) != 0
+            || info.Protect == 0
+        {
+            return false;
+        }
+        let region_end = (info.BaseAddress as usize).saturating_add(info.RegionSize);
+        if region_end <= next {
+            return false;
+        }
+        next = region_end;
+    }
+    true
+}
 
 /// Fills `out` (the source size) from the request's file or memory.
 fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
@@ -2448,6 +2567,52 @@ mod tests {
         assert_eq!(seen, plain);
     }
     #[test]
+    fn a_page_list_filled_after_its_request_starts() {
+        use crate::modules::xmem;
+        let (mut given, mut page) = (1usize, [0usize; 1]);
+        assert_eq!(
+            xmem::XMemAllocatePhysicalPages(0, &mut given, page.as_mut_ptr()),
+            1
+        );
+        let mapped = xmem::XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            PAGE,
+            0x2000 | 0x2040_0000, // reserve, 64 KiB pages
+            0,
+            0x04,
+        );
+        assert!(!mapped.is_null());
+        assert_eq!(xmem::XMemMapPhysicalPages(mapped, 1, page.as_ptr()), mapped);
+
+        // The title's list, still empty when the request is submitted.
+        let list = Box::leak(Box::new([0usize; 1]));
+        let at = std::ptr::from_mut(list) as usize;
+        let plain = pattern(4096);
+        let (queue, array) = (new_queue(1), status_array(1));
+        let r = request(
+            PAGE_DESTINATION | MEMORY_SOURCE,
+            list.as_mut_ptr().cast(),
+            plain.len(),
+            plain.as_ptr().cast(),
+            0,
+            plain.len(),
+        );
+        let number = page[0];
+        let filler = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            // SAFETY: the leaked list, alive for the whole test.
+            unsafe { std::ptr::write_volatile(at as *mut usize, number) };
+        });
+        enqueue(queue, &r);
+        enqueue_status(queue, array, 0);
+        void(queue, 0x30);
+        assert_eq!(wait(array, 0), S_OK);
+        filler.join().unwrap();
+        // SAFETY: the page is mapped read-write.
+        let seen = unsafe { std::slice::from_raw_parts(mapped.cast::<u8>(), plain.len()) };
+        assert_eq!(seen, plain);
+    }
+    #[test]
     fn zlib_into_pages_in_place_and_across_allocations() {
         use crate::modules::xmem;
         let allocate = |n: usize| {
@@ -2561,5 +2726,23 @@ mod tests {
         assert_eq!(inflate(&bad_body, &mut out), Err(INVALID_DATA));
         assert_eq!(inflate(&packed, &mut out), Ok(plain.len()));
         assert_eq!(out, plain);
+    }
+
+    #[test]
+    fn worker_scratch_reuses_capacity_and_trims_outliers() {
+        let mut scratch = WorkerScratch::new();
+        scratch.source.resize(64 * 1024, 0);
+        scratch.intermediate.resize(128 * 1024, 0);
+        let src_ptr = scratch.source.as_ptr();
+        let inter_ptr = scratch.intermediate.as_ptr();
+        scratch.trim();
+        assert_eq!(scratch.source.as_ptr(), src_ptr);
+        assert_eq!(scratch.intermediate.as_ptr(), inter_ptr);
+
+        scratch.source.resize(SCRATCH_RETAIN_CAP + 4096, 0);
+        scratch.intermediate.resize(SCRATCH_RETAIN_CAP + 4096, 0);
+        scratch.trim();
+        assert_eq!(scratch.source.capacity(), 0);
+        assert_eq!(scratch.intermediate.capacity(), 0);
     }
 }

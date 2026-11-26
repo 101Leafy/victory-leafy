@@ -358,11 +358,43 @@ pub(crate) enum C {
     /// the ones the pool had none idle for.
     ReadBackPoolNs,
     ReadBacksMadeNs,
+    /// Of `FreshShared`: tables found parked, made by a list that had run
+    /// already, and their slots.
+    FreshRevived,
+    FreshRevivedSlots,
+    /// The most dynamic descriptor slots held at once in the frame, and the
+    /// most wanted: held when an ask was refused, plus the slots of the
+    /// frame's refused asks so far ([`most`], not sums).
+    DynamicHeldMost,
+    DynamicWantedMost,
+    /// Slots of refused asks, and refused asks with fewer slots free than
+    /// asked (the rest of `DynamicFull` met a longest free run too short).
+    DynamicRefusedSlots,
+    DynamicShortOfFree,
+    /// The heap pass's once-a-frame look at known holes
+    /// (`watch::look_at_holes`), whole; and inside it, the waits for the
+    /// guards' lock and the time it is held.
+    HolesNs,
+    HolesWaitNs,
+    HolesHoldNs,
+    /// Tables that found no dynamic slots and read instead a run another
+    /// list made this frame from the same records at another table
+    /// (`VICTORY_SAME_TABLES`), and their slots: draws that would have
+    /// been dropped.
+    FreshSameUsed,
+    FreshSameUsedSlots,
+    /// The batched clamps' passes on the card (`indirect::batch::Stamps`),
+    /// counted when their list is reset after it ran.
+    ClampPassNs,
+    ClampPasses,
+    /// Bytes of texture memory read for the rows a watched write touched
+    /// (`texture::Staging::detile_written`).
+    TexRowsDetiled,
 }
 const COUNTERS: usize = 256;
 
 /// The counters' names, in the order of [`C`], for the frame recorder's columns.
-pub(crate) const NAMES: [&str; 193] = [
+pub(crate) const NAMES: [&str; 207] = [
     "Submissions", "Copies", "CopyBytes", "Refreshes", "RefreshBytes", "Skipped", "SkippedBytes", "Runs",
     "RunUs", "Queries", "QueryUs", "MoveUs", "Unmapped", "Watches", "WatchUs", "Checked", "Unchanged",
     "Fallbacks", "GuardFaults", "TexWatched", "TexHashed", "TexChanged", "TexHot", "Frames", "RecordCalls",
@@ -399,6 +431,12 @@ pub(crate) const NAMES: [&str; 193] = [
     "SettleTablesNs", "SettleResultsNs", "SettleListsNs",
     "SubmitLockDoneNs", "SubmitLockSettleNs",
     "ReadBackPoolNs", "ReadBacksMadeNs",
+    "FreshRevived", "FreshRevivedSlots",
+    "DynamicHeldMost", "DynamicWantedMost", "DynamicRefusedSlots", "DynamicShortOfFree",
+    "HolesNs", "HolesWaitNs", "HolesHoldNs",
+    "FreshSameUsed", "FreshSameUsedSlots",
+    "ClampPassNs", "ClampPasses",
+    "TexRowsDetiled",
 ];
 /// One of some sets of counters, each in lines of the processor's memory of
 /// its own: a set for all threads had them wait for each other's lines at
@@ -428,6 +466,12 @@ fn bank() -> usize {
 
 pub(crate) fn add(c: C, n: u64) {
     COUNT[bank()].0[c as usize].fetch_add(n, Relaxed);
+}
+
+/// `c` becomes `n` if `n` is more: a high mark for the frame, kept in the
+/// first set only so the sum of the sets is the mark.
+pub(crate) fn most(c: C, n: u64) {
+    COUNT[0].0[c as usize].fetch_max(n, Relaxed);
 }
 
 /// The counter, all sets together, as it is now (it goes back to 0 with
@@ -714,7 +758,7 @@ mod command_tests {
     #[test]
     fn every_counter_is_named() {
         use super::{C, COUNTERS, NAMES};
-        assert_eq!(C::HeapTexUploadNs as usize + 1, NAMES.len());
+        assert_eq!(C::TexRowsDetiled as usize + 1, NAMES.len());
         assert_eq!(NAMES[C::Frames as usize], "Frames");
         assert!(NAMES.len() <= COUNTERS);
     }
@@ -1256,6 +1300,27 @@ fn log_memory() {
         mb(copies[3]),
         mb(crate::shadow::window_cover()),
         lists[3],
+    );
+    // Round 4: what makes new shapes of placed views, and what became of
+    // the views past the last shape a record can number.
+    let (past, collided, varied) = crate::descriptor::shapes_new();
+    let words: Vec<String> = varied
+        .iter()
+        .enumerate()
+        .filter(|&(_, &n)| n > 0)
+        .map(|(k, n)| match k {
+            0..14 => format!("r{k} {n}"),
+            14..24 => format!("v{} {n}", k - 14),
+            _ => format!("v{} {n}", k - 12),
+        })
+        .collect();
+    tracing::info!(
+        "memory, shapes: placed views made table entries because the shapes were full: {}; views \
+         and shapes kept by themselves because another had their digest: {}; words of new shapes \
+         that differed from the last new shape of their kind (r: resource description, v: view): {}",
+        past,
+        collided,
+        if words.is_empty() { "none".to_string() } else { words.join(", ") },
     );
 }
 
