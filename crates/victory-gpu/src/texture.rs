@@ -121,6 +121,24 @@ struct Last {
     /// every third frame, so "again" cannot mean "the next frame".
     changed_at: u64,
     verify: bool,
+    /// The frame the texture was last hashed on its turn: a turn is a
+    /// sample, and the frame's later checks pass it over.
+    turned: u64,
+}
+
+/// Counts `size` bytes hashed, by `why` (see `Staging::refresh_timed`).
+fn count_hashed(size: usize, why: u8) {
+    #[cfg(feature = "diagnostics")]
+    {
+        use crate::copystat::{C, add};
+        add(C::TexHashed, size as u64);
+        match why {
+            1 => add(C::TexHashedTurn, size as u64),
+            2 => add(C::TexHashedHot, size as u64),
+            _ => {}
+        }
+    }
+    let _ = (size, why);
 }
 
 /// How many frames a texture that keeps changing stays hashed at every
@@ -1565,6 +1583,9 @@ impl Staging {
         static GUARD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         // The guard saw no write: a change the hash finds came another way.
         let mut blind = false;
+        // Why an unwritten texture is hashed: 0 written or unguarded, 1 its
+        // turn, 2 due.
+        let mut why = 0;
         if !alone
             && *GUARD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD").is_none_or(|v| v != "0"))
             && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, true))
@@ -1582,8 +1603,18 @@ impl Staging {
                 last.started = frame + HOT_FRAMES;
             }
             let due = hot_level() >= 1 && (frame < last.started || last.hash_due(frame));
-            if unwritten && !turn && !due {
+            if unwritten && !due && (!turn || last.turned == frame) {
+                #[cfg(feature = "diagnostics")]
+                if turn {
+                    crate::copystat::add(crate::copystat::C::TexTurnSkipped, size as u64);
+                }
                 return 0;
+            }
+            if unwritten {
+                why = if due { 2 } else { 1 };
+                if !due {
+                    last.turned = frame;
+                }
             }
             blind = unwritten;
         }
@@ -1617,8 +1648,7 @@ impl Staging {
                 return 0;
             }
             last.partial = Some(frame);
-            #[cfg(feature = "diagnostics")]
-            crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
+            count_hashed(size, why);
             let changed = with_read(size, |read| {
                 crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
                 let hash = digest(read);
@@ -1644,8 +1674,7 @@ impl Staging {
         if through_copy() {
             return with_title(self.memory, size, |tiled| {
                 let hash = digest(tiled);
-                #[cfg(feature = "diagnostics")]
-                crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
+                count_hashed(size, why);
                 if last.hash == Some(hash) {
                     self.found_unchanged(last);
                     return size;
@@ -1662,8 +1691,7 @@ impl Staging {
         // stays committed while `_mapped` is held.
         let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
         let hash = digest(tiled);
-        #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
+        count_hashed(size, why);
         if last.hash == Some(hash) {
             self.found_unchanged(last);
             return size;
