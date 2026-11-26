@@ -94,6 +94,11 @@ pub const USER_ROOT_ADDRESS: u32 = 0x104;
 /// the group's width. Asked for by the structure builder's programs
 /// ([`crate::spill::is_spilled`]).
 pub const USER_DISPATCH_THREADS_X: u32 = 0x106;
+/// `RootType::Other` code of a user-data dword the host sets for each piece
+/// of a dispatch it splits: the number of the piece's first group along X,
+/// added to the group id the program reads (0 when not split). The host
+/// runs at most 65,535 groups a dimension; the console runs more.
+pub const USER_GROUP_BASE_X: u32 = 0x107;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
