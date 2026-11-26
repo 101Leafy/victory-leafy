@@ -352,7 +352,11 @@ pub(crate) fn save_read_back(
 /// (what each holds at the end of the frame; formats normalized to show
 /// structure: floats scaled by their largest value, depth by its range).
 /// The host copies are held: the title may release a target before the
-/// frame is presented.
+/// frame is presented. With `VICTORY_DUMP_VOLUMES` too, 3D textures (colour
+/// grading tables, froxel volumes) are saved as well: their slices side by
+/// side in `...-<w>x<h>x<depth>-f<format>-volume.png` (one scale for all
+/// slices), and their texels as they are, slice after slice and row after
+/// row without padding, in the `.raw` file of the same name.
 static TARGETS: std::sync::Mutex<Vec<(usize, std::sync::Arc<crate::resource::HostTexture>)>> =
     std::sync::Mutex::new(Vec::new());
 
@@ -383,7 +387,9 @@ pub(crate) fn dump_targets(frame: u64) {
         let texture = &copy.texture;
         // SAFETY: a live resource.
         let d = unsafe { texture.GetDesc() };
-        if d.SampleDesc.Count > 1 || d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D {
+        // Volumes (`VICTORY_DUMP_VOLUMES`): their slices side by side.
+        let volume = d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D && crate::switch::on("VICTORY_DUMP_VOLUMES");
+        if d.SampleDesc.Count > 1 || d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D && !volume {
             continue;
         }
         // Every submission has run; the dump's list moves it there and back.
@@ -461,6 +467,56 @@ fn dump_one(
                 (v.len(), v.into_iter().take(12).collect::<Vec<_>>())
             };
             tracing::info!(?resource, depths = ?most(depths), top_bytes = ?most(tops), "24-bit depth plane values (value, texels)");
+        }
+        if f.Depth > 1 {
+            // A volume: its slices side by side in one picture (one scale
+            // for all of them, each texel shown 2x2 since the save halves),
+            // and the slices' texels as they are in `<name>.raw` (row after
+            // row of slice after slice, no padding).
+            let texel = match f.Format.0 {
+                1..=4 => 16,
+                5..=8 => 12,
+                9..=22 => 8,
+                23..=47 | 67 | 87..=93 => 4,
+                48..=59 => 2,
+                60..=65 => 1,
+                _ => 0,
+            };
+            let (w, h, depth) = (f.Width as usize, f.Height as usize, f.Depth as usize);
+            if texel > 0 {
+                let row = w * texel;
+                let slice = pitch * h;
+                let all = std::slice::from_raw_parts(data.cast::<u8>(), slice * depth);
+                let mut mosaic = vec![0u8; row * depth * h];
+                let mut raw = Vec::with_capacity(row * h * depth);
+                for z in 0..depth {
+                    for y in 0..h {
+                        let from = &all[z * slice + y * pitch..][..row];
+                        mosaic[y * row * depth + z * row..][..row].copy_from_slice(from);
+                        raw.extend_from_slice(from);
+                    }
+                }
+                let name = format!(
+                    "frame-{frame}-{i:02}-{resource:?}-{}x{}x{depth}-f{}-volume",
+                    d.Width, d.Height, d.Format.0
+                );
+                if let Some(folder) = folder() {
+                    let _ = std::fs::write(folder.join(format!("{name}.raw")), &raw);
+                }
+                let mw = w * depth;
+                if let Some(rgba) = to_rgba(f.Format.0 as u32, mw, h, row * depth, &mosaic) {
+                    let (bw, bh) = (mw * 2, h * 2);
+                    let mut big = vec![0u8; bw * bh * 4];
+                    for y in 0..bh {
+                        for x in 0..bw {
+                            big[(y * bw + x) * 4..][..4].copy_from_slice(&rgba[((y / 2) * mw + x / 2) * 4..][..4]);
+                        }
+                    }
+                    save_as(&name, bw as u32, bh as u32, bw * 4, false, &big);
+                }
+            }
+            buffer.Unmap(0, None);
+            return;
         }
         if let Some(rgba) = to_rgba(f.Format.0 as u32, f.Width as usize, f.Height as usize, pitch, rows) {
             let name = format!(

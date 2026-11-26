@@ -59,6 +59,8 @@ pub fn run(
         victory_hle::modules::d3d12x::start_host();
     }
     let cfg = victory_core::Config::load()?;
+    victory_hle::modules::controls::configure(cfg.controls.as_ref())
+        .map_err(anyhow::Error::msg)?;
     let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
     let prepared = victory_loader::prepare(&original)?;
     let hash = prepared.original_hash.to_hex();

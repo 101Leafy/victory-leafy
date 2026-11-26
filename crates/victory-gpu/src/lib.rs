@@ -51,6 +51,8 @@ mod port_journal;
 mod land;
 pub mod list;
 pub mod object;
+#[cfg(windows)]
+pub mod overlay;
 pub mod pipeline;
 #[cfg(windows)]
 mod picked;

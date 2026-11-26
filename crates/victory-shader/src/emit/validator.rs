@@ -126,6 +126,14 @@ impl Validator {
         let mut versions: Vec<PathBuf> = std::fs::read_dir(&kits)
             .ok()?
             .filter_map(Result::ok)
+            // dxil.dll before SDK 10.0.22000.0 stops at DXIL 1.5 and crashes on 1.6 shaders.
+            .filter(|e| {
+                e.file_name()
+                    .to_str()
+                    .and_then(|s| s.split('.').nth(2))
+                    .and_then(|b| b.parse::<u32>().ok())
+                    .is_some_and(|build| build >= 22000)
+            })
             .map(|e| e.path().join(r"x64\dxil.dll"))
             .filter(|p| p.exists())
             .collect();
