@@ -4012,11 +4012,27 @@ impl State {
             let desc = unsafe { host.GetDesc() };
             Some((desc, heap.gpu_handle((start + offset * 4) / 32)))
         };
+        // Variants of the miss program bind the rays' image and the depth at
+        // other places of their tables than the one found first (run
+        // final-1: 416 of 472 dispatches had "other tables"): where the
+        // usual place has none, the first table entry of that kind that
+        // fits (a 2D R11G11B10 image; a 2D 32-bit depth at least its size).
+        let scan = |kind: ResourceType, fits: &dyn Fn(&D3D12_RESOURCE_DESC) -> bool| {
+            t.used
+                .iter()
+                .filter(|u| u.kind == kind && u.root == RootType::Table)
+                .filter_map(|u| entry(kind, (u.slot, u.table_offset_dwords)))
+                .find(|(desc, _)| fits(desc))
+        };
         let image = match role {
             Role::Resolve => entry(ResourceType::Uav, LIGHT),
             Role::Radiance => entry(ResourceType::Uav, RADIANCE),
             Role::Air => entry(ResourceType::Uav, AIR),
-            Role::Miss => entry(ResourceType::Uav, MISS_LIGHT),
+            Role::Miss => entry(ResourceType::Uav, MISS_LIGHT).or_else(|| {
+                scan(ResourceType::Uav, &|d| {
+                    d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && d.Format.0 == 26
+                })
+            }),
             // The first of the places that holds a 2D image of the format.
             Role::Reflect => REFLECTIONS.iter().find_map(|&at| {
                 entry(ResourceType::Uav, at).filter(|(d, _)| {
@@ -4050,7 +4066,7 @@ impl State {
                     DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_D32_FLOAT_S8X24_UINT, DXGI_FORMAT_R32_FLOAT,
                     DXGI_FORMAT_R32_TYPELESS, DXGI_FORMAT_R32G8X24_TYPELESS,
                 };
-                let found = entry(ResourceType::Srv, MISS_DEPTH).filter(|(seen, _)| {
+                let fits = |seen: &D3D12_RESOURCE_DESC| {
                     matches!(
                         seen.Format,
                         DXGI_FORMAT_R32_TYPELESS
@@ -4061,6 +4077,9 @@ impl State {
                     ) && seen.Width >= of.Width
                         && seen.Height >= of.Height
                         && seen.Width <= of.Width * 4
+                };
+                let found = entry(ResourceType::Srv, MISS_DEPTH).filter(|(seen, _)| fits(seen)).or_else(|| {
+                    scan(ResourceType::Srv, &|d| d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && fits(d))
                 });
                 let Some((seen, depth)) = found else {
                     once!(?role, "no stand-in for the indirect light: missing depth SRV");
