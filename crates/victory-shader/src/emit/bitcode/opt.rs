@@ -81,8 +81,6 @@ pub(crate) struct Usage {
     pub int64: bool,
     /// A typed load of several components from a UAV.
     pub typed_uav_loads: bool,
-    /// A handle annotated as a rasterizer-ordered view.
-    pub rovs: bool,
     /// A handle from the view heap.
     pub heap_views: bool,
     /// A handle from the sampler heap.
