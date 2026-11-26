@@ -74,6 +74,10 @@ pub(super) trait Work: Send {
     }
     /// Waits until a folded one is free to go.
     fn settle(_: &Self::Ask) {}
+    /// The queue has something in the line now, after nothing; and has
+    /// nothing left in it or being done.
+    fn pin(_queue: usize) {}
+    fn unpin(_queue: usize) {}
     /// Takes `next`, what its queue was given behind it, along to be done with
     /// it; or gives it back. Whether it is a submission that was taken.
     fn take_along(&mut self, next: Self) -> Result<bool, Self>
@@ -140,6 +144,9 @@ impl<W: Work> Lane<W> {
     }
 
     fn put(state: &mut State<W>, queue: usize, what: W) {
+        if state.running != Some(queue) && !state.items.iter().any(|e| e.queue == queue) {
+            W::pin(queue);
+        }
         state.presents += usize::from(what.shows());
         state.runs += usize::from(what.runs());
         let number = state.next;
@@ -321,11 +328,16 @@ impl<W: Work> Lane<W> {
             // Its parts take its place: behind everything before it, before
             // everything after it (they share its number; the first of them
             // is found first).
+            let queue = entry.queue;
             let mut state = self.lock();
             state.running = None;
             let at = state.items.iter().position(|e| e.number > entry.number).unwrap_or(state.items.len());
             Self::unfold(&mut state, at, entry);
+            let idle = !state.items.iter().any(|e| e.queue == queue);
             drop(state);
+            if idle {
+                W::unpin(queue);
+            }
             self.moved.notify_all();
             return true;
         }
@@ -360,12 +372,17 @@ impl<W: Work> Lane<W> {
                 }
             }
         }
+        let queue = entry.queue;
         entry.what.go(forced);
-        {
+        let idle = {
             let mut state = self.lock();
             state.running = None;
             state.presents -= usize::from(shows);
             state.runs -= runs;
+            !state.items.iter().any(|e| e.queue == queue)
+        };
+        if idle {
+            W::unpin(queue);
         }
         self.moved.notify_all();
         true
@@ -408,6 +425,19 @@ enum Ask {
 
 impl Work for Job {
     type Ask = Ask;
+
+    // The queue is kept while the line has its work.
+    fn pin(queue: usize) {
+        if queue != 0 {
+            crate::object::add_ref(queue as This);
+        }
+    }
+
+    fn unpin(queue: usize) {
+        if queue != 0 {
+            super::release(queue as This);
+        }
+    }
 
     fn ask(&self) -> Option<Ask> {
         match self {
