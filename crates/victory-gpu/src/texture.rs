@@ -105,7 +105,7 @@ struct Last {
     asked: u64,
     /// The frame a partly mapped texture was last read in.
     partial: Option<u64>,
-    /// Until this frame a guarded texture is hashed at every check from its
+    /// Until this frame a guarded texture is hashed once a frame from its
     /// first check on, for the ones written behind the guard from the start
     /// (the six-star screen of the first seconds, which the hash never
     /// caught changing). 0: not checked under the guard yet.
@@ -121,8 +121,8 @@ struct Last {
     /// every third frame, so "again" cannot mean "the next frame".
     changed_at: u64,
     verify: bool,
-    /// The frame the texture was last hashed on its turn: a turn is a
-    /// sample, and the frame's later checks pass it over.
+    /// The frame the texture was last hashed on its turn or in its first
+    /// frames: either is a sample, and the frame's later checks pass it over.
     turned: u64,
 }
 
@@ -135,6 +135,10 @@ fn count_hashed(size: usize, why: u8) {
         match why {
             1 => add(C::TexHashedTurn, size as u64),
             2 => add(C::TexHashedHot, size as u64),
+            3 => {
+                add(C::TexHashedHot, size as u64);
+                add(C::TexHashedFirst, size as u64);
+            }
             _ => {}
         }
     }
@@ -142,7 +146,8 @@ fn count_hashed(size: usize, why: u8) {
 }
 
 /// How many frames a texture that keeps changing stays hashed at every
-/// check after its last change, and a guarded texture from its first check.
+/// check after its last change, and a guarded texture once a frame from its
+/// first check.
 const HOT_FRAMES: u64 = 64;
 /// How long after a change the next check still counts as "again".
 const VERIFY_FRAMES: u64 = 24;
@@ -188,8 +193,9 @@ impl Last {
 /// late and in turns: the boot logo video and the loading animation
 /// flickered between old and new pictures (fx-flicker run 1441). 0: on its
 /// turns only (every eighth frame), as before; 1: hashed at every check
-/// for its first frames ([`HOT_FRAMES`]), after a change the guard did not
-/// see, and while it keeps changing ([`Last::hash_due`]); 2 (default): as
+/// after a change the guard did not see and while it keeps changing
+/// ([`Last::hash_due`]), and once a frame for its first frames
+/// ([`HOT_FRAMES`], [`first_once`]); 2 (default): as
 /// 1, a check in the frame right after a change does not end the
 /// verifying, and while the next check may hash the texture every list
 /// that samples it records the copy into its host texture.
@@ -200,6 +206,18 @@ fn hot_level() -> u8 {
         Some(v) if v == "1" => 1,
         _ => 2,
     })
+}
+
+/// Whether a texture in its first frames, not changing, is hashed once a
+/// frame rather than at every check (`VICTORY_TEXTURE_FIRST_ONCE=0`, as
+/// before). Every texture streamed in has these frames, and each list that
+/// samples one checked it: 100-158 MB a frame hashed while due against
+/// 18-48 MB changed in the first gameplay seconds of run play-b, up to
+/// 50 ms of texture time a frame. A change made after the frame's hash is
+/// found by the next frame's.
+fn first_once() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_FIRST_ONCE").is_none_or(|v| v != "0"))
 }
 
 // SAFETY: the staging mapping is written only at submission, under
@@ -1584,7 +1602,7 @@ impl Staging {
         // The guard saw no write: a change the hash finds came another way.
         let mut blind = false;
         // Why an unwritten texture is hashed: 0 written or unguarded, 1 its
-        // turn, 2 due.
+        // turn, 2 due, 3 in its first frames only.
         let mut why = 0;
         if !alone
             && *GUARD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD").is_none_or(|v| v != "0"))
@@ -1602,17 +1620,28 @@ impl Staging {
             if last.started == 0 {
                 last.started = frame + HOT_FRAMES;
             }
-            let due = hot_level() >= 1 && (frame < last.started || last.hash_due(frame));
+            let first = frame < last.started && !last.hash_due(frame);
+            let mut due = hot_level() >= 1 && (frame < last.started || last.hash_due(frame));
+            let passed = due && first && last.turned == frame && first_once();
+            if passed {
+                due = false;
+            }
             if unwritten && !due && (!turn || last.turned == frame) {
                 #[cfg(feature = "diagnostics")]
-                if turn {
+                if passed {
+                    crate::copystat::add(crate::copystat::C::TexFirstSkipped, size as u64);
+                } else if turn {
                     crate::copystat::add(crate::copystat::C::TexTurnSkipped, size as u64);
                 }
                 return 0;
             }
             if unwritten {
-                why = if due { 2 } else { 1 };
-                if !due {
+                why = match (due, first) {
+                    (false, _) => 1,
+                    (true, false) => 2,
+                    (true, true) => 3,
+                };
+                if !due || first {
                     last.turned = frame;
                 }
             }
