@@ -390,11 +390,20 @@ pub(crate) enum C {
     /// Bytes of texture memory read for the rows a watched write touched
     /// (`texture::Staging::detile_written`).
     TexRowsDetiled,
+    /// Unordered views of textures the title placed itself that the device
+    /// refused, left null (`descriptor::host`'s placed arm).
+    PlacedUavRefused,
+    /// Inside `HeapTexLoopNs`: making the due slots' views
+    /// (`HostHeap::mirror`), finding their host textures, and the
+    /// fingerprints taken after an upload for the looks that follow.
+    HeapTexMirrorNs,
+    HeapTexHostNs,
+    HeapTexPrintNs,
 }
 const COUNTERS: usize = 256;
 
 /// The counters' names, in the order of [`C`], for the frame recorder's columns.
-pub(crate) const NAMES: [&str; 207] = [
+pub(crate) const NAMES: [&str; 211] = [
     "Submissions", "Copies", "CopyBytes", "Refreshes", "RefreshBytes", "Skipped", "SkippedBytes", "Runs",
     "RunUs", "Queries", "QueryUs", "MoveUs", "Unmapped", "Watches", "WatchUs", "Checked", "Unchanged",
     "Fallbacks", "GuardFaults", "TexWatched", "TexHashed", "TexChanged", "TexHot", "Frames", "RecordCalls",
@@ -436,7 +445,8 @@ pub(crate) const NAMES: [&str; 207] = [
     "HolesNs", "HolesWaitNs", "HolesHoldNs",
     "FreshSameUsed", "FreshSameUsedSlots",
     "ClampPassNs", "ClampPasses",
-    "TexRowsDetiled",
+    "TexRowsDetiled", "PlacedUavRefused",
+    "HeapTexMirrorNs", "HeapTexHostNs", "HeapTexPrintNs",
 ];
 /// One of some sets of counters, each in lines of the processor's memory of
 /// its own: a set for all threads had them wait for each other's lines at
@@ -758,7 +768,7 @@ mod command_tests {
     #[test]
     fn every_counter_is_named() {
         use super::{C, COUNTERS, NAMES};
-        assert_eq!(C::TexRowsDetiled as usize + 1, NAMES.len());
+        assert_eq!(C::HeapTexPrintNs as usize + 1, NAMES.len());
         assert_eq!(NAMES[C::Frames as usize], "Frames");
         assert!(NAMES.len() <= COUNTERS);
     }
