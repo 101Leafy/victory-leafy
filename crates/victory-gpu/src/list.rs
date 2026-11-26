@@ -1853,6 +1853,12 @@ extern "system" fn clear_dsv(
     #[cfg(windows)]
     {
         use windows::Win32::Graphics::Direct3D12::D3D12_CLEAR_FLAGS;
+        // The bits above 1 are the console's own; the host rejects a clear
+        // left with no flags, which can lose the list.
+        let flags = flags as i32 & 3;
+        if flags == 0 {
+            return;
+        }
         let (Some(list), Some(record)) = (host_list(this), crate::descriptor::dsv_record(handle))
         else {
             return;
@@ -1879,7 +1885,7 @@ extern "system" fn clear_dsv(
         // SAFETY: an open list, a fresh view of a live texture.
         unsafe {
             list.list
-                .ClearDepthStencilView(dsv, D3D12_CLEAR_FLAGS(flags as i32 & 3), depth, stencil, rects)
+                .ClearDepthStencilView(dsv, D3D12_CLEAR_FLAGS(flags), depth, stencil, rects)
         };
     }
     #[cfg(not(windows))]
