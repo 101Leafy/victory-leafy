@@ -1373,16 +1373,6 @@ impl State {
         crate::draw::depth_bounds(list, min, max);
     }
 
-    /// The host list's pipeline, root signatures and heaps were set by
-    /// code of ours between the title's calls (the AMD upscaler stand-in,
-    /// `crate::list::stretch_texture`): the next draw or dispatch sets the
-    /// title's again (`bind`).
-    pub(crate) fn forget_host_bindings(&mut self) {
-        self.host_pipeline = 0;
-        self.host_roots = [0; 2];
-        self.host_heaps = [0; 2];
-    }
-
     /// `list` is a new host list that continues the title's list (it was
     /// cut at a wait for a memory value, `crate::list::cut`): a new host
     /// list has nothing set, so what the title set so far is set again.
