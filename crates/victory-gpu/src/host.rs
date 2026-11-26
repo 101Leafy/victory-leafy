@@ -57,6 +57,11 @@ pub(crate) struct Host {
     /// The adapter the device is on, for its memory budget
     /// ([`Host::video_memory`]); `None` if the system does not name it.
     adapter: Option<IDXGIAdapter3>,
+    /// Heaps of one null view and one sampler, bound where a list has no
+    /// heap of that kind: root signatures that index the heaps directly
+    /// need both set ([`Host::fallback_view_heap`]).
+    fallback_view: OnceLock<Option<ID3D12DescriptorHeap>>,
+    fallback_sampler: OnceLock<Option<ID3D12DescriptorHeap>>,
 }
 
 // SAFETY: D3D12 devices, queues, fences and descriptor heaps are
@@ -368,7 +373,11 @@ pub(crate) fn keep_freed() -> bool {
 /// when free physical RAM is low. Never returns less than 2,000 ms.
 /// With plenty of it five minutes ([`keep_freed`]).
 pub(crate) fn ram_idle_ms(avail_phys: Option<u64>) -> u64 {
-    ram_idle_for(avail_phys, keep_freed())
+    let effective = match (avail_phys, crate::residency::headroom()) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    };
+    ram_idle_for(effective, keep_freed() && !crate::residency::limited_host_ram())
 }
 
 fn ram_idle_for(avail_phys: Option<u64>, keep: bool) -> u64 {
@@ -432,6 +441,10 @@ fn sweep() {
     }
     #[cfg(feature = "diagnostics")]
     crate::book::check();
+    crate::residency::refresh();
+    if crate::residency::pressured() {
+        trim_spare_chunks();
+    }
     crate::pool::room(host().and_then(|h| h.video_memory()));
     crate::pipeline::trim_library();
     crate::shadow::let_go_idle();
@@ -484,7 +497,23 @@ pub(crate) fn retire_resource(object: ID3D12Resource) {
 /// recorded and not yet sent may name them. `VICTORY_BURY_LAG=0`: not.
 fn bury_lag() -> u64 {
     static LAG: OnceLock<u64> = OnceLock::new();
-    *LAG.get_or_init(|| std::env::var("VICTORY_BURY_LAG").ok().and_then(|v| v.parse().ok()).unwrap_or(64))
+    *LAG.get_or_init(|| {
+        let default = if crate::residency::limited_host_ram() { 16 } else { 64 };
+        std::env::var("VICTORY_BURY_LAG").ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    })
+}
+
+/// Whether a flight's lists give their dynamic descriptor slots back when
+/// it lands, as a submission that is waited for does
+/// ([`crate::list::tables_done`]), and not when the lists are reset
+/// [`bury_lag`] landings later (`VICTORY_TABLES_AT_LANDING=0`: then). Held
+/// for 64 landings, the binocular zoom ran the slots out with 4,200 to
+/// 4,600 asks a frame refused and a third of its draws gone (codec_d,
+/// pareto-residency f4b48ad76). The card has read the slots by then; the
+/// objects they name still wait for the bury.
+pub(crate) fn tables_at_landing() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_TABLES_AT_LANDING").map_or(true, |v| v.trim() != "0"))
 }
 
 /// Drops what waited for submissions up to `finished` ([`bury_lag`]). The
@@ -987,6 +1016,8 @@ fn create() -> windows::core::Result<Host> {
             next_rtv: AtomicU32::new(0),
             presenter: Mutex::new(None),
             adapter,
+            fallback_view: OnceLock::new(),
+            fallback_sampler: OnceLock::new(),
         })
     }
 }
@@ -1935,7 +1966,12 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
         let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
         for (chunk, size) in chunks {
             let back = if scratch_pool() {
-                spare.give(chunk, size, if keep_freed() { SPARE_KEPT } else { SPARE_MOST })
+                let limit = if keep_freed() && !crate::residency::limited_host_ram() {
+                    SPARE_KEPT
+                } else {
+                    SPARE_MOST
+                };
+                spare.give(chunk, size, limit)
             } else {
                 Some(chunk)
             };
@@ -1953,6 +1989,25 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
         }
     }
     // Freed outside the lock.
+    drop(freed);
+}
+
+/// Drops spare scratch chunks kept idle when host memory is pressured.
+fn trim_spare_chunks() {
+    let freed: Vec<(Chunk, u64)> = {
+        let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+        if spare.kept.is_empty() {
+            return;
+        }
+        spare.bytes = 0;
+        std::mem::take(&mut spare.kept)
+    };
+    let count = freed.len() as u64;
+    let bytes: u64 = freed.iter().map(|(_, s)| *s).sum();
+    ALIVE[1].fetch_sub(count, Ordering::Relaxed);
+    ALIVE[2].fetch_sub(bytes, Ordering::Relaxed);
+    ALIVE[3].fetch_sub(count, Ordering::Relaxed);
+    ALIVE[4].fetch_sub(bytes, Ordering::Relaxed);
     drop(freed);
 }
 
@@ -2662,6 +2717,10 @@ struct Line {
     in_hand: Vec<(usize, crate::queue::Written, usize)>,
     /// With [`card_steps`]: what the flights being landed write.
     landing: Vec<card_steps::Writer>,
+    /// With [`relay`]: things of the line landed so far, and how many the
+    /// landing under way took ([`settle_unlocked`]).
+    landed_items: u64,
+    taking: u64,
 }
 
 // SAFETY: D3D12 objects (free-threaded) and host lists nothing records
@@ -2678,6 +2737,8 @@ static LINE: Mutex<Line> = Mutex::new(Line {
     landed: Vec::new(),
     in_hand: Vec::new(),
     landing: Vec::new(),
+    landed_items: 0,
+    taking: 0,
 });
 /// Told when a flight joins [`LINE`] or it is poked.
 static LINE_MOVED: std::sync::Condvar = std::sync::Condvar::new();
@@ -3027,7 +3088,12 @@ fn stale_under_flights(runs: &[&HostList]) -> Vec<(std::sync::Arc<crate::shadow:
         // title's ring of constants come here too, which were waited for
         // before: hundreds of short runs each, at about 1.5 us a run.
         let mut runs_left = if card_steps::stage() > 0 { 4096 } else { 512 };
-        spans.retain(|(shadow, from, to)| shadow.merge_under_writes(*from, *to - *from, &mut runs_left));
+        let busy: Vec<Vec<(usize, usize)>> = spans.iter().map(|(shadow, from, to)| shadow.busy(*from, *to - *from)).collect();
+        let asked = crate::shadow::Writes::ask(
+            spans.iter().zip(&busy).filter(|((shadow, ..), _)| !shadow.unwatched()).flat_map(|(_, b)| b.iter().copied()).collect(),
+        );
+        let mut busy = busy.into_iter();
+        spans.retain(|(shadow, ..)| shadow.merge_under_writes(busy.next().unwrap_or_default(), &asked, &mut runs_left));
         return spans;
     }
     spans.retain(|(shadow, from, to)| shadow.stale_under_writes(*from, *to - *from));
@@ -3195,8 +3261,30 @@ pub(crate) fn settle_now(why: usize) {
     let Some(host) = host() else {
         return;
     };
+    if relay() && settle_unlocked() {
+        let mark = {
+            let line = line();
+            line.landed_items + line.taking + line.line.len() as u64
+        };
+        relay_wait(why, |line| line.landed_items >= mark);
+        return;
+    }
     let mut submitted = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+    let held = std::time::Instant::now();
     host.settle(&mut submitted, why);
+    crate::copystat::lap(crate::copystat::C::SubmitLockSettleNs, held);
+}
+
+/// `VICTORY_SETTLE_UNLOCKED=1` (off by default), with [`relay`]: a
+/// [`settle_now`] waits until what was in the line when it was called has
+/// landed, without the submission lock, so the submitting thread goes on
+/// meanwhile. Under the lock it waited for the line to empty, and for the
+/// submissions of other threads that held the lock first; the title cannot
+/// count on those being done anyway, as nothing orders them before the
+/// present or fence wait that settles.
+fn settle_unlocked() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SETTLE_UNLOCKED").is_some_and(|v| v == "1"))
 }
 
 /// [`settle_now`] at a present, and for a fence the title blocks on.
@@ -3210,7 +3298,9 @@ pub(crate) fn settle_for_fence() {
 /// lists give theirs back as they land. Counted with the settles for too
 /// much in the air, which it is.
 pub(crate) fn settle_for_tables() {
+    let began = std::time::Instant::now();
     settle_now(WHY_MOST);
+    crate::copystat::lap(crate::copystat::C::SettleTablesNs, began);
 }
 
 /// Resets the host lists of settled flights and keeps them for reuse, as
@@ -3280,7 +3370,9 @@ fn late_helper() {
             if line().target != target {
                 continue;
             }
+            let held = std::time::Instant::now();
             host.settle(&mut submitted, WHY_CARD_DONE);
+            crate::copystat::lap(crate::copystat::C::SubmitLockDoneNs, held);
         }
         land();
         crate::queue::release_held(false);
@@ -3410,6 +3502,7 @@ fn relay_worker() {
                 }
                 line.settling = true;
                 let items: Vec<Late> = line.line.drain(..n).collect();
+                line.taking = n as u64;
                 line.in_hand = items
                     .iter()
                     .filter_map(|l| match l {
@@ -3639,10 +3732,11 @@ fn late_line(frames: f64) {
     #[cfg(feature = "diagnostics")]
     log_blame(frames);
     if late_exact() {
-        let [pages, runs, bytes] = crate::shadow::merged_stats().map(|n| n as f64 / frames);
+        let [pages, runs, bytes, current, asked, alone] = crate::shadow::merged_stats().map(|n| n as f64 / frames);
         tracing::info!(
             "title bytes put in under flights' shader writes per frame (VICTORY_LATE_WAIT=2): {pages:.0} pages looked at, \
-             {runs:.0} changed runs, {:.2} MB",
+             {runs:.0} changed runs, {:.2} MB; {current:.0} pages not looked at, put in after the title's last write; \
+             {asked:.0} ranges asked for all copies at once, {alone:.0} asked again on their own",
             bytes / (1 << 20) as f64
         );
     }
@@ -4286,6 +4380,8 @@ impl Host {
                     // pass: a wait between each copy and its pass had the
                     // card do them one after the other.
                     let mut sent = Vec::new();
+                    // A buffer twice in `dirty` is moved out of COPY_DEST once.
+                    let mut transitioned = Vec::new();
                     if let Some(own) = &own {
                         own.record(self, list, &dirty, |shadow| looks.as_ref().is_some_and(|l| l.hold(shadow)));
                     }
@@ -4304,11 +4400,15 @@ impl Host {
                         #[cfg(feature = "diagnostics")]
                         traffic::moved(traffic::UP, shadow.span(), ranges.iter().copied());
                         if own.is_none() && before.is_some() && !ranges.is_empty() {
-                            sent.push(transition(
-                                &shadow.buffer,
-                                D3D12_RESOURCE_STATE_COPY_DEST,
-                                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-                            ));
+                            let raw = shadow.buffer.as_raw();
+                            if !transitioned.contains(&raw) {
+                                transitioned.push(raw);
+                                sent.push(transition(
+                                    &shadow.buffer,
+                                    D3D12_RESOURCE_STATE_COPY_DEST,
+                                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                ));
+                            }
                         }
                     }
                     if !sent.is_empty() {
@@ -4879,7 +4979,7 @@ impl Host {
         let mut telling = std::time::Instant::now();
         for item in items {
             telling = match item {
-                Late::Run(flight) => {
+                Late::Run(mut flight) => {
                     last = flight.number;
                     for &i in &flight.order {
                         read_backs(flight.lists[i].host());
@@ -4889,6 +4989,11 @@ impl Host {
                     }
                     if let Some(own) = flight.own {
                         own.landed();
+                    }
+                    if tables_at_landing() {
+                        for list in &mut flight.lists {
+                            list.release_tables();
+                        }
                     }
                     landed.push((flight.lists, flight.order));
                     crate::land::spent(crate::land::stat::READ_BACKS, telling)
@@ -4922,9 +5027,12 @@ impl Host {
                 landed: kept,
                 in_hand,
                 landing,
+                landed_items,
+                taking,
                 ..
             } = &mut *line;
             kept.extend(landed);
+            *landed_items += std::mem::take(taking);
             in_hand.clear();
             landing.clear();
             // What is still in the air, from the flights that are.
@@ -5092,6 +5200,13 @@ impl Host {
         let _ = self.submit(runs, &[], false);
     }
 
+    /// [`Host::execute`] of a closed upload-only list of our own, without
+    /// waiting for the title's queues (`queue::before_sync`): safe from
+    /// `VICTORY_THIN=1` recording threads.
+    pub(crate) fn execute_sync_internal(&self, list: &HostList) {
+        let _ = self.submit(&[list], &[], false);
+    }
+
     /// A queue's submission with [`late`]: the host lists `lists`, taken
     /// from the title's, go to the card in `order` and are not waited for.
     /// They join the line of flights and are settled, with the others in
@@ -5173,9 +5288,13 @@ impl Host {
             self.settle(&mut submitted, WHY_READ);
         } else if most && relay_exact() {
             // Until there are fewer, not until there are none.
+            let began = std::time::Instant::now();
             relay_wait(WHY_MOST, |line| line.lists < late_most());
+            crate::copystat::lap(crate::copystat::C::SettleListsNs, began);
         } else if most {
+            let began = std::time::Instant::now();
             self.settle(&mut submitted, WHY_MOST);
+            crate::copystat::lap(crate::copystat::C::SettleListsNs, began);
         } else {
             LINE_MOVED.notify_one();
         }
@@ -5349,13 +5468,18 @@ impl Host {
             let mut landed = Vec::new();
             for item in items {
                 match item {
-                    Late::Run(flight) => {
+                    Late::Run(mut flight) => {
                         last = flight.number;
                         for &i in &flight.order {
                             read_backs(flight.lists[i].host());
                         }
                         if let Some(card) = flight.card {
                             self.card_done(card);
+                        }
+                        if tables_at_landing() {
+                            for list in &mut flight.lists {
+                                list.release_tables();
+                            }
                         }
                         landed.push((flight.lists, flight.order));
                     }
@@ -5625,6 +5749,7 @@ impl Host {
             let settling = std::time::Instant::now();
             self.settle(&mut submitted, WHY_MOST);
             settled += settling.elapsed();
+            crate::copystat::lap(crate::copystat::C::SettleResultsNs, settling);
         }
         // What shaders may write through views they pick: last, so that no
         // refresh of this submission leaves it alone.
@@ -6274,6 +6399,12 @@ impl HostList {
     /// See [`HostList::changed_something`].
     pub(crate) fn epoch(&self) -> u64 {
         self.epoch.load(Ordering::Relaxed)
+    }
+
+    /// Whether steps or texture state changes were recorded since the list
+    /// was made or last reset.
+    pub(crate) fn has_recorded_work(&self) -> bool {
+        !self.deferred().copies.is_empty() || !self.states.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
     }
 
     /// Moves a title texture's host copy to `wanted` (a host state) in this
@@ -8522,10 +8653,18 @@ impl Host {
         /// Buffers up to this size are kept: up to 16 MiB rounded up to a
         /// power of two from 64 KiB, larger ones to a multiple of 8 MiB.
         const LARGEST: u64 = 256 << 20;
-        const KEPT: usize = 48;
         const KEPT_BYTES: u64 = 1 << 30;
         static POOL: Mutex<Vec<(u64, ID3D12Resource)>> = Mutex::new(Vec::new());
         static ON: OnceLock<bool> = OnceLock::new();
+        // How many are kept; with `VICTORY_READ_BACK_KEEP=<n>` more (play-g:
+        // with 48, each frame made about 11 while lists in the air held the
+        // kept ones, slower as the run went on), and the pool's lock is not
+        // held while one is made.
+        static KEEP: OnceLock<Option<usize>> = OnceLock::new();
+        let keep = *KEEP.get_or_init(|| {
+            std::env::var("VICTORY_READ_BACK_KEEP").ok().and_then(|v| v.parse().ok()).filter(|&n: &usize| n > 0).map(|n| n.min(4096))
+        });
+        let kept = keep.unwrap_or(48);
         // SAFETY: a live buffer of the pool's; the count before the
         // reference taken here tells whether anyone else holds it, and only
         // the pool hands it out, under its lock.
@@ -8541,7 +8680,11 @@ impl Host {
             0..=0x100_0000 => size.max(64 << 10).next_power_of_two(),
             _ => size.next_multiple_of(8 << 20),
         };
-        let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+        #[cfg(feature = "diagnostics")]
+        let started = std::time::Instant::now();
+        let pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::ReadBackPoolNs, started.elapsed().as_nanos() as u64);
         if pooled
             && let Some((_, buffer)) = pool.iter().find(|(kept, buffer)| *kept == size && idle(buffer))
         {
@@ -8554,6 +8697,14 @@ impl Host {
             crate::copystat::add(crate::copystat::C::ReadBacksMade, 1);
             crate::copystat::add(crate::copystat::C::ReadBacksMadeBytes, size);
         }
+        let mut pool = if keep.is_some() {
+            drop(pool);
+            None
+        } else {
+            Some(pool)
+        };
+        #[cfg(feature = "diagnostics")]
+        let making = std::time::Instant::now();
         let heap = D3D12_HEAP_PROPERTIES {
             Type: D3D12_HEAP_TYPE_READBACK,
             ..Default::default()
@@ -8583,11 +8734,14 @@ impl Host {
                 &mut buffer,
             )
         };
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::ReadBacksMadeNs, making.elapsed().as_nanos() as u64);
         match made {
             Ok(()) => {
                 if pooled && let Some(buffer) = &buffer {
+                    let mut pool = pool.take().unwrap_or_else(|| POOL.lock().unwrap_or_else(|e| e.into_inner()));
                     let full = |pool: &Vec<(u64, ID3D12Resource)>| {
-                        pool.len() >= KEPT || pool.iter().map(|(kept, _)| kept).sum::<u64>() + size > KEPT_BYTES
+                        pool.len() >= kept || pool.iter().map(|(kept, _)| kept).sum::<u64>() + size > KEPT_BYTES
                     };
                     while full(&pool) {
                         let Some(i) = pool.iter().position(|(_, b)| idle(b)) else {
@@ -8656,6 +8810,7 @@ impl Host {
         match made {
             Ok(()) => Some((buffer?, data.cast())),
             Err(e) => {
+                crate::residency::allocation_error(&e);
                 tracing::warn!(error = %e, size, "no upload buffer");
                 None
             }
@@ -8689,6 +8844,9 @@ struct Presenter {
     ahead: Vec<(HostList, u64)>,
     hwnd: HWND,
     meter: Meter,
+    /// Puts a present's two planes together ([`crate::compose`]); made at
+    /// the first present of two.
+    composer: Option<crate::compose::Composer>,
     #[cfg(feature = "diagnostics")]
     panel: panel::Panel,
     #[cfg(feature = "diagnostics")]
@@ -9039,14 +9197,39 @@ impl Meter {
 
 impl Host {
     /// Shows `texture`, which is in `state` (a host state) and stays in it,
-    /// as frame `frame` (saved if captures are on). `None` if nothing was
-    /// shown; else, in diagnostics builds, whether the frame was black.
-    pub(crate) fn present(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
+    /// as frame `frame` (saved if captures are on), with `overlay`, in its
+    /// own host state (which it stays in), put over it ([`crate::compose`]).
+    /// Planes the composer cannot read, or no composer: `texture` alone.
+    /// `None` if nothing was shown; else, in diagnostics builds, whether the
+    /// frame was black.
+    pub(crate) fn present_planes(
+        &self,
+        texture: &ID3D12Resource,
+        state: u32,
+        overlay: Option<(&ID3D12Resource, u32)>,
+        frame: u64,
+    ) -> Option<bool> {
+        static NO_COMPOSER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };
-        let Some(format) = swap_format(desc.Format) else {
-            tracing::warn!(format = desc.Format.0, "cannot present this format");
-            return None;
+        let planes = overlay.filter(|_| !NO_COMPOSER.load(Ordering::Relaxed)).and_then(|(over, over_state)| {
+            // SAFETY: a live resource.
+            let over_desc = unsafe { over.GetDesc() };
+            Some((
+                over,
+                D3D12_RESOURCE_STATES(over_state as i32),
+                crate::compose::view(&desc)?,
+                crate::compose::view(&over_desc)?,
+            ))
+        });
+        let format = if planes.is_some() {
+            DXGI_FORMAT_R8G8B8A8_UNORM
+        } else {
+            let Some(format) = swap_format(desc.Format) else {
+                tracing::warn!(format = desc.Format.0, "cannot present this format");
+                return None;
+            };
+            format
         };
         let (width, height) = (desc.Width as u32, desc.Height);
         let mut presenter = self.presenter.lock().unwrap_or_else(|e| e.into_inner());
@@ -9060,6 +9243,20 @@ impl Host {
             };
         }
         let p = presenter.as_mut()?;
+        if planes.is_some() && p.composer.is_none() {
+            match crate::compose::Composer::new(self, format) {
+                Ok(composer) => {
+                    tracing::info!(frame, width, height, "presents of two planes are put together");
+                    p.composer = Some(composer);
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "no composer for two planes; the first is shown alone");
+                    NO_COMPOSER.store(true, Ordering::Relaxed);
+                    drop(presenter);
+                    return self.present_planes(texture, state, None, frame);
+                }
+            }
+        }
         if (p.width, p.height, p.format) != (width, height, format) {
             // Presents sent ahead hold back buffers until they have run.
             settle_now(WHY_SYNC);
@@ -9117,35 +9314,85 @@ impl Host {
             };
             copy.reset();
             let list = &copy.list;
-            list.ResourceBarrier(&[
-                transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE),
-                transition(
-                    &back,
-                    D3D12_RESOURCE_STATE_PRESENT,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                ),
-            ]);
-            list.CopyResource(&back, texture);
+            let composed = match (planes, p.composer.as_mut()) {
+                (Some((over, over_state, base_view, over_view)), Some(composer)) => {
+                    const READ: D3D12_RESOURCE_STATES = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+                    copy.keep(texture);
+                    copy.keep(over);
+                    let moves = |to_read: bool, back_from: D3D12_RESOURCE_STATES, back_to: D3D12_RESOURCE_STATES| {
+                        let mut moves = Vec::with_capacity(3);
+                        for (plane, at) in [(texture, state), (over, over_state)] {
+                            if at != READ {
+                                moves.push(if to_read { transition(plane, at, READ) } else { transition(plane, READ, at) });
+                            }
+                        }
+                        moves.push(transition(&back, back_from, back_to));
+                        moves
+                    };
+                    list.ResourceBarrier(&moves(true, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET));
+                    let views = slot.map_or(0, |i| i + 1);
+                    match composer.record(self, views, list, [(texture, base_view), (over, over_view)], &back, (width, height)) {
+                        Ok(()) => {
+                            list.ResourceBarrier(&moves(false, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_DEST));
+                            true
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "two planes not put together; the first is shown alone");
+                            list.ResourceBarrier(&moves(false, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT));
+                            false
+                        }
+                    }
+                }
+                _ => false,
+            };
+            if !composed {
+                list.ResourceBarrier(&[
+                    transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                    transition(
+                        &back,
+                        D3D12_RESOURCE_STATE_PRESENT,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                    ),
+                ]);
+                list.CopyResource(&back, texture);
+            }
+            // (A frame put together is read from the back buffer.)
             #[cfg(feature = "diagnostics")]
             let capture = crate::capture::wanted(frame)
-                .then(|| crate::capture::read_back(&self.device, list, texture))
+                .then(|| {
+                    if !composed {
+                        return crate::capture::read_back(&self.device, list, texture);
+                    }
+                    list.ResourceBarrier(&[transition(&back, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                    let read = crate::capture::read_back(&self.device, list, &back);
+                    list.ResourceBarrier(&[transition(&back, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST)]);
+                    read
+                })
                 .flatten();
             #[cfg(feature = "diagnostics")]
-            let probe = if slot.is_some() { None } else { crate::capture::probe(&self.device, list, texture) };
+            let probe = if slot.is_some() || composed { None } else { crate::capture::probe(&self.device, list, texture) };
             #[cfg(feature = "diagnostics")]
-            let watched = crate::popwatch::take(&self.device, list, texture);
+            let watched = if composed { None } else { crate::popwatch::take(&self.device, list, texture) };
             #[cfg(feature = "diagnostics")]
             p.panel.draw(self, copy, &back, (width, height), format);
             #[cfg(not(feature = "diagnostics"))]
             let _ = frame;
-            list.ResourceBarrier(&[
-                transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state),
-                transition(
+            if composed {
+                list.ResourceBarrier(&[transition(
                     &back,
                     D3D12_RESOURCE_STATE_COPY_DEST,
                     D3D12_RESOURCE_STATE_PRESENT,
-                ),
-            ]);
+                )]);
+            } else {
+                list.ResourceBarrier(&[
+                    transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state),
+                    transition(
+                        &back,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                        D3D12_RESOURCE_STATE_PRESENT,
+                    ),
+                ]);
+            }
             copy.close();
             let flown = match slot {
                 Some(i) => {
@@ -9237,6 +9484,7 @@ impl Host {
                 ahead: Vec::new(),
                 hwnd,
                 meter: Meter::new(),
+                composer: None,
                 #[cfg(feature = "diagnostics")]
                 panel: panel::Panel::new(),
                 #[cfg(feature = "diagnostics")]
@@ -9294,6 +9542,66 @@ pub(crate) fn legal_for(flags: u32, state: u32) -> u32 {
 }
 
 impl Host {
+    /// A shader-visible view heap of one null buffer view, for lists that
+    /// set no view heap (codec_d, pareto-residency e05d4633a).
+    pub(crate) fn fallback_view_heap(&self) -> Option<&ID3D12DescriptorHeap> {
+        self.fallback_view
+            .get_or_init(|| {
+                // SAFETY: a heap of one descriptor and a null view in it.
+                unsafe {
+                    let heap: ID3D12DescriptorHeap = self
+                        .device
+                        .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                            Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                            NumDescriptors: 1,
+                            Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                            NodeMask: 0,
+                        })
+                        .ok()?;
+                    let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                        Format: DXGI_FORMAT_R32_UINT,
+                        ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+                        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                        Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 { Buffer: D3D12_BUFFER_SRV::default() },
+                    };
+                    self.device.CreateShaderResourceView(None, Some(&desc), heap.GetCPUDescriptorHandleForHeapStart());
+                    Some(heap)
+                }
+            })
+            .as_ref()
+    }
+
+    /// A shader-visible sampler heap of one point sampler, for lists that
+    /// set no sampler heap.
+    pub(crate) fn fallback_sampler_heap(&self) -> Option<&ID3D12DescriptorHeap> {
+        self.fallback_sampler
+            .get_or_init(|| {
+                // SAFETY: a heap of one descriptor and a sampler in it.
+                unsafe {
+                    let heap: ID3D12DescriptorHeap = self
+                        .device
+                        .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                            Type: D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER,
+                            NumDescriptors: 1,
+                            Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                            NodeMask: 0,
+                        })
+                        .ok()?;
+                    let desc = D3D12_SAMPLER_DESC {
+                        Filter: D3D12_FILTER_MIN_MAG_MIP_POINT,
+                        AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+                        AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+                        AddressW: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+                        MaxLOD: f32::MAX,
+                        ..Default::default()
+                    };
+                    self.device.CreateSampler(&desc, heap.GetCPUDescriptorHandleForHeapStart());
+                    Some(heap)
+                }
+            })
+            .as_ref()
+    }
+
     /// The card's memory as the system accounts it to this process, in
     /// bytes: the budget and the use of the card's own memory, then of the
     /// PC's memory shared with the card (where the system moves what does
@@ -10149,7 +10457,7 @@ mod refresh_tests {
                 for c in &carded {
                     if c.shadow.writes_pending() {
                         let mut runs = usize::MAX;
-                        assert!(!c.shadow.merge_under_writes(c.start, c.len, &mut runs), "round {round}");
+                        assert!(!c.shadow.merge_alone(c.start, c.len, &mut runs), "round {round}");
                     }
                 }
                 let mut ranges = Vec::new();
@@ -10271,7 +10579,7 @@ mod refresh_tests {
             }
             let started = std::time::Instant::now();
             let mut runs = usize::MAX;
-            assert!(!copy.merge_under_writes(big, BIG, &mut runs));
+            assert!(!copy.merge_alone(big, BIG, &mut runs));
             best = best.min(started.elapsed().as_secs_f64() * 1e3);
             copy.take_dirty();
         }
