@@ -673,12 +673,16 @@ fn next(screens_only: bool) -> Arc<Pending> {
 }
 
 /// How many workers make pipelines: `asked` (`VICTORY_PIPELINE_WORKERS`, 1 to
-/// 64), else two thirds of the logical processors, 2 to 16. They run below the
-/// title's own threads, and a cold cache queues hundreds at once.
+/// 64), else three quarters of the logical processors, 2 to 24. They run below
+/// the title's own threads, and a cold cache queues hundreds at once. The
+/// driver compiles each pipeline on one thread: the first run after a change
+/// of the translator (980073cbe) had 7.5 ks of compute pipelines to make, at
+/// least 470 s on 16 workers; with a warm library they wait idle (two thirds,
+/// at most 16, before).
 fn worker_count(asked: Option<usize>, processors: usize) -> usize {
     match asked {
         Some(n) => n.clamp(1, 64),
-        None => (processors * 2 / 3).clamp(2, 16),
+        None => (processors * 3 / 4).clamp(2, 24),
     }
 }
 
@@ -828,8 +832,9 @@ mod tests {
     #[test]
     fn worker_count_follows_the_processors_and_the_switch() {
         assert_eq!(worker_count(None, 1), 2);
-        assert_eq!(worker_count(None, 24), 16);
-        assert_eq!(worker_count(None, 64), 16);
+        assert_eq!(worker_count(None, 24), 18);
+        assert_eq!(worker_count(None, 32), 24);
+        assert_eq!(worker_count(None, 64), 24);
         assert_eq!(worker_count(Some(0), 24), 1);
         assert_eq!(worker_count(Some(20), 24), 20);
     }
