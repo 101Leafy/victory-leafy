@@ -1149,7 +1149,7 @@ mod stretch {
     use windows::Win32::Graphics::Direct3D12::*;
     use windows::core::Interface;
 
-    use super::{CopyLocation, List, This, ensure_state, host_list};
+    use super::{CopyLocation, List, This, ensure_state, host_list, sync_copy_source};
     use crate::object::Object;
 
     /// `R16G16B16A16_FLOAT`.
