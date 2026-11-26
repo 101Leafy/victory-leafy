@@ -787,6 +787,9 @@ pub mod known;
 #[cfg(windows)]
 mod library;
 #[cfg(windows)]
+#[allow(dead_code)] // until loose pipelines get their draw-time state
+mod loose;
+#[cfg(windows)]
 mod make;
 #[cfg(windows)]
 mod spent;
