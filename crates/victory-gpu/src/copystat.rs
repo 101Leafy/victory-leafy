@@ -243,11 +243,20 @@ pub(crate) enum C {
     RefusedNoIndex,
     RefusedKind,
     RefusedRootTable,
+    /// `list::copy_texture_region` by step (`list::CopyLaps`), its calls,
+    /// and the calls of 4 ms or more.
+    CopyTexBackNs,
+    CopyTexSourceNs,
+    CopyTexFirstNs,
+    CopyTexLevelsNs,
+    CopyTexRecordNs,
+    CopyTexCalls,
+    CopyTexSlow,
 }
-const COUNTERS: usize = 128;
+const COUNTERS: usize = 136;
 
 /// The counters' names, in the order of [`C`], for the frame recorder's columns.
-pub(crate) const NAMES: [&str; 128] = [
+pub(crate) const NAMES: [&str; 135] = [
     "Submissions", "Copies", "CopyBytes", "Refreshes", "RefreshBytes", "Skipped", "SkippedBytes", "Runs",
     "RunUs", "Queries", "QueryUs", "MoveUs", "Unmapped", "Watches", "WatchUs", "Checked", "Unchanged",
     "Fallbacks", "GuardFaults", "TexWatched", "TexHashed", "TexChanged", "TexHot", "Frames", "RecordCalls",
@@ -268,6 +277,8 @@ pub(crate) const NAMES: [&str; 128] = [
     "Closes", "CloseTwinsNs", "CloseTexBackNs", "CloseIndirectNs", "CloseBatchesNs",
     "CloseBudgetNs", "CloseComingNs", "CloseQueryNs", "CloseDriverNs", "ReadBacksMade", "ReadBacksReused",
     "RefusedNoSlots", "RefusedNoHeap", "RefusedNotHeld", "RefusedNoIndex", "RefusedKind", "RefusedRootTable",
+    "CopyTexBackNs", "CopyTexSourceNs", "CopyTexFirstNs", "CopyTexLevelsNs", "CopyTexRecordNs", "CopyTexCalls",
+    "CopyTexSlow",
 ];
 /// One of some sets of counters, each in lines of the processor's memory of
 /// its own: a set for all threads had them wait for each other's lines at
@@ -578,7 +589,7 @@ mod command_tests {
     #[test]
     fn every_counter_is_named() {
         use super::{C, COUNTERS, NAMES};
-        assert_eq!(C::RefusedRootTable as usize + 1, NAMES.len());
+        assert_eq!(C::CopyTexSlow as usize + 1, NAMES.len());
         assert_eq!(NAMES[C::Frames as usize], "Frames");
         assert!(NAMES.len() <= COUNTERS);
     }
@@ -640,7 +651,7 @@ mod own_tests {
     /// and only for at least this block).
     #[test]
     fn a_block_is_counted_while_it_lives() {
-        let block = vec![1u8; 8 << 20];
+        let block = std::hint::black_box(vec![1u8; 8 << 20]);
         assert!(owned(3) >= 8 << 20);
         assert!(owned(7) >= 1);
         drop(block);
