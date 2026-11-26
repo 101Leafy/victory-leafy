@@ -200,11 +200,16 @@ pub(crate) enum C {
     TexHashedTurn,
     TexHashedHot,
     TexTurnSkipped,
+    /// Of TexHashedHot, the bytes hashed only for being in the texture's
+    /// first frames; and those frames' checks passed over as the texture
+    /// was hashed earlier in the frame (`texture::first_once`).
+    TexHashedFirst,
+    TexFirstSkipped,
 }
 const COUNTERS: usize = 112;
 
 /// The counters' names, in the order of [`C`], for the frame recorder's columns.
-pub(crate) const NAMES: [&str; 105] = [
+pub(crate) const NAMES: [&str; 107] = [
     "Submissions", "Copies", "CopyBytes", "Refreshes", "RefreshBytes", "Skipped", "SkippedBytes", "Runs",
     "RunUs", "Queries", "QueryUs", "MoveUs", "Unmapped", "Watches", "WatchUs", "Checked", "Unchanged",
     "Fallbacks", "GuardFaults", "TexWatched", "TexHashed", "TexChanged", "TexHot", "Frames", "RecordCalls",
@@ -220,7 +225,7 @@ pub(crate) const NAMES: [&str; 105] = [
     "AskRefused", "AskRefusedUs", "AskRefusedAgain", "AskSkipped", "AskAgain", "AskAgainBytes", "GuardAgain",
     "BackAgainBytes", "RefreshGapBytes", "LookupQuick", "LookupTables", "LookupLoose", "ThinDrawNs",
     "ThinDraws", "ThinSetNs", "ThinBarrierNs", "ThinCopyNs", "ThinOtherNs", "TexHashedTurn", "TexHashedHot",
-    "TexTurnSkipped",
+    "TexTurnSkipped", "TexHashedFirst", "TexFirstSkipped",
 ];
 /// One of some sets of counters, each in lines of the processor's memory of
 /// its own: a set for all threads had them wait for each other's lines at
@@ -531,7 +536,7 @@ mod command_tests {
     #[test]
     fn every_counter_is_named() {
         use super::{C, COUNTERS, NAMES};
-        assert_eq!(C::TexTurnSkipped as usize + 1, NAMES.len());
+        assert_eq!(C::TexFirstSkipped as usize + 1, NAMES.len());
         assert_eq!(NAMES[C::Frames as usize], "Frames");
         assert!(NAMES.len() <= COUNTERS);
     }
