@@ -3186,6 +3186,12 @@ pub(crate) fn settle_for_present() {
 pub(crate) fn settle_for_fence() {
     settle_now(WHY_FENCE);
 }
+/// [`settle_now`] when the dynamic descriptor slots ran out: the flights'
+/// lists give theirs back as they land. Counted with the settles for too
+/// much in the air, which it is.
+pub(crate) fn settle_for_tables() {
+    settle_now(WHY_MOST);
+}
 
 /// Resets the host lists of settled flights and keeps them for reuse, as
 /// a queue does for the lists it ran (`crate::list::recycle`).
@@ -5399,6 +5405,16 @@ impl Host {
     /// ([`joins`]): those go to the queue in calls of their own, one after the
     /// other, as they would have.
     fn submit<'a>(&'a self, runs: &[&HostList], parts: &[usize], late: bool) -> Option<(std::sync::MutexGuard<'a, u64>, Sent)> {
+        // What the heap pass beside the recording finds is waited for here,
+        // ahead of the submission lock, and no longer at the list's close:
+        // the close waited 15-30 ms a frame for it on a recording thread in
+        // the prof runs of 2026-11-25 (17 ms a frame on the Intel run), with
+        // the title's Close call held that long. Nothing reads a list's
+        // refreshes before this (`joinable` and `will_meet` pass them over),
+        // and its descriptors are only read once it runs.
+        for list in runs {
+            list.take_coming();
+        }
         #[cfg(feature = "diagnostics")]
         let called = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
@@ -6125,15 +6141,24 @@ impl HostList {
 
     pub(crate) fn close(&self) {
         let _closing = crate::timeline::span("closing a host list");
+        let mut lap = Lap::begin();
         self.twins_to_depth();
+        lap.to(0);
         self.textures_back();
+        lap.to(1);
         let scratch = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner()).clone();
         if let Some((scratch, _)) = scratch {
             self.indirect_common(&scratch);
         }
+        lap.to(2);
         self.batches_common();
+        lap.to(3);
         self.card_budget_out();
-        self.take_coming();
+        lap.to(4);
+        if coming_at_close() {
+            self.take_coming();
+        }
+        lap.to(5);
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
             let count = (self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32).min(STAMPS - 1);
@@ -6143,12 +6168,14 @@ impl HostList {
                 self.list.ResolveQueryData(heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, count + 1, back, 0);
             }
         }
+        lap.to(6);
         // SAFETY: our list.
         if let Err(e) = unsafe { self.list.Close() } {
             fail(format_args!(
                 "a host command list did not close ({e}): a command recorded into it was invalid"
             ));
         }
+        lap.to(7);
     }
 
     /// `work` finds, on a thread of ours, refreshes that belong at this
@@ -6160,7 +6187,8 @@ impl HostList {
         *self.coming.lock().unwrap_or_else(|e| e.into_inner()) = Some((at, coming));
     }
 
-    /// The refreshes that were still to come are put among the steps.
+    /// The refreshes that were still to come are put among the steps: when
+    /// the list is submitted, or at its close with `VICTORY_COMING_AT_CLOSE=1`.
     fn take_coming(&self) {
         let Some((at, coming)) = self.coming.lock().unwrap_or_else(|e| e.into_inner()).take() else {
             return;
@@ -6181,7 +6209,11 @@ impl HostList {
         let started = std::time::Instant::now();
         let _resetting = crate::timeline::span("resetting a host list");
         self._alive.used();
-        *self.coming.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        // A list closed and never submitted: the pass may still be writing
+        // its descriptors.
+        if let Some((_, coming)) = self.coming.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            coming.wait();
+        }
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -7345,6 +7377,64 @@ impl Split {
     }
 }
 
+/// Whether a list's close waits for the heap pass beside its recording
+/// (`VICTORY_COMING_AT_CLOSE=1`, as before) instead of its submission.
+fn coming_at_close() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_COMING_AT_CLOSE").is_some_and(|v| v == "1"))
+}
+
+/// Since the last frame line: the nanoseconds of each step of the lists'
+/// closes, in the order of `copystat::C::CloseTwinsNs` and on, and the
+/// number of closes. dup-record measured 195 closes a frame of 295-538 us
+/// each (2026-11-25): about 60-100 ms a frame on the recording threads.
+#[cfg(feature = "diagnostics")]
+static CLOSE_NS: [std::sync::atomic::AtomicU64; 9] = [const { std::sync::atomic::AtomicU64::new(0) }; 9];
+
+/// Times the steps of a list's close ([`HostList::close`]); nothing without
+/// diagnostics.
+struct Lap {
+    #[cfg(feature = "diagnostics")]
+    at: std::time::Instant,
+}
+
+impl Lap {
+    fn begin() -> Self {
+        #[cfg(feature = "diagnostics")]
+        {
+            crate::copystat::add(crate::copystat::C::Closes, 1);
+            CLOSE_NS[8].fetch_add(1, Ordering::Relaxed);
+        }
+        Lap {
+            #[cfg(feature = "diagnostics")]
+            at: std::time::Instant::now(),
+        }
+    }
+
+    /// Step `i` of the close ended now.
+    #[cfg_attr(not(feature = "diagnostics"), allow(unused_variables))]
+    fn to(&mut self, i: usize) {
+        #[cfg(feature = "diagnostics")]
+        {
+            use crate::copystat::C;
+            let now = std::time::Instant::now();
+            let ns = (now - std::mem::replace(&mut self.at, now)).as_nanos() as u64;
+            let c = match i {
+                0 => C::CloseTwinsNs,
+                1 => C::CloseTexBackNs,
+                2 => C::CloseIndirectNs,
+                3 => C::CloseBatchesNs,
+                4 => C::CloseBudgetNs,
+                5 => C::CloseComingNs,
+                6 => C::CloseQueryNs,
+                _ => C::CloseDriverNs,
+            };
+            crate::copystat::add(c, ns);
+            CLOSE_NS[i.min(7)].fetch_add(ns, Ordering::Relaxed);
+        }
+    }
+}
+
 /// The split of the preparing, per frame, for the frame-rate line.
 #[cfg(feature = "diagnostics")]
 fn split_line(frames: f64) {
@@ -7411,11 +7501,28 @@ fn split_line(frames: f64) {
     );
     tracing::info!(
         "the pass over the heap's views per frame: {:.1} ms looking at slots, {:.1} their copies' spans and refreshes, {:.1} textures; the \
-         first two beside the recording (VICTORY_HEAP_PASS_ASIDE), {:.1} ms waited for at the lists' close",
+         first two beside the recording (VICTORY_HEAP_PASS_ASIDE), {:.1} ms waited for at the lists' submission",
         h[0],
         h[1],
         h[2],
         aside::WAITED.swap(0, Ordering::Relaxed) as f64 / 1e3 / frames,
+    );
+    let c: Vec<f64> = CLOSE_NS.iter().map(|n| n.swap(0, Ordering::Relaxed) as f64).collect();
+    let each = c[..8].iter().sum::<f64>() / 1e3 / c[8].max(1.0);
+    let c: Vec<f64> = c.iter().map(|n| n / frames).collect();
+    tracing::info!(
+        "host lists closed per frame: {:.0}, {:.0} us each; {:.1} ms copying depth twins back, {:.1} textures read back, {:.1} the          indirect clamps, {:.1} the batched clamps, {:.1} the card budget's notes, {:.1} waiting for the heap pass ({}), {:.1}          timestamps, {:.1} the driver's Close",
+        c[8],
+        each,
+        c[0] / 1e6,
+        c[1] / 1e6,
+        c[2] / 1e6,
+        c[3] / 1e6,
+        c[4] / 1e6,
+        c[5] / 1e6,
+        if coming_at_close() { "VICTORY_COMING_AT_CLOSE=1" } else { "at the submission instead" },
+        c[6] / 1e6,
+        c[7] / 1e6,
     );
 }
 
@@ -8378,8 +8485,55 @@ impl Host {
 
     /// A buffer in the upload heap, mapped for writing.
     /// A buffer of `size` bytes the card writes and we read (a read back),
-    /// in the state copies into it need.
+    /// in the state copies into it need. One made before is given again when
+    /// nobody else holds it: every holder keeps its buffer until the list
+    /// that copies into it has run (`defer_read_back`, `texback::Back`), so
+    /// a buffer only the pool holds is not in use. dup-record saw about two
+    /// CreateCommittedResource calls a frame here (2026-11-25).
+    /// `VICTORY_READ_BACK_POOL=0`: a new buffer each time, as before.
+    ///
+    /// Buffers up to 16 MiB were kept, 32 at most, never let go: in run
+    /// play-f's open world 12 a frame were still made against 6 given
+    /// again, and the textures-read-back step of the lists' close took
+    /// 74 ms a frame (all threads), about 6 ms a buffer. Now buffers up to
+    /// `LARGEST` are kept, up to `KEPT_BYTES` in all, and one nobody holds
+    /// makes room for a new size when the pool is full.
     pub(crate) fn read_back_buffer(&self, size: u64) -> Option<ID3D12Resource> {
+        /// Buffers up to this size are kept: up to 16 MiB rounded up to a
+        /// power of two from 64 KiB, larger ones to a multiple of 8 MiB.
+        const LARGEST: u64 = 256 << 20;
+        const KEPT: usize = 48;
+        const KEPT_BYTES: u64 = 1 << 30;
+        static POOL: Mutex<Vec<(u64, ID3D12Resource)>> = Mutex::new(Vec::new());
+        static ON: OnceLock<bool> = OnceLock::new();
+        // SAFETY: a live buffer of the pool's; the count before the
+        // reference taken here tells whether anyone else holds it, and only
+        // the pool hands it out, under its lock.
+        let idle = |buffer: &ID3D12Resource| unsafe {
+            let vtable = Interface::vtable(buffer);
+            let count = (vtable.base__.base__.base__.base__.AddRef)(buffer.as_raw());
+            (vtable.base__.base__.base__.base__.Release)(buffer.as_raw());
+            count == 2
+        };
+        let pooled = size <= LARGEST && *ON.get_or_init(|| std::env::var_os("VICTORY_READ_BACK_POOL").is_none_or(|v| v != "0"));
+        let size = match size {
+            _ if !pooled => size,
+            0..=0x100_0000 => size.max(64 << 10).next_power_of_two(),
+            _ => size.next_multiple_of(8 << 20),
+        };
+        let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+        if pooled
+            && let Some((_, buffer)) = pool.iter().find(|(kept, buffer)| *kept == size && idle(buffer))
+        {
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::ReadBacksReused, 1);
+            return Some(buffer.clone());
+        }
+        #[cfg(feature = "diagnostics")]
+        {
+            crate::copystat::add(crate::copystat::C::ReadBacksMade, 1);
+            crate::copystat::add(crate::copystat::C::ReadBacksMadeBytes, size);
+        }
         let heap = D3D12_HEAP_PROPERTIES {
             Type: D3D12_HEAP_TYPE_READBACK,
             ..Default::default()
@@ -8410,7 +8564,23 @@ impl Host {
             )
         };
         match made {
-            Ok(()) => buffer,
+            Ok(()) => {
+                if pooled && let Some(buffer) = &buffer {
+                    let full = |pool: &Vec<(u64, ID3D12Resource)>| {
+                        pool.len() >= KEPT || pool.iter().map(|(kept, _)| kept).sum::<u64>() + size > KEPT_BYTES
+                    };
+                    while full(&pool) {
+                        let Some(i) = pool.iter().position(|(_, b)| idle(b)) else {
+                            break;
+                        };
+                        pool.swap_remove(i);
+                    }
+                    if !full(&pool) {
+                        pool.push((size, buffer.clone()));
+                    }
+                }
+                buffer
+            }
             Err(e) => {
                 tracing::warn!(error = %e, size, "no read-back buffer");
                 None
@@ -8672,6 +8842,13 @@ impl Meter {
                 "placed texture views: {} writes of another view of the texture a slot showed (it kept the old view until the new was made)",
                 crate::descriptor::host::KEPT_VIEWS.load(Ordering::Relaxed)
             );
+            let short = &crate::draw::DYNAMIC_SHORT;
+            let (found, refused) = (short[0].load(Ordering::Relaxed), short[1].load(Ordering::Relaxed));
+            if found + refused > 0 {
+                tracing::info!(
+                    "dynamic descriptor slots run out, since the start: {found} found after settling the flights in the air, {refused} refused (their draws dropped; VICTORY_TABLE_SETTLE=0: not settled)"
+                );
+            }
             crate::tiles::status();
             {
                 let [queued, due, away, partly, oldest] =

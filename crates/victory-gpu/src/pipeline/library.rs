@@ -557,7 +557,13 @@ pub(crate) fn pipeline(
     let wide = HSTRING::from(name);
     let Some(library) = library() else {
         MADE.fetch_add(1, Ordering::Relaxed);
-        return create();
+        let began = std::time::Instant::now();
+        let pso = create();
+        super::spent::add(|p| {
+            p.create += began.elapsed();
+            p.made += 1;
+        });
+        return pso;
     };
     let began = std::time::Instant::now();
     let loaded = {
@@ -566,12 +572,15 @@ pub(crate) fn pipeline(
         let _call = call("load", name);
         load(&library.library, PCWSTR(wide.as_ptr()))
     };
+    let load_took = began.elapsed();
+    super::spent::add(|p| p.load += load_took);
     // The load read the library's file (see `trim`).
     LOADED_AT.store(crate::host::now_ms(), Ordering::Relaxed);
     TRIMMED.store(false, Ordering::Relaxed);
     let refused = match loaded {
         Ok(pso) => {
             LOADED.fetch_add(1, Ordering::Relaxed);
+            super::spent::add(|p| p.loaded += 1);
             crate::host::trail(|| {
                 let label = LABEL.with(|l| l.borrow().clone());
                 format!("pipeline library: loaded {label} in {:.1} ms", began.elapsed().as_secs_f64() * 1e3)
@@ -583,9 +592,18 @@ pub(crate) fn pipeline(
     // Compiled outside any lock: compiles take up to seconds.
     let pso = {
         let _call = call("make", name);
-        create()?
+        let creating = std::time::Instant::now();
+        let pso = create();
+        super::spent::add(|p| {
+            p.create += creating.elapsed();
+            p.made += 1;
+        });
+        pso?
     };
     MADE.fetch_add(1, Ordering::Relaxed);
+    if !MADE_NAMES.lock().unwrap_or_else(|e| e.into_inner()).insert(name.to_owned()) {
+        MADE_AGAIN.fetch_add(1, Ordering::Relaxed);
+    }
     crate::host::trail(|| {
         let label = LABEL.with(|l| l.borrow().clone());
         format!(
@@ -593,15 +611,58 @@ pub(crate) fn pipeline(
             began.elapsed().as_secs_f64() * 1e3
         )
     });
+    let waiting = std::time::Instant::now();
     let _all = one_call();
-    let _stores = library.saving.read().unwrap_or_else(|e| e.into_inner());
-    let _call = call("store", name);
+    // A save holds the library for the whole serialise (seconds for some
+    // 400 MB): the pipeline is stored after it instead of the worker
+    // waiting that long.
+    let stores = match library.saving.try_read() {
+        Ok(stores) => stores,
+        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            LATER.lock().unwrap_or_else(|e| e.into_inner()).push(Later(wide, pso.clone()));
+            STORED_LATER.fetch_add(1, Ordering::Relaxed);
+            return Ok(pso);
+        }
+    };
+    let storing = std::time::Instant::now();
+    store(library, &wide, &pso);
+    store_later(library);
+    drop(stores);
+    super::spent::add(|p| {
+        p.store_wait += storing - waiting;
+        p.store += storing.elapsed();
+    });
+    Ok(pso)
+}
+
+/// Pipelines made while a save held the library, for the next store.
+struct Later(HSTRING, ID3D12PipelineState);
+// SAFETY: D3D12 objects are free-threaded.
+unsafe impl Send for Later {}
+static LATER: Mutex<Vec<Later>> = Mutex::new(Vec::new());
+static STORED_LATER: AtomicU64 = AtomicU64::new(0);
+
+/// Names of the pipelines the driver compiled in this run, and how many it
+/// compiled again under a name it had compiled before.
+static MADE_NAMES: std::sync::LazyLock<Mutex<HashSet<String>>> = std::sync::LazyLock::new(Default::default);
+static MADE_AGAIN: AtomicU64 = AtomicU64::new(0);
+
+fn store(library: &Library, name: &HSTRING, pso: &ID3D12PipelineState) {
+    let _call = call("store", &name.to_string());
     // SAFETY: a live pipeline; a name already stored (a description that
     // differs) is refused, which leaves the library as it was.
-    if unsafe { library.library.StorePipeline(PCWSTR(wide.as_ptr()), &pso) }.is_ok() {
+    if unsafe { library.library.StorePipeline(PCWSTR(name.as_ptr()), pso) }.is_ok() {
         library.added.fetch_add(1, Ordering::Relaxed);
     }
-    Ok(pso)
+}
+
+/// Stores the pipelines a save held up; the caller holds `saving` to read.
+fn store_later(library: &Library) {
+    let later = std::mem::take(&mut *LATER.lock().unwrap_or_else(|e| e.into_inner()));
+    for Later(name, pso) in &later {
+        store(library, name, pso);
+    }
 }
 
 /// Writes the library and the early list if pipelines were added since the
@@ -623,6 +684,12 @@ pub(crate) fn save(now: bool) {
         return;
     }
     let tmp = shared.join(LIBRARY_FILE).with_extension("tmp");
+    {
+        let _stores = library.saving.read().unwrap_or_else(|e| e.into_inner());
+        store_later(library);
+    }
+    let began = std::time::Instant::now();
+    let mut held = std::time::Duration::ZERO;
     // The bytes of the library written to `tmp`; 0 when no pipeline was
     // added: the library on disk is then what it was, and only the early
     // list is written (a title pipeline first drawn with wrote all 1,352 MB
@@ -655,6 +722,7 @@ pub(crate) fn save(now: bool) {
             }
             library.added.store(0, Ordering::Relaxed);
             SAVED.store(size as u64, Ordering::Relaxed);
+            held = began.elapsed();
             (size, lock)
         }
     };
@@ -685,8 +753,12 @@ pub(crate) fn save(now: bool) {
             bytes,
             early = used.len(),
             made = MADE.load(Ordering::Relaxed),
+            made_again = MADE_AGAIN.load(Ordering::Relaxed),
             loaded = LOADED.load(Ordering::Relaxed),
             started_early = EARLY.load(Ordering::Relaxed),
+            held_ms = held.as_millis() as u64,
+            ms = began.elapsed().as_millis() as u64,
+            stored_later = STORED_LATER.load(Ordering::Relaxed),
             "host pipeline library saved"
         ),
         Err(e) => tracing::warn!(error = %e, "host pipeline library not saved"),

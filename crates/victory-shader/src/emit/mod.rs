@@ -134,6 +134,25 @@ pub use shader::{
     raw_views, set_raw_views, set_view_heap_limit, view_heap_limit,
 };
 
+/// The translator's number in the shader cache's key (`victory-gpu`'s
+/// `shader_cache`), in place of a hash of this crate's source, so that a
+/// change the default output does not see keeps every cached translation.
+///
+/// Raise it in the commit that changes anything the cache stores under
+/// default settings: the DXIL, a [`HostShader`] field (stage, bindings, user
+/// data, samplers, flags), or whether a container is refused or translated.
+/// A change behind a switch that is off by default needs no raise, but the
+/// switch joins the key in the commit that reads it: in the list of
+/// `VICTORY_*` names in `shader_cache`'s `build`, or as a bit of
+/// [`host_settings`] (taken: 0-3 of the last for [`rdna`], 31 for
+/// `VICTORY_COLOR_FINITE`). A dependency update needs none: the `Cargo.lock`
+/// entries this crate is built from are in the key.
+///
+/// The first run after a source change without a raise translates its first
+/// 64 cached shaders again and compares the entries byte for byte; if one
+/// differs, that build keys on the whole source instead, as before.
+pub const VERSION: u32 = 1;
+
 /// The loop limit without an override: 2^20.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
 

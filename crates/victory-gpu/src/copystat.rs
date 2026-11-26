@@ -200,11 +200,89 @@ pub(crate) enum C {
     TexHashedTurn,
     TexHashedHot,
     TexTurnSkipped,
+    /// Of TexHashedHot, the bytes hashed only for being in the texture's
+    /// first frames; and those frames' checks passed over as the texture
+    /// was hashed earlier in the frame (`texture::first_once`).
+    TexHashedFirst,
+    TexFirstSkipped,
+    /// The heap pass's rounds ahead (`draw::start_ahead`): rounds that looked
+    /// at slots, the slots, and their nanoseconds; and slots a round left
+    /// to the pass as it waited.
+    HeapAheadRounds,
+    HeapAheadLooked,
+    HeapAheadNs,
+    HeapCarried,
+    /// Host lists closed, and the nanoseconds of each step of the close:
+    /// depth twins copied back, textures read back, the indirect and
+    /// batched clamps' common work, the card budget's notes copied out, the
+    /// wait for refreshes still to come from the heap pass beside the
+    /// recording (here only with `VICTORY_COMING_AT_CLOSE=1`; otherwise the
+    /// submission waits), the timestamp
+    /// query's end and resolve, and the driver's Close.
+    Closes,
+    CloseTwinsNs,
+    CloseTexBackNs,
+    CloseIndirectNs,
+    CloseBatchesNs,
+    CloseBudgetNs,
+    CloseComingNs,
+    CloseQueryNs,
+    CloseDriverNs,
+    /// Read-back buffers made, and given again from the pool
+    /// (`Host::read_back_buffer`).
+    ReadBacksMade,
+    ReadBacksReused,
+    /// Draws dropped in `State::bind` or `State::prepare_for`, by why: a
+    /// descriptor table found no free slots, a shader reads memory by
+    /// address with no view heap, or with one whose host could not hold the
+    /// memory, an index buffer with no host copy, a pipeline of another
+    /// kind, and a root view table with no slot or view heap.
+    RefusedNoSlots,
+    RefusedNoHeap,
+    RefusedNotHeld,
+    RefusedNoIndex,
+    RefusedKind,
+    RefusedRootTable,
+    /// `list::copy_texture_region` by step (`list::CopyLaps`), its calls,
+    /// and the calls of 4 ms or more.
+    CopyTexBackNs,
+    CopyTexSourceNs,
+    CopyTexFirstNs,
+    CopyTexLevelsNs,
+    CopyTexRecordNs,
+    CopyTexCalls,
+    CopyTexSlow,
+    /// Watch: write faults in the descriptor heaps' guarded blocks that
+    /// opened one 4 KiB part, ones that opened the whole block because
+    /// enough parts were open or because the block has other views, and,
+    /// as guards made them read-only again, the blocks with parts open and
+    /// those parts (`VICTORY_GUARD_PARTS`).
+    GuardPartFaults,
+    GuardPartWhole,
+    GuardPartAliased,
+    GuardPartBlocks,
+    GuardPartParts,
+    /// Draws: fresh tables built and their slots, asks another list made at
+    /// the same table this frame (slots, those holding constant views), asks
+    /// made from the same records at another table, build time, and asks
+    /// served from another list's table (`VICTORY_SHARED_TABLES`).
+    FreshMade,
+    FreshMadeSlots,
+    FreshAgainSlots,
+    FreshAgainCbvSlots,
+    FreshSame,
+    FreshSameSlots,
+    FreshNs,
+    FreshShared,
+    FreshSharedSlots,
+    /// The bytes of the read-back buffers made (`ReadBacksMade`), after
+    /// rounding.
+    ReadBacksMadeBytes,
 }
-const COUNTERS: usize = 112;
+const COUNTERS: usize = 160;
 
 /// The counters' names, in the order of [`C`], for the frame recorder's columns.
-pub(crate) const NAMES: [&str; 105] = [
+pub(crate) const NAMES: [&str; 150] = [
     "Submissions", "Copies", "CopyBytes", "Refreshes", "RefreshBytes", "Skipped", "SkippedBytes", "Runs",
     "RunUs", "Queries", "QueryUs", "MoveUs", "Unmapped", "Watches", "WatchUs", "Checked", "Unchanged",
     "Fallbacks", "GuardFaults", "TexWatched", "TexHashed", "TexChanged", "TexHot", "Frames", "RecordCalls",
@@ -220,7 +298,16 @@ pub(crate) const NAMES: [&str; 105] = [
     "AskRefused", "AskRefusedUs", "AskRefusedAgain", "AskSkipped", "AskAgain", "AskAgainBytes", "GuardAgain",
     "BackAgainBytes", "RefreshGapBytes", "LookupQuick", "LookupTables", "LookupLoose", "ThinDrawNs",
     "ThinDraws", "ThinSetNs", "ThinBarrierNs", "ThinCopyNs", "ThinOtherNs", "TexHashedTurn", "TexHashedHot",
-    "TexTurnSkipped",
+    "TexTurnSkipped", "TexHashedFirst", "TexFirstSkipped",
+    "HeapAheadRounds", "HeapAheadLooked", "HeapAheadNs", "HeapCarried",
+    "Closes", "CloseTwinsNs", "CloseTexBackNs", "CloseIndirectNs", "CloseBatchesNs",
+    "CloseBudgetNs", "CloseComingNs", "CloseQueryNs", "CloseDriverNs", "ReadBacksMade", "ReadBacksReused",
+    "RefusedNoSlots", "RefusedNoHeap", "RefusedNotHeld", "RefusedNoIndex", "RefusedKind", "RefusedRootTable",
+    "CopyTexBackNs", "CopyTexSourceNs", "CopyTexFirstNs", "CopyTexLevelsNs", "CopyTexRecordNs", "CopyTexCalls",
+    "CopyTexSlow",
+    "GuardPartFaults", "GuardPartWhole", "GuardPartAliased", "GuardPartBlocks", "GuardPartParts",
+    "FreshMade", "FreshMadeSlots", "FreshAgainSlots", "FreshAgainCbvSlots", "FreshSame", "FreshSameSlots",
+    "FreshNs", "FreshShared", "FreshSharedSlots", "ReadBacksMadeBytes",
 ];
 /// One of some sets of counters, each in lines of the processor's memory of
 /// its own: a set for all threads had them wait for each other's lines at
@@ -531,7 +618,7 @@ mod command_tests {
     #[test]
     fn every_counter_is_named() {
         use super::{C, COUNTERS, NAMES};
-        assert_eq!(C::TexTurnSkipped as usize + 1, NAMES.len());
+        assert_eq!(C::FreshSharedSlots as usize + 1, NAMES.len());
         assert_eq!(NAMES[C::Frames as usize], "Frames");
         assert!(NAMES.len() <= COUNTERS);
     }
@@ -593,7 +680,7 @@ mod own_tests {
     /// and only for at least this block).
     #[test]
     fn a_block_is_counted_while_it_lives() {
-        let block = vec![1u8; 8 << 20];
+        let block = std::hint::black_box(vec![1u8; 8 << 20]);
         assert!(owned(3) >= 8 << 20);
         assert!(owned(7) >= 1);
         drop(block);

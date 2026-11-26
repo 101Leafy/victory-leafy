@@ -145,8 +145,12 @@ impl Shader {
     /// The translation, made on first use; a shader that does not
     /// translate is logged once.
     pub(crate) fn translated(&self) -> Option<&Translated> {
-        self.translated
+        let asked = std::time::Instant::now();
+        let mut own = false;
+        let done = self
+            .translated
             .get_or_init(|| {
+                own = true;
                 // Time spent here is part of a slow pipeline's time
                 // (`slow-pipelines.txt`); this tells it from the driver's.
                 let began = std::time::Instant::now();
@@ -186,7 +190,18 @@ impl Shader {
                 }
                 done.ok()
             })
-            .as_ref()
+            .as_ref();
+        // Another thread translating the same shader holds this one up.
+        let spent = asked.elapsed();
+        if own {
+            spent::add(|p| {
+                p.translate += spent;
+                p.translated += 1;
+            });
+        } else if spent > std::time::Duration::from_millis(1) {
+            spent::add(|p| p.shared += spent);
+        }
+        done
     }
 }
 
@@ -308,6 +323,13 @@ fn of_builder(shaders: &[Arc<Shader>]) -> bool {
 pub(crate) fn builder_quarantined(this: This) -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     is_builder(this) && *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_QUARANTINE").is_some_and(|v| v == "1"))
+}
+
+/// Whether one of the title's pipeline `this`'s shaders has the 16-digit
+/// hash `hash` (as the log names shaders).
+#[cfg(windows)]
+pub(crate) fn has_shader(this: This, hash: &str) -> bool {
+    !this.is_null() && pipeline(this).shaders.iter().any(|s| s.hash == hash)
 }
 
 /// Whether the title's pipeline `this` is one of the structure builder's.
@@ -766,6 +788,8 @@ pub mod known;
 mod library;
 #[cfg(windows)]
 mod make;
+#[cfg(windows)]
+mod spent;
 
 /// Lets the pipeline library's mapped file go from memory when no pipeline
 /// has loaded for a while (`library::trim`); called by the host's sweep.
