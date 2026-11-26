@@ -2971,6 +2971,9 @@ fn same_bytes() {
     // buffers, card copies), pieces of zeros; then the host buffers'
     // width, of copies under 64 KiB their bytes, width and 4 KiB lines.
     let mut b = [0u64; 10];
+    // Of the zeros and of the copies alike whole: bytes in windows, buffers
+    // and card copies.
+    let (mut zero_in, mut alike_in) = ([0u64; 3], [0u64; 3]);
     let mut alike_copies = 0u64;
     let mut small = 0u64;
     let mut wholes = std::collections::HashSet::new();
@@ -2979,6 +2982,7 @@ fn same_bytes() {
     let mut spans = Vec::with_capacity(copies.len());
     for s in &copies {
         let len = s.len as usize;
+        let kind = if s.card.is_some() { 2 } else if s.window { 0 } else { 1 };
         // SAFETY: the copy is alive (held here) and its mapping `len` bytes.
         let bytes = unsafe { std::slice::from_raw_parts(s.data.cast_const(), len) };
         let mut whole = blake3::Hasher::new();
@@ -2989,13 +2993,15 @@ fn same_bytes() {
             let n = piece.len() as u64;
             if hash == zero {
                 b[4] += n;
+                zero_in[kind] += n;
             } else if !pieces.insert((piece.len(), hash)) {
-                b[if s.card.is_some() { 3 } else if s.window { 1 } else { 2 }] += n;
+                b[1 + kind] += n;
             }
         }
         if !wholes.insert((len, whole.finalize())) {
             alike_copies += 1;
             b[5] += s.len;
+            alike_in[kind] += s.len;
         }
         b[0] += s.len;
         b[6] += s.width();
@@ -3016,15 +3022,26 @@ fn same_bytes() {
     }
     let mb = |v: u64| v >> 20;
     tracing::info!(
-        "memory, the same bytes in host copies of title memory (VICTORY_DUP_CENSUS, once, {} ms): {} copies {} MB read,          {mapped} windows in card memory the CPU maps not read; {alike_copies} copies the same as another whole, {} MB;          of 64 KiB pieces, the same as another: {} MB in windows, {} MB in buffers, {} MB in copies in the card's memory,          and {} MB all zeros; title memory under more than one copy: {} MB; host buffers {} MB for {} MB of title memory,          of them {small} under 64 KiB {} MB for {} KB (on 4 KiB lines {} KB)",
+        "memory, the same bytes in host copies of title memory (VICTORY_DUP_CENSUS, once, {} ms): {} copies {} MB read, \
+         {mapped} windows in card memory the CPU maps not read; {alike_copies} copies the same as another whole, {} MB \
+         ({} MB windows, {} MB buffers, {} MB card copies); of 64 KiB pieces, the same as another: {} MB in windows, \
+         {} MB in buffers, {} MB in copies in the card's memory, and {} MB all zeros ({} MB windows, {} MB buffers, \
+         {} MB card copies); title memory under more than one copy: {} MB; host buffers {} MB for {} MB of title memory, \
+         of them {small} under 64 KiB {} MB for {} KB (on 4 KiB lines {} KB)",
         started.elapsed().as_millis(),
         copies.len(),
         mb(b[0]),
         mb(b[5]),
+        mb(alike_in[0]),
+        mb(alike_in[1]),
+        mb(alike_in[2]),
         mb(b[1]),
         mb(b[2]),
         mb(b[3]),
         mb(b[4]),
+        mb(zero_in[0]),
+        mb(zero_in[1]),
+        mb(zero_in[2]),
         mb(b[0] - under),
         mb(b[6]),
         mb(b[0]),
