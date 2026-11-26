@@ -129,11 +129,28 @@ pub(crate) enum C {
     WaitsForGroups,
     WaitsForBuffers,
     IndirectBounded,
+    /// Slots the heap's buffer-view pass looked at, the ones of them in the
+    /// written set, those of these whose copy and range came out as they
+    /// were, and the marks its own looks would have put back in the
+    /// written set (left out: the pass just found what they would ask).
+    HeapLooked,
+    HeapLookedWritten,
+    HeapSameAgain,
+    HeapSelfMarks,
+    /// Dynamic slots asked for (`DynamicAsked` counts tables), the slots the
+    /// search for a free run stepped over, and refusals made without a
+    /// search (too few free, or a run as long known not to fit).
+    DynamicSlots,
+    DynamicSteps,
+    DynamicFull,
+    /// Tables made afresh in a list that another list of the same frame
+    /// had made already from the same records.
+    FreshAgain,
 }
-const COUNTERS: usize = 80;
+const COUNTERS: usize = 96;
 
 /// The counters' names, in the order of [`C`], for the frame recorder's columns.
-pub(crate) const NAMES: [&str; 71] = [
+pub(crate) const NAMES: [&str; 79] = [
     "Submissions", "Copies", "CopyBytes", "Refreshes", "RefreshBytes", "Skipped", "SkippedBytes", "Runs",
     "RunUs", "Queries", "QueryUs", "MoveUs", "Unmapped", "Watches", "WatchUs", "Checked", "Unchanged",
     "Fallbacks", "GuardFaults", "TexWatched", "TexHashed", "TexChanged", "TexHot", "Frames", "RecordCalls",
@@ -143,7 +160,9 @@ pub(crate) const NAMES: [&str; 71] = [
     "TexUploads", "TexSkipped", "Forced", "GpuWritesLeftOut", "GpuWritesLeftOutBytes", "WaitChecks",
     "WaitCheckNs", "HostLists", "HostListNs", "PartsTogether", "WholeUs", "CardUnder2", "Card2To8",
     "Card8To32", "CardOver32", "CardUnder2Us", "Card2To8Us", "Card8To32Us", "CardOver32Us", "NothingBack",
-    "NothingBackUs", "WaitsForGroups", "WaitsForBuffers", "IndirectBounded",
+    "NothingBackUs", "WaitsForGroups", "WaitsForBuffers", "IndirectBounded", "HeapLooked",
+    "HeapLookedWritten", "HeapSameAgain", "HeapSelfMarks", "DynamicSlots", "DynamicSteps", "DynamicFull",
+    "FreshAgain",
 ];
 /// One of some sets of counters, each in lines of the processor's memory of
 /// its own: a set for all threads had them wait for each other's lines at
