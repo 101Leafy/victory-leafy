@@ -278,11 +278,82 @@ pub(crate) enum C {
     /// The bytes of the read-back buffers made (`ReadBacksMade`), after
     /// rounding.
     ReadBacksMadeBytes,
+    /// Slots the heap pass planned under a freed table entry.
+    HeapDueFreed,
+    /// Held slots it planned in the sweep's part of 256.
+    HeapDueSweepPart,
+    /// Held slots out of that part it planned for a changed record.
+    HeapDueSweepChanged,
+    /// Orphan slots it planned in the sweep's part of 16.
+    HeapDueOrphanPart,
+    /// Orphan slots out of that part it planned for a changed record.
+    HeapDueOrphanChanged,
+    /// Slots it planned more than once in a plan.
+    HeapDueTwice,
+    /// Looks that found the same copy and range as the last one.
+    HeapAgainShows,
+    /// Looks at an orphan that found it still left for later.
+    HeapAgainLater,
+    /// Of those, the ones left because a draw's table copies it.
+    HeapAgainTabled,
+    /// Looks at a slot neither held nor orphaned that found no buffer
+    /// view of ours again.
+    HeapAgainNothing,
+    /// Draws and dispatches by step (`draw.rs`): textures picked by index,
+    /// descriptor tables, title memory by address, user data and root
+    /// views, vertex and index buffers, target states, and the argument
+    /// refresh and clamp of indirect calls.
+    DrawEarlyNs,
+    DrawTablesNs,
+    DrawMemoryNs,
+    DrawRootsNs,
+    DrawBuffersNs,
+    DrawStatesNs,
+    IndirectArgsNs,
+    /// The whole of `bind` (the steps above plus heaps, root signature,
+    /// pipeline state and twins), the driver's draw, dispatch and
+    /// `ExecuteIndirect` calls, and what follows a draw (`drew`,
+    /// `buffers_written`).
+    DrawBindNs,
+    DrawDriverNs,
+    DrawAfterNs,
+    /// Indirect calls: buffer lookups and signature before the clamp, the
+    /// prepare or bind call, and the driver's `ExecuteIndirect`.
+    IndirectFindNs,
+    IndirectPrepareNs,
+    IndirectDriverNs,
+    /// The texture part of the heap pass (`draw.rs` heap_textures) by
+    /// step: slots held while the card was full, slots of remapped memory,
+    /// of textures short of memory, views made again, flips, uploads left
+    /// waiting, and the due list with the card's accounting.
+    HeapTexRoomNs,
+    HeapTexRemappedNs,
+    HeapTexShortNs,
+    HeapTexRemadeNs,
+    HeapTexFlipNs,
+    HeapTexWaitingNs,
+    HeapTexDueNs,
+    /// The loop over the due slots, and the slots it looked at.
+    HeapTexLoopNs,
+    HeapTexLooks,
+    /// Inside the loop: the look at an uploaded texture's bytes, asking
+    /// how much of a placed texture is mapped, the check that the host
+    /// copy holds the same bytes, and the upload.
+    HeapTexCheckNs,
+    HeapTexMappedNs,
+    HeapTexSameNs,
+    HeapTexUploadNs,
+    /// Settles for lists in the air, by cause: dynamic descriptor slots run
+    /// out (`settle_for_tables`), the card compare result area full
+    /// (`card_results_low`), and too many lists out (`late_most`).
+    SettleTablesNs,
+    SettleResultsNs,
+    SettleListsNs,
 }
-const COUNTERS: usize = 160;
+const COUNTERS: usize = 192;
 
 /// The counters' names, in the order of [`C`], for the frame recorder's columns.
-pub(crate) const NAMES: [&str; 150] = [
+pub(crate) const NAMES: [&str; 189] = [
     "Submissions", "Copies", "CopyBytes", "Refreshes", "RefreshBytes", "Skipped", "SkippedBytes", "Runs",
     "RunUs", "Queries", "QueryUs", "MoveUs", "Unmapped", "Watches", "WatchUs", "Checked", "Unchanged",
     "Fallbacks", "GuardFaults", "TexWatched", "TexHashed", "TexChanged", "TexHot", "Frames", "RecordCalls",
@@ -308,6 +379,15 @@ pub(crate) const NAMES: [&str; 150] = [
     "GuardPartFaults", "GuardPartWhole", "GuardPartAliased", "GuardPartBlocks", "GuardPartParts",
     "FreshMade", "FreshMadeSlots", "FreshAgainSlots", "FreshAgainCbvSlots", "FreshSame", "FreshSameSlots",
     "FreshNs", "FreshShared", "FreshSharedSlots", "ReadBacksMadeBytes",
+    "HeapDueFreed", "HeapDueSweepPart", "HeapDueSweepChanged", "HeapDueOrphanPart", "HeapDueOrphanChanged",
+    "HeapDueTwice", "HeapAgainShows", "HeapAgainLater", "HeapAgainTabled", "HeapAgainNothing",
+    "DrawEarlyNs", "DrawTablesNs", "DrawMemoryNs", "DrawRootsNs", "DrawBuffersNs", "DrawStatesNs",
+    "IndirectArgsNs", "DrawBindNs", "DrawDriverNs", "DrawAfterNs", "IndirectFindNs", "IndirectPrepareNs",
+    "IndirectDriverNs",
+    "HeapTexRoomNs", "HeapTexRemappedNs", "HeapTexShortNs", "HeapTexRemadeNs", "HeapTexFlipNs", "HeapTexWaitingNs",
+    "HeapTexDueNs", "HeapTexLoopNs", "HeapTexLooks", "HeapTexCheckNs", "HeapTexMappedNs", "HeapTexSameNs",
+    "HeapTexUploadNs",
+    "SettleTablesNs", "SettleResultsNs", "SettleListsNs",
 ];
 /// One of some sets of counters, each in lines of the processor's memory of
 /// its own: a set for all threads had them wait for each other's lines at
@@ -341,6 +421,11 @@ pub(crate) fn add(c: C, n: u64) {
 
 /// The counter, all sets together, as it is now (it goes back to 0 with
 /// [`log`]).
+/// The nanoseconds since `began`, added to `c`.
+pub(crate) fn lap(c: C, began: std::time::Instant) {
+    add(c, began.elapsed().as_nanos() as u64);
+}
+
 pub(crate) fn peek(c: C) -> u64 {
     let i = c as usize;
     COUNT.iter().map(|b| b.0[i].load(Relaxed)).sum()
@@ -618,7 +703,7 @@ mod command_tests {
     #[test]
     fn every_counter_is_named() {
         use super::{C, COUNTERS, NAMES};
-        assert_eq!(C::FreshSharedSlots as usize + 1, NAMES.len());
+        assert_eq!(C::HeapTexUploadNs as usize + 1, NAMES.len());
         assert_eq!(NAMES[C::Frames as usize], "Frames");
         assert!(NAMES.len() <= COUNTERS);
     }
