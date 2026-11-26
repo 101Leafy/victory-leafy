@@ -139,10 +139,11 @@ fn air() -> f32 {
 /// The most a reflection may hold, as a multiple of the light around
 /// (`VICTORY_AMBIENT_REFLECT=<multiple>`; `0` or `off`: the title's own).
 /// Unset: [`REFLECT`]. Like the rest of the stand-in it acts only while
-/// `VICTORY_AMBIENT` is set and the builder does not run.
+/// `VICTORY_AMBIENT` is set and the builder does not run. Under `VICTORY_AB`
+/// the hold comes and goes with the phases, at this multiple (1 if it is 0).
 fn reflect() -> f32 {
     static SET: OnceLock<f32> = OnceLock::new();
-    *SET.get_or_init(|| {
+    let held = *SET.get_or_init(|| {
         let held = std::env::var("VICTORY_AMBIENT_REFLECT").map_or(REFLECT, |v| parse_reflect(&v));
         if held > 0.0 && set() != Set::Off {
             tracing::info!(
@@ -151,7 +152,12 @@ fn reflect() -> f32 {
             );
         }
         held
-    })
+    });
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_AMBIENT_REFLECT") {
+        return if !on { 0.0 } else if held > 0.0 { held } else { REFLECT };
+    }
+    held
 }
 
 /// The multiple when the switch is unset.
