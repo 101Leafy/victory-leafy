@@ -269,11 +269,17 @@ impl GraphicsState {
                 }
                 15 => {
                     self.targets = data.cast::<D3D12_RT_FORMAT_ARRAY>().read_unaligned();
-                    for f in &mut self.targets.RTFormats {
+                    let count =
+                        (self.targets.NumRenderTargets as usize).min(self.targets.RTFormats.len());
+                    self.targets.NumRenderTargets = count as u32;
+                    for f in &mut self.targets.RTFormats[..count] {
                         f.0 = crate::resource::target_format(crate::resource::pc_format(
                             f.0 as u32,
                         )) as i32;
                     }
+                    // D3D12 rejects pipelines with non-unknown formats past `NumRenderTargets`
+                    // (`E_INVALIDARG`), and `describe` hashes all 8 slots into the cache key.
+                    self.targets.RTFormats[count..].fill(DXGI_FORMAT_UNKNOWN);
                 }
                 16 => {
                     let f = data.cast::<u32>().read_unaligned();
@@ -1348,6 +1354,20 @@ mod tests {
         dxc.exists().then_some(dxc)
     }
 
+    /// The empty graphics root signature. Windows 10's own D3D12 refuses its
+    /// directly indexed heap flags (`E_INVALIDARG`) and only victory.exe
+    /// loads the Agility SDK (`agility.rs`), so there the test is skipped.
+    fn empty_root(device: &ID3D12Device) -> Option<(ID3D12RootSignature, Vec<u8>)> {
+        match root_signature(device, &[], &[], false) {
+            Ok(r) => Some(r),
+            Err(e) if e.code() == windows::Win32::Foundation::E_INVALIDARG => {
+                eprintln!("this D3D12 refuses directly indexed heaps (no Agility SDK); skipped");
+                None
+            }
+            Err(e) => panic!("{e}"),
+        }
+    }
+
     fn compile(dxc: &Path, dir: &Path, src: &str, profile: &str) -> Vec<u8> {
         let (hlsl, out) = (
             dir.join(format!("{profile}.hlsl")),
@@ -1389,7 +1409,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let ms = compile(&dxc, dir.path(), MS, "ms_6_5");
         let ps = compile(&dxc, dir.path(), PS, "ps_6_5");
-        let (root, root_blob) = root_signature(&host.device, &[], &[], false).unwrap();
+        let Some((root, root_blob)) = empty_root(&host.device) else { return };
         let mut g = GraphicsState::default();
         // This pipeline has only a color target, with no depth buffer.
         g.depth.DepthEnable = false.into();
@@ -1412,6 +1432,33 @@ mod tests {
         };
         t.RTFormats[..formats.len()].copy_from_slice(formats);
         t
+    }
+
+    /// Formats past `NumRenderTargets` read as unknown and the count stops at
+    /// 8, so stale slots neither fail pipeline creation nor change the key.
+    #[test]
+    fn unused_target_slots_are_cleared_and_the_count_clamped() {
+        #[repr(C, align(8))]
+        struct Sub15(u32, D3D12_RT_FORMAT_ARRAY);
+        let read = |t: D3D12_RT_FORMAT_ARRAY| {
+            let mut g = GraphicsState::default();
+            let sub = Sub15(15, t);
+            // SAFETY: `sub` is a complete subobject 15.
+            unsafe { g.read(15, (&raw const sub).cast()) };
+            g
+        };
+        let mut stale = targets(&[DXGI_FORMAT_R8G8B8A8_UNORM]);
+        stale.RTFormats[1] = DXGI_FORMAT_R32_FLOAT;
+        stale.RTFormats[7] = DXGI_FORMAT_R32_FLOAT;
+        let g = read(stale);
+        assert_eq!(g.targets.NumRenderTargets, 1);
+        assert_eq!(g.targets.RTFormats[0], DXGI_FORMAT_R8G8B8A8_UNORM);
+        assert!(g.targets.RTFormats[1..].iter().all(|&f| f == DXGI_FORMAT_UNKNOWN));
+        assert_eq!(g.describe(), read(targets(&[DXGI_FORMAT_R8G8B8A8_UNORM])).describe());
+
+        let g = read(D3D12_RT_FORMAT_ARRAY { RTFormats: [DXGI_FORMAT_R32_FLOAT; 8], NumRenderTargets: 10 });
+        assert_eq!(g.targets.NumRenderTargets, 8);
+        assert!(g.targets.RTFormats.iter().all(|&f| f == DXGI_FORMAT_R32_FLOAT));
     }
 
     fn blending(independent: bool) -> D3D12_BLEND_DESC {
@@ -1485,7 +1532,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let vs = compile(&dxc, dir.path(), VS, "vs_6_5");
         let ps = compile(&dxc, dir.path(), PS, "ps_6_5");
-        let (root, root_blob) = root_signature(&host.device, &[], &[], false).unwrap();
+        let Some((root, root_blob)) = empty_root(&host.device) else { return };
 
         let mut g = GraphicsState::default();
         // Subobject 21 (`DEPTH_STENCIL1`) with `DepthBoundsTestEnable = true`,
