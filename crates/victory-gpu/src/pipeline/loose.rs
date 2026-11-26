@@ -1,7 +1,17 @@
 //! Host state for pipelines handed over as loose parts (device method
 //! 0x1c8, `victory_shader::loose_graphics`).
 
+use std::cell::RefCell;
+use std::ffi::CString;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+
 use windows::Win32::Graphics::Direct3D12::*;
+use windows::Win32::Graphics::Dxgi::Common::*;
+use windows::core::PCSTR;
+
+use super::host::{GraphicsState, HostPipeline};
+use super::{Shader, make};
 
 /// A blend factor of CB_BLENDn_CONTROL. The alpha factors take no colour:
 /// D3D12 refuses a colour factor there, which reads the same channel's
@@ -69,6 +79,150 @@ pub(crate) fn blend(target_mask: u32, controls: &[u32; 8]) -> Option<D3D12_BLEND
         .any(|t| *t != desc.RenderTarget[0])
         .into();
     Some(desc)
+}
+
+/// What a draw's targets add to a loose pipeline: the views' formats and
+/// sample count, which the description leaves to the draw.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct Targets {
+    colour: [DXGI_FORMAT; 8],
+    count: u32,
+    depth: DXGI_FORMAT,
+    samples: u32,
+}
+
+impl Targets {
+    /// The views at `handles` and `depth` as `State::set_targets` binds
+    /// them: a typed null view keeps its slot, a view it leaves out takes
+    /// none. A view without a format has its resource's.
+    pub(crate) fn of(handles: &[u64], depth: u64) -> Targets {
+        let mut t = Targets {
+            colour: [DXGI_FORMAT_UNKNOWN; 8],
+            count: 0,
+            depth: DXGI_FORMAT_UNKNOWN,
+            samples: 1,
+        };
+        let described = |format: Option<DXGI_FORMAT>, texture: Option<&ID3D12Resource>| {
+            // SAFETY: a live host resource.
+            let desc = texture.map(|r| unsafe { r.GetDesc() });
+            let format = format.filter(|f| f.0 != 0).or(desc.map(|d| d.Format))?;
+            Some((format, desc.map_or(1, |d| d.SampleDesc.Count)))
+        };
+        for &h in handles {
+            let Some(record) = crate::descriptor::rtv_record(h) else {
+                continue;
+            };
+            let view = record.desc();
+            let texture = crate::resource::host_resource(record.resource);
+            if texture.is_none() && view.is_none_or(|d| d.ViewDimension.0 == 0) {
+                continue;
+            }
+            let Some((format, samples)) = described(view.map(|d| d.Format), texture) else {
+                continue;
+            };
+            if let Some(slot) = t.colour.get_mut(t.count as usize) {
+                *slot = format;
+                t.count += 1;
+                t.samples = samples;
+            }
+        }
+        let dsv = crate::descriptor::dsv_record(depth).and_then(|record| {
+            let texture = crate::resource::host_resource(record.resource)?;
+            described(record.depth_desc().map(|d| d.Format), Some(texture))
+        });
+        if let Some((format, samples)) = dsv {
+            t.depth = format;
+            t.samples = samples;
+        }
+        t
+    }
+}
+
+/// A pipeline handed over as loose parts. It has one host pipeline per set
+/// of target formats it is drawn into, made at the first draw into them.
+pub(crate) struct Loose {
+    id: u64,
+    shaders: Vec<Arc<Shader>>,
+    inputs: Vec<victory_shader::InputElement>,
+    blend: D3D12_BLEND_DESC,
+    made: Mutex<Vec<(Targets, Arc<make::Pending>)>>,
+}
+
+thread_local! {
+    /// The host pipeline the last draw on this thread chose, and whose.
+    static CHOSEN: RefCell<Option<(u64, Arc<make::Pending>)>> = const { RefCell::new(None) };
+}
+
+impl Loose {
+    /// None for a blend state D3D12 has no form of.
+    pub(crate) fn new(shaders: Vec<Arc<Shader>>, g: &victory_shader::LooseGraphics) -> Option<Loose> {
+        static IDS: AtomicU64 = AtomicU64::new(1);
+        Some(Loose {
+            id: IDS.fetch_add(1, Ordering::Relaxed),
+            shaders,
+            inputs: g.inputs.clone(),
+            blend: blend(g.target_mask, &g.blend)?,
+            made: Mutex::new(Vec::new()),
+        })
+    }
+
+    /// shortcut: depth testing is off and nothing culls. The description has
+    /// neither, and a guess at the title's depth convention (reversed or
+    /// not) would drop whole passes; every draw is taken as triangles.
+    fn state(&self, t: &Targets) -> GraphicsState {
+        let mut g = GraphicsState { blend: self.blend, ..GraphicsState::default() };
+        g.rasterizer.CullMode = D3D12_CULL_MODE_NONE;
+        g.depth.DepthEnable = false.into();
+        g.depth.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+        g.names = self.inputs.iter().map(|e| CString::new(e.name.as_str()).unwrap_or_default()).collect();
+        g.inputs = self
+            .inputs
+            .iter()
+            .zip(&g.names)
+            .map(|(e, name)| D3D12_INPUT_ELEMENT_DESC {
+                SemanticName: PCSTR(name.as_ptr().cast()),
+                SemanticIndex: e.index,
+                Format: DXGI_FORMAT(crate::resource::pc_format(e.format) as i32),
+                InputSlot: e.slot,
+                AlignedByteOffset: e.offset,
+                InputSlotClass: D3D12_INPUT_CLASSIFICATION(e.class as i32),
+                InstanceDataStepRate: e.step,
+            })
+            .collect();
+        g.topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        g.targets = D3D12_RT_FORMAT_ARRAY { RTFormats: t.colour, NumRenderTargets: t.count };
+        g.depth_format = t.depth;
+        g.samples.Count = t.samples;
+        g
+    }
+
+    /// At a draw: the host pipeline for the targets bound, queued the first
+    /// time, which [`Loose::chosen`] then gives on this thread.
+    pub(crate) fn choose(&self, handles: &[u64], depth: u64) {
+        let targets = Targets::of(handles, depth);
+        let p = {
+            let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+            match made.iter().find(|(t, _)| *t == targets) {
+                Some((_, p)) => p.clone(),
+                None => {
+                    let state = Box::new(self.state(&targets));
+                    let p = Arc::new(make::Pending::new(self.shaders.clone(), Some(state)));
+                    made.push((targets, p.clone()));
+                    p
+                }
+            }
+        };
+        CHOSEN.with_borrow_mut(|c| *c = Some((self.id, p)));
+    }
+
+    /// The host pipeline the last [`Loose::choose`] on this thread picked,
+    /// if it was for this pipeline and is made.
+    pub(crate) fn chosen(&self) -> Option<&HostPipeline> {
+        let p = CHOSEN.with_borrow(|c| c.as_ref().filter(|(id, _)| *id == self.id).map(|(_, p)| p.clone()))?;
+        let made: *const HostPipeline = make::ready(&p)?;
+        // SAFETY: `self.made` holds `p`, and so what it made, while self lives.
+        Some(unsafe { &*made })
+    }
 }
 
 #[cfg(test)]

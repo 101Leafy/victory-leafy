@@ -446,6 +446,9 @@ struct Pipeline {
     /// One of the ray-tracing structure builder's ([`Builder`]).
     #[cfg(windows)]
     builder: bool,
+    /// Made from loose parts: its host pipelines go by the draw's targets.
+    #[cfg(windows)]
+    loose: Option<Box<loose::Loose>>,
 }
 const _: () = assert!(offset_of!(Pipeline, packet) == 0x10);
 
@@ -481,7 +484,24 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
     if this.is_null() {
         return None;
     }
-    make::ready(&pipeline(this).host)
+    let p = pipeline(this);
+    if let Some(loose) = &p.loose {
+        return loose.chosen();
+    }
+    make::ready(&p.host)
+}
+
+/// At a draw, before [`host_pipeline`]: a pipeline made from loose parts
+/// picks its host pipeline for the targets bound (`State::set_targets`'s
+/// handles). Nothing for other pipelines.
+#[cfg(windows)]
+pub(crate) fn draw_targets(this: This, handles: &[u64], depth: u64) {
+    if this.is_null() {
+        return;
+    }
+    if let Some(loose) = &pipeline(this).loose {
+        loose.choose(handles, depth);
+    }
 }
 
 /// Host pipelines queued and not made yet.
@@ -590,6 +610,24 @@ fn hand_out(
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
+    hand_out_loose(
+        shaders,
+        #[cfg(windows)]
+        graphics,
+        #[cfg(windows)]
+        None,
+        iid,
+        out,
+    )
+}
+
+fn hand_out_loose(
+    shaders: Vec<Arc<Shader>>,
+    #[cfg(windows)] graphics: Option<Box<host::GraphicsState>>,
+    #[cfg(windows)] loose: Option<Box<loose::Loose>>,
+    iid: *const Iid,
+    out: *mut This,
+) -> HRESULT {
     tracing::trace!(?shaders, "pipeline state");
     #[cfg(windows)]
     let host = Arc::new(make::Pending::new(shaders.clone(), graphics));
@@ -613,10 +651,24 @@ fn hand_out(
         host,
         #[cfg(windows)]
         builder,
+        #[cfg(windows)]
+        loose,
         shaders,
         bound: std::sync::atomic::AtomicBool::new(false),
     });
     object::hand_out(PIPELINE, pipeline, iid, &PIPELINE_IIDS, out)
+}
+
+/// A graphics pipeline from loose parts (device method 0x1c8). Its host
+/// pipelines wait for the draws' targets ([`draw_targets`]).
+#[cfg(windows)]
+pub(crate) fn create_loose_graphics(g: &victory_shader::LooseGraphics, iid: *const Iid, out: *mut This) -> HRESULT {
+    let mut shaders = vec![shader("vertex", &g.vs)];
+    shaders.extend(g.ps.as_deref().map(|ps| shader("pixel", ps)));
+    let Some(loose) = loose::Loose::new(shaders.clone(), g) else {
+        return E_INVALIDARG;
+    };
+    hand_out_loose(shaders, None, Some(Box::new(loose)), iid, out)
 }
 
 /// Device method.
@@ -787,7 +839,6 @@ pub mod known;
 #[cfg(windows)]
 mod library;
 #[cfg(windows)]
-#[allow(dead_code)] // until loose pipelines get their draw-time state
 mod loose;
 #[cfg(windows)]
 mod make;
