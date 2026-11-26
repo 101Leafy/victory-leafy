@@ -1210,7 +1210,31 @@ fn own_bits_on() -> bool {
 /// wave, the view heap's limit, where the raw twins of its views start, and
 /// what it writes for the console's own hardware.
 pub fn host_settings() -> [u32; 4] {
-    [host_max_wave(), super::shader::view_heap_limit(), super::shader::raw_views(), host_rdna()]
+    // (bit 31 of the last: `VICTORY_COLOR_FINITE`, so the key is the same while it is off)
+    let rdna = host_rdna() | u32::from(color_finite_on()) << 31;
+    [host_max_wave(), super::shader::view_heap_limit(), super::shader::raw_views(), rdna]
+}
+
+/// `VICTORY_COLOR_FINITE=1`: float colour exports are held to +-65024 and a NaN
+/// becomes 0. The console's colour block clamps an f32 export that is too big
+/// for a 16-bit or 11/10-bit float target; a host that rounds it to nearest
+/// writes an infinity there, and a pass that blends it with its history
+/// (inf - inf) keeps a NaN, black on screen. 65024 is the largest finite
+/// R11G11B10 value and exact in 16 bits. Off by default: it also clamps
+/// 32-bit float targets, and no run has shown it yet.
+fn color_finite_on() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_COLOR_FINITE.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_COLOR_FINITE").is_some_and(|v| v == "1"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`color_finite_on`], for its thread only.
+    pub(super) static TEST_COLOR_FINITE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
 static HOST_RDNA: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -12472,6 +12496,7 @@ impl<'a> Lower<'a> {
             }
             let el = &mut elements(self, primitive)[id];
             el.usage |= 1 << col;
+            let color = !mesh && el.kind == 16;
             let (suffix, x) = match el.comp {
                 9 if half.is_some() => (".f32", self.as_float(x)),
                 9 => {
@@ -12479,6 +12504,7 @@ impl<'a> Lower<'a> {
                         Some(&f) => f,
                         None => self.as_float(x),
                     };
+                    let f = if color && color_finite_on() { self.finite_color(f) } else { f };
                     (".f32", f)
                 }
                 _ => (".i32", x),
@@ -12505,6 +12531,17 @@ impl<'a> Lower<'a> {
         }
         self.end_guarded(at, &[]);
         Ok(())
+    }
+
+    /// `f` held to +-65024, a NaN as 0 ([`color_finite_on`]).
+    fn finite_color(&mut self, f: V) -> V {
+        let c = self.cur;
+        let (low, high) = (self.s.m.f32((-65024.0f32).to_bits()), self.s.m.f32(65024.0f32.to_bits()));
+        let t = self.binary(35, f, low);
+        let held = self.binary(36, t, high);
+        let nan = self.is_nan_f32(f);
+        let zero = self.s.m.f32(0);
+        self.s.m.select(c, nan, zero, held)
     }
 
     /// Mesh: `exp prim` as the lane's primitive. Each corner takes ten
