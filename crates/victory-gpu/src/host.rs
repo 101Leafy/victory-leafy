@@ -746,6 +746,26 @@ fn card_clock_line(frames: f64, ms: f64) {
          had not submitted; the submitting thread stood waiting for the card {stood:.1} ms",
         if ms > 0.0 { (100.0 * (1.0 - idle / ms)).clamp(0.0, 100.0) } else { 0.0 }
     );
+    #[cfg(feature = "diagnostics")]
+    if let Some(sides) = crate::sidetime::line(frames) {
+        // The driver's own paging can't be seen from here: what can is our
+        // waits for new memory to be resident and the use against the budget.
+        static LAST: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+        let [waits, us] = [0, 1].map(|i| {
+            let now = RESIDENT[i].load(Ordering::Relaxed);
+            now.saturating_sub(LAST[i].swap(now, Ordering::Relaxed)) as f64 / frames
+        });
+        let memory = host().and_then(|h| h.video_memory()).unwrap_or_default();
+        tracing::info!(
+            "the card's time per frame in side sends (VICTORY_SIDE_STAMPS=1): {sides}; new memory waited for {waits:.1} times, \
+             {:.2} ms; the card's memory {} MB over its budget, {} MB of the PC's shared memory in use; mesh dispatches cut to \
+             65,535 groups since the start: {}",
+            us / 1000.0,
+            memory[1].saturating_sub(memory[0]) >> 20,
+            memory[3] >> 20,
+            crate::draw::MESH_CUT.load(Ordering::Relaxed)
+        );
+    }
 }
 
 /// Of the preparing: title memory copies (microseconds, bytes) and texture
@@ -1014,8 +1034,11 @@ fn create() -> windows::core::Result<Host> {
             tracing::info!(min = o1.WaveLaneCountMin, max = o1.WaveLaneCountMax, "host wave lanes");
             victory_shader::emit::set_host_max_wave(o1.WaveLaneCountMax);
             // (RDNA has waves of 32 and 64, the vendor's older cards of 64 alone.)
+            // `VICTORY_HOST_RDNA=1` takes any card for one, to time `VICTORY_RDNA_FLOAT`'s
+            // host-neutral bits (2, the legacy products) elsewhere.
             let amd = crate::indirect::amd(&device);
-            victory_shader::emit::set_host_rdna(amd && o1.WaveLaneCountMin == 32 && o1.WaveLaneCountMax == 64);
+            let forced = std::env::var_os("VICTORY_HOST_RDNA").is_some_and(|v| v == "1");
+            victory_shader::emit::set_host_rdna(forced || amd && o1.WaveLaneCountMin == 32 && o1.WaveLaneCountMax == 64);
         }
         let mut model = D3D12_FEATURE_DATA_SHADER_MODEL {
             HighestShaderModel: D3D_SHADER_MODEL_6_7,
@@ -4912,6 +4935,8 @@ impl Host {
                 (|| -> windows::core::Result<()> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
+                    #[cfg(feature = "diagnostics")]
+                    let side = crate::sidetime::begin(&self.device, &self.queue, list, crate::sidetime::SYNC);
                     if upcheck::on() {
                         looks = upcheck::record(self, list, &dirty);
                     }
@@ -4985,6 +5010,8 @@ impl Host {
                             card_pass(list, &run, size as u32, 0, 0);
                         }
                     }
+                    #[cfg(feature = "diagnostics")]
+                    crate::sidetime::end(list, side);
                     list.Close()?;
                     self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
                     Ok(())
@@ -5067,6 +5094,8 @@ impl Host {
                 (|| -> windows::core::Result<ID3D12CommandList> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
+                    #[cfg(feature = "diagnostics")]
+                    let side = crate::sidetime::begin(&self.device, &self.queue, list, crate::sidetime::CHECK);
                     // What the submission's shaders wrote, first.
                     list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
                         Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
@@ -5091,6 +5120,8 @@ impl Host {
                         card_pass(list, &r.span, size as u32, r.at, if flown && !r.picked { 2 } else { 1 });
                         CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
                     }
+                    #[cfg(feature = "diagnostics")]
+                    crate::sidetime::end(list, side);
                     list.Close()?;
                     list.cast()
                 })()
@@ -5642,9 +5673,13 @@ impl Host {
                 (|| -> windows::core::Result<()> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
+                    #[cfg(feature = "diagnostics")]
+                    let side = crate::sidetime::begin(&self.device, &self.queue, list, crate::sidetime::FETCH);
                     for &(i, lo, hi, at) in &pieces {
                         list.CopyBufferRegion(fetched, at, &plan.ranges[i].shadow.buffer, lo as u64, (hi - lo) as u64);
                     }
+                    #[cfg(feature = "diagnostics")]
+                    crate::sidetime::end(list, side);
                     list.Close()?;
                     self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
                     self.card_sent();
