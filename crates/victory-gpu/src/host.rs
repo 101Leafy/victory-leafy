@@ -1073,8 +1073,8 @@ mod tests {
         assert_eq!(pool.take(4), None, "submission 5 is not done");
         assert_eq!(pool.take(5).map(|p| p < 3), Some(true));
         assert_eq!((pool.free.len(), pool.flight.len()), (1, 1));
-        assert_eq!(pool.take(6).map(|p| p < 3), Some(true));
         assert_eq!(pool.take(6), Some(3));
+        assert_eq!(pool.take(6).map(|p| p < 3), Some(true));
         assert!(pool.flight.is_empty());
     }
 
