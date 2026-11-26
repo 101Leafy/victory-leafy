@@ -99,6 +99,8 @@ fn build(translator: &str) -> [u8; 32] {
             "VICTORY_BVH_BOUNDS",
             "VICTORY_WAVE_PAIRS",
             "VICTORY_LAUNCHED_EXEC",
+            "VICTORY_GUARD_FLOAT",
+            "VICTORY_GUARD_RUNS",
         ] {
             append_switch(&mut bytes, name, std::env::var_os(name).as_deref());
         }
