@@ -77,6 +77,25 @@ fn count_out(counts: &mut BTreeMap<u64, u32>, at: u64) {
     }
 }
 
+/// What the last [`Picked::plan`] took and why, counted before the slots
+/// taken more than once were made one (written and carried slots are
+/// counted where they come from).
+#[derive(Clone, Copy, Default)]
+pub(crate) struct Due {
+    /// Under a freed table entry.
+    pub(crate) freed: u64,
+    /// Held, in this pass's part of [`FULL_EVERY`].
+    pub(crate) sweep_part: u64,
+    /// Held, out of the part, with a record not the one seen.
+    pub(crate) sweep_changed: u64,
+    /// Orphans in this pass's part of [`ORPHANS_EVERY`].
+    pub(crate) orphan_part: u64,
+    /// Orphans out of the part with a record not the one seen.
+    pub(crate) orphan_changed: u64,
+    /// Taken more than once.
+    pub(crate) twice: u64,
+}
+
 /// What a pass looks at (see the module).
 pub(crate) struct Picked<C> {
     passes: u64,
@@ -100,6 +119,8 @@ pub(crate) struct Picked<C> {
     whole: bool,
     /// The old pass (`VICTORY_HEAP_PASS_FULL=1`).
     full: bool,
+    /// The last plan's.
+    due: Due,
 }
 
 impl<C: Clone> Picked<C> {
@@ -114,6 +135,7 @@ impl<C: Clone> Picked<C> {
             carried: Vec::new(),
             whole: false,
             full,
+            due: Due::default(),
         }
     }
 
@@ -145,6 +167,7 @@ impl<C: Clone> Picked<C> {
     ) -> Vec<u32> {
         let pass = self.passes;
         let forgotten = self.forgotten.replace(Vec::new());
+        self.due = Due::default();
         self.whole = pass == 0 || (!self.full && forgotten.is_none());
         if self.whole || sweep {
             self.passes += 1;
@@ -180,28 +203,54 @@ impl<C: Clone> Picked<C> {
                         // Only those whose record still names the entry.
                         if seen.is_some_and(|r| entry(r) == Some(e)) {
                             due.push(s);
+                            self.due.freed += 1;
                         }
                     }
                 }
             }
             if sweep {
+                let Due { sweep_part, sweep_changed, orphan_part, orphan_changed, .. } = &mut self.due;
+                // In the part, or else with another record; the record is
+                // not read for those in the part.
+                let mut take = |slot: u32, every: u64, seen: Record, part: &mut u64, changed: &mut u64| {
+                    if in_part(slot, pass, every) {
+                        *part += 1;
+                    } else if record(slot) != Some(seen) {
+                        *changed += 1;
+                    } else {
+                        return None;
+                    }
+                    Some(slot)
+                };
                 due.extend(
                     self.slots
                         .iter()
-                        .filter(|&(&slot, kept)| in_part(slot, pass, FULL_EVERY) || record(slot) != Some(kept.record))
-                        .map(|(&slot, _)| slot),
+                        .filter_map(|(&slot, kept)| take(slot, FULL_EVERY, kept.record, sweep_part, sweep_changed)),
                 );
                 due.extend(
                     self.orphans
                         .iter()
-                        .filter(|&(&slot, &(seen, _))| in_part(slot, pass, ORPHANS_EVERY) || record(slot) != Some(seen))
-                        .map(|(&slot, _)| slot),
+                        .filter_map(|(&slot, &(seen, _))| take(slot, ORPHANS_EVERY, seen, orphan_part, orphan_changed)),
                 );
             }
         }
+        let taken = due.len();
         due.sort_unstable();
         due.dedup();
+        self.due.twice = (taken - due.len()) as u64;
         due
+    }
+
+    /// What the last plan took and why.
+    #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+    pub(crate) fn due(&self) -> Due {
+        self.due
+    }
+
+    /// Whether slot `slot` found no host copy at its last look.
+    #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+    pub(crate) fn orphaned(&self, slot: u32) -> bool {
+        self.orphans.contains_key(&slot)
     }
 
     /// Slots of the last plan that were not looked at: the next plan has
@@ -403,6 +452,21 @@ mod tests {
         assert_eq!(pass(&mut p, &heap, vec![], vec![117, 105]), vec![slot(17)]);
         // And the next pass leaves them alone again.
         assert!(pass(&mut p, &heap, vec![], vec![]).is_empty());
+    }
+
+    #[test]
+    fn a_plan_counts_why_it_took_each_slot() {
+        let mut heap = heap(64);
+        let mut p = Picked::new(false);
+        pass(&mut p, &heap, vec![], vec![]);
+        // Written through the API and found by its record both: taken twice.
+        heap.records.insert(slot(5), [1, 500, 1]);
+        heap.records.insert(slot(9), [1, 900, 1]);
+        assert_eq!(pass(&mut p, &heap, vec![slot(5)], vec![117]), vec![slot(5), slot(9), slot(17)]);
+        let due = p.due();
+        assert_eq!((due.freed, due.sweep_changed, due.sweep_part, due.twice), (1, 2, 0, 1));
+        assert!(pass(&mut p, &heap, vec![], vec![]).is_empty());
+        assert_eq!(p.due().sweep_changed, 0);
     }
 
     #[test]
