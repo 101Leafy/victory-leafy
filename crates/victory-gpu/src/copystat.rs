@@ -328,11 +328,16 @@ pub(crate) enum C {
     SettleTablesNs,
     SettleResultsNs,
     SettleListsNs,
+    /// The submission lock held by others than the submitting thread: the
+    /// late thread's settle once the card is done (`WHY_CARD_DONE`), and
+    /// `settle_now` (a present, a fence, descriptor slots run out).
+    SubmitLockDoneNs,
+    SubmitLockSettleNs,
 }
 const COUNTERS: usize = 192;
 
 /// The counters' names, in the order of [`C`], for the frame recorder's columns.
-pub(crate) const NAMES: [&str; 176] = [
+pub(crate) const NAMES: [&str; 178] = [
     "Submissions", "Copies", "CopyBytes", "Refreshes", "RefreshBytes", "Skipped", "SkippedBytes", "Runs",
     "RunUs", "Queries", "QueryUs", "MoveUs", "Unmapped", "Watches", "WatchUs", "Checked", "Unchanged",
     "Fallbacks", "GuardFaults", "TexWatched", "TexHashed", "TexChanged", "TexHot", "Frames", "RecordCalls",
@@ -363,6 +368,7 @@ pub(crate) const NAMES: [&str; 176] = [
     "DrawEarlyNs", "DrawTablesNs", "DrawMemoryNs", "DrawRootsNs", "DrawBuffersNs", "DrawStatesNs",
     "IndirectArgsNs", "DrawBindNs", "DrawDriverNs", "DrawAfterNs", "IndirectFindNs", "IndirectPrepareNs",
     "IndirectDriverNs", "SettleTablesNs", "SettleResultsNs", "SettleListsNs",
+    "SubmitLockDoneNs", "SubmitLockSettleNs",
 ];
 /// One of some sets of counters, each in lines of the processor's memory of
 /// its own: a set for all threads had them wait for each other's lines at
