@@ -895,6 +895,59 @@ fn unlike(dst: This, src: This) -> bool {
 #[cfg(windows)]
 pub(crate) static SELF_COPIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// The steps of one [`copy_texture_region`], timed into their counters: a
+/// read back whole; the source (its upload or the footprint's buffer); the
+/// destination's first contents (zeros or its upload); its levels on demand;
+/// the states and the copy itself. Play run c: 6 such copies a frame at
+/// about 10 ms each, with nothing to say which step. A call of 4 ms or more
+/// is logged with its steps.
+#[cfg(all(windows, feature = "diagnostics"))]
+struct CopyLaps {
+    began: std::time::Instant,
+    at: std::time::Instant,
+    us: [u64; 5],
+}
+
+#[cfg(all(windows, feature = "diagnostics"))]
+impl CopyLaps {
+    fn new() -> Self {
+        let now = std::time::Instant::now();
+        Self { began: now, at: now, us: [0; 5] }
+    }
+
+    fn lap(&mut self, step: usize) {
+        use crate::copystat::C;
+        let now = std::time::Instant::now();
+        let ns = (now - self.at).as_nanos() as u64;
+        self.at = now;
+        self.us[step] += ns / 1000;
+        let c = match step {
+            0 => C::CopyTexBackNs,
+            1 => C::CopyTexSourceNs,
+            2 => C::CopyTexFirstNs,
+            3 => C::CopyTexLevelsNs,
+            _ => C::CopyTexRecordNs,
+        };
+        crate::copystat::add(c, ns);
+    }
+
+    fn done(&self, what: impl FnOnce() -> String) {
+        use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+        let us = self.began.elapsed().as_micros() as u64;
+        crate::copystat::add(crate::copystat::C::CopyTexCalls, 1);
+        if us < 4000 {
+            return;
+        }
+        crate::copystat::add(crate::copystat::C::CopyTexSlow, 1);
+        static SLOW: AtomicU64 = AtomicU64::new(0);
+        let n = SLOW.fetch_add(1, Relaxed) + 1;
+        if n <= 32 || n.is_multiple_of(256) {
+            let [back, source, first, levels, record] = self.us;
+            tracing::info!(slow = n, us, back, source, first, levels, record, what = %what(), "a slow texture copy");
+        }
+    }
+}
+
 extern "system" fn copy_resource(this: This, dst: This, src: This) {
     #[cfg(windows)]
     {
@@ -999,6 +1052,8 @@ extern "system" fn copy_texture_region(
         else {
             return;
         };
+        #[cfg(feature = "diagnostics")]
+        let mut laps = CopyLaps::new();
         let Some(to) = crate::resource::host_resource(dst.resource) else {
             // Texture to buffer: a read back. The list copies the texels
             // into a host buffer of ours; once it has run they go to the
@@ -1010,6 +1065,11 @@ extern "system" fn copy_texture_region(
             static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let n = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
             let made = read_back(list, dst, x, y, z, src, source_box);
+            #[cfg(feature = "diagnostics")]
+            {
+                laps.lap(0);
+                laps.done(|| format!("read back from {:?}, {made:?}", src.resource));
+            }
             if n <= 16 || n.is_multiple_of(4096) || made.is_err() {
                 static REFUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
                 if made.is_err() && REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 16 {
@@ -1092,6 +1152,8 @@ extern "system" fn copy_texture_region(
             }
             from.resource = texture.as_raw().cast_const().cast();
         }
+        #[cfg(feature = "diagnostics")]
+        laps.lap(1);
         // A depth texture shaders also write: what they wrote, first (the
         // source above too).
         list.twin_use(dst.resource, false, true);
@@ -1128,12 +1190,16 @@ extern "system" fn copy_texture_region(
                 ensure_state(list, dst.resource, COPY_SOURCE);
             }
         }
+        #[cfg(feature = "diagnostics")]
+        laps.lap(2);
         // A destination made level by level gets the level's memory ahead
         // of this list (`crate::tiles`): the title's bake copies each level
         // of its result into a block-compressed texture of that kind, and
         // a copy into a level without memory is dropped.
         crate::texture::card_writes(list, dst.resource, to, Some(dst.footprint.offset as u32));
         crate::texture::host_written(dst.resource);
+        #[cfg(feature = "diagnostics")]
+        laps.lap(3);
         if same {
             SELF_COPIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return;
@@ -1178,6 +1244,11 @@ extern "system" fn copy_texture_region(
                 host_box,
             )
         };
+        #[cfg(feature = "diagnostics")]
+        {
+            laps.lap(4);
+            laps.done(|| format!("copy to {:?} kind {} from {:?} kind {}", dst.resource, dst.kind, src.resource, src.kind));
+        }
     }
     #[cfg(not(windows))]
     let _ = (this, dst, x, y, z, src, source_box);
