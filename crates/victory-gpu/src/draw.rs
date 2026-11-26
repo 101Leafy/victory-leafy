@@ -1336,6 +1336,16 @@ impl State {
         crate::draw::depth_bounds(list, min, max);
     }
 
+    /// The host list's pipeline, root signatures and heaps were set by
+    /// code of ours between the title's calls (the AMD upscaler stand-in,
+    /// `crate::list::stretch_texture`): the next draw or dispatch sets the
+    /// title's again (`bind`).
+    pub(crate) fn forget_host_bindings(&mut self) {
+        self.host_pipeline = 0;
+        self.host_roots = [0; 2];
+        self.host_heaps = [0; 2];
+    }
+
     /// `list` is a new host list that continues the title's list (it was
     /// cut at a wait for a memory value, `crate::list::cut`): a new host
     /// list has nothing set, so what the title set so far is set again.
@@ -1348,16 +1358,6 @@ impl State {
     /// shortcut: the render target views are made again from the handles'
     /// descriptors as they are now, not as they were when the title set
     /// the targets (a descriptor rewritten in between names another view).
-    /// The host list's pipeline, root signatures and heaps were set by
-    /// code of ours between the title's calls (the AMD upscaler stand-in,
-    /// `crate::list::stretch_texture`): the next draw or dispatch sets the
-    /// title's again (`bind`).
-    pub(crate) fn forget_host_bindings(&mut self) {
-        self.host_pipeline = 0;
-        self.host_roots = [0; 2];
-        self.host_heaps = [0; 2];
-    }
-
     pub(crate) fn replay(&mut self, list: &HostList) {
         self.host_pipeline = 0;
         self.host_roots = [0; 2];
@@ -1434,6 +1434,10 @@ impl State {
         }
         // All of every group, unless the dispatch says otherwise.
         if kind == victory_shader::emit::USER_DISPATCH_THREADS_X {
+            return 0;
+        }
+        // The first group of a piece of a split dispatch, set by the dispatch.
+        if kind == victory_shader::emit::USER_GROUP_BASE_X {
             return 0;
         }
         if kind == USER_ROOT_ADDRESS || kind == USER_ROOT_ADDRESS + 1 {
@@ -3000,9 +3004,29 @@ impl State {
                 unsafe { list.list.SetComputeRoot32BitConstant(param, threads[0], word) };
             }
         }
+        let base = compute_word(p, victory_shader::emit::USER_GROUP_BASE_X);
         let began = std::time::Instant::now();
-        // SAFETY: an open list with everything set.
-        unsafe { list.list.Dispatch(x, y, z) };
+        if x <= crate::indirect::PIECE {
+            // SAFETY: an open list with everything set.
+            unsafe { list.list.Dispatch(x, y, z) };
+        } else {
+            // More groups along X than the host runs at once: in pieces, the
+            // program told the first group of each where it reads its group id.
+            for first in (0..x).step_by(crate::indirect::PIECE as usize) {
+                // SAFETY: an open list with everything set; the root
+                // signature has the word.
+                unsafe {
+                    if let Some((param, word)) = base {
+                        list.list.SetComputeRoot32BitConstant(param, first, word);
+                    }
+                    list.list.Dispatch((x - first).min(crate::indirect::PIECE), y, z);
+                }
+            }
+            if let Some((param, word)) = base {
+                // SAFETY: as above; back to what `bind` set.
+                unsafe { list.list.SetComputeRoot32BitConstant(param, 0, word) };
+            }
+        }
         crate::copystat::lap(crate::copystat::C::DrawDriverNs, began);
         let began = std::time::Instant::now();
         self.buffers_written();
@@ -4322,8 +4346,17 @@ impl State {
             },
             None => None,
         };
+        // A dispatch that may ask for more groups along X than the host runs
+        // at once runs in pieces (`crate::indirect::SPLIT`), each record
+        // setting the word that tells the program its first group.
+        let split = (kind == DISPATCH && crate::indirect::splits_dispatches())
+            .then(|| compute_word(p, victory_shader::emit::USER_GROUP_BASE_X))
+            .flatten();
         let Some(signature) = matches!(kind, DRAW | INDEXED | DISPATCH | MESH)
-            .then(|| host_signature(kind, stride))
+            .then(|| {
+                let step = if split.is_some() { 16 } else { stride };
+                host_signature(kind, step, split.map(|(param, word)| (&p.root, param, word)))
+            })
             .flatten()
         else {
             why("no host signature");
@@ -4336,7 +4369,7 @@ impl State {
         crate::copystat::lap(crate::copystat::C::IndirectFindNs, entered);
         let began = std::time::Instant::now();
         // One record without a count: clamped in a batch (`batches`).
-        let batch = if batches() > 0 && max == 1 && count.is_none() {
+        let batch = if batches() > 0 && max == 1 && count.is_none() && split.is_none() {
             args.refresh(list, arguments, len);
             self.batched(list, &args, arguments, kind)
         } else {
@@ -4405,7 +4438,8 @@ impl State {
                 let bounded = if windowed && records > 1 {
                     crate::indirect::bound_ahead(list, (&args.buffer, offset), (kind, step, records))
                 } else {
-                    crate::indirect::bound(list, (&args.buffer, offset), count_arg, (kind, step, records))
+                    let clamped = if split.is_some() { crate::indirect::SPLIT } else { kind };
+                    crate::indirect::bound(list, (&args.buffer, offset), count_arg, (clamped, step, records))
                 };
                 let Some(bounded) = bounded else {
                     self.window = None;
@@ -4453,16 +4487,32 @@ impl State {
         // SAFETY: an open list with everything set; the scratch buffer and
         // host copies are kept alive by the list, and the signature is cached.
         unsafe {
-            list.list.ExecuteIndirect(
-                &signature,
-                max,
-                &bounded,
-                at,
-                counter.as_ref().map(|(s, _)| &s.buffer),
-                counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
-            )
+            match split {
+                // The pieces, counted after them by the clamp.
+                Some(_) => list.list.ExecuteIndirect(
+                    &signature,
+                    max.saturating_mul(crate::indirect::PIECES),
+                    &bounded,
+                    at,
+                    Some(&bounded),
+                    u64::from(max) * u64::from(crate::indirect::PIECES * 16),
+                ),
+                None => list.list.ExecuteIndirect(
+                    &signature,
+                    max,
+                    &bounded,
+                    at,
+                    counter.as_ref().map(|(s, _)| &s.buffer),
+                    counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
+                ),
+            }
         };
         crate::copystat::lap(crate::copystat::C::IndirectDriverNs, began);
+        if split.is_some() {
+            // Root arguments a command signature sets are undefined after it.
+            self.host_pipeline = 0;
+            self.host_roots[1] = 0;
+        }
         if kind == MESH {
             self.mesh_scissor(list, false);
         }
@@ -4525,31 +4575,53 @@ mod thread_tests {
 }
 
 /// The host command signature for one argument of `kind` with records
-/// `stride` bytes apart (no root arguments, so no root signature), made
-/// once.
-fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
-    static MADE: std::sync::Mutex<Vec<((u32, u32), ID3D12CommandSignature)>> =
+/// `stride` bytes apart, made once. With `constant` (a root signature, one
+/// of its root constant parameters, and a dword of it) each record first
+/// sets that dword; without, there are no root arguments, so no root
+/// signature.
+fn host_signature(
+    kind: u32,
+    stride: u32,
+    constant: Option<(&ID3D12RootSignature, u32, u32)>,
+) -> Option<ID3D12CommandSignature> {
+    type Key = (u32, u32, Option<(usize, u32, u32)>);
+    // The root signatures are kept, so their addresses are not reused.
+    static MADE: std::sync::Mutex<Vec<(Key, Option<ID3D12RootSignature>, ID3D12CommandSignature)>> =
         std::sync::Mutex::new(Vec::new());
+    let key = (kind, stride, constant.map(|(root, param, word)| (root.as_raw() as usize, param, word)));
     let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some((_, s)) = made.iter().find(|(k, _)| *k == (kind, stride)) {
+    if let Some((.., s)) = made.iter().find(|(k, ..)| *k == key) {
         return Some(s.clone());
     }
-    let argument = D3D12_INDIRECT_ARGUMENT_DESC {
+    let mut arguments = Vec::with_capacity(2);
+    if let Some((_, param, word)) = constant {
+        arguments.push(D3D12_INDIRECT_ARGUMENT_DESC {
+            Type: D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT,
+            Anonymous: D3D12_INDIRECT_ARGUMENT_DESC_0 {
+                Constant: D3D12_INDIRECT_ARGUMENT_DESC_0_1 {
+                    RootParameterIndex: param,
+                    DestOffsetIn32BitValues: word,
+                    Num32BitValuesToSet: 1,
+                },
+            },
+        });
+    }
+    arguments.push(D3D12_INDIRECT_ARGUMENT_DESC {
         Type: D3D12_INDIRECT_ARGUMENT_TYPE(kind as i32),
         ..Default::default()
-    };
+    });
     let desc = D3D12_COMMAND_SIGNATURE_DESC {
         ByteStride: stride,
-        NumArgumentDescs: 1,
-        pArgumentDescs: &argument,
+        NumArgumentDescs: arguments.len() as u32,
+        pArgumentDescs: arguments.as_ptr(),
         NodeMask: 0,
     };
     let mut signature: Option<ID3D12CommandSignature> = None;
-    // SAFETY: a description of one argument; no root arguments.
+    // SAFETY: a description of these arguments; the root signature is live.
     let result = unsafe {
         crate::host::host()?.device.CreateCommandSignature(
             &desc,
-            None::<&ID3D12RootSignature>,
+            constant.map(|(root, ..)| root),
             &mut signature,
         )
     };
@@ -4558,7 +4630,7 @@ fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
         return None;
     }
     let signature = signature?;
-    made.push(((kind, stride), signature.clone()));
+    made.push((key, constant.map(|(root, ..)| root.clone()), signature.clone()));
     Some(signature)
 }
 

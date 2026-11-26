@@ -130,6 +130,9 @@ struct List {
     /// at them before it runs `host`.
     #[cfg(windows)]
     gate: Vec<ValueWait>,
+    /// Queries begun on `host` and not ended yet: heap, type, index.
+    #[cfg(windows)]
+    open_queries: Vec<(usize, windows::Win32::Graphics::Direct3D12::D3D12_QUERY_TYPE, u32)>,
     /// With `VICTORY_THIN=1`, of a list the title has: what it wrote down
     /// ([`thin`]; then there is no `host`).
     #[cfg(windows)]
@@ -328,6 +331,7 @@ fn cut(this: This, wait: ValueWait) {
         list.gate.push(wait);
         return;
     };
+    end_queries_at_cut(current, &mut list.open_queries);
     current.close();
     static CUTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     if CUTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
@@ -343,6 +347,24 @@ fn cut(this: This, wait: ValueWait) {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .replay(host);
+    }
+}
+
+/// Ends the queries begun on the host list a cut closes, as D3D12 wants a
+/// query begun and ended on one list. They counted only part of what the
+/// title measures, so their resolve answers as without host queries.
+#[cfg(windows)]
+fn end_queries_at_cut(
+    current: &crate::host::HostList,
+    open: &mut Vec<(usize, windows::Win32::Graphics::Direct3D12::D3D12_QUERY_TYPE, u32)>,
+) {
+    for (heap, r#type, index) in open.drain(..) {
+        if let Some(host) = crate::query::host_heap(heap as This) {
+            // SAFETY: an open list and our query heap, whose query was
+            // begun on it.
+            unsafe { current.list.EndQuery(&host, r#type, index) };
+        }
+        crate::query::cut_short(heap as This, index);
     }
 }
 
@@ -618,6 +640,8 @@ fn boxed(kind: u32, pipeline: This, thin: bool) -> Box<List> {
         #[cfg(windows)]
         gate: Vec::new(),
         #[cfg(windows)]
+        open_queries: Vec::new(),
+        #[cfg(windows)]
         thin: Default::default(),
     });
     #[cfg(not(windows))]
@@ -678,6 +702,7 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
         let list = unsafe { &mut *this.cast_mut().cast::<List>() };
         list.earlier.clear();
         list.gate.clear();
+        list.open_queries.clear();
     }
     #[cfg(windows)]
     with_state(this, |host, state| {
@@ -701,6 +726,24 @@ pub(crate) struct Barrier {
     first: This,
     second: u64,
     last: u64,
+}
+
+/// An unordered access barrier on `texture`, or on every resource when the
+/// host texture has no unordered access: naming it then is a debug layer
+/// error (523, missing bind flags) and `Close` fails with `E_INVALIDARG`.
+#[cfg(windows)]
+fn uav_barrier_for(texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource) -> Barrier {
+    use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    use windows::core::Interface;
+    // SAFETY: a plain query on a live host resource.
+    let flags = unsafe { texture.GetDesc() }.Flags;
+    if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
+        return UAV_BARRIER;
+    }
+    Barrier {
+        first: texture.as_raw().cast_const().cast(),
+        ..UAV_BARRIER
+    }
 }
 
 /// The barrier on host resources, or `None` if it names a resource the host
@@ -741,20 +784,16 @@ fn host_barrier(list: &crate::host::HostList, b: &Barrier) -> Option<Barrier> {
             },
             ..*b
         }),
-        2 => Some(Barrier {
-            first: if b.first.is_null() {
-                b.first
-            } else {
-                // A depth texture's unordered access is its colour twin's
-                // (the host gives the depth texture none): the barrier is
-                // on the texture shaders write.
-                match crate::resource::twin_resource(b.first) {
-                    Some(twin) => twin.as_raw().cast_const().cast(),
-                    None => host(b.first)?,
-                }
+        2 if b.first.is_null() => Some(UAV_BARRIER),
+        // A depth texture's unordered access is its colour twin's (the host
+        // gives the depth texture none): the barrier is on the texture
+        // shaders write. Console barrier flags are dropped.
+        2 => Some(uav_barrier_for(
+            match crate::resource::twin_resource(b.first) {
+                Some(twin) => twin,
+                None => crate::resource::host_resource(b.first)?,
             },
-            ..*b
-        }),
+        )),
         _ => None,
     }
 }
@@ -948,6 +987,23 @@ impl CopyLaps {
     }
 }
 
+/// Brings a copy source texture up to date: from the texture it was placed
+/// over in another format when the host wrote that one
+/// (`crate::texture::alias`), else from title memory when the title writes
+/// it. Either can leave the source in the copy destination state, so the
+/// caller sets the source state after this. After upstream #3170.
+#[cfg(windows)]
+fn sync_copy_source(
+    list: &crate::host::HostList,
+    src: This,
+    texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+) {
+    let aliased = crate::resource::alias_of(src).is_some_and(|source| crate::texture::alias(list, src, source));
+    if !aliased && crate::texture::title_written(texture) {
+        crate::texture::upload(list, src, texture);
+    }
+}
+
 extern "system" fn copy_resource(this: This, dst: This, src: This) {
     #[cfg(windows)]
     {
@@ -973,10 +1029,9 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             // triippywhale 6e502b3b.
             let same = windows::core::Interface::as_raw(to) == windows::core::Interface::as_raw(from);
             // A source the title fills itself is uploaded first (upstream
-            // PR #671): a copy read whatever the host texture held.
-            if crate::texture::title_written(from) {
-                crate::texture::upload(list, src, from);
-            }
+            // PR #671): a copy read whatever the host texture held. One
+            // placed over a texture the host writes gets that one's texels.
+            sync_copy_source(list, src, from);
             // Depth textures shaders also write: what they wrote, first.
             list.twin_use(dst, false, true);
             list.twin_use(src, false, false);
@@ -1286,9 +1341,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         // The source: what the title wrote itself, first; then to the
         // first buffer.
         list.twin_use(src, false, false);
-        if crate::texture::title_written(from) {
-            crate::texture::upload(list, src, from);
-        }
+        sync_copy_source(list, src, from);
         ensure_state(list, src, COPY_SOURCE);
         barrier(l, &a, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
         let texels = CopyLocation { resource: raw(from), kind: 0, footprint: crate::resource::PlacedFootprint::ZERO };
@@ -1492,9 +1545,7 @@ extern "system" fn copy_texture_region(
                 && dst.kind != FOOTPRINT
                 && src.footprint.offset as u32 == dst.footprint.offset as u32;
             list.twin_use(src.resource, false, false);
-            if crate::texture::title_written(texture) {
-                crate::texture::upload(list, src.resource, texture);
-            }
+            sync_copy_source(list, src.resource, texture);
             if !same {
                 ensure_state(list, src.resource, COPY_SOURCE);
             }
@@ -1643,9 +1694,7 @@ fn read_back(
     // As a texture source of any copy: what shaders wrote to a depth twin
     // and what the title wrote itself first, then the state.
     list.twin_use(src.resource, false, false);
-    if crate::texture::title_written(texture) {
-        crate::texture::upload(list, src.resource, texture);
-    }
+    sync_copy_source(list, src.resource, texture);
     ensure_state(list, src.resource, COPY_SOURCE);
     let mut from = src;
     from.resource = texture.as_raw().cast_const().cast();
@@ -1791,19 +1840,10 @@ extern "system" fn clear_rtv(
             unsafe { std::slice::from_raw_parts(rects.cast(), count as usize) }
         });
         const RENDER_TARGET: u32 = 0x4;
+        ensure_state(list, record.resource, RENDER_TARGET);
         let rtv = host.rtv(Some(texture), record.desc().as_ref());
         // SAFETY: an open list, a fresh view of a live texture.
-        unsafe {
-            if let Some((_, before)) = list.transition(record.resource, RENDER_TARGET) {
-                use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATES as State;
-                list.list.ResourceBarrier(&[crate::host::transition(
-                    texture,
-                    State(before as i32),
-                    State(RENDER_TARGET as i32),
-                )]);
-            }
-            list.list.ClearRenderTargetView(rtv, color, rects);
-        }
+        unsafe { list.list.ClearRenderTargetView(rtv, color, rects) };
     }
     #[cfg(not(windows))]
     let _ = (this, handle, color, count, rects);
@@ -1823,6 +1863,12 @@ extern "system" fn clear_dsv(
     #[cfg(windows)]
     {
         use windows::Win32::Graphics::Direct3D12::D3D12_CLEAR_FLAGS;
+        // The bits above 1 are the console's own; the host rejects a clear
+        // left with no flags, which can lose the list.
+        let flags = flags as i32 & 3;
+        if flags == 0 {
+            return;
+        }
         let (Some(list), Some(record)) = (host_list(this), crate::descriptor::dsv_record(handle))
         else {
             return;
@@ -1849,7 +1895,7 @@ extern "system" fn clear_dsv(
         // SAFETY: an open list, a fresh view of a live texture.
         unsafe {
             list.list
-                .ClearDepthStencilView(dsv, D3D12_CLEAR_FLAGS(flags as i32 & 3), depth, stencil, rects)
+                .ClearDepthStencilView(dsv, D3D12_CLEAR_FLAGS(flags), depth, stencil, rects)
         };
     }
     #[cfg(not(windows))]
@@ -1898,22 +1944,90 @@ extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, flags: u32) {
     let _ = (this, x, y, z, flags);
 }
 
-/// `BeginQuery`/`EndQuery(heap, type, index)`: queries are answered when
-/// resolved.
-extern "system" fn query_mark(_: This, _heap: This, _kind: u32, _index: u32) {}
+/// `BeginQuery(heap, type, index)`: the host GPU starts counting when the
+/// heap has a host heap (`crate::query::host_heap`). D3D12 has no begin
+/// for timestamps.
+#[cfg(windows)]
+extern "system" fn begin_query(this: This, heap: This, kind: u32, index: u32) {
+    use windows::Win32::Graphics::Direct3D12::D3D12_QUERY_TYPE_TIMESTAMP;
+    let (Some(host), Some(r#type)) = (crate::query::host_heap(heap), query_type(kind)) else {
+        return;
+    };
+    if r#type == D3D12_QUERY_TYPE_TIMESTAMP || this.is_null() {
+        return;
+    }
+    // SAFETY: the title passes one of our lists; a list is recorded by one
+    // thread at a time.
+    let list = unsafe { &mut *this.cast_mut().cast::<List>() };
+    let Some(recording) = list.host.as_ref() else {
+        return;
+    };
+    recording.keep(&host);
+    // SAFETY: an open list and our query heap.
+    unsafe { recording.list.BeginQuery(&host, r#type, index) };
+    list.open_queries.push((heap as usize, r#type, index));
+}
+#[cfg(not(windows))]
+extern "system" fn begin_query(_: This, _heap: This, _kind: u32, _index: u32) {}
+
+/// `EndQuery(heap, type, index)`: ends what [`begin_query`] began on the
+/// same host list (a cut ends it there), or takes a timestamp.
+#[cfg(windows)]
+extern "system" fn end_query(this: This, heap: This, kind: u32, index: u32) {
+    use windows::Win32::Graphics::Direct3D12::D3D12_QUERY_TYPE_TIMESTAMP;
+    let (Some(host), Some(r#type)) = (crate::query::host_heap(heap), query_type(kind)) else {
+        return;
+    };
+    if this.is_null() {
+        return;
+    }
+    // SAFETY: the title passes one of our lists; a list is recorded by one
+    // thread at a time.
+    let list = unsafe { &mut *this.cast_mut().cast::<List>() };
+    let Some(recording) = list.host.as_ref() else {
+        return;
+    };
+    if r#type != D3D12_QUERY_TYPE_TIMESTAMP {
+        let Some(at) = list.open_queries.iter().position(|&(h, _, i)| h == heap as usize && i == index) else {
+            return;
+        };
+        list.open_queries.swap_remove(at);
+    }
+    recording.keep(&host);
+    // SAFETY: an open list and our query heap.
+    unsafe { recording.list.EndQuery(&host, r#type, index) };
+}
+#[cfg(not(windows))]
+extern "system" fn end_query(_: This, _heap: This, _kind: u32, _index: u32) {}
+
+/// The host query type of a console one (the numbers match: 0 occlusion,
+/// 1 binary occlusion, 2 timestamp, 3 pipeline statistics).
+#[cfg(windows)]
+fn query_type(kind: u32) -> Option<windows::Win32::Graphics::Direct3D12::D3D12_QUERY_TYPE> {
+    use windows::Win32::Graphics::Direct3D12::*;
+    Some(match kind {
+        0 => D3D12_QUERY_TYPE_OCCLUSION,
+        1 => D3D12_QUERY_TYPE_BINARY_OCCLUSION,
+        2 => D3D12_QUERY_TYPE_TIMESTAMP,
+        3 => D3D12_QUERY_TYPE_PIPELINE_STATISTICS,
+        _ => return None,
+    })
+}
 
 /// `ResolveQueryData(heap, type, first, count, buffer, offset)`: writes
-/// each query's result into the buffer once the list has run. Timestamps
-/// (type 2) are the GPU clock then; occlusion counts (0) say a million
-/// samples passed and binary occlusion (1) visible, so nothing is culled
-/// by a query.
-/// shortcut: no query runs on the host GPU; results are plausible values,
-/// not measured ones (time spans come out as the submission's length).
+/// each query's result into the buffer once the list has run. With host
+/// queries (`crate::query::host_heap`) they are what the host GPU counted,
+/// timestamps in the title's clock.
+/// shortcut: otherwise, and for queries a cut ended early, results are
+/// plausible values, not measured ones: timestamps (type 2) are the GPU
+/// clock when the list has run (time spans come out as the submission's
+/// length), occlusion counts (0) say a million samples passed and binary
+/// occlusion (1) visible, so nothing is culled by a query.
 extern "system" fn resolve_queries(
     this: This,
-    _heap: This,
+    heap: This,
     kind: u32,
-    _first: u32,
+    first: u32,
     count: u32,
     buffer: This,
     offset: u64,
@@ -1938,6 +2052,34 @@ extern "system" fn resolve_queries(
     if end > size {
         return;
     }
+    #[cfg(windows)]
+    if let Some(r#type) = query_type(kind)
+        && let Some(query_heap) = crate::query::host_heap(heap)
+        && let Some(recording) = host_list(this)
+        && !crate::query::take_cut_short(heap, first, count)
+    {
+        let len = u64::from(count) * bytes;
+        // A chunk of the list's read-back memory, or a buffer of the pool's.
+        let space = recording
+            .readback_space(len)
+            .or_else(|| Some((crate::host::host()?.read_back_buffer(len)?, 0, std::ptr::null())));
+        if let Some((back, at, mapped)) = space {
+            recording.keep(&query_heap);
+            // SAFETY: an open list, our query heap, and read-back memory of
+            // at least `len` bytes from `at`.
+            unsafe { recording.list.ResolveQueryData(&query_heap, r#type, first, count, &back, at) };
+            // SAFETY: inside the buffer, checked above.
+            let dst = unsafe { data.add(offset as usize) };
+            if kind == TIMESTAMP {
+                recording.defer_stamps(back, mapped, dst, count as usize);
+            } else {
+                recording.defer_read_back(back, mapped, dst, [len as usize, 1, len as usize]);
+            }
+            return;
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = (heap, first);
     for i in 0..u64::from(count) {
         // Wider results are written as 8-byte pieces.
         for piece in 0..bytes / 8 {
@@ -2640,6 +2782,7 @@ fn value_written(this: This, address: u64, value: u64) {
         let Some(fresh) = fresh_list() else {
             return;
         };
+        end_queries_at_cut(current, &mut list.open_queries);
         current.close();
         if let Some(done) = list.host.replace(fresh) {
             // The part so far keeps its waits; nothing stands before the
@@ -2732,8 +2875,8 @@ const METHODS: [(usize, *const ()); 52] = [
 ];
 /// The rest of [`METHODS`], kept apart only to stay readable.
 const MORE_METHODS: [(usize, *const ()); 9] = [
-    (28, query_mark as *const ()),             // 0xe0 BeginQuery
-    (29, query_mark as *const ()),             // 0xe8 EndQuery
+    (28, begin_query as *const ()),             // 0xe0 BeginQuery
+    (29, end_query as *const ()),             // 0xe8 EndQuery
     (30, resolve_queries as *const ()),        // 0xf0
     (78, dispatch_x as *const ()),             // 0x270
     (98, state::dispatch_mesh_x as *const ()), // 0x310
@@ -2917,6 +3060,70 @@ mod tests {
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         for object in [buffer, list, allocator] {
             assert_eq!(release(object), 0);
+        }
+    }
+
+    /// An unordered access barrier on a host texture without unordered access
+    /// (a depth texture) becomes one on every resource, and the list closes.
+    #[cfg(windows)]
+    #[test]
+    fn uav_barrier_on_non_uav_texture_falls_back_to_global() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::*;
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let make = |format, flags, initial| -> ID3D12Resource {
+            let heap = D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_DEFAULT,
+                ..Default::default()
+            };
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: 4,
+                Height: 4,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: format,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
+                Flags: flags,
+                ..Default::default()
+            };
+            let mut texture: Option<ID3D12Resource> = None;
+            // SAFETY: a small texture on the live host device.
+            unsafe {
+                host.device
+                    .CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, initial, None, &mut texture)
+                    .unwrap();
+            }
+            texture.unwrap()
+        };
+        let depth = make(
+            DXGI_FORMAT_R32_TYPELESS,
+            D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
+            D3D12_RESOURCE_STATE_DEPTH_WRITE,
+        );
+        let colour = make(
+            DXGI_FORMAT_R8G8B8A8_UNORM,
+            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        );
+        let on_depth = uav_barrier_for(&depth);
+        assert_eq!(on_depth.kind, 2);
+        assert!(on_depth.first.is_null());
+        let on_colour = uav_barrier_for(&colour);
+        assert_eq!(on_colour.kind, 2);
+        assert!(!on_colour.first.is_null());
+        let list = host.new_list().expect("host command list");
+        // SAFETY: the host's barrier layout; live resources.
+        unsafe {
+            let barriers = [
+                std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(on_depth),
+                std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(on_colour),
+            ];
+            list.list.ResourceBarrier(&barriers);
+            list.list.Close().expect("the list closes");
         }
     }
 }
