@@ -592,6 +592,7 @@ fn emit_forms(
     // A pixel program that waits for the pixels it overlaps (POPS): the host orders its views
     // instead (`Shader::ordered`), and the program goes past the wait.
     if native.stage == HwStage::Ps
+        && p.blocks.iter().flat_map(|b| &b.insts).any(lower::sets_pops_packer)
         && let Some(q) = ir::without_pops_wait(p)
     {
         let st = structure::structure(&q)?;

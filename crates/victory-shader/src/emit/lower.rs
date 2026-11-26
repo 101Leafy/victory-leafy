@@ -1310,7 +1310,7 @@ fn barrier_mode(
 
 /// `s_setreg*` of `HW_REG_POPS_PACKER` (hardware register 25): how a pixel program takes part
 /// in POPS, the console's ordering of the view accesses of overlapping pixels by primitive.
-fn sets_pops_packer(i: &Inst) -> bool {
+pub(super) fn sets_pops_packer(i: &Inst) -> bool {
     matches!(i.name(), "s_setreg_b32" | "s_setreg_imm32_b32")
         && matches!(i.fields, Fields::Sop { imm: Some(imm), .. } if imm & 0x3F == 25)
 }
