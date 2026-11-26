@@ -7727,6 +7727,11 @@ impl Batch {
         match self.index.get(&key) {
             Some(&at) => {
                 let r = &mut self.refreshes[at];
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(
+                    crate::copystat::C::RefreshGapBytes,
+                    address.saturating_sub(r.2).max(r.1.saturating_sub(end)) as u64,
+                );
                 (r.1, r.2) = (r.1.min(address), r.2.max(end));
             }
             None => {
@@ -7773,7 +7778,19 @@ impl Batch {
         let copied = shadow.update(from, to - from);
         let us = started.elapsed().as_micros() as u64;
         #[cfg(feature = "diagnostics")]
-        crate::copystat::range(from, to - from, us, 0);
+        {
+            use crate::copystat::{C, add, again};
+            crate::copystat::range(from, to - from, us, 0);
+            add(C::RefreshUpdates, 1);
+            if copied == 0 {
+                add(C::RefreshEmpty, 1);
+                add(C::RefreshEmptyUs, us);
+            }
+            if again(0, (shadow as *const crate::shadow::Shadow as usize, from, to)) {
+                add(C::RefreshAgain, 1);
+                add(C::RefreshAgainBytes, (to - from) as u64);
+            }
+        }
         PREPARING[0].fetch_add(us, Ordering::Relaxed);
         PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
     }
@@ -8527,6 +8544,26 @@ impl Meter {
         tracing::debug!(target: "victory_gpu::frame", token = crate::frame::current(), "present");
         #[cfg(feature = "diagnostics")]
         crate::copystat::presented();
+        // Launch time as the player sees it: from the process's creation,
+        // which is before anything of ours runs.
+        static FIRST: std::sync::Once = std::sync::Once::new();
+        FIRST.call_once(|| {
+            use windows_sys::Win32::Foundation::FILETIME;
+            use windows_sys::Win32::System::SystemInformation::GetSystemTimeAsFileTime;
+            use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
+            let zero = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+            let (mut created, mut exited, mut kernel, mut user, mut now) = (zero, zero, zero, zero, zero);
+            // SAFETY: our own process and valid out pointers.
+            let ok = unsafe {
+                GetSystemTimeAsFileTime(&mut now);
+                GetProcessTimes(GetCurrentProcess(), &mut created, &mut exited, &mut kernel, &mut user)
+            } != 0;
+            let ticks = |t: FILETIME| (u64::from(t.dwHighDateTime) << 32) | u64::from(t.dwLowDateTime);
+            if ok {
+                let ms = ticks(now).saturating_sub(ticks(created)) / 10_000;
+                tracing::info!(ms, "first frame presented");
+            }
+        });
         self.frames += 1;
         #[cfg(feature = "diagnostics")]
         {

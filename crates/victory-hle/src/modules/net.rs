@@ -66,8 +66,15 @@ const WSAID_WSASENDMSG: Guid = Guid(
 type Socket = usize;
 type Handle = *mut c_void;
 
-/// Logs `what` for `destination` the first time (no payload, ever).
+/// Logs `what` for `destination` the first time (no payload, ever). The
+/// title looks up its own machine name, which is the PC's, so that one
+/// prints as `<pc>`.
 fn once(what: &'static str, destination: String) {
+    let own = ["COMPUTERNAME", "USERDOMAIN"]
+        .iter()
+        .filter_map(|name| std::env::var(name).ok())
+        .any(|name| name.eq_ignore_ascii_case(&destination));
+    let destination = if own { "<pc>".to_owned() } else { destination };
     static SEEN: Mutex<Vec<(&str, String)>> = Mutex::new(Vec::new());
     let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
     if !seen.iter().any(|(w, d)| *w == what && *d == destination) {

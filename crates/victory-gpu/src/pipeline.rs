@@ -145,9 +145,17 @@ impl Shader {
     /// The translation, made on first use; a shader that does not
     /// translate is logged once.
     pub(crate) fn translated(&self) -> Option<&Translated> {
-        self.translated
+        let asked = std::time::Instant::now();
+        let mut own = false;
+        let done = self
+            .translated
             .get_or_init(|| {
+                own = true;
+                // Time spent here is part of a slow pipeline's time
+                // (`slow-pipelines.txt`); this tells it from the driver's.
+                let began = std::time::Instant::now();
                 let done = translate(&self.container);
+                let ms = began.elapsed().as_millis() as u64;
                 // `VICTORY_SHADER_SAVE=<dir>`: each shader as the title gave it (`.cdxil`) and as
                 // translated (`.dxil`), by the hash crash reports name it with
                 if let Some(dir) = std::env::var_os("VICTORY_SHADER_SAVE") {
@@ -169,18 +177,31 @@ impl Shader {
                         hash = %self.hash,
                         user_data = t.host.user_data.len(),
                         samplers = t.host.samplers.len(),
+                        ms,
                         "shader translated"
                     ),
                     Err(e) => tracing::warn!(
                         stage = self.stage,
                         hash = %self.hash,
                         error = %e,
+                        ms,
                         "shader does not translate; its pipelines' draws are dropped"
                     ),
                 }
                 done.ok()
             })
-            .as_ref()
+            .as_ref();
+        // Another thread translating the same shader holds this one up.
+        let spent = asked.elapsed();
+        if own {
+            spent::add(|p| {
+                p.translate += spent;
+                p.translated += 1;
+            });
+        } else if spent > std::time::Duration::from_millis(1) {
+            spent::add(|p| p.shared += spent);
+        }
+        done
     }
 }
 
@@ -760,6 +781,8 @@ pub mod known;
 mod library;
 #[cfg(windows)]
 mod make;
+#[cfg(windows)]
+mod spent;
 
 /// Lets the pipeline library's mapped file go from memory when no pipeline
 /// has loaded for a while (`library::trim`); called by the host's sweep.
