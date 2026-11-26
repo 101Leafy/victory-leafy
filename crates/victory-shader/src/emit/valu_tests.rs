@@ -589,6 +589,53 @@ fn v_permlane16_and_x16_read_the_lanes_their_selectors_pick() {
     }
 }
 
+/// VOP2 `op vdst, vsrc0, vsrc1` with a DPP16 dword (all rows and banks on).
+const fn vop2_dpp16(op: u8, vdst: u8, vsrc0: u8, vsrc1: u8, ctrl: u16) -> [u32; 2] {
+    [
+        (op as u32) << 25 | (vdst as u32) << 17 | (vsrc1 as u32) << 9 | 0xFA,
+        0xF << 28 | 0xF << 24 | (ctrl as u32 & 0x1FF) << 8 | vsrc0 as u32,
+    ]
+}
+
+#[test]
+fn dpp16_reverse_integer_ops_shuffle_the_second_source() {
+    // Before GFX11 the reverse subtract and shifts take the lane DPP picks
+    // as src1 and their own lane's src0 (LLVM `isSrc1DPPRevOpcode`, Mesa
+    // README-ISA.md). v1 = 0x1000_0001 + lane, v3 = 0x0001_0000 + lane,
+    // quad pairs swapped (0xB1); v_sub_nc_u32 is the control, shuffling src0.
+    let v1 = |lane: u32| 0x1000_0001 + lane;
+    let v3 = |lane: u32| 0x0001_0000 + lane;
+    for (op, name) in [
+        (0x27u8, "v_subrev_nc_u32"),
+        (0x1A, "v_lshlrev_b32"),
+        (0x16, "v_lshrrev_b32"),
+        (0x18, "v_ashrrev_i32"),
+        (0x26, "v_sub_nc_u32"),
+    ] {
+        for read in [0u8, 1, 6, 17, 30, 31] {
+            let mut body = Vec::new();
+            body.push(0x25 << 25 | 1 << 17 | 1 << 9 | 256); // v_add_nc_u32 v1, v0, v1
+            body.push(0x25 << 25 | 3 << 17 | 3 << 9 | 256); // v_add_nc_u32 v3, v0, v3
+            body.extend_from_slice(&vop2_dpp16(op, 2, 1, 3, 0xB1));
+            body.extend_from_slice(&vop3(0x360, 12, vgpr(2), 128 + u16::from(read), 0));
+            body.push(vop1(0x001, 0, sgpr(12)));
+            let shader = build_cs(&body, 32, 0);
+            let (lane, src) = (u32::from(read), u32::from(read) ^ 1);
+            let want = match op {
+                0x27 => v3(src).wrapping_sub(v1(lane)),
+                0x1A => v3(src) << (v1(lane) & 31),
+                0x16 => v3(src) >> (v1(lane) & 31),
+                0x18 => ((v3(src) as i32) >> (v1(lane) & 31)) as u32,
+                _ => v1(src).wrapping_sub(v3(lane)),
+            };
+            let inputs = [[0x1000_0001, 0, 0x0001_0000, 0]];
+            run_cases_on(&shader, &inputs, &[("hardware", false)], |backend, _, _, got| {
+                assert_eq!(got, want, "{backend}: {name}, lane {read}");
+            });
+        }
+    }
+}
+
 #[test]
 fn v_med3_f32_matches_rdna2_with_nan() {
     // v_med3_f32 v0, v1, v2, v3 (VOP3 opcode 0x157)
@@ -825,6 +872,67 @@ fn v_cmp_lg_is_false_for_nan() {
             );
         });
     }
+}
+
+/// `v_div_fixup_f16` as the RDNA2 ISA lists it; `None` for a NaN.
+fn div_fixup_f16_reference(q: u16, den: u16, num: u16) -> Option<u16> {
+    let nan = |x: u16| is_f16_nan(x);
+    let abs = |x: u16| x & 0x7FFF;
+    let sign = (den ^ num) & 0x8000;
+    if nan(num) || nan(den) {
+        return None;
+    }
+    if (abs(den) == 0 && abs(num) == 0) || (abs(den) == 0x7C00 && abs(num) == 0x7C00) {
+        return None;
+    }
+    if abs(den) == 0 || abs(num) == 0x7C00 {
+        return Some(sign | 0x7C00);
+    }
+    if abs(den) == 0x7C00 || abs(num) == 0 {
+        return Some(sign);
+    }
+    if nan(q) {
+        return None;
+    }
+    Some(sign | abs(q))
+}
+
+#[test]
+fn v_div_fixup_f16_follows_the_isa_special_cases() {
+    // v_mov_b32 v0, 0; v_div_fixup_f16 v0, v1, v2, v3 (VOP3 opcode 0x35f):
+    // v1 the quotient, v2 the denominator, v3 the numerator.
+    let mut body = vec![vop1(0x001, 0, 128)];
+    body.extend_from_slice(&vop3(0x35f, 0, vgpr(1), vgpr(2), vgpr(3)));
+    let shader = build_valu_cs(&body);
+    // 0, -0, 1, -1.5, 2^-24, max finite, inf, -inf, NaN, -NaN.
+    let values = [
+        0x0000u16, 0x8000, 0x3C00, 0xBE00, 0x0001, 0x7BFF, 0x7C00, 0xFC00, 0x7E00, 0xFE01,
+    ];
+    let mut cases = Vec::new();
+    for &q in &[0x4248u16, 0xC248, 0x7E00] {
+        for &den in &values {
+            for &num in &values {
+                cases.push([u32::from(q), u32::from(den), u32::from(num), 0]);
+            }
+        }
+    }
+    run_cases(&shader, &cases, |backend, _, inp, got| {
+        let (q, den, num) = (inp[0] as u16, inp[1] as u16, inp[2] as u16);
+        let got_h = got as u16;
+        assert_eq!(got >> 16, 0, "{backend}: the high half changed");
+        match div_fixup_f16_reference(q, den, num) {
+            Some(want) => assert_eq!(
+                got_h, want,
+                "{backend}: v_div_fixup_f16({q:#06x}, {den:#06x}, {num:#06x}) = {got_h:#06x}, \
+                 want {want:#06x}",
+            ),
+            None => assert!(
+                is_f16_nan(got_h),
+                "{backend}: v_div_fixup_f16({q:#06x}, {den:#06x}, {num:#06x}) = {got_h:#06x}, \
+                 want NaN",
+            ),
+        }
+    });
 }
 
 #[test]
