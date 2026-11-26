@@ -84,7 +84,7 @@
 //!   It binds nothing.
 
 mod bitcode;
-mod container;
+pub(crate) mod container;
 #[cfg(all(test, windows))]
 mod cube_lod_tests;
 #[cfg(all(test, windows))]
@@ -96,8 +96,10 @@ mod intersect_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
 mod idiom;
+#[cfg(all(test, windows))]
+mod lane_order_tests;
 mod link;
-mod lower;
+pub(crate) mod lower;
 mod own_bits;
 #[cfg(all(test, windows))]
 mod permlane_tests;
@@ -144,14 +146,31 @@ pub use shader::{
 /// A change behind a switch that is off by default needs no raise, but the
 /// switch joins the key in the commit that reads it: in the list of
 /// `VICTORY_*` names in `shader_cache`'s `build`, or as a bit of
-/// [`host_settings`] (taken: 0-3 of the last for [`rdna`], 31 for
+/// [`host_settings`] (taken: 0-3 of the last for [`rdna`], 30 for helper lane waves, 31 for
 /// `VICTORY_COLOR_FINITE`). A dependency update needs none: the `Cargo.lock`
 /// entries this crate is built from are in the key.
 ///
 /// The first run after a source change without a raise translates its first
 /// 64 cached shaders again and compares the entries byte for byte; if one
 /// differs, that build keys on the whole source instead, as before.
-pub const VERSION: u32 = 9;
+pub const VERSION: u32 = 12;
+
+static HELPER_LANE_WAVES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Tells translation that the host runs shader model 6.7: pixel shaders
+/// with wave operations then include helper lanes in them, as the
+/// console's do. Without it a loop that serves one lane's value per pass
+/// (sampling with a per-lane descriptor) never serves a helper lane and
+/// runs to the loop limit, which hangs NVIDIA GPUs. Part of the
+/// translation, so the shader cache must key on it (`victory-gpu`'s does).
+pub fn set_helper_lane_waves(on: bool) {
+    HELPER_LANE_WAVES.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// See [`set_helper_lane_waves`].
+pub fn helper_lane_waves() -> bool {
+    HELPER_LANE_WAVES.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 /// The loop limit without an override: 2^20.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;

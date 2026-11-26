@@ -194,7 +194,14 @@ pub(crate) enum Attr {
     ReadOnly = 3,
     /// Barriers.
     NoDuplicate = 4,
+    /// `main` of a pixel shader whose wave operations include helper lanes
+    /// (shader model 6.7).
+    HelperLaneWaves = 5,
 }
+
+/// The string attribute DXC gives an entry point with
+/// `[WaveOpsIncludeHelperLanes]`.
+const HELPER_LANE_WAVES: &str = "waveops-include-helper-lanes";
 
 struct Func {
     name: String,
@@ -238,6 +245,38 @@ impl Module {
             .filter_map(|inst| match &inst.op {
                 Op::Call(f, args) if self.funcs[*f as usize].name == "dx.op.barrier" => {
                     Some(self.int_value(args[1]).expect("constant barrier flags") as u32)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Constant integer false-arms of every live written `select` instruction.
+    #[cfg(test)]
+    pub fn written_select_false_ints(&self) -> Vec<Option<i64>> {
+        let live = self.live();
+        self.blocks
+            .iter()
+            .flat_map(|b| &b.body)
+            .filter(|&&i| live[i as usize])
+            .filter_map(|&i| match self.insts[i as usize].op {
+                Op::Select(_, _, f) => Some(self.int_value(f)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Integer-constant arguments of every written call to `name`.
+    #[cfg(test)]
+    pub fn written_call_int_args(&self, name: &str) -> Vec<Vec<Option<i64>>> {
+        let live = self.live();
+        self.blocks
+            .iter()
+            .flat_map(|b| &b.body)
+            .filter(|&&i| live[i as usize])
+            .filter_map(|&i| match &self.insts[i as usize].op {
+                Op::Call(f, args) if self.funcs[*f as usize].name == name => {
+                    Some(args.iter().map(|&a| self.int_value(a)).collect())
                 }
                 _ => None,
             })
@@ -358,6 +397,12 @@ impl Module {
     }
 
     /// A function declaration (or `main` with `body`), found by name.
+    /// Sets the attributes of function `f`.
+    pub fn set_function_attr(&mut self, f: V, attr: Attr) {
+        let V::Func(i) = f else { panic!("not a function") };
+        self.funcs[i as usize].attr = Some(attr);
+    }
+
     pub fn function(&mut self, name: &str, ty: Ty, attr: Option<Attr>, body: bool) -> V {
         if let Some(&i) = self.func_ids.get(name) {
             return V::Func(i);
@@ -593,9 +638,25 @@ impl Module {
             }
             w.record(3, &r);
         }
+        // Group 5 only when a function has it, so other modules' bytes
+        // stay as they were: a string attribute without a value (kind 3,
+        // its bytes, then 0).
+        let groups = if self
+            .funcs
+            .iter()
+            .any(|f| f.attr == Some(Attr::HelperLaneWaves))
+        {
+            let mut r = vec![5, 0xFFFF_FFFF, 3];
+            r.extend(HELPER_LANE_WAVES.bytes().map(u64::from));
+            r.push(0);
+            w.record(3, &r);
+            5
+        } else {
+            4
+        };
         w.exit();
         w.enter(PARAMATTR_BLOCK, 3);
-        for id in 1..=4 {
+        for id in 1..=groups {
             w.record(2, &[id]);
         }
         w.exit();
