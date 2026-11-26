@@ -596,19 +596,28 @@ fn full_card_pass() -> bool {
 pub(crate) static DYNAMIC_SHORT: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 
 /// `n` dynamic slots of `host` ([`HostHeap::dynamic`]); with none free,
-/// the flights in the air are settled first and the slots asked for again
-/// (`VICTORY_TABLE_SETTLE=0`: not). A frame of some 18,700 draws in the
-/// world ran the ring out while the frames sent ahead still held theirs,
-/// and its draws went without their tables. The slots the title's lists
-/// hold before they are submitted cannot be had this way.
+/// the flights in the air are settled first and the slots asked for again,
+/// once a frame (`VICTORY_TABLE_SETTLE=0`: never; `2`: at every ask that
+/// finds none). A frame of some 18,700 draws in the world ran the ring out
+/// while the frames sent ahead still held theirs, and its draws went
+/// without their tables. The slots the title's lists hold before they are
+/// submitted cannot be had this way: in play-e a settle at every ask came
+/// back with slots for 5,152 of 761,000 asks, and the 15 or so settles a
+/// frame waited 150 to 350 ms a frame for the card (2.3 fps).
 ///
 /// [`HostHeap::dynamic`]: crate::descriptor::host::HostHeap::dynamic
 fn dynamic_slots(host: &crate::descriptor::host::HostHeap, n: u32) -> Option<u32> {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    static SETTLED: AtomicU64 = AtomicU64::new(u64::MAX);
     if let Some(first) = host.dynamic(n) {
         return Some(first);
     }
-    if !*ON.get_or_init(|| std::env::var_os("VICTORY_TABLE_SETTLE").is_none_or(|v| v != "0")) {
+    let mode = *MODE.get_or_init(|| match std::env::var("VICTORY_TABLE_SETTLE").as_deref().map(str::trim) {
+        Ok("0") => 0,
+        Ok("2") => 2,
+        _ => 1,
+    });
+    if mode == 0 || mode == 1 && !settle_due(&SETTLED, crate::frame::current()) {
         DYNAMIC_SHORT[1].fetch_add(1, Ordering::Relaxed);
         return None;
     }
@@ -616,6 +625,12 @@ fn dynamic_slots(host: &crate::descriptor::host::HostHeap, n: u32) -> Option<u32
     let found = host.dynamic(n);
     DYNAMIC_SHORT[usize::from(found.is_none())].fetch_add(1, Ordering::Relaxed);
     found
+}
+
+/// Whether frame `frame` has not settled for tables yet ([`dynamic_slots`]);
+/// it has from now on.
+fn settle_due(settled: &AtomicU64, frame: u64) -> bool {
+    settled.swap(frame, Ordering::Relaxed) != frame
 }
 
 /// Whether a texture that has its host copy is still brought up to date
@@ -4678,7 +4693,7 @@ fn staging_budget_per_frame(vram_budget: Option<u64>) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::staging_budget_per_frame;
+    use super::{settle_due, staging_budget_per_frame};
 
     #[test]
     fn staging_budget_scales_with_vram_budget() {
@@ -4695,6 +4710,17 @@ mod tests {
         assert_eq!(staging_budget_per_frame(Some(20 * GIB)), 384 * MIB);
         assert_eq!(staging_budget_per_frame(Some(24 * GIB)), 384 * MIB);
         assert_eq!(staging_budget_per_frame(Some(32 * GIB)), 384 * MIB);
+    }
+
+    #[test]
+    fn tables_settle_once_a_frame() {
+        let settled = std::sync::atomic::AtomicU64::new(u64::MAX);
+        assert!(settle_due(&settled, 0));
+        assert!(!settle_due(&settled, 0));
+        assert!(!settle_due(&settled, 0));
+        assert!(settle_due(&settled, 1));
+        assert!(!settle_due(&settled, 1));
+        assert!(settle_due(&settled, 7));
     }
 }
 
