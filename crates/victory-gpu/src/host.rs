@@ -3007,7 +3007,12 @@ fn stale_under_flights(runs: &[&HostList]) -> Vec<(std::sync::Arc<crate::shadow:
         // title's ring of constants come here too, which were waited for
         // before: hundreds of short runs each, at about 1.5 us a run.
         let mut runs_left = if card_steps::stage() > 0 { 4096 } else { 512 };
-        spans.retain(|(shadow, from, to)| shadow.merge_under_writes(*from, *to - *from, &mut runs_left));
+        let busy: Vec<Vec<(usize, usize)>> = spans.iter().map(|(shadow, from, to)| shadow.busy(*from, *to - *from)).collect();
+        let asked = crate::shadow::Writes::ask(
+            spans.iter().zip(&busy).filter(|((shadow, ..), _)| !shadow.unwatched()).flat_map(|(_, b)| b.iter().copied()).collect(),
+        );
+        let mut busy = busy.into_iter();
+        spans.retain(|(shadow, ..)| shadow.merge_under_writes(busy.next().unwrap_or_default(), &asked, &mut runs_left));
         return spans;
     }
     spans.retain(|(shadow, from, to)| shadow.stale_under_writes(*from, *to - *from));
@@ -3619,10 +3624,11 @@ fn late_line(frames: f64) {
     #[cfg(feature = "diagnostics")]
     log_blame(frames);
     if late_exact() {
-        let [pages, runs, bytes, current] = crate::shadow::merged_stats().map(|n| n as f64 / frames);
+        let [pages, runs, bytes, current, asked, alone] = crate::shadow::merged_stats().map(|n| n as f64 / frames);
         tracing::info!(
             "title bytes put in under flights' shader writes per frame (VICTORY_LATE_WAIT=2): {pages:.0} pages looked at, \
-             {runs:.0} changed runs, {:.2} MB; {current:.0} pages not looked at, put in after the title's last write",
+             {runs:.0} changed runs, {:.2} MB; {current:.0} pages not looked at, put in after the title's last write; \
+             {asked:.0} ranges asked for all copies at once, {alone:.0} asked again on their own",
             bytes / (1 << 20) as f64
         );
     }
@@ -10129,7 +10135,7 @@ mod refresh_tests {
                 for c in &carded {
                     if c.shadow.writes_pending() {
                         let mut runs = usize::MAX;
-                        assert!(!c.shadow.merge_under_writes(c.start, c.len, &mut runs), "round {round}");
+                        assert!(!c.shadow.merge_alone(c.start, c.len, &mut runs), "round {round}");
                     }
                 }
                 let mut ranges = Vec::new();
@@ -10251,7 +10257,7 @@ mod refresh_tests {
             }
             let started = std::time::Instant::now();
             let mut runs = usize::MAX;
-            assert!(!copy.merge_under_writes(big, BIG, &mut runs));
+            assert!(!copy.merge_alone(big, BIG, &mut runs));
             best = best.min(started.elapsed().as_secs_f64() * 1e3);
             copy.take_dirty();
         }

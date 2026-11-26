@@ -808,6 +808,45 @@ fn joined(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
     out
 }
 
+/// One write asking for the ranges shaders may be writing in every copy a
+/// submission refreshes ([`Shadow::merge_under_writes`]), made before the
+/// first of them is merged: (from, to, what [`crate::watch::writes`] said),
+/// in order. Ranges that overlap are asked as one; ranges that only touch
+/// stay apart, since two copies side by side may be two allocations.
+///
+/// Each copy asked on its own, once per range, and views of the title's
+/// heap from dozens of offsets asked the same pages dozens of times, the
+/// guards' lock taken for each (5-17 ms a frame in the open world).
+pub(crate) struct Writes(Vec<(usize, usize, Option<(u64, Vec<(usize, u64)>)>)>);
+
+impl Writes {
+    pub(crate) fn ask(mut ranges: Vec<(usize, usize)>) -> Self {
+        ranges.sort_unstable();
+        let mut joined: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+        for (from, to) in ranges {
+            match joined.last_mut() {
+                Some(last) if from < last.1 => last.1 = last.1.max(to),
+                _ => joined.push((from, to)),
+            }
+        }
+        MERGED[4].fetch_add(joined.len() as u64, Ordering::Relaxed);
+        Writes(joined.into_iter().map(|(a, e)| (a, e, crate::watch::writes(a, e, true))).collect())
+    }
+
+    /// The asking number and pages written (in order) of `[a, e)`, if one
+    /// asked range holds all of it and the journal said what was written.
+    fn of(&self, a: usize, e: usize) -> Option<(u64, &[(usize, u64)])> {
+        let (from, to, asked) = self.0.get(self.0.partition_point(|r| r.1 <= a))?;
+        if *from > a || e > *to {
+            return None;
+        }
+        let (now, written) = asked.as_ref()?;
+        let lo = written.partition_point(|&(page, _)| page < a / PAGE);
+        let hi = written.partition_point(|&(page, _)| page < e.div_ceil(PAGE));
+        Some((*now, &written[lo..hi]))
+    }
+}
+
 /// Runs of pieces to hash again (`Host::card_before`), those that overlap
 /// or touch as one, in order: every piece of `runs` is in the result once
 /// and no other piece is. Ranges sent up lie close together (514 a frame
@@ -2001,8 +2040,9 @@ fn back_piece(
 /// Since the last frame-rate line, of [`Shadow::merge_under_writes`]: pages
 /// compared, changed runs put in, their bytes, and pages not compared
 /// because a merge or a range taken whole put in their part after the
-/// title's last write ([`past_floor`]).
-static MERGED: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+/// title's last write ([`past_floor`]); write askings made for all copies
+/// at once ([`Writes`]), and ranges asked on their own after.
+static MERGED: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 
 /// Why [`Shadow::merge_under_writes`] last left the caller to wait.
 static STALE_WHY: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -2024,8 +2064,8 @@ pub(crate) fn stale_why() -> &'static str {
 }
 
 /// [`MERGED`], taken.
-pub(crate) fn merged_stats() -> [u64; 4] {
-    [0, 1, 2, 3].map(|i| MERGED[i].swap(0, Ordering::Relaxed))
+pub(crate) fn merged_stats() -> [u64; 6] {
+    [0, 1, 2, 3, 4, 5].map(|i| MERGED[i].swap(0, Ordering::Relaxed))
 }
 
 /// The runs of bytes where `now` differs from `was` (of one length), as
@@ -2815,6 +2855,24 @@ mod stale_tests {
         // Part of a page counts as the page; pages outside the copy do not.
         assert_eq!(stale_pages_in(base, &copied, at(0x101) + 8, at(0x101) + 16, &[]), [0x101]);
         assert!(stale_pages_in(base, &copied, at(0x104), at(0x106), &[(0x104, 9)]).is_empty());
+    }
+
+    #[test]
+    fn one_asking_answers_each_range_inside_it() {
+        let at = |page: usize| page * PAGE;
+        let asked = Writes(vec![
+            (at(0x100), at(0x104), Some((7, vec![(0x100, 3), (0x102, 5), (0x103, 6)]))),
+            (at(0x104), at(0x106), None),
+            (at(0x108), at(0x10a), Some((7, vec![(0x109, 2)]))),
+        ]);
+        assert_eq!(asked.of(at(0x101) + 8, at(0x103)), Some((7, &[(0x102, 5)][..])));
+        assert_eq!(asked.of(at(0x102), at(0x103) + 1), Some((7, &[(0x102, 5), (0x103, 6)][..])));
+        // Across two asked ranges, in one the journal could not answer, or
+        // outside every one: asked again on its own.
+        assert_eq!(asked.of(at(0x103), at(0x105)), None);
+        assert_eq!(asked.of(at(0x104), at(0x105)), None);
+        assert_eq!(asked.of(at(0x106), at(0x107)), None);
+        assert_eq!(asked.of(at(0x108), at(0x10a)), Some((7, &[(0x109, 2)][..])));
     }
 
     #[test]
@@ -3738,35 +3796,21 @@ impl Shadow {
     /// snapshot, so the compare after the card ran takes them for the
     /// title's and not the shaders').
     ///
+    /// `busy` is [`Shadow::busy`] of the refreshed span, and `asked` the
+    /// submission's write asking for the busy ranges of every copy.
+    ///
     /// Whether the caller must still settle the flights: the journal
     /// cannot say what was written, a snapshot is missing, or `runs_left`
     /// ran out. Pages done before that stay done.
-    pub(crate) fn merge_under_writes(&self, address: usize, len: usize, runs_left: &mut usize) -> bool {
+    pub(crate) fn merge_under_writes(&self, busy: Vec<(usize, usize)>, asked: &Writes, runs_left: &mut usize) -> bool {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
-        let (from, to) = (address.max(start), (address + len).min(end));
-        if from >= to {
-            return false;
-        }
-        let busy: Vec<(usize, usize)> = self
-            .pending
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .filter(|&&(a, e)| a < to && e > from)
-            .map(|&(a, e)| (a.max(from), e.min(to)))
-            .collect();
         if busy.is_empty() {
             return false;
         }
-        if self.watched.load(Ordering::Relaxed) == NOT_WATCHED {
+        if self.unwatched() {
             note_stale(0);
             return true;
         }
-        // The declared ranges overlap (views of the title's whole heap from
-        // dozens of offsets): as one range each page is asked about and
-        // compared once. Every byte of it is in a declared range, and of a
-        // copy in the PC's memory in the snapshot.
-        let busy = if crate::watch::light() { joined(busy) } else { busy };
         let base = start / PAGE;
         for (a, e) in busy {
             // As the refresh itself asks (`update_free`): the journal if
@@ -3775,13 +3819,22 @@ impl Shadow {
             // of view memory, which is guarded and not write-watched, and
             // those were all of run 99's cases: the flights were settled
             // 4-5 times a frame for "0 pages looked at".
-            let Some((now, written)) = crate::watch::writes(a, e, true) else {
-                note_stale(1);
-                return true;
+            let own;
+            let (now, written) = match asked.of(a, e) {
+                Some(asked) => asked,
+                None => {
+                    MERGED[5].fetch_add(1, Ordering::Relaxed);
+                    let Some(w) = crate::watch::writes(a, e, true) else {
+                        note_stale(1);
+                        return true;
+                    };
+                    own = w;
+                    (own.0, &own.1[..])
+                }
             };
             let stale: Vec<usize> = {
                 let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-                self.stale_in(base, &copied, a, e, &written)
+                self.stale_in(base, &copied, a, e, written)
             };
             if stale.is_empty() {
                 continue;
@@ -3869,7 +3922,7 @@ impl Shadow {
                 // since is current too, and joins this one where they meet.
                 for (page, lo, hi) in parts {
                     let (lo, hi) = match merged.get(&page) {
-                        Some(&(l, h, put)) if l <= hi && lo <= h && !written_after(&written, page, put) => {
+                        Some(&(l, h, put)) if l <= hi && lo <= h && !written_after(written, page, put) => {
                             (l.min(lo), h.max(hi))
                         }
                         _ => (lo, hi),
@@ -3883,6 +3936,42 @@ impl Shadow {
             }
         }
         false
+    }
+
+    /// The ranges of `[address, address + len)` that shaders may be writing,
+    /// in order, for [`Shadow::merge_under_writes`].
+    pub(crate) fn busy(&self, address: usize, len: usize) -> Vec<(usize, usize)> {
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (from, to) = (address.max(start), (address + len).min(end));
+        if from >= to {
+            return Vec::new();
+        }
+        let busy: Vec<(usize, usize)> = self
+            .pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|&&(a, e)| a < to && e > from)
+            .map(|&(a, e)| (a.max(from), e.min(to)))
+            .collect();
+        // The declared ranges overlap (views of the title's whole heap from
+        // dozens of offsets): as one range each page is asked about and
+        // compared once. Every byte of it is in a declared range, and of a
+        // copy in the PC's memory in the snapshot.
+        if crate::watch::light() && !busy.is_empty() { joined(busy) } else { busy }
+    }
+
+    /// Whether the copy's memory is known not to be write-watched.
+    pub(crate) fn unwatched(&self) -> bool {
+        self.watched.load(Ordering::Relaxed) == NOT_WATCHED
+    }
+
+    /// [`Shadow::merge_under_writes`] of one copy, with an asking of its own.
+    #[cfg(test)]
+    pub(crate) fn merge_alone(&self, address: usize, len: usize, runs_left: &mut usize) -> bool {
+        let busy = self.busy(address, len);
+        let asked = Writes::ask(if self.unwatched() { Vec::new() } else { busy.clone() });
+        self.merge_under_writes(busy, &asked, runs_left)
     }
 
     /// Of [`Shadow::merge_under_writes`]: title memory `[lo, lo + n)`, in one
@@ -4982,7 +5071,7 @@ mod land_tests {
             s.spawn(|| {
                 while !stop.load(Ordering::Relaxed) {
                     let mut runs = usize::MAX;
-                    assert!(!shadow.merge_under_writes(title, LEN, &mut runs));
+                    assert!(!shadow.merge_alone(title, LEN, &mut runs));
                     // Sent up, as the preparing of a submission would: noted
                     // with a number behind the fetches'.
                     let card = shadow.card.as_ref().expect("made with one");
