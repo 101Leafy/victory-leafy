@@ -1293,10 +1293,24 @@ mod tests {
             block: 4,
             ..desc(4096, 4096, 13, n, swizzle)
         };
+        let bc1024 = |n, swizzle| Desc {
+            block: 4,
+            ..desc(1024, 1024, 11, n, swizzle)
+        };
+        let bc256 = |n, swizzle| Desc {
+            block: 4,
+            ..desc(256, 256, 9, n, swizzle)
+        };
         let cases = [
             ("BC7 64KB_D", bc(16, Swizzle::SW_64KB_D), 0),
             ("BC7 64KB_S", bc(16, Swizzle::SW_64KB_S), 0),
             ("BC1 64KB_D", bc(8, Swizzle::SW_64KB_D), 0),
+            // GTA VI's packs: 89% of textures are 4 KB tiled, most 1024 or smaller.
+            ("BC1 4KB_S 1024", bc1024(8, Swizzle::SW_4KB_S), 0),
+            ("BC7 4KB_S 1024", bc1024(16, Swizzle::SW_4KB_S), 0),
+            ("BC1 4KB_D 1024", bc1024(8, Swizzle::SW_4KB_D), 0),
+            ("BC1 4KB_S 256", bc256(8, Swizzle::SW_4KB_S), 0),
+            ("BC7 64KB_S 1024", bc1024(16, Swizzle::SW_64KB_S), 0),
             (
                 "RGBA8 64KB_D",
                 desc(1920, 1080, 1, 4, Swizzle::SW_64KB_D),
