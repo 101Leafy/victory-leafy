@@ -9696,6 +9696,15 @@ impl HostList {
         self.deferred().copies.push(Step::Checked(Box::new(work)));
     }
 
+    /// The list's submission-time steps, as a submission of it alone runs them.
+    #[cfg(test)]
+    pub(crate) fn run_steps(&self) {
+        let mut batch = Batch::default();
+        self.run_deferred(&mut batch, &[], |_| false);
+        batch.fill();
+        batch.flush();
+    }
+
     /// As [`HostList::defer_host`], for work that reads `len` bytes of title
     /// memory at `from`.
     pub(crate) fn defer_host_read(&self, from: usize, len: usize, work: impl Fn() + Send + 'static) {

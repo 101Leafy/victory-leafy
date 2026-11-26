@@ -2871,6 +2871,44 @@ mod remap_tests {
         assert_ne!(unsafe { VirtualFree(base, 0, MEM_RELEASE) }, 0);
     }
 
+    /// A checked host callback after a texture's step sees what the check
+    /// found, also when wide checks would leave it to the batch's flush
+    /// (hyphennn#1314).
+    #[test]
+    fn a_checked_host_callback_runs_after_the_texture_check() {
+        use windows_sys::Win32::System::Memory::*;
+        const PAGE_RUN: usize = 0x1_0000;
+        // SAFETY: a private allocation of our own, released at the end.
+        let base = unsafe { VirtualAlloc(std::ptr::null(), PAGE_RUN, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) };
+        assert!(!base.is_null());
+        let description = [3, 0, 0, 0, 4, 0, 4, 0x1_0001, 28, 1, 0, 1, 0, 0];
+        let staged = crate::resource::texture_at(base as u64, &description).and_then(|resource| {
+            let copy = crate::resource::host_copy(resource)?;
+            super::staging(resource, &copy, 0)
+        });
+        let list = crate::host::host().and_then(|host| host.new_list().ok());
+        // `None`: no GPU to make the host texture on.
+        if let (Some(staging), Some(list)) = (staged, list) {
+            let state = |s: &super::Staging| {
+                let last = s.last.lock().unwrap();
+                (last.hash.is_some(), last.asked)
+            };
+            let before = state(&staging);
+            let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+            list.defer_texture(staging.clone());
+            {
+                let (staging, seen) = (staging.clone(), seen.clone());
+                list.defer_host_checked(move || *seen.lock().unwrap() = Some(state(&staging)));
+            }
+            list.run_steps();
+            let after = state(&staging);
+            assert_ne!(before, after, "the texture was not checked");
+            assert_eq!(*seen.lock().unwrap(), Some(after), "the callback ran before the check");
+        }
+        // SAFETY: the allocation above, released once.
+        assert_ne!(unsafe { VirtualFree(base, 0, MEM_RELEASE) }, 0);
+    }
+
     /// Settling: a write again under a settling key moves its last write
     /// on; keys are taken once quiet or after the longest wait, oldest
     /// first, within the count and byte bounds (the first whatever its size).
