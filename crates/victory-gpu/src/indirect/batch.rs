@@ -288,6 +288,51 @@ impl Table {
     }
 }
 
+/// Title ranges shaders were declared to write since a pass was recorded
+/// (`VICTORY_INDIRECT_BATCH=3`): a record in none of them is as the pass
+/// read it. Past [`WriteLog::MOST`] ranges every record counts as written.
+#[derive(Default)]
+pub(crate) struct WriteLog {
+    /// Start and end of each range.
+    ranges: Vec<(u64, u64)>,
+    full: bool,
+}
+
+impl WriteLog {
+    const MOST: usize = 4096;
+
+    /// Shaders may write `len` bytes from `address` on.
+    pub(crate) fn note(&mut self, address: u64, len: u64) {
+        let end = address.saturating_add(len);
+        if self.full || end == address {
+            return;
+        }
+        // The same views are declared by dispatch after dispatch.
+        if let Some(last) = self.ranges.last_mut()
+            && address <= last.1
+            && last.0 <= end
+        {
+            *last = (last.0.min(address), last.1.max(end));
+            return;
+        }
+        if self.ranges.iter().any(|&(a, b)| a <= address && end <= b) {
+            return;
+        }
+        if self.ranges.len() == Self::MOST {
+            self.ranges = Vec::new();
+            self.full = true;
+            return;
+        }
+        self.ranges.push((address, end));
+    }
+
+    /// Whether shaders may have written any of `len` bytes from `address` on.
+    pub(crate) fn touches(&self, address: u64, len: u64) -> bool {
+        let end = address.saturating_add(len);
+        self.full || self.ranges.iter().any(|&(a, b)| address < b && a < end)
+    }
+}
+
 /// Records the pass over the table at `jobs` (a host address) into `dst`,
 /// which is in state `before` and left in `INDIRECT_ARGUMENT`: after every
 /// earlier shader write (the title's argument passes) if `wait`, before
@@ -446,5 +491,41 @@ impl Stamps {
         let ns = (u128::from(ticks) * 1_000_000_000 / u128::from(frequency)) as u64;
         crate::copystat::add(crate::copystat::C::ClampPassNs, ns);
         crate::copystat::add(crate::copystat::C::ClampPasses, passes);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::WriteLog;
+
+    #[test]
+    fn write_log() {
+        let mut log = WriteLog::default();
+        assert!(!log.touches(0x1000, 16));
+        log.note(0x1000, 0x100);
+        log.note(0x1000, 0x100);
+        log.note(0x1080, 0x100);
+        assert_eq!(log.ranges, [(0x1000, 0x1180)]);
+        assert!(log.touches(0x1170, 16));
+        assert!(log.touches(0xff8, 16));
+        assert!(!log.touches(0x1180, 16));
+        assert!(!log.touches(0xff0, 16));
+        log.note(0x8000, 0);
+        assert!(!log.touches(0x8000, 4));
+        log.note(0x9000, 0x10);
+        log.note(0x1010, 0x10);
+        assert_eq!(log.ranges, [(0x1000, 0x1180), (0x9000, 0x9010)]);
+    }
+
+    #[test]
+    fn write_log_full() {
+        let mut log = WriteLog::default();
+        for i in 0..WriteLog::MOST as u64 {
+            log.note(i * 0x100, 0x10);
+        }
+        assert!(!log.touches(0x80, 16));
+        log.note(u64::MAX - 0x100, 0x10);
+        assert!(log.full);
+        assert!(log.touches(0x80, 16));
     }
 }

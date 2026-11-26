@@ -3547,6 +3547,9 @@ struct Deferred {
     /// memory (host copy, address, bytes): declaring them again would
     /// change nothing.
     gpu_written: std::collections::HashSet<(usize, usize, usize), std::hash::BuildHasherDefault<AddressHash>>,
+    /// Ranges declared written by shaders since the open batched clamp
+    /// ([`HostList::batch_opened`]).
+    batch_writes: Option<crate::indirect::batch::WriteLog>,
     /// Scratch memory [`HostList::fill_scratch`] fills since the list last
     /// wrote title memory (source, bytes): its host address.
     filled: std::collections::HashMap<(usize, usize), u64, std::hash::BuildHasherDefault<AddressHash>>,
@@ -9241,10 +9244,34 @@ impl HostList {
         len: usize,
     ) {
         let mut deferred = self.deferred();
+        if let Some(log) = &mut deferred.batch_writes {
+            log.note(address as u64, len as u64);
+        }
         let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
         if deferred.gpu_written.insert(key) || !declare_once() {
             deferred.copies.push(Step::GpuWrite(shadow.clone(), address, len));
         }
+    }
+
+    /// A batched clamp was recorded: what shaders are declared to write
+    /// from here on is noted for [`HostList::batch_written`]
+    /// (`VICTORY_INDIRECT_BATCH=3`).
+    pub(crate) fn batch_opened(&self) {
+        self.deferred().batch_writes = Some(crate::indirect::batch::WriteLog::default());
+    }
+
+    /// Shaders of the list write `len` bytes from title `address` on, in
+    /// memory no step is deferred for (title memory itself).
+    pub(crate) fn note_batch_write(&self, address: u64, len: u64) {
+        if let Some(log) = &mut self.deferred().batch_writes {
+            log.note(address, len);
+        }
+    }
+
+    /// Whether shaders may have written any of `len` bytes from title
+    /// `address` on since the last batched clamp (true if none was noted).
+    pub(crate) fn batch_written(&self, address: u64, len: u64) -> bool {
+        self.deferred().batch_writes.as_ref().is_none_or(|log| log.touches(address, len))
     }
 
     /// A read back: once the list has run, `rows` rows of `row` bytes go

@@ -378,11 +378,18 @@ fn windows() -> bool {
 /// dispatches the title runs side by side (its tile classes, up to 92 at a
 /// time) are not held up by waits of ours. Off: whether the title has ways
 /// to wait that do not pass through its lists' methods is not known.
-fn batches() -> u8 {
+///
+/// `VICTORY_INDIRECT_BATCH=3`: as 2, but neither the title's waits nor its
+/// draws end the batch: an execution whose record lies in a range shaders
+/// were declared to write since the pass ([`HostList::batch_written`])
+/// opens a new one. After a shader that stores by address (it may write
+/// anywhere) the batch ends as with 2.
+pub(crate) fn batches() -> u8 {
     static ON: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *ON.get_or_init(|| match std::env::var("VICTORY_INDIRECT_BATCH").as_deref() {
         Ok("0") => 0,
         Ok("2") => 2,
+        Ok("3") => 3,
         _ => 1,
     })
 }
@@ -424,6 +431,8 @@ struct Batch {
     /// Dispatches since, which may have written arguments
     /// (`VICTORY_INDIRECT_BATCH=2`).
     wrote: bool,
+    /// A shader since that stores by address (`VICTORY_INDIRECT_BATCH=3`).
+    anywhere: bool,
 }
 
 /// The host copies arguments were read from last: what a batch opens with,
@@ -2042,6 +2051,9 @@ impl State {
                 // Only through a store by address: what it stores through
                 // views is declared with them.
                 let use_ = if crate::pipeline::is_builder(self.pipeline as This) || writes && t.stores_by_address {
+                    if let Some(b) = &mut self.batch {
+                        b.anywhere = true;
+                    }
                     crate::memory::Use::Builds { back: writes }
                 } else {
                     crate::memory::Use::Reads
@@ -5052,7 +5064,7 @@ impl State {
     fn buffers_written(&mut self) {
         self.quiet = false;
         match &mut self.batch {
-            Some(batch) if batches() == 2 => batch.wrote = true,
+            Some(batch) if batches() >= 2 => batch.wrote = true,
             batch => *batch = None,
         }
     }
@@ -5119,19 +5131,19 @@ impl State {
 
     /// The title waits for earlier work (a barrier or a pipeline sync).
     pub(crate) fn synced(&mut self) {
-        if self.batch.as_ref().is_some_and(|b| b.wrote) {
+        if self.batch.as_ref().is_some_and(|b| b.wrote && (batches() != 3 || b.anywhere)) {
             self.batch = None;
         }
     }
 
-    /// Where the clamped record of `kind` at `arguments` of the copy `args`
-    /// is, from the open batch or a new one ([`batches`]). `None` if it
-    /// cannot be clamped in one.
+    /// Where the clamped record of `kind` at `arguments` (`len` bytes) of
+    /// the copy `args` is, from the open batch or a new one ([`batches`]).
+    /// `None` if it cannot be clamped in one.
     fn batched(
         &mut self,
         list: &HostList,
         args: &std::sync::Arc<crate::shadow::Shadow>,
-        arguments: u64,
+        (arguments, len): (u64, u64),
         kind: u32,
     ) -> Option<(ID3D12Resource, u64)> {
         const BATCH_USE: usize = usize::MAX - 0x78;
@@ -5143,6 +5155,11 @@ impl State {
         // A draw after dispatches waits for them.
         if kind != DISPATCH && kind != crate::indirect::SPLIT {
             self.synced();
+        }
+        if batches() == 3 && self.batch.is_some() && list.batch_written(arguments, len) {
+            self.batch = None;
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::BatchArgsWritten, 1);
         }
         let (id, offset) = (args.id(), args.offset(arguments));
         if let Some(b) = &mut self.batch
@@ -5156,7 +5173,10 @@ impl State {
         self.host_pipeline = 0;
         self.host_roots[1] = 0;
         let at = table.place(id, offset, kind)?;
-        self.batch = Some(Batch { table, scratch: scratch.clone(), wrote: false });
+        self.batch = Some(Batch { table, scratch: scratch.clone(), wrote: false, anywhere: false });
+        if batches() == 3 {
+            list.batch_opened();
+        }
         Some((scratch, at))
     }
 
@@ -5305,7 +5325,7 @@ impl State {
         // One record without a count: clamped in a batch (`batches`).
         let batch = if batches() > 0 && max == 1 && count.is_none() && (split.is_none() || split_batch()) {
             args.refresh(list, arguments, len);
-            self.batched(list, &args, arguments, if split.is_some() { crate::indirect::SPLIT } else { kind })
+            self.batched(list, &args, (arguments, len), if split.is_some() { crate::indirect::SPLIT } else { kind })
         } else {
             None
         };

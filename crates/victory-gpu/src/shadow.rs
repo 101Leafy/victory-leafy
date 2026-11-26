@@ -4024,6 +4024,7 @@ impl Shadow {
         // inside this one with a copy of its own, a texture in it) is not
         // told: the card's writes are not seen by write watching.
         if self.place.is_some() {
+            list.note_batch_write(address, len);
             return;
         }
         self.written.store(true, Ordering::Relaxed);

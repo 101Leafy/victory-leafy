@@ -463,11 +463,16 @@ pub(crate) enum C {
     /// them left as they were (`VICTORY_TABLE_SAME=1`).
     TableEntries,
     TableEntriesSame,
+    /// Batched clamps ended by a record shaders may have written since
+    /// (`VICTORY_INDIRECT_BATCH=3`), and the title's full waits left out as
+    /// nothing ran since the last one (`VICTORY_WAIT_SHARE=1`).
+    BatchArgsWritten,
+    WaitsLeftOut,
 }
 const COUNTERS: usize = 256;
 
 /// The counters' names, in the order of [`C`], for the frame recorder's columns.
-pub(crate) const NAMES: [&str; 243] = [
+pub(crate) const NAMES: [&str; 245] = [
     "Submissions", "Copies", "CopyBytes", "Refreshes", "RefreshBytes", "Skipped", "SkippedBytes", "Runs",
     "RunUs", "Queries", "QueryUs", "MoveUs", "Unmapped", "Watches", "WatchUs", "Checked", "Unchanged",
     "Fallbacks", "GuardFaults", "TexWatched", "TexHashed", "TexChanged", "TexHot", "Frames", "RecordCalls",
@@ -522,6 +527,7 @@ pub(crate) const NAMES: [&str; 243] = [
     "TexPartialWritten", "TexPartialSkipped",
     "TexUploadBytes", "TexForced", "TexForcedBytes", "TexForcedSame", "TexForcedSameBytes",
     "TableEntries", "TableEntriesSame",
+    "BatchArgsWritten", "WaitsLeftOut",
 ];
 /// One of some sets of counters, each in lines of the processor's memory of
 /// its own: a set for all threads had them wait for each other's lines at
@@ -900,7 +906,7 @@ mod command_tests {
     #[test]
     fn every_counter_is_named() {
         use super::{C, COUNTERS, NAMES};
-        assert_eq!(C::TableEntriesSame as usize + 1, NAMES.len());
+        assert_eq!(C::WaitsLeftOut as usize + 1, NAMES.len());
         assert_eq!(NAMES[C::Frames as usize], "Frames");
         assert!(NAMES.len() <= COUNTERS);
     }
@@ -2003,12 +2009,15 @@ pub(crate) fn log(frames: f64) {
     crate::host::pstats::report(frames);
     tracing::info!(
         "  waits for every earlier shader write, per frame: {:.0} for the title's barrier groups, {:.0} \
-         for its barriers on buffers; {:.0} indirect commands bounded (a dispatch of ours between two \
-         such waits each); {:.0} of all these after nothing that writes; of the groups' waits {:.0} \
+         for its barriers on buffers, {:.0} of the title's left out; {:.0} indirect commands bounded (a \
+         dispatch of ours between two such waits each), {:.0} of them for a record written since the \
+         last; {:.0} of all these after nothing that writes; of the groups' waits {:.0} \
          for reads alone and {:.0} for textures alone (VICTORY_GROUP_WAITS); barrier experiment {}",
         c[C::WaitsForGroups as usize],
         c[C::WaitsForBuffers as usize],
+        c[C::WaitsLeftOut as usize],
         c[C::IndirectBounded as usize],
+        c[C::BatchArgsWritten as usize],
         c[C::WaitsQuiet as usize],
         c[C::WaitsGroupsRead as usize],
         c[C::WaitsGroupsTexture as usize],
