@@ -1221,7 +1221,8 @@ pub fn host_settings() -> [u32; 4] {
 /// writes an infinity there, and a pass that blends it with its history
 /// (inf - inf) keeps a NaN, black on screen. 65024 is the largest finite
 /// R11G11B10 value and exact in 16 bits. Off by default: it also clamps
-/// 32-bit float targets, and no run has shown it yet.
+/// 32-bit float targets; `super::with_finite_targets` holds only the targets
+/// it names.
 fn color_finite_on() -> bool {
     #[cfg(test)]
     if let Some(on) = TEST_COLOR_FINITE.get() {
@@ -12496,7 +12497,9 @@ impl<'a> Lower<'a> {
             }
             let el = &mut elements(self, primitive)[id];
             el.usage |= 1 << col;
-            let color = !mesh && el.kind == 16;
+            let finite = !mesh
+                && el.kind == 16
+                && (color_finite_on() || el.index < 8 && super::finite_here() >> el.index & 1 != 0);
             let (suffix, x) = match el.comp {
                 9 if half.is_some() => (".f32", self.as_float(x)),
                 9 => {
@@ -12504,7 +12507,7 @@ impl<'a> Lower<'a> {
                         Some(&f) => f,
                         None => self.as_float(x),
                     };
-                    let f = if color && color_finite_on() { self.finite_color(f) } else { f };
+                    let f = if finite { self.finite_color(f) } else { f };
                     (".f32", f)
                 }
                 _ => (".i32", x),
