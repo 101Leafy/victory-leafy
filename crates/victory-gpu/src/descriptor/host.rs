@@ -2597,6 +2597,10 @@ impl HostHeap {
                 self.put(index);
                 self.clear_twin(index);
                 LATE[3].fetch_add(u64::from(kept.is_some()), Relaxed);
+                #[cfg(feature = "diagnostics")]
+                if kept.is_some() {
+                    crate::host::panel::log_event(format!("LATE TEX {index}"));
+                }
                 self.keep(index, kept);
             }
             stale
