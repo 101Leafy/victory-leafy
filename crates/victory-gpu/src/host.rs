@@ -1371,6 +1371,35 @@ mod tests {
         assert_eq!(super::title_ticks(1_000_000_000, 0), 100_000_000_000_000_000);
     }
 
+    /// A fill takes the bytes of a copy at its place in front of it
+    /// (`place::forwards`) only if they are all it reads and no step in
+    /// between may write there.
+    #[test]
+    fn fills_take_a_placed_copys_bytes_by_step_order() {
+        use super::place::{Order, forwards_of};
+        type Got = Vec<((usize, usize), (usize, usize), usize)>;
+        fn got(written: &[(usize, usize)], lists: &[&[Order]]) -> Got {
+            forwards_of(written, lists.iter().map(|l| l.iter().copied())).iter().map(|f| (f.fill, f.copy, f.at)).collect()
+        }
+        let copy = Order::Placed(2000, 9000, 64, false);
+        // In the same list, and in a later one.
+        assert_eq!(got(&[], &[&[copy, Order::Fill(2016, 16)], &[Order::Other, Order::Fill(2000, 64)]]), vec![((0, 1), (0, 0), 16), ((1, 1), (0, 0), 0)]);
+        // A later copy over the same bytes: those are the fill's.
+        assert_eq!(got(&[], &[&[copy, Order::Placed(2000, 9500, 64, false), Order::Fill(2000, 8)]]), vec![((0, 2), (0, 1), 0)]);
+        // A CPU copy over part of it, or a run, in between.
+        assert_eq!(got(&[], &[&[copy, Order::Write(2060, 4), Order::Fill(2000, 8)]]), Got::new());
+        assert_eq!(got(&[], &[&[copy], &[Order::Run, Order::Fill(2000, 8)]]), Got::new());
+        // Work that writes host memory only (`Step::Host`) leaves it.
+        assert_eq!(got(&[], &[&[copy, Order::Other, Order::Fill(2000, 8)]]).len(), 1);
+        // A source only partly inside the destination, and a fill ahead of the copy.
+        assert_eq!(got(&[], &[&[copy, Order::Fill(2056, 16), Order::Fill(1992, 16)]]), Got::new());
+        assert_eq!(got(&[], &[&[Order::Fill(2000, 8), copy]]), Got::new());
+        // No upload memory and a source flights may write: the bytes are not
+        // known at submission. With upload memory they are.
+        assert_eq!(got(&[(9000, 9010)], &[&[copy, Order::Fill(2000, 8)]]), Got::new());
+        assert_eq!(got(&[(9000, 9010)], &[&[Order::Placed(2000, 9000, 64, true), Order::Fill(2000, 8)]]).len(), 1);
+    }
+
     /// A list's preludes: one a use took comes back once the submission it
     /// was sent with is done, not before, and those of a later submission
     /// stay queued.

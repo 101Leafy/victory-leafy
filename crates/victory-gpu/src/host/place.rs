@@ -157,22 +157,51 @@ pub(super) struct Forward {
 /// of them, with no step between that writes there. `written`: what flights
 /// may write.
 pub(super) fn forwards(written: &[(usize, usize)], runs: &[&HostList]) -> Vec<Forward> {
-    let mut found = Vec::new();
     if !on() || !forward_on() {
-        return found;
+        return Vec::new();
     }
+    forwards_of(written, runs.iter().map(|list| list.deferred().copies.iter().map(Order::of)))
+}
+
+/// What [`forwards`] looks at in a step.
+#[derive(Clone, Copy)]
+pub(super) enum Order {
+    /// A fill's source and length.
+    Fill(usize, usize),
+    /// A CPU write of title memory: destination, length.
+    Write(usize, usize),
+    /// A copy at its place: destination, source, length, and whether it has
+    /// upload memory to give the source's bytes.
+    Placed(usize, usize, usize, bool),
+    /// Work that may write title memory anywhere.
+    Run,
+    Other,
+}
+
+impl Order {
+    fn of(step: &Step) -> Order {
+        match step {
+            &Step::Fill(_, src, len, _) => Order::Fill(src, len),
+            &Step::Copy(dst, _, len) => Order::Write(dst, len),
+            Step::Placed(p) => Order::Placed(p.dst, p.src, p.len, p.from.is_some()),
+            Step::Run(_) => Order::Run,
+            _ => Order::Other,
+        }
+    }
+}
+
+/// [`forwards`] over the steps of each list, in submission order.
+pub(super) fn forwards_of<L: IntoIterator<Item = Order>>(written: &[(usize, usize)], lists: impl IntoIterator<Item = L>) -> Vec<Forward> {
+    let mut found = Vec::new();
     let mut standing = Standing::default();
-    for (n, list) in runs.iter().enumerate() {
-        for (i, step) in list.deferred().copies.iter().enumerate() {
+    for (n, list) in lists.into_iter().enumerate() {
+        for (i, step) in list.into_iter().enumerate() {
             match step {
-                &Step::Fill(_, src, len, _) => found.extend(standing.fill((n, i), src, len)),
-                &Step::Copy(dst, _, len) => standing.written(dst, len),
-                Step::Placed(p) => {
-                    let known = p.from.is_some() || !touches(written, p.src, p.src + p.len);
-                    standing.copy((n, i), p.dst, p.len, known);
-                }
-                Step::Run(_) => standing.0.clear(),
-                _ => {}
+                Order::Fill(src, len) => found.extend(standing.fill((n, i), src, len)),
+                Order::Write(dst, len) => standing.written(dst, len),
+                Order::Placed(dst, src, len, from) => standing.copy((n, i), dst, len, from || !touches(written, src, src + len)),
+                Order::Run => standing.0.clear(),
+                Order::Other => {}
             }
         }
     }
