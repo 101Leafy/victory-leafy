@@ -9338,7 +9338,15 @@ fn swap_format(format: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
     })
 }
 
-const BUFFERS: u32 = 2;
+/// Swap chain back buffers, VICTORY_SWAP_BUFFERS (2 to 16, default 2). With
+/// 3, a frame can render while the display still holds the other two.
+fn buffers() -> u32 {
+    static N: OnceLock<u32> = OnceLock::new();
+    *N.get_or_init(|| {
+        let n = std::env::var("VICTORY_SWAP_BUFFERS").ok().and_then(|v| v.trim().parse().ok());
+        n.map_or(2, |n: u32| n.clamp(2, 16))
+    })
+}
 
 struct Presenter {
     swap_chain: IDXGISwapChain3,
@@ -9729,7 +9737,7 @@ impl Host {
             // SAFETY: no back buffer is held; every submission was waited for.
             let resized = unsafe {
                 p.swap_chain
-                    .ResizeBuffers(BUFFERS, width, height, format, DXGI_SWAP_CHAIN_FLAG(0))
+                    .ResizeBuffers(buffers(), width, height, format, DXGI_SWAP_CHAIN_FLAG(0))
             };
             match resized {
                 Ok(()) => {
@@ -9880,7 +9888,7 @@ impl Host {
                     Quality: 0,
                 },
                 BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
-                BufferCount: BUFFERS,
+                BufferCount: buffers(),
                 SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
                 ..Default::default()
             };
