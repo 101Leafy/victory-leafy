@@ -30,6 +30,8 @@ pub use victory_gpu::replay;
 pub use victory_gpu::pipeline::known as known_pipelines;
 #[cfg(windows)]
 pub use victory_gpu::pipeline::note_title_dll;
+#[cfg(windows)]
+pub use victory_gpu::pipeline::save_pipeline_cache;
 
 use victory_loader::{ImportResolver, Provenance, Resolution};
 use victory_pe::ImportSymbol;
