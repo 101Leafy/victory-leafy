@@ -709,7 +709,7 @@ mod command_tests {
     #[test]
     fn every_counter_is_named() {
         use super::{C, COUNTERS, NAMES};
-        assert_eq!(C::HeapTexUploadNs as usize + 1, NAMES.len());
+        assert_eq!(C::SubmitLockSettleNs as usize + 1, NAMES.len());
         assert_eq!(NAMES[C::Frames as usize], "Frames");
         assert!(NAMES.len() <= COUNTERS);
     }
