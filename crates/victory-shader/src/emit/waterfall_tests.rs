@@ -6,6 +6,7 @@
 use windows::Win32::Graphics::Direct3D12::*;
 
 use super::host::{Dispatch, Host, Root, Stride, View};
+use super::shader::USER_VIEW_ADDRESS;
 use super::{HostShader, lower, validator};
 use crate::native::{
     ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
@@ -126,10 +127,12 @@ pub(super) fn run(shader: &HostShader, views: &[View]) -> Vec<(&'static str, Vec
             Ok(p) => p,
             Err(e) => panic!("{label}: compute_pipeline failed: {e}"),
         };
-        // Both tables start at heap index 0.
+        // Both tables start at heap index 0. A view whose size alone is read also gets
+        // its address from the host (descriptor_data.rs); nothing here reads through it.
         let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
         for u in &shader.user_data {
-            assert_eq!(u.root, RootType::Table, "{u:?}");
+            let address = [USER_VIEW_ADDRESS, USER_VIEW_ADDRESS + 1].map(RootType::Other);
+            assert!(u.root == RootType::Table || address.contains(&u.root), "{u:?}");
             ud[u.index as usize] = 0;
         }
         let words = host

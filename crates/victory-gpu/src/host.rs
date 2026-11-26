@@ -368,9 +368,39 @@ pub(crate) fn keep_freed() -> bool {
 /// Effective idle timeout (in milliseconds) for system-RAM caches (staging
 /// buffers, loose shadows, and the mapped pipeline library), scaled down
 /// when free physical RAM is low. Never returns less than 2,000 ms.
-/// With plenty of it five minutes ([`keep_freed`]).
+/// With plenty of it five minutes ([`keep_freed`]), unless this process
+/// is already near the PC's commit limit ([`near_commit_limit`]).
 pub(crate) fn ram_idle_ms(avail_phys: Option<u64>) -> u64 {
-    ram_idle_for(avail_phys, keep_freed())
+    ram_idle_for(avail_phys, keep_freed() && !near_commit_limit())
+}
+
+/// Whether this process's private bytes have reached 70 % of the smaller
+/// of the PC's RAM and its commit limit (RAM plus page files). Free RAM
+/// alone does not show it: on a 32 GB PC the process grows to 35-43 GB of
+/// commit while 12 GB of RAM can still look free, and freed copies kept for
+/// five minutes then push it into the page file. The commit limit alone
+/// does not either: with a 48 GB page file it is 80 GB, far past where
+/// paging starts. Past the mark the shorter idle times by free RAM apply.
+/// A failed query changes nothing.
+fn near_commit_limit() -> bool {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    // SAFETY: plain data the call fills in.
+    let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+    // SAFETY: a sized structure.
+    if unsafe { GlobalMemoryStatusEx(&mut m) } == 0 {
+        return false;
+    }
+    private_near_limit(private_bytes(), m.ullTotalPhys, m.ullTotalPageFile)
+}
+
+fn private_near_limit(private: u64, total_physical: u64, commit_limit: u64) -> bool {
+    let room = match (total_physical, commit_limit) {
+        (0, 0) => return false,
+        (0, b) | (b, 0) => b,
+        (a, b) => a.min(b),
+    };
+    private.saturating_mul(10) >= room.saturating_mul(7)
 }
 
 fn ram_idle_for(avail_phys: Option<u64>, keep: bool) -> u64 {
@@ -775,8 +805,8 @@ pub(crate) static ALIVE: [std::sync::atomic::AtomicU64; 8] = [const { std::sync:
 /// makes at its start).
 pub(crate) static LISTS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
-/// The process's private bytes (diagnostics: around the making of lists).
-#[cfg(feature = "diagnostics")]
+/// The process's private bytes (0 if the query fails): around the making
+/// of lists (diagnostics), and against the PC's RAM ([`near_commit_limit`]).
 fn private_bytes() -> u64 {
     use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
@@ -977,6 +1007,23 @@ fn create() -> windows::core::Result<Host> {
             );
             tracing::info!(ok = set.is_ok(), "the host's background shader work is switched off (VICTORY_D3D12_BACKGROUND=0)");
         }
+        // `VICTORY_DRIVER_CACHE=0`: the driver's own shader cache (and the
+        // runtime's, for a driver without one) is not used by this run, so a
+        // run with an empty `VICTORY_LIBRARY_DIR` makes its pipelines cold
+        // without a VERSION bump. Needs Windows developer mode. Switched off
+        // for this process only, never cleared.
+        if std::env::var_os("VICTORY_DRIVER_CACHE").is_some_and(|v| v == "0") {
+            let off = device.cast::<ID3D12Device9>().and_then(|device9| {
+                device9.ShaderCacheControl(
+                    D3D12_SHADER_CACHE_KIND_FLAG_IMPLICIT_DRIVER_MANAGED | D3D12_SHADER_CACHE_KIND_FLAG_IMPLICIT_D3D_CACHE_FOR_DRIVER,
+                    D3D12_SHADER_CACHE_CONTROL_FLAG_DISABLE,
+                )
+            });
+            match off {
+                Ok(()) => tracing::info!("the driver's shader cache is off for this run (VICTORY_DRIVER_CACHE=0)"),
+                Err(e) => tracing::warn!(error = %e, "the driver's shader cache could not be switched off"),
+            }
+        }
         // the widest wave the GPU runs: 32 (NVIDIA) gets console wave64 compute programs whose
         // cross-lane code stays in 32-lane halves translated for waves of 32
         let mut o1 = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
@@ -1163,8 +1210,8 @@ mod tests {
         let texture = std::sync::Arc::new(crate::resource::HostTexture::new(made.unwrap(), 0));
         let key = std::sync::Arc::as_ptr(&texture) as usize;
         list.states.lock().unwrap().insert(key, (start, leave, texture.clone()));
-        let first = list.prelude().expect("a move is recorded");
-        let second = list.prelude().expect("the second use records a move too");
+        let first = list.prelude(false).expect("a move is recorded");
+        let second = list.prelude(false).expect("the second use records a move too");
         assert_ne!(
             windows::core::Interface::as_raw(&first),
             windows::core::Interface::as_raw(&second),
@@ -1173,6 +1220,18 @@ mod tests {
         assert_eq!(texture.state.load(std::sync::atomic::Ordering::Relaxed), leave);
         let preludes = list.preludes.lock().unwrap();
         assert_eq!((preludes.free.len(), preludes.flight.len()), (0, 2));
+    }
+
+    /// The first list of a part sent in one call behind others
+    /// (`VICTORY_JOIN_ONE_CALL`) has a prelude with the barriers even with
+    /// nothing to move.
+    #[test]
+    fn a_joined_parts_first_list_gets_a_prelude() {
+        let Some(host) = super::host() else { return };
+        let list = host.new_list().unwrap();
+        list.close();
+        assert!(list.prelude(false).is_none(), "nothing to move: no prelude");
+        assert!(list.prelude(true).is_some(), "behind another part: a prelude with the barriers");
     }
 
     mod builder_memory {
@@ -3548,6 +3607,20 @@ pub(crate) fn joins() -> (usize, usize) {
     if ahead_of_writes() { joins_asked() } else { (1, 1) }
 }
 
+/// Whether the parts [`joins`] gives the host go to the queue in one call,
+/// the first list of each part after the first behind a barrier that waits
+/// for everything before it ([`join_barriers`]) (`VICTORY_JOIN_ONE_CALL=1`;
+/// off by default, a call per part).
+///
+/// From Skyfrye's AnyXboxX#337 (`VICTORY_MERGE_SUBMISSIONS`), which holds the
+/// title's submissions back and sends them as one host submission with these
+/// barriers between them; here only the barriers and the one call, over the
+/// parts the line's thread joins already.
+fn join_one_call() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_JOIN_ONE_CALL"))
+}
+
 fn joins_asked() -> (usize, usize) {
     static MOST: OnceLock<(usize, usize)> = OnceLock::new();
     let of = |name: &str| std::env::var(name).ok().and_then(|v| v.trim().parse::<usize>().ok());
@@ -4163,6 +4236,7 @@ fn late_line(frames: f64) {
         );
     }
     card_steps::log(frames);
+    crate::port_journal::line(frames);
     crate::picked::log(frames);
     #[cfg(feature = "diagnostics")]
     log_blame(frames);
@@ -4361,6 +4435,7 @@ fn read_backs(list: &HostList) {
                 let from = data.cast::<u8>().cast_const();
                 for line in 0..*rows {
                     std::ptr::copy_nonoverlapping(from.add(line * row.next_multiple_of(256)), (*at as *mut u8).add(line * pitch), *row);
+                    crate::watch::told(&[(*at + line * pitch, *row)]);
                 }
                 // The walls trace: what the title is handed (one row of at
                 // most 24 values: its 5x1 and 1x1 float targets).
@@ -6081,7 +6156,13 @@ impl Host {
         ahead.part(13);
         // Descriptors the title copied into placed heaps directly, before
         // command lists that index those slots are submitted.
-        let heaps_synced = crate::descriptor::begin_sync_heaps();
+        // Renderer port #7 (from renderer patch #4): the round asked for when
+        // the title submitted it, if that is known (`crate::port_journal`).
+        let heaps_on = crate::port_journal::on();
+        let heaps_synced = match crate::port_journal::needed() {
+            0 => crate::descriptor::begin_sync_heaps(),
+            mark => crate::descriptor::begin_sync_heaps_after(mark),
+        };
         // That list runs first, and is one of the submission's from here on.
         let with: Vec<&HostList>;
         let runs = match &own {
@@ -6193,10 +6274,11 @@ impl Host {
             batch.refresh_ahead(runs, |list, i| own.as_ref().is_some_and(|own| own.takes(list, i)));
         }
         stage.next("submit: the lists' steps");
-        for list in runs {
+        let one_call = late && !parts.is_empty() && join_one_call();
+        for (n, list) in runs.iter().enumerate() {
             list.run_deferred(&mut batch, &air, |i| own.as_ref().is_some_and(|own| own.takes(list, i)));
             firsts.push(lists.len());
-            if let Some(prelude) = list.prelude() {
+            if let Some(prelude) = list.prelude(one_call && parts.contains(&n)) {
                 lists.push(Some(prelude));
             }
             lists.push(list.list.cast().ok());
@@ -6251,7 +6333,9 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         split.part(4);
         stage.next("submit: waiting for the heaps' records");
+        let heaps_began = std::time::Instant::now();
         drop(heaps_synced);
+        crate::port_journal::heaps_waited(heaps_began.elapsed().as_nanos() as u64, heaps_on);
         // The slots that waited for a texture's host copy, before the
         // lists that may read them run.
         crate::descriptor::make_waiting();
@@ -6281,7 +6365,8 @@ impl Host {
                 lists.push(Some(behind));
                 firsts.iter_mut().for_each(|first| *first += 1);
             }
-            let cuts: Vec<usize> = parts.iter().filter_map(|&n| firsts.get(n).copied()).collect();
+            // With [`join_one_call`] the parts' barriers stand in for the cuts.
+            let cuts: Vec<usize> = if one_call { Vec::new() } else { parts.iter().filter_map(|&n| firsts.get(n).copied()).collect() };
             // SAFETY: closed lists; the fence is ours.
             let signalled = unsafe {
                 let mut from = 0;
@@ -6487,7 +6572,8 @@ impl Host {
         let mut text = String::new();
         let mut fault_va = None;
         // SAFETY: the outputs are the runtime's, valid while the device
-        // lives; nodes are walked as linked, histories have their counts.
+        // lives; nodes are walked as linked, histories read as far as they
+        // are mapped (`readable_history`).
         unsafe {
             if let Ok(fault) = dred.GetPageFaultAllocationOutput1()
                 && fault.PageFaultVA != 0
@@ -6548,12 +6634,8 @@ impl Host {
             while let Some(p) = plain.as_ref() {
                 let done = p.pLastBreadcrumbValue.as_ref().copied().unwrap_or(0);
                 if done < p.BreadcrumbCount && !p.pCommandHistory.is_null() {
-                    let history =
-                        std::slice::from_raw_parts(p.pCommandHistory, p.BreadcrumbCount as usize);
-                    text.push_str(&format!(
-                        "; a list stopped at command {done} of {} (op {})",
-                        p.BreadcrumbCount, history[done as usize].0
-                    ));
+                    let history = readable_history(p.pCommandHistory, p.BreadcrumbCount);
+                    text.push_str(&stopped_at(&history, p.BreadcrumbCount, done));
                     let list = p.pCommandList.as_ref().map(|l| l.as_raw());
                     let run = runs.iter().find(|r| Some(r.list.as_raw()) == list);
                     let named = [
@@ -6603,12 +6685,12 @@ impl Host {
                     let markers: Vec<(u32, String)> = Vec::new();
                     #[cfg(not(feature = "diagnostics"))]
                     let _ = fault_va;
-                    if done > 0 {
-                        text.push_str(&in_flight(history, &markers, done as usize));
+                    if done > 0 && (done as usize) < history.len() {
+                        text.push_str(&in_flight(&history, &markers, done as usize));
                     }
                     #[cfg(feature = "diagnostics")]
                     if let Some(indirects) = indirects {
-                        text.push_str(&indirects_around(history, done as usize, &indirects));
+                        text.push_str(&indirects_around(&history, done as usize, &indirects));
                     }
                     // (Without markers a list that stopped midway says what
                     // it may have been at only by what it binds.)
@@ -7159,7 +7241,10 @@ impl HostList {
     /// states become those the list ends with. For depth textures with a
     /// colour twin it first copies the side the list uses as it finds it
     /// from the other, if a list submitted earlier left it behind.
-    fn prelude(&self) -> Option<ID3D12CommandList> {
+    /// With `join` the list is the first of a part sent in one call behind
+    /// others ([`join_one_call`]): the prelude is made in any case, and first
+    /// waits for everything before it ([`join_barriers`]).
+    fn prelude(&self, join: bool) -> Option<ID3D12CommandList> {
         const COPY_DEST: u32 = 0x400;
         const COPY_SOURCE: u32 = 0x800;
         let host_state = |state: u32| D3D12_RESOURCE_STATES(state as i32);
@@ -7220,7 +7305,7 @@ impl HostList {
             (real != *first)
                 .then(|| transition(&copy.texture, host_state(real), host_state(*first)))
         }));
-        if barriers.is_empty() && syncs.is_empty() {
+        if !join && barriers.is_empty() && syncs.is_empty() {
             return None;
         }
         // SAFETY: a plain query.
@@ -7234,6 +7319,9 @@ impl HostList {
         let recorded = unsafe {
             allocator.Reset().and_then(|()| {
                 list.Reset(&allocator, None)?;
+                if join {
+                    list.ResourceBarrier(&join_barriers());
+                }
                 if !to_copy.is_empty() {
                     list.ResourceBarrier(&to_copy);
                 }
@@ -7884,6 +7972,11 @@ impl HostList {
                     }
                     batch.fill();
                     batch.title_written();
+                    // Renderer port #7: into a heap's records, the rounds
+                    // asked earlier did not see it.
+                    if crate::descriptor::in_shader_heap(dst, len) {
+                        crate::port_journal::prep_wrote();
+                    }
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     // With the submission's one asking: the journal learns it.
                     crate::watch::wrote(dst, len);
@@ -7910,6 +8003,9 @@ impl HostList {
                 }
                 Step::Placed(p) => {
                     let started = std::time::Instant::now();
+                    if crate::descriptor::in_shader_heap(p.dst, p.len) {
+                        crate::port_journal::prep_wrote();
+                    }
                     let free = !touches(air, p.src, p.src + p.len) && !touches(air, p.dst, p.dst + p.len);
                     batch.fill();
                     if free {
@@ -7935,6 +8031,8 @@ impl HostList {
                     let started = std::time::Instant::now();
                     if matches!(step, Step::Run(_)) {
                         batch.title_written();
+                        // (It may write anywhere, a heap's records too.)
+                        crate::port_journal::prep_wrote();
                     }
                     let _step = crate::timeline::span("a step of ours");
                     work();
@@ -9517,6 +9615,29 @@ struct Presenter {
     frames: frames::Frames,
 }
 
+/// The times between presents over the last 5 s: their median, 95th and
+/// 99th percentiles, the longest, and how many were over 50 and 100 ms (a
+/// frame rate's steadiness, which the averages of the frame-rate line hide).
+#[cfg(feature = "diagnostics")]
+fn frame_times_line(mut ms: Vec<f32>) {
+    if ms.is_empty() {
+        return;
+    }
+    ms.sort_by(f32::total_cmp);
+    let at = |q: f32| ms[((ms.len() - 1) as f32 * q).round() as usize];
+    let over = |limit: f32| ms.iter().filter(|&&m| m > limit).count();
+    tracing::info!(
+        "frame times over the last 5 s: {} frames, median {:.1} ms, p95 {:.1}, p99 {:.1}, longest {:.1}; {} over 50 ms, {} over 100 ms",
+        ms.len(),
+        at(0.5),
+        at(0.95),
+        at(0.99),
+        ms[ms.len() - 1],
+        over(50.0),
+        over(100.0)
+    );
+}
+
 /// The frame rate, shown in the window's caption every second and logged
 /// every few seconds.
 struct Meter {
@@ -9528,6 +9649,12 @@ struct Meter {
     logged: std::time::Instant,
     /// The caption the window had, once read.
     caption: Option<Vec<u16>>,
+    /// The last present, and the times between presents since the last
+    /// line of every 5 s (ms), for the frame-time line ([`frame_times_line`]).
+    #[cfg(feature = "diagnostics")]
+    last_frame: std::time::Instant,
+    #[cfg(feature = "diagnostics")]
+    intervals: Vec<f32>,
 }
 
 impl Meter {
@@ -9541,6 +9668,10 @@ impl Meter {
             drawn: crate::draw::drawn(),
             logged: now,
             caption: None,
+            #[cfg(feature = "diagnostics")]
+            last_frame: now,
+            #[cfg(feature = "diagnostics")]
+            intervals: Vec::with_capacity(512),
         }
     }
 
@@ -9580,6 +9711,9 @@ impl Meter {
         #[cfg(feature = "diagnostics")]
         {
             self.copy_stats_frames += 1;
+            let now = std::time::Instant::now();
+            self.intervals.push((now - self.last_frame).as_secs_f32() * 1000.0);
+            self.last_frame = now;
         }
         let elapsed = self.since.elapsed();
         if elapsed < std::time::Duration::from_secs(1) {
@@ -9675,11 +9809,10 @@ impl Meter {
         let card = crate::shadow::card_stats();
         #[cfg(feature = "diagnostics")]
         let slow = crate::watch::slow_asks();
-        // Over the same frames as the counts above.
-        #[cfg(feature = "diagnostics")]
-        let drops = crate::pipeline::take_drops();
         if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
             self.logged = std::time::Instant::now();
+            #[cfg(feature = "diagnostics")]
+            frame_times_line(std::mem::take(&mut self.intervals));
             tracing::info!(
                 "placed texture views: {} writes of another view of the texture a slot showed (it kept the old view until the new was made)",
                 crate::descriptor::host::KEPT_VIEWS.load(Ordering::Relaxed)
@@ -9813,12 +9946,13 @@ impl Meter {
                     put[3]
                 );
                 traffic::line(self.copy_stats_frames as f64);
-                crate::copystat::log(std::mem::take(&mut self.copy_stats_frames) as f64);
-                for (why, n) in drops.iter().take(40) {
-                    tracing::info!(
-                        "dropped {:.1}/frame without a host pipeline: {why}",
-                        *n as f64 / frames
-                    );
+                let report_frames = std::mem::take(&mut self.copy_stats_frames);
+                crate::copystat::log(report_frames as f64);
+                // The caption has a shorter interval. Keep the reasons until
+                // this report so the counts and frame total cover the same window.
+                for (why, count) in crate::pipeline::take_drops().into_iter().take(40) {
+                    let per_frame = count as f64 / report_frames as f64;
+                    tracing::info!(count, frames = report_frames, "dropped {per_frame:.1}/frame: {why}");
                 }
             }
         }
@@ -10465,6 +10599,35 @@ fn indirects_around(history: &[D3D12_AUTO_BREADCRUMB_OP], done: usize, all: &ind
     text
 }
 
+/// The first `count` commands of a breadcrumb node's history, up to the
+/// first page that cannot be read: the runtime's count can run past the
+/// history it committed (a report on an RTX 3070 Ti faulted reading
+/// command 15,360 of a long list).
+fn readable_history(history: *const D3D12_AUTO_BREADCRUMB_OP, count: u32) -> Vec<D3D12_AUTO_BREADCRUMB_OP> {
+    let mut ops = Vec::new();
+    let mut readable = true;
+    // Page by page: the kernel copies a range whole or fails it.
+    for_pieces(history as usize, 4 * count as usize, 4 << 10, |at, n| {
+        let mut piece = vec![D3D12_AUTO_BREADCRUMB_OP(0); n / 4];
+        readable = readable && read(at as *const u8, piece.as_mut_ptr().cast(), n);
+        if readable {
+            ops.extend(piece);
+        }
+    });
+    ops
+}
+
+/// Where a list stopped, from the part of its history that could be read
+/// and the runtime's count of its commands.
+fn stopped_at(history: &[D3D12_AUTO_BREADCRUMB_OP], count: u32, done: u32) -> String {
+    let op = history.get(done as usize).map_or_else(|| "unknown".to_owned(), |op| op.0.to_string());
+    let mut text = format!("; a list stopped at command {done} of {count} (op {op})");
+    if history.len() < count as usize {
+        text.push_str(&format!(", but only its first {} commands can be read", history.len()));
+    }
+    text
+}
+
 fn in_flight(history: &[D3D12_AUTO_BREADCRUMB_OP], markers: &[(u32, String)], done: usize) -> String {
     let barrier = |op: &D3D12_AUTO_BREADCRUMB_OP| *op == D3D12_AUTO_BREADCRUMB_OP_RESOURCEBARRIER;
     let from = history[..done].iter().rposition(barrier).map_or(0, |b| b + 1);
@@ -10513,6 +10676,36 @@ pub(crate) fn transition(
     }
 }
 
+/// What the first list of a part sent in one call behind others waits for
+/// ([`join_one_call`]): every shader write before it (an unordered-access
+/// barrier on no resource) and every use of memory before it (an aliasing
+/// barrier between no resources), as a call of its own made the card wait
+/// before. Lists of one `ExecuteCommandLists` may overlap on the card; lists
+/// of two calls do not. (Skyfrye's, AnyXboxX#337.)
+fn join_barriers() -> [D3D12_RESOURCE_BARRIER; 2] {
+    [
+        D3D12_RESOURCE_BARRIER {
+            Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+            Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                    pResource: std::mem::ManuallyDrop::new(None),
+                }),
+            },
+        },
+        D3D12_RESOURCE_BARRIER {
+            Type: D3D12_RESOURCE_BARRIER_TYPE_ALIASING,
+            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+            Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                Aliasing: std::mem::ManuallyDrop::new(D3D12_RESOURCE_ALIASING_BARRIER {
+                    pResourceBefore: std::mem::ManuallyDrop::new(None),
+                    pResourceAfter: std::mem::ManuallyDrop::new(None),
+                }),
+            },
+        },
+    ]
+}
+
 /// A window of the given client size, owned by its own message thread.
 fn window(width: u32, height: u32) -> windows::core::Result<HWND> {
     let (sender, receiver) = std::sync::mpsc::channel();
@@ -10557,27 +10750,126 @@ fn make_window(width: u32, height: u32) -> windows::core::Result<HWND> {
             ..Default::default()
         };
         RegisterClassExW(&class);
-        let mut rect = RECT {
-            left: 0,
-            top: 0,
-            right: width as i32,
-            bottom: height as i32,
-        };
-        AdjustWindowRect(&mut rect, WS_OVERLAPPEDWINDOW, false)?;
+        let display = borderless().then(primary_display).flatten();
+        let place = window_place(width, height, display)?;
         CreateWindowExW(
             WINDOW_EX_STYLE(0),
             CLASS,
             w!("VIctory"),
-            WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-            CW_USEDEFAULT,
-            CW_USEDEFAULT,
-            rect.right - rect.left,
-            rect.bottom - rect.top,
+            place.style | WS_VISIBLE,
+            place.x,
+            place.y,
+            place.width,
+            place.height,
             None,
             None,
             Some(instance.into()),
             None,
         )
+    }
+}
+
+/// `VICTORY_BORDERLESS=1`: the window covers the primary display with no border or title bar
+/// (windowed borderless, not exclusive full screen: the swap chain stretches the picture to it,
+/// the title's render size is unchanged, alt-tab and other windows work as before).
+fn borderless() -> bool {
+    std::env::var("VICTORY_BORDERLESS").is_ok_and(|v| v.trim() == "1")
+}
+
+/// The primary display's rectangle on the desktop; `None` when it cannot be asked.
+fn primary_display() -> Option<RECT> {
+    use windows::Win32::Foundation::POINT;
+    use windows::Win32::Graphics::Gdi::{
+        GetMonitorInfoW, MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromPoint,
+    };
+    let mut info = MONITORINFO {
+        cbSize: size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: the primary display's handle, and a MONITORINFO of the size it declares.
+    let asked = unsafe {
+        let monitor = MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY);
+        GetMonitorInfoW(monitor, &mut info).as_bool()
+    };
+    asked.then_some(info.rcMonitor)
+}
+
+/// Where the window goes and how it looks.
+#[derive(Debug, PartialEq, Eq)]
+struct WindowPlace {
+    style: WINDOW_STYLE,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+}
+
+/// A bordered window whose client area is `width` x `height` where the system puts it, or with a
+/// display given, a borderless window that covers exactly that display.
+fn window_place(
+    width: u32,
+    height: u32,
+    display: Option<RECT>,
+) -> windows::core::Result<WindowPlace> {
+    if let Some(d) = display {
+        return Ok(WindowPlace {
+            style: WS_POPUP,
+            x: d.left,
+            y: d.top,
+            width: d.right - d.left,
+            height: d.bottom - d.top,
+        });
+    }
+    let mut rect = RECT {
+        left: 0,
+        top: 0,
+        right: width as i32,
+        bottom: height as i32,
+    };
+    // SAFETY: adjusts a rectangle we own.
+    unsafe { AdjustWindowRect(&mut rect, WS_OVERLAPPEDWINDOW, false)? };
+    Ok(WindowPlace {
+        style: WS_OVERLAPPEDWINDOW,
+        x: CW_USEDEFAULT,
+        y: CW_USEDEFAULT,
+        width: rect.right - rect.left,
+        height: rect.bottom - rect.top,
+    })
+}
+
+#[cfg(test)]
+mod window_place_tests {
+    use super::*;
+
+    #[test]
+    fn a_display_given_makes_a_borderless_window_that_covers_it() {
+        // A secondary display left of the primary one: negative desktop coordinates.
+        let display = RECT {
+            left: -2560,
+            top: 0,
+            right: 0,
+            bottom: 1440,
+        };
+        let place = window_place(3840, 2160, Some(display)).unwrap();
+        assert_eq!(
+            place,
+            WindowPlace {
+                style: WS_POPUP,
+                x: -2560,
+                y: 0,
+                width: 2560,
+                height: 1440,
+            }
+        );
+    }
+
+    #[test]
+    fn without_a_display_the_window_is_bordered_around_the_client_size() {
+        let place = window_place(1920, 1080, None).unwrap();
+        assert_eq!(place.style, WS_OVERLAPPEDWINDOW);
+        assert_eq!((place.x, place.y), (CW_USEDEFAULT, CW_USEDEFAULT));
+        // The border and title bar are added around the client area.
+        assert!(place.width > 1920 && place.height > 1080);
     }
 }
 
@@ -11454,5 +11746,82 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         // Missing falls back to normal
         assert_eq!(ram_idle_ms(None), 10_000);
     }
+
+    #[test]
+    fn freed_copies_not_kept_near_the_commit_limit() {
+        use super::private_near_limit;
+        let gib = 1u64 << 30;
+        // 70 % exactly of the smaller one is near, a byte under it is not.
+        assert!(private_near_limit(7 * gib, 10 * gib, 20 * gib));
+        assert!(!private_near_limit(7 * gib - 1, 10 * gib, 20 * gib));
+        assert!(private_near_limit(7 * gib, 20 * gib, 10 * gib));
+        // A 32 GB PC with a 48 GB page file (an 80 GB commit limit): RAM
+        // sets the mark, about 22.4 GB, not 56 GB.
+        assert!(!private_near_limit(20 * gib, 32 * gib, 80 * gib));
+        assert!(private_near_limit(23 * gib, 32 * gib, 80 * gib));
+        assert!(private_near_limit(40 * gib, 32 * gib, 80 * gib));
+        // A 64 GB PC at the README's 30 GB keeps its copies as before.
+        assert!(!private_near_limit(30 * gib, 64 * gib, 80 * gib));
+        // One unknown number: the other one; both unknown: never near.
+        assert!(private_near_limit(23 * gib, 0, 32 * gib));
+        assert!(private_near_limit(23 * gib, 32 * gib, 0));
+        assert!(!private_near_limit(u64::MAX, 0, 0));
+        // No overflow on huge values.
+        assert!(private_near_limit(u64::MAX, u64::MAX, u64::MAX));
+    }
 }
 
+#[cfg(test)]
+mod breadcrumbs {
+    use super::{readable_history, stopped_at};
+    use windows::Win32::Graphics::Direct3D12::{
+        D3D12_AUTO_BREADCRUMB_OP, D3D12_AUTO_BREADCRUMB_OP_DISPATCH, D3D12_AUTO_BREADCRUMB_OP_SETMARKER,
+    };
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+    };
+
+    const PAGE: usize = 4 << 10;
+
+    /// The device-removed report of a list whose breadcrumb count runs a
+    /// page past its committed history (as the runtime's did on an RTX
+    /// 3070 Ti): the report takes the commands that are there and says the
+    /// rest cannot be read, instead of faulting.
+    #[test]
+    fn a_history_shorter_than_its_count_is_read_as_far_as_it_is_there() {
+        let op = |i: usize| -> D3D12_AUTO_BREADCRUMB_OP {
+            if i.is_multiple_of(2) { D3D12_AUTO_BREADCRUMB_OP_SETMARKER } else { D3D12_AUTO_BREADCRUMB_OP_DISPATCH }
+        };
+        let committed = PAGE / 4;
+        // SAFETY: a fresh reservation of two pages; the first is committed
+        // and ours to fill.
+        let base = unsafe {
+            let base =
+                VirtualAlloc(std::ptr::null(), 2 * PAGE, MEM_RESERVE, PAGE_NOACCESS).cast::<D3D12_AUTO_BREADCRUMB_OP>();
+            assert!(!base.is_null());
+            assert!(!VirtualAlloc(base.cast(), PAGE, MEM_COMMIT, PAGE_READWRITE).is_null());
+            for i in 0..committed {
+                base.add(i).write(op(i));
+            }
+            base
+        };
+        let count = 2 * committed as u32;
+        let history = readable_history(base, count);
+        assert_eq!(history.len(), committed, "the committed page");
+        assert!(history.iter().enumerate().all(|(i, o)| *o == op(i)), "its commands, in order");
+        assert_eq!(
+            stopped_at(&history, count, 7),
+            "; a list stopped at command 7 of 2048 (op 6), but only its first 1024 commands can be read"
+        );
+        assert_eq!(
+            stopped_at(&history, count, 1500),
+            "; a list stopped at command 1500 of 2048 (op unknown), but only its first 1024 commands can be read"
+        );
+        // A history that is all there reads whole, without the note.
+        let whole = readable_history(base, committed as u32);
+        assert_eq!(whole.len(), committed);
+        assert_eq!(stopped_at(&whole, committed as u32, 7), "; a list stopped at command 7 of 1024 (op 6)");
+        // SAFETY: the reservation made above.
+        assert_ne!(unsafe { VirtualFree(base.cast(), 0, MEM_RELEASE) }, 0);
+    }
+}

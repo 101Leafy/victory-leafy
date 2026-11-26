@@ -51,7 +51,9 @@ scripts\play.ps1 -Exe <path of your copy's executable>
 ```
 
 `scripts\play.ps1 -Safe` leaves out the newest, faster ways; try it first when
-something is wrong. `-RayTracing` turns the title's ray-traced indirect light on.
+something is wrong. `-RayTracing` turns the title's ray-traced indirect light on. `-Borderless`
+(`VICTORY_BORDERLESS=1`) covers the primary display with no border or title bar;
+the picture is stretched to it and the render size stays.
 
 Before the first run, ahead of time (both can be stopped and go on later):
 
