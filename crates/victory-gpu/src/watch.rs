@@ -1080,12 +1080,12 @@ pub(crate) fn told(spans: &[(usize, usize)]) {
     j.ahead_asked = now;
     for &(at, len) in spans.iter().filter(|s| s.1 > 0) {
         for page in at / KERNEL_PAGE..(at + len - 1) / KERNEL_PAGE + 1 {
-            j.note(page / PARTS, 1u16 << (page % PARTS), now);
+            j.notes.note(page / PARTS, 1u16 << (page % PARTS), now);
         }
     }
     for (_, others) in &elsewhere {
         for &other in others {
-            j.note(other / PAGE, WHOLE, now);
+            j.notes.note(other / PAGE, WHOLE, now);
         }
     }
 }
