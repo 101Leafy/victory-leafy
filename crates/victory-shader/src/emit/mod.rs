@@ -454,6 +454,65 @@ fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
     emit(&c, &native, &p, &st, &io, &res)
 }
 
+thread_local! {
+    /// Wave-wide branches for the program being translated on this thread
+    /// ([`with_wave_wide`]), with `VICTORY_WAVE_WIDE` unset.
+    static WIDE_HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether `VICTORY_WAVE_WIDE_ONLY=<hash prefix>,...` names the container whose hash (as a
+/// run's log names it: the first 16 hex digits of its BLAKE3) is `hash`. Those programs alone
+/// get the wave-wide form that `VICTORY_WAVE_WIDE=1` gives every program: a console wave64
+/// program in thread groups of one console wave, whose per-lane branches around its
+/// cross-lane code are taken by the whole wave ([`widen`]). The form is off by default
+/// because it once left a dispatch on the card until the device was reset, so it is turned
+/// on only for programs checked one by one.
+pub fn wave_wide_only(hash: &str) -> bool {
+    static ONLY: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let only = ONLY.get_or_init(|| {
+        std::env::var("VICTORY_WAVE_WIDE_ONLY")
+            .unwrap_or_default()
+            .split(',')
+            .map(|h| h.trim().to_lowercase())
+            .filter(|h| !h.is_empty())
+            .collect()
+    });
+    let hash = hash.to_lowercase();
+    only.iter().any(|o| hash.starts_with(o.as_str()))
+}
+
+/// Runs `f` (a translation on this thread) with the wave-wide form on when `on`
+/// ([`wave_wide_only`]).
+pub fn with_wave_wide<T>(on: bool, f: impl FnOnce() -> T) -> T {
+    let before = WIDE_HERE.replace(on);
+    let r = f();
+    WIDE_HERE.set(before);
+    r
+}
+
+
+thread_local! {
+    /// [`with_firstlane_own`]'s choice, for this thread's translations.
+    static FIRSTLANE_OWN_HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` (a translation) with a first-lane read where not every lane runs
+/// taken from the host wave's own first lane, as `VICTORY_FIRSTLANE_OWN=1`
+/// takes it for all: exact where the value is the same in every lane of the
+/// console wave, which holds for the programs it is asked for (the
+/// ray-tracing structure builder's scans, which read a sum of scalars).
+pub fn with_firstlane_own<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    let before = FIRSTLANE_OWN_HERE.replace(on);
+    let out = f();
+    FIRSTLANE_OWN_HERE.set(before);
+    out
+}
+
+/// Whether [`with_firstlane_own`] asked for it on this thread.
+pub(super) fn firstlane_own_here() -> bool {
+    FIRSTLANE_OWN_HERE.get()
+}
+
 /// Emits a program whose earlier stages already ran.
 pub fn emit(
     c: &Container,
@@ -592,6 +651,7 @@ fn emit_forms(
     // A pixel program that waits for the pixels it overlaps (POPS): the host orders its views
     // instead (`Shader::ordered`), and the program goes past the wait.
     if native.stage == HwStage::Ps
+        && p.blocks.iter().flat_map(|b| &b.insts).any(lower::sets_pops_packer)
         && let Some(q) = ir::without_pops_wait(p)
     {
         let st = structure::structure(&q)?;
@@ -672,7 +732,7 @@ fn emit_forms(
         // lost the card in a submission of two programs that had just moved to it
         // (`ptfx_CS_lightAtlas_Sprite` and `_Trail`). The 32-lane programs' form below, which
         // has no barrier, stays on.
-        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1");
+        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1") || WIDE_HERE.get();
         // Where an approximate form below translates the program, the paired form
         // ([`paired`]) is tried first: it runs each console wave as one host wave and gives
         // what the console's 64 lanes compute, at no barrier but the entry's; the approximate
@@ -889,13 +949,10 @@ fn widen(
     match native.io {
         // (a program whose waves are the host's meets no one: no barrier, any group)
         crate::native::StageIo::Cs(_) if !(native.wave64 && lower::host_max_wave() == 32) => {}
-        crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 64 => {}
-        crate::native::StageIo::Cs(cs) => {
-            if why {
-                eprintln!("WAVE64-WIDE not tried: thread groups of {:?}", cs.threads);
-            }
-            return Err(NOT);
-        }
+        // Any group of console waves: a wave-wide decision covers the whole group now
+        // (`Lower::wave_wide` ORs every console wave's exchange pair), so the branches taken
+        // this way are entered by every thread and the barriers inside them are reached.
+        crate::native::StageIo::Cs(_) => {}
         _ => return Err(NOT),
     }
     let mut wide = std::collections::HashSet::new();
@@ -910,23 +967,39 @@ fn widen(
         // every lane runs, whose blocks the lowering names too)
         let stuck = matches!(&r, Err(ShaderError::Unsupported { what, .. })
                 if lower::needs_every_lane(what) || *what == lower::LANE_MASK && !needs.is_empty())
-            || matches!(&r, Ok((_, Some(64)))) && !needs.is_empty();
+            || r.is_ok() && !needs.is_empty();
         if !stuck {
             if why {
                 eprintln!("WAVE64-WIDE {} branches taken wave-wide", wide.len());
             }
             return r;
         }
-        let more: Vec<usize> = lower::branches_around(&st, &needs)
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|b| !wide.contains(b))
-            .collect();
+        let Some((around, unsafe_loop)) = lower::branches_around(&st, &needs) else {
+            // Not followed (an indirect exit): emitting the program as it stands could put a
+            // barrier where one of the two host waves never comes.
+            return Err(ShaderError::Unsupported {
+                offset: 0,
+                what: "a barrier in a loop the two host waves cannot leave together",
+            });
+        };
+        if unsafe_loop {
+            return Err(ShaderError::Unsupported {
+                offset: 0,
+                what: "a barrier in a loop the two host waves cannot leave together",
+            });
+        }
+        let more: Vec<usize> = around.into_iter().filter(|b| !wide.contains(b)).collect();
         if more.is_empty() {
             if why {
                 eprintln!("WAVE64-WIDE stopped with {} branches wave-wide: a branch around it cannot be", wide.len());
             }
-            return r;
+            // Nothing is left to widen and a barrier still stands where not every lane runs:
+            // the program is refused rather than emitted, because such a barrier hangs the
+            // group (0x887A0006, measured 2026-11-26).
+            return Err(ShaderError::Unsupported {
+                offset: 0,
+                what: "a barrier where not every lane runs, and no branch left to widen",
+            });
         }
         wide.extend(more);
     }
@@ -1055,7 +1128,7 @@ fn emit_program(
         }
         _ => 0,
     };
-    let l = lower::lower(&lower::Parts {
+    let parts = lower::Parts {
         native,
         p,
         st,
@@ -1065,7 +1138,33 @@ fn emit_program(
         outputs,
         prims,
         mesh_stride,
-    })?;
+    };
+    // A console wave64 program on a host of 32-lane waves, dispatched by a count of threads:
+    // the threads past the count cannot leave at the start when the two host waves of a
+    // console wave exchange (each meets the other at group barriers). With EXEC on entry the
+    // launched lanes ([`structure::with_launched_exec`]) they run on with their EXEC bit
+    // clear, as the console's lanes past the count do. (`VICTORY_LAUNCHED_EXEC=0`: not tried.)
+    let launched = (lower::counted_in_launched_lanes(&parts)
+        && std::env::var_os("VICTORY_LAUNCHED_EXEC").is_none_or(|v| v != "0"))
+    .then(|| {
+        let st = structure::with_launched_exec(|| structure::structure_wide(p, &st.wide)).ok()?;
+        let res = resource::track(p, &native.layout, native.stage, Some(&st)).ok()?;
+        let parts = lower::Parts {
+            st: &st,
+            res: &res,
+            inputs: parts.inputs.clone(),
+            outputs: parts.outputs.clone(),
+            prims: parts.prims.clone(),
+            ..parts
+        };
+        let l = lower::lower_counted(&parts, true).ok()?;
+        (l.wave_size != Some(64)).then(|| (l, res.root_indexed_views.clone()))
+    })
+    .flatten();
+    let (l, root_indexed_views) = match launched {
+        Some(done) => done,
+        None => (lower::lower(&parts)?, res.root_indexed_views.clone()),
+    };
     let wave_size = l.wave_size;
     let shader = HostShader {
         stage: native.stage,
@@ -1087,7 +1186,7 @@ fn emit_program(
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
         root_uavs: l.root_uavs,
-        root_indexed_views: res.root_indexed_views.clone(),
+        root_indexed_views,
     };
     Ok((shader, wave_size))
 }
