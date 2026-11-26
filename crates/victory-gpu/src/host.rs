@@ -5710,9 +5710,13 @@ impl Host {
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
             let started = std::time::Instant::now();
+            // While the overlay shows, between two timestamps (its GPU
+            // busy time).
+            let timed = crate::overlay::time_lists(&self.device, &self.queue, group);
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
-                self.queue.ExecuteCommandLists(group);
+                self.queue
+                    .ExecuteCommandLists(timed.as_deref().unwrap_or(group));
                 self.card_sent();
                 let waited = self
                     .queue
@@ -5731,6 +5735,9 @@ impl Host {
                     }
                     Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
                 }
+            }
+            if timed.is_some() {
+                crate::overlay::time_read();
             }
             // With timing on each group is one of `runs` (and the compare
             // of copies in the card's memory, with the last): every
@@ -8654,6 +8661,8 @@ struct Presenter {
     panel: panel::Panel,
     #[cfg(feature = "diagnostics")]
     frames: frames::Frames,
+    /// The debug overlay (Alt+Z), drawn into each frame it shows.
+    overlay: crate::overlay::Overlay,
 }
 
 /// The frame rate, shown in the window's caption every second and logged
@@ -8733,6 +8742,11 @@ impl Meter {
         // Of a frame, ms preparing submissions and ms waiting for the GPU.
         let [cpu, gpu] = [0, 1].map(|i| {
             SUBMISSION_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames
+        });
+        crate::overlay::second(crate::overlay::Second {
+            draws,
+            prepare_ms: cpu,
+            gpu_wait_ms: gpu,
         });
         let [copy_ms, copy_mb, texture_ms, texture_mb] = [0, 1, 2, 3].map(|i| {
             let scale = if i % 2 == 0 { 1e3 } else { 1e6 };
@@ -9061,6 +9075,9 @@ impl Host {
             let read_now = crate::capture::wanted(frame) || crate::capture::listed(frame);
             #[cfg(not(feature = "diagnostics"))]
             let read_now = false;
+            // The overlay rewrites its upload buffer between presents, so
+            // while it shows each present is waited for.
+            let read_now = read_now || crate::overlay::captured();
             let slot = if late_free_present() && !read_now {
                 let finished = FINISHED.load(Ordering::Acquire);
                 p.ahead.iter().position(|(_, flown)| *flown <= finished).or_else(|| {
@@ -9087,6 +9104,8 @@ impl Host {
                 ),
             ]);
             list.CopyResource(&back, texture);
+            let shape = (width, height, format);
+            p.overlay.record(self, list, &back, shape, p.hwnd, D3D12_RESOURCE_STATE_COPY_DEST);
             #[cfg(feature = "diagnostics")]
             let capture = crate::capture::wanted(frame)
                 .then(|| crate::capture::read_back(&self.device, list, texture))
@@ -9202,6 +9221,7 @@ impl Host {
                 panel: panel::Panel::new(),
                 #[cfg(feature = "diagnostics")]
                 frames: frames::Frames::new(self),
+                overlay: crate::overlay::Overlay::default(),
             })
         }
     }
