@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering::Relaxed};
 
 /// Counters since the last line.
 pub(crate) enum C {
@@ -557,11 +557,32 @@ static COMMANDS_BY_WORK: Mutex<Option<HashMap<String, (u64, u64, u64)>>> = Mutex
 /// kind and size first, then the pipeline in brackets, then what it binds.
 pub(crate) fn command_took(op: &str, ms: f64) {
     let us = (ms * 1e3) as u64;
+    let key = command_key(op);
+    let mut sizes = COMMAND_SIZES.lock().unwrap_or_else(|e| e.into_inner());
+    let e = sizes.get_or_insert_with(HashMap::new).entry(key.clone()).or_default();
+    let e = e.entry(command_size(op)).or_insert((0, 0));
+    e.0 += 1;
+    e.1 += us;
+    drop(sizes);
     let mut by = COMMANDS_BY_WORK.lock().unwrap_or_else(|e| e.into_inner());
-    let e = by.get_or_insert_with(HashMap::new).entry(command_key(op)).or_insert((0, 0, 0));
+    let e = by.get_or_insert_with(HashMap::new).entry(key).or_insert((0, 0, 0));
     e.0 += 1;
     e.1 += us;
     e.2 = e.2.max(us);
+}
+
+/// The commands of each key of [`COMMANDS_BY_WORK`] by their size (a
+/// dispatch's groups, a draw's counts, an indirect command's kind and
+/// most records): how many, and their microseconds.
+static COMMAND_SIZES: Mutex<Option<HashMap<String, HashMap<String, (u64, u64)>>>> = Mutex::new(None);
+
+/// The size in a command's note: the words after the first, up to the
+/// pipeline, without an address.
+fn command_size(op: &str) -> String {
+    let head = op.split(" | ").next().unwrap_or(op);
+    let head = head.split('[').next().unwrap_or(head);
+    let head = head.split(" at ").next().unwrap_or(head);
+    head.split(' ').skip(1).filter(|w| !w.is_empty()).collect::<Vec<_>>().join(" ")
 }
 
 /// What a command's note is summed under: its pipeline (`[compute ...]`,
@@ -607,16 +628,49 @@ pub(crate) fn card_waited(us: u64, what: impl FnOnce() -> String) {
 /// for `groups` (the title's barrier groups record no wait for earlier
 /// shader writes), bit 1 for `indirect` (the pass that bounds an indirect
 /// command runs without its two such waits; its state changes stay), both
-/// bits for `both`. For timing only: without the waits a shader may read
-/// what another has not finished writing.
+/// bits for `both`. `cycle` runs off, groups, indirect and both in turn,
+/// `VICTORY_BARRIER_TEST_SECS` (90) each, changing only where a counter line
+/// is logged, so each line was counted under the one mode it names. For
+/// timing only: without the waits a shader may read what another has not
+/// finished writing.
 pub(crate) fn barrier_test() -> u8 {
-    static TEST: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-    *TEST.get_or_init(|| match std::env::var("VICTORY_BARRIER_TEST").as_deref() {
-        Ok("groups") => 1,
-        Ok("indirect") => 2,
-        Ok("both") => 3,
-        _ => 0,
+    barrier_cycle();
+    BARRIER_TEST.load(Relaxed)
+}
+
+static BARRIER_TEST: AtomicU8 = AtomicU8::new(0);
+
+/// The seconds each mode of `VICTORY_BARRIER_TEST=cycle` runs, and the
+/// fixed mode set otherwise.
+fn barrier_cycle() -> Option<u64> {
+    static CYCLE: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *CYCLE.get_or_init(|| {
+        let mode = match std::env::var("VICTORY_BARRIER_TEST").as_deref() {
+            Ok("groups") => 1,
+            Ok("indirect") => 2,
+            Ok("both") => 3,
+            Ok("cycle") => {
+                let secs = std::env::var("VICTORY_BARRIER_TEST_SECS").ok().and_then(|v| v.parse().ok());
+                return Some(secs.unwrap_or(90).max(1));
+            }
+            _ => 0,
+        };
+        BARRIER_TEST.store(mode, Relaxed);
+        None
     })
+}
+
+/// After a counter line: the mode the next lines run under, for `cycle`.
+fn barrier_next() {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let Some(secs) = barrier_cycle() else {
+        return;
+    };
+    let start = *START.get_or_init(std::time::Instant::now);
+    let mode = (start.elapsed().as_secs() / secs % 4) as u8;
+    if BARRIER_TEST.swap(mode, Relaxed) != mode {
+        tracing::info!("barrier experiment {mode} from here (cycle of {secs} s each)");
+    }
 }
 
 /// Per range compared after a submission (start, length): times, and the
@@ -1780,13 +1834,29 @@ pub(crate) fn log(frames: f64) {
             text.join(", ")
         );
     }
-    for (what, (n, us, longest)) in by.into_iter().take(40) {
+    let mut sizes = COMMAND_SIZES.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
+    for (i, (what, (n, us, longest))) in by.into_iter().take(40).enumerate() {
         tracing::info!(
             "  the card's time by command (timing run): {:.2} ms a frame in {:.1} commands a frame, the longest {:.2} ms: {what}",
             us as f64 / 1e3 / frames,
             n as f64 / frames,
             longest as f64 / 1e3
         );
+        // The sizes of the ten heaviest: is one pass heavy for its size, or
+        // asked for more groups than the others?
+        let Some(by_size) = sizes.remove(&what).filter(|_| i < 10) else {
+            continue;
+        };
+        let mut by_size: Vec<_> = by_size.into_iter().collect();
+        by_size.sort_by_key(|&(_, (_, us))| std::cmp::Reverse(us));
+        let text: Vec<String> = by_size
+            .iter()
+            .take(6)
+            .map(|(size, (n, us))| {
+                format!("{size}: {:.1}x {:.2} ms", *n as f64 / frames, *us as f64 / 1e3 / frames)
+            })
+            .collect();
+        tracing::info!("    by size, {} sizes: {}", by_size.len(), text.join(", "));
     }
     tracing::info!(
         "  waits for every earlier shader write, per frame: {:.0} for the title's barrier groups, {:.0} \
@@ -1797,6 +1867,7 @@ pub(crate) fn log(frames: f64) {
         c[C::IndirectBounded as usize],
         barrier_test()
     );
+    barrier_next();
     // What is compared after submissions, largest first, and how much of
     // it shaders had written.
     let compared = COMPARED.lock().unwrap_or_else(|e| e.into_inner()).take();
