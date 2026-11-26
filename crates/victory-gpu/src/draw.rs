@@ -2132,7 +2132,9 @@ impl State {
             _ => u64::MAX,
         };
         let len = left.min(low.saturating_sub(address));
+        #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::RootTailAsked, left);
+        #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::RootTailCovered, left - len);
         if len > 0 {
             s.refresh(list, address, len);
