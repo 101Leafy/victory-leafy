@@ -411,6 +411,40 @@ fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<HostPipeline>
     None
 }
 
+/// `VICTORY_COLOR_FINITE=targets`: a pixel stage drawing to 16-bit or
+/// 11/10-bit float targets gets a translation of its own whose float
+/// exports to those targets are held to +-65024, a NaN as 0
+/// (`emit::finite_targets`), as the console's colour block stores them.
+/// Only the export values change, so the root signature stays.
+fn finite_ps(ps: Option<&Shader>, targets: &D3D12_RT_FORMAT_ARRAY) -> Option<Arc<Vec<u8>>> {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var("VICTORY_COLOR_FINITE").is_ok_and(|v| v == "targets")) {
+        return None;
+    }
+    let ps = ps?;
+    let count = (targets.NumRenderTargets as usize).min(8);
+    let formats: Vec<u32> = targets.RTFormats[..count].iter().map(|f| f.0 as u32).collect();
+    let mask = victory_shader::emit::finite_targets(&formats);
+    if mask == 0 {
+        return None;
+    }
+    type Variants = std::collections::HashMap<(String, u8), Option<Arc<Vec<u8>>>>;
+    static MADE: std::sync::Mutex<Option<Variants>> = std::sync::Mutex::new(None);
+    let key = (ps.hash.clone(), mask);
+    if let Some(made) = MADE.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_default().get(&key) {
+        return made.clone();
+    }
+    let made = match crate::shader_cache::host_shader_finite(&ps.container, mask) {
+        Ok(t) => Some(Arc::new(t.dxil)),
+        Err(e) => {
+            tracing::warn!(error = %e, shader = %ps.hash, mask, "no finite translation; the plain one draws");
+            None
+        }
+    };
+    MADE.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_default().insert(key, made.clone());
+    made
+}
+
 impl HostPipeline {
     /// A host pipeline for vertex and pixel shaders with the graphics
     /// state `g`, or for one compute shader.
@@ -664,6 +698,14 @@ impl HostPipeline {
             false
         };
         let state = g.describe();
+        let finite = finite_ps(stages.get(1).map(|(s, _)| &***s), &g.targets);
+        let code = |i: usize| match (i, &finite) {
+            (1, Some(ps)) => D3D12_SHADER_BYTECODE {
+                pShaderBytecode: ps.as_ptr().cast(),
+                BytecodeLength: ps.len(),
+            },
+            _ => code(i),
+        };
         if mesh.is_some() {
             // "triangles": the stream names its topology since it did not
             // load from the library without one (see `mesh_pipeline`); a
