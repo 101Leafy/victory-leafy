@@ -3633,7 +3633,7 @@ pub(crate) mod awake;
 mod card_steps;
 pub(crate) mod indirects;
 #[cfg(feature = "diagnostics")]
-mod panel;
+pub(crate) mod panel;
 #[cfg(feature = "diagnostics")]
 mod frames;
 mod place;

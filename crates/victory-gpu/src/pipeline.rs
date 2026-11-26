@@ -576,6 +576,7 @@ pub(crate) fn note_drop(this: This) {
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn note_why(why: String) {
     crate::capture::op(0, || format!("DROPPED {why}"));
+    crate::host::panel::log_event(format!("DROP {why}"));
     let mut drops = DROPS.lock().unwrap_or_else(|e| e.into_inner());
     *drops.get_or_insert_with(HashMap::new).entry(why).or_default() += 1;
 }
