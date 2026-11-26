@@ -4554,6 +4554,7 @@ fn make_twinned(
                     // refused (fits() or a format it can't write) is a null
                     // slot and a missing effect: counted, and each shape
                     // said once (the first 64).
+                    #[cfg(feature = "diagnostics")]
                     crate::copystat::add(crate::copystat::C::PlacedUavRefused, 1);
                     static SHAPES: Mutex<std::collections::BTreeSet<([u32; 14], [u32; 10])>> =
                         Mutex::new(std::collections::BTreeSet::new());
