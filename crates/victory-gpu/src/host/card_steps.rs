@@ -561,7 +561,9 @@ fn does_of(written: &[(usize, usize)], runs: &[&HostList]) -> (Vec<Does>, Vec<(u
     // Which step each is. One list's lock at a time: a submission may
     // name a list twice.
     let mut steps = Vec::new();
-    for list in runs {
+    // Fills that take a copy's bytes are not stopped by flights.
+    let forwards = place::forwards(written, runs);
+    for (n, list) in runs.iter().enumerate() {
         for (i, step) in list.deferred().copies.iter().enumerate() {
             does.push(match step {
                 &Step::Copy(dst, src, len) => Does::Copy {
@@ -573,7 +575,7 @@ fn does_of(written: &[(usize, usize)], runs: &[&HostList]) -> (Vec<Does>, Vec<(u
                 Step::Fill(_, src, len, to) => Does::Fill {
                     src: *src,
                     len: *len,
-                    asked: read_blocked(written, *src, *len),
+                    asked: read_blocked(written, *src, *len) && !place::forwarded(&forwards, n, i),
                     to: to.is_some(),
                 },
                 Step::Texture(staging) => {

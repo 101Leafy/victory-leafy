@@ -47,8 +47,9 @@ pub(super) fn on() -> bool {
 const MOST: usize = 8 << 20;
 
 /// Since the last frame-rate line: copies at their place, their bytes, those
-/// out of a host copy, and texture copies out of one.
-pub(super) static STATS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+/// out of a host copy, texture copies out of one, and fills that took a
+/// copy's bytes ([`forwards`]).
+pub(super) static STATS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 
 /// What the CPU does at submission for a copy at its place in a list.
 pub(super) struct Placed {
@@ -77,9 +78,10 @@ impl Placed {
     /// At submission, in the order of the steps: the list's upload memory
     /// takes the source's bytes and, if `free` (no flight in the air may write
     /// source or destination), title memory at the destination does. Gives
-    /// the bytes if it took them.
-    pub(super) fn prepare(&self, free: bool) -> Option<Vec<u8>> {
-        if !free && self.from.is_none() {
+    /// the bytes if it took them (always if `keep`), and whether title memory
+    /// holds them.
+    pub(super) fn prepare(&self, free: bool, keep: bool) -> Option<(Vec<u8>, bool)> {
+        if !free && self.from.is_none() && !keep {
             return None;
         }
         let mut bytes = vec![0u8; self.len];
@@ -90,13 +92,14 @@ impl Placed {
             unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), to as *mut u8, self.len) };
         }
         if !free {
-            return None;
+            return Some((bytes, false));
         }
         copy_mapped(self.dst as *mut u8, bytes.as_ptr(), self.len, true);
         crate::watch::wrote(self.dst, self.len);
         // Title memory that is not all there was left alone.
         let mut there = vec![0u8; self.len];
-        (read_into(self.dst as *const u8, &mut there) && there == bytes).then_some(bytes)
+        let held = read_into(self.dst as *const u8, &mut there) && there == bytes;
+        Some((bytes, held))
     }
 }
 
@@ -109,12 +112,14 @@ pub(super) enum Waits {
     Yes,
 }
 
-/// Whether a step of `runs` reads one of `ranges` on the CPU.
-pub(super) fn read_by(runs: &[&HostList], mut ranges: Vec<(usize, usize)>) -> bool {
+/// Whether a step of `runs` reads one of `ranges` on the CPU (fills of
+/// `forwards` read a copy's bytes instead).
+pub(super) fn read_by(runs: &[&HostList], mut ranges: Vec<(usize, usize)>, forwards: &[Forward]) -> bool {
     join_ranges(&mut ranges, []);
-    runs.iter().any(|list| {
-        list.deferred().copies.iter().any(|step| match step {
-            &Step::Copy(_, src, len) | &Step::Fill(_, src, len, _) => touches(&ranges, src, src + len),
+    runs.iter().enumerate().any(|(n, list)| {
+        list.deferred().copies.iter().enumerate().any(|(i, step)| match step {
+            &Step::Copy(_, src, len) => touches(&ranges, src, src + len),
+            &Step::Fill(_, src, len, _) => !forwarded(forwards, n, i) && touches(&ranges, src, src + len),
             Step::Texture(staging) => {
                 let (at, len) = staging.memory();
                 touches(&ranges, at, at + len)
@@ -124,6 +129,83 @@ pub(super) fn read_by(runs: &[&HostList], mut ranges: Vec<(usize, usize)>) -> bo
             _ => false,
         })
     })
+}
+
+/// Fills of upload memory that read only bytes an earlier copy at its place
+/// in the submission put take the bytes the copy took at submission
+/// (`VICTORY_FORWARD_PLACED`, on by default; `0`: from title memory, as
+/// before). From title memory such a fill waited for flights that may write
+/// the copy's destination, although the copy stands over what they write
+/// (two of the three longest waits in the ft2 run of 2026-11-26). A copy out
+/// of a host copy counts where no flight may write its source: title memory
+/// there is what the wait would have found.
+pub(super) fn forward_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FORWARD_PLACED").is_none_or(|v| v != "0"))
+}
+
+/// A fill that takes its bytes from a copy at its place: each by its list's
+/// place in the submission and its own in the list; `at`, where in the copy
+/// the fill's bytes begin.
+pub(super) struct Forward {
+    pub(super) fill: (usize, usize),
+    pub(super) copy: (usize, usize),
+    pub(super) at: usize,
+}
+
+/// The fills of `runs` that read only what a copy at its place put in front
+/// of them, with no step between that writes there. `written`: what flights
+/// may write.
+pub(super) fn forwards(written: &[(usize, usize)], runs: &[&HostList]) -> Vec<Forward> {
+    let mut found = Vec::new();
+    if !on() || !forward_on() {
+        return found;
+    }
+    let mut standing = Standing::default();
+    for (n, list) in runs.iter().enumerate() {
+        for (i, step) in list.deferred().copies.iter().enumerate() {
+            match step {
+                &Step::Fill(_, src, len, _) => found.extend(standing.fill((n, i), src, len)),
+                &Step::Copy(dst, _, len) => standing.written(dst, len),
+                Step::Placed(p) => {
+                    let known = p.from.is_some() || !touches(written, p.src, p.src + p.len);
+                    standing.copy((n, i), p.dst, p.len, known);
+                }
+                Step::Run(_) => standing.0.clear(),
+                _ => {}
+            }
+        }
+    }
+    found
+}
+
+/// Copies at their place whose bytes stand, in the order of the steps:
+/// destination, its end, the copy.
+#[derive(Default)]
+struct Standing(Vec<(usize, usize, (usize, usize))>);
+
+impl Standing {
+    fn written(&mut self, dst: usize, len: usize) {
+        self.0.retain(|s| !(s.0 < dst + len && dst < s.1));
+    }
+
+    /// `known`: its bytes are known at submission.
+    fn copy(&mut self, copy: (usize, usize), dst: usize, len: usize, known: bool) {
+        self.written(dst, len);
+        if known && len > 0 {
+            self.0.push((dst, dst + len, copy));
+        }
+    }
+
+    fn fill(&self, fill: (usize, usize), src: usize, len: usize) -> Option<Forward> {
+        let &(dst, _, copy) = self.0.iter().find(|s| len > 0 && s.0 <= src && src + len <= s.1)?;
+        Some(Forward { fill, copy, at: src - dst })
+    }
+}
+
+/// Whether step `i` of the `n`th list is a fill of `forwards`.
+pub(super) fn forwarded(forwards: &[Forward], n: usize, i: usize) -> bool {
+    forwards.iter().any(|f| f.fill == (n, i))
 }
 
 /// Everything recorded so far is done, and seen, before what follows.
@@ -345,7 +427,7 @@ pub(super) fn forwarding() -> bool {
 /// place ([`forward_fills`]).
 pub(super) static FORWARDED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// What [`forwards`] looks at of a step.
+/// What [`fill_forwards`] looks at of a step.
 #[derive(Clone, Copy, Debug)]
 enum View {
     /// A copy at its place: where it puts its bytes, how many, and where its
@@ -378,7 +460,7 @@ impl View {
 /// submission, its steps in order) take their bytes from a copy at its
 /// place ([`forwarding`]); `blocked` says which fills would wait for
 /// flights. Each: (the run's place, the step's place, where its bytes are).
-fn forwards(runs: &[(bool, Vec<View>)], blocked: impl Fn(usize, usize) -> bool) -> Vec<(usize, usize, usize)> {
+fn fill_forwards(runs: &[(bool, Vec<View>)], blocked: impl Fn(usize, usize) -> bool) -> Vec<(usize, usize, usize)> {
     // The copies whose bytes still stand: (where, how many, where held).
     let mut puts: Vec<(usize, usize, usize)> = Vec::new();
     let mut moves = Vec::new();
@@ -426,7 +508,7 @@ pub(super) fn forward_fills(runs: &[&HostList], written: &[(usize, usize)]) {
             (twice, list.deferred().copies.iter().map(View::of).collect())
         })
         .collect();
-    let moves = forwards(&views, |src, len| read_blocked(written, src, len));
+    let moves = fill_forwards(&views, |src, len| read_blocked(written, src, len));
     for &(k, i, from) in &moves {
         if let Some(Step::Fill(_, src, ..)) = runs[k].deferred().copies.get_mut(i) {
             *src = from;
@@ -599,6 +681,30 @@ void main() { to.Store(0, from.Load(0) + 1u); }
         // SAFETY: a live buffer.
         unsafe { out.GetGPUVirtualAddress() }
     }
+    /// A fill takes a copy's bytes only if all it reads is that copy's, and
+    /// nothing wrote over them in between.
+    #[test]
+    fn fills_take_the_bytes_of_the_copy_in_front() {
+        let found = |s: &Standing, src, len| s.fill((9, 9), src, len).map(|f: Forward| (f.copy, f.at));
+        let mut s = Standing::default();
+        assert_eq!(found(&s, 2000, 8), None);
+        s.copy((0, 1), 2000, 64, true);
+        assert_eq!(found(&s, 2000, 64), Some(((0, 1), 0)));
+        assert_eq!(found(&s, 2032, 16), Some(((0, 1), 32)));
+        assert_eq!(found(&s, 2032, 64), None);
+        assert_eq!(found(&s, 1990, 16), None);
+        // A later copy over part of it: the bytes there are its.
+        s.copy((1, 0), 2040, 8, true);
+        assert_eq!(found(&s, 2000, 8), None);
+        assert_eq!(found(&s, 2040, 8), Some(((1, 0), 0)));
+        // One whose source flights may write.
+        s.copy((1, 1), 2040, 8, false);
+        assert_eq!(found(&s, 2040, 8), None);
+        s.copy((1, 2), 3000, 16, true);
+        s.written(3008, 1);
+        assert_eq!(found(&s, 3000, 4), None);
+    }
+
     /// What copies with two sides cost to make (ignored: a measurement for
     /// `VICTORY_CARD_ALL`): buffers of 64 KiB on the card and in the PC's
     /// memory.
@@ -626,11 +732,11 @@ void main() { to.Store(0, from.Load(0) + 1u); }
     }
 }
 
-/// [`forwards`]: which fills take the bytes of a copy at its place ahead of
+/// [`fill_forwards`]: which fills take the bytes of a copy at its place ahead of
 /// them, and which keep reading title memory.
 #[cfg(test)]
 mod forward_tests {
-    use super::{View, forwards};
+    use super::{View, fill_forwards};
 
     fn put(dst: usize, len: usize, from: usize) -> View {
         View::Put { dst, len, from: Some(from) }
@@ -643,30 +749,30 @@ mod forward_tests {
     #[test]
     fn a_fill_behind_a_copy_takes_its_bytes() {
         let runs = vec![(false, vec![put(0x1000, 0xd0, 0x9000), View::Other, fill(0x1020, 0xb0)])];
-        assert_eq!(forwards(&runs, |_, _| true), vec![(0, 2, 0x9020)]);
+        assert_eq!(fill_forwards(&runs, |_, _| true), vec![(0, 2, 0x9020)]);
         // In a later list too.
         let runs = vec![(false, vec![put(0x1000, 0xd0, 0x9000)]), (false, vec![View::Other, fill(0x1000, 0xd0)])];
-        assert_eq!(forwards(&runs, |_, _| true), vec![(1, 1, 0x9000)]);
+        assert_eq!(fill_forwards(&runs, |_, _| true), vec![(1, 1, 0x9000)]);
     }
 
     #[test]
     fn fills_ahead_of_the_copy_keep_the_old_bytes() {
         let runs = vec![(false, vec![fill(0x1000, 0x20)]), (false, vec![fill(0x1040, 0x20), put(0x1000, 0xd0, 0x9000)])];
-        assert!(forwards(&runs, |_, _| true).is_empty());
+        assert!(fill_forwards(&runs, |_, _| true).is_empty());
     }
 
     #[test]
     fn the_last_copy_ahead_of_the_fill_is_the_one_taken() {
         let runs = vec![(false, vec![put(0x1000, 0xd0, 0x9000), put(0x1000, 0xd0, 0xa000), fill(0x1010, 0x10)])];
-        assert_eq!(forwards(&runs, |_, _| true), vec![(0, 2, 0xa010)]);
+        assert_eq!(fill_forwards(&runs, |_, _| true), vec![(0, 2, 0xa010)]);
         // One that puts only part of the first leaves neither standing there.
         let runs = vec![(false, vec![put(0x1000, 0xd0, 0x9000), put(0x1080, 0x10, 0xa000), fill(0x1000, 0x10)])];
-        assert!(forwards(&runs, |_, _| true).is_empty());
+        assert!(fill_forwards(&runs, |_, _| true).is_empty());
     }
 
     #[test]
     fn anything_that_may_change_the_bytes_leaves_the_fill_alone() {
-        let alone = |steps: Vec<View>, twice: bool, blocked: bool| forwards(&[(twice, steps)], |_, _| blocked).is_empty();
+        let alone = |steps: Vec<View>, twice: bool, blocked: bool| fill_forwards(&[(twice, steps)], |_, _| blocked).is_empty();
         // A shader's declared write or a buffer copy in between.
         assert!(alone(vec![put(0x1000, 0xd0, 0x9000), View::Writes { at: 0x10cc, len: 4 }, fill(0x1000, 0xd0)], false, true));
         // A step of ours in between.

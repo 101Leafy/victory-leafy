@@ -4307,8 +4307,9 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
     }
     // Destinations of copies at their place, if a step reads them.
     let mut placed: Vec<(usize, usize)> = Vec::new();
-    for list in runs {
-        for step in &list.deferred().copies {
+    let forwards = place::forwards(written, runs);
+    for (n, list) in runs.iter().enumerate() {
+        for (i, step) in list.deferred().copies.iter().enumerate() {
             match step {
                 &Step::Copy(dst, src, len) => {
                     if let Some(_read) = copy_blocked(written, dst, src, len) {
@@ -4325,7 +4326,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                     }
                 }
                 &Step::Fill(_, src, len, _) => {
-                    if read_blocked(written, src, len) {
+                    if read_blocked(written, src, len) && !place::forwarded(&forwards, n, i) {
                         if count {
                             LATE_STATS[16].fetch_add(1, Ordering::Relaxed);
                             #[cfg(feature = "diagnostics")]
@@ -4362,7 +4363,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
             }
         }
     }
-    (!placed.is_empty() && place::read_by(runs, placed)).then_some(WHY_READ)
+    (!placed.is_empty() && place::read_by(runs, placed, &forwards)).then_some(WHY_READ)
 }
 
 /// With flights in the air, after the submission's write-watch asking:
@@ -5191,11 +5192,13 @@ fn late_line(frames: f64) {
     if place::on() {
         let t: Vec<f64> = place::STATS.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
         tracing::info!(
-            "title buffer copies at their place in the lists, per frame (VICTORY_COPIES_IN_PLACE): {:.1} of {:.1} KB, {:.1} of them out              of what shaders wrote; {:.2} copies into textures out of what shaders wrote",
+            "title buffer copies at their place in the lists, per frame (VICTORY_COPIES_IN_PLACE): {:.1} of {:.1} KB, {:.1} of them out              of what shaders wrote; {:.2} copies into textures out of what shaders wrote; {:.2} fills that took a copy's bytes              (VICTORY_FORWARD_PLACED={})",
             t[0],
             t[1] / 1024.0,
             t[2],
             t[3],
+            t[4],
+            u8::from(place::forward_on()),
         );
     }
     card_steps::log(frames);
@@ -7778,8 +7781,9 @@ impl Host {
         }
         stage.next("submit: the lists' steps");
         let one_call = late && !parts.is_empty() && join_one_call();
+        batch.forwards = place::forwards(&air, runs);
         for (n, list) in runs.iter().enumerate() {
-            list.run_deferred(&mut batch, &air, |i| own.as_ref().is_some_and(|own| own.takes(list, i)));
+            list.run_deferred(&mut batch, &air, n, |i| own.as_ref().is_some_and(|own| own.takes(list, i)));
             firsts.push(lists.len());
             if let Some(prelude) = list.prelude(one_call && parts.contains(&n)) {
                 lists.push(Some(prelude));
@@ -9624,8 +9628,8 @@ impl HostList {
     /// (the title's big buffers, a 174 MB one among them, are read by most
     /// lists of a submission, through many ranges). Copies and fills that
     /// `taken` names (by their place) are left out: they are done on the
-    /// card ([`card_steps`]).
-    fn run_deferred(&self, batch: &mut Batch, air: &[(usize, usize)], taken: impl Fn(usize) -> bool) {
+    /// card ([`card_steps`]). `n`: the list's place in the submission.
+    fn run_deferred(&self, batch: &mut Batch, air: &[(usize, usize)], n: usize, taken: impl Fn(usize) -> bool) {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
         // The time and the bytes of the copies and fills, some 13,000 a
@@ -9666,14 +9670,24 @@ impl HostList {
                     {
                         copies += 1;
                     }
-                    if wide_fills() {
+                    if let Some(f) = batch.forwards.iter().find(|f| f.fill == (n, i))
+                        && let Some((_, from)) = batch.kept.iter().find(|k| k.0 == f.copy)
+                    {
+                        let started = std::time::Instant::now();
+                        // SAFETY: the fill's upload memory, `len` bytes; its
+                        // bytes lie inside the copy's.
+                        unsafe { std::ptr::copy_nonoverlapping(from[f.at..f.at + len].as_ptr(), dst as *mut u8, len) };
+                        place::STATS[4].fetch_add(1, Ordering::Relaxed);
+                        (started, len)
+                    } else if wide_fills() {
                         batch.fills.push((dst, src, len));
                         bytes += len as u64;
                         continue;
+                    } else {
+                        let started = std::time::Instant::now();
+                        copy_mapped(dst as *mut u8, src as *const u8, len, false);
+                        (started, len)
                     }
-                    let started = std::time::Instant::now();
-                    copy_mapped(dst as *mut u8, src as *const u8, len, false);
-                    (started, len)
                 }
                 Step::Placed(p) => {
                     let started = std::time::Instant::now();
@@ -9685,8 +9699,16 @@ impl HostList {
                     if free {
                         batch.title_written();
                     }
-                    if let Some(bytes) = p.prepare(free) {
-                        batch.placed.push((p.shadow.clone(), p.dst, bytes));
+                    let kept = batch.forwards.iter().any(|f| f.copy == (n, i));
+                    match p.prepare(free, kept) {
+                        Some((bytes, true)) => {
+                            if kept {
+                                batch.kept.push(((n, i), bytes.clone()));
+                            }
+                            batch.placed.push((p.shadow.clone(), p.dst, bytes));
+                        }
+                        Some((bytes, false)) if kept => batch.kept.push(((n, i), bytes)),
+                        _ => {}
                     }
                     (started, p.len)
                 }
@@ -10101,6 +10123,10 @@ struct Batch {
     placed: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, Vec<u8>)>,
     /// Fills not done yet (destination, source, bytes): [`wide_fills`].
     fills: Vec<(usize, usize, usize)>,
+    /// Fills that take a copy's bytes ([`place::forwards`]), and the bytes
+    /// of those copies, by their place.
+    forwards: Vec<place::Forward>,
+    kept: Vec<((usize, usize), Vec<u8>)>,
     /// Copies (by address) brought up to date ahead of the steps, and the
     /// range (from, to) ([`Batch::refresh_ahead`]).
     ahead: ByCopy<(usize, usize)>,
