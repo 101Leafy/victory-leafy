@@ -17,12 +17,15 @@
 //!   a draw's table brought it up to date): every 16 passes, as before;
 //! - every [`FULL_EVERY`] passes, all of them, as a safety net.
 //!
-//! Those last two are spread: a part of the slots each pass, each slot in
-//! the same part each time. The span of a copy is worked out again only
-//! when one of its slots went. `VICTORY_HEAP_PASS_FULL=1` brings back the
+//! Those last three are the sweep, done once a pass; the first two can be
+//! looked at in rounds between passes as well ([`Picked::plan`] without a
+//! sweep). The last two are spread: a part of the slots each pass, each
+//! slot in the same part each time. The span of a copy is kept as counts of
+//! its views' starts and ends, so a view that goes costs a lookup and not a
+//! walk over the copy's views. `VICTORY_HEAP_PASS_FULL=1` brings back the
 //! old pass to compare.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 
 /// Passes between two looks at every slot, besides those marked.
 pub(crate) const FULL_EVERY: u64 = 256;
@@ -50,15 +53,28 @@ struct Slot {
     from: u64,
     to: u64,
     record: Record,
+    /// The table entry under which `by_entry` has the slot.
+    entry: Option<u32>,
 }
 
 struct Copy<C> {
     copy: C,
-    slots: HashSet<u32>,
-    from: u64,
-    to: u64,
-    /// A slot went: the span is worked out again from those left.
-    stale: bool,
+    /// How many of its views begin, and end, at each address.
+    froms: BTreeMap<u64, u32>,
+    tos: BTreeMap<u64, u32>,
+}
+
+fn count_in(counts: &mut BTreeMap<u64, u32>, at: u64) {
+    *counts.entry(at).or_default() += 1;
+}
+
+fn count_out(counts: &mut BTreeMap<u64, u32>, at: u64) {
+    if let Some(n) = counts.get_mut(&at) {
+        *n -= 1;
+        if *n == 0 {
+            counts.remove(&at);
+        }
+    }
 }
 
 /// What a pass looks at (see the module).
@@ -69,14 +85,17 @@ pub(crate) struct Picked<C> {
     /// those reads fall all over the heap.
     slots: BTreeMap<u32, Slot>,
     copies: HashMap<usize, Copy<C>>,
-    /// Slots that found no host copy, with the record seen. In slot order
-    /// as `slots` is.
-    orphans: BTreeMap<u32, Record>,
+    /// Slots that found no host copy, with the record seen and the entry
+    /// `by_entry` has them under. In slot order as `slots` is.
+    orphans: BTreeMap<u32, (Record, Option<u32>)>,
     /// View table entry -> slots whose record named it at their last look
-    /// (some may name another by now: checked when used).
+    /// (some may name another by now: checked when used). A slot is under
+    /// one entry once, however often it is looked at.
     by_entry: HashMap<u32, Vec<u32>>,
-    /// Table entries freed since the last pass; `None`: not known.
+    /// Table entries freed since the last plan; `None`: not known.
     forgotten: Option<Vec<u32>>,
+    /// Slots planned and not looked at ([`Picked::put_back`]).
+    carried: Vec<u32>,
     /// The last plan was every slot.
     whole: bool,
     /// The old pass (`VICTORY_HEAP_PASS_FULL=1`).
@@ -92,13 +111,14 @@ impl<C: Clone> Picked<C> {
             orphans: BTreeMap::new(),
             by_entry: HashMap::new(),
             forgotten: None,
+            carried: Vec::new(),
             whole: false,
             full,
         }
     }
 
     /// View table entries were freed (`None`: some were, which is not
-    /// known): their slots are looked at next pass. Every heap's pass is
+    /// known): their slots are looked at next plan. Every heap's pass is
     /// told, though one of them asks.
     pub(crate) fn note_forgotten(&mut self, entries: Option<&[u32]>) {
         match (entries, &mut self.forgotten) {
@@ -107,28 +127,34 @@ impl<C: Clone> Picked<C> {
         }
     }
 
-    /// The slots this pass looks at again, in order. `changed`: the slots
-    /// whose buffer view was written or went since the last pass (and the
-    /// entries [`Picked::note_forgotten`] was told of: if it was told it
-    /// does not know, all slots are looked at); `all`: every slot that holds a
-    /// buffer view; `record`: a slot's record now; `entry`: the table
-    /// entry a record names, if it names one.
+    /// The slots to look at again, in order. `changed`: the slots whose
+    /// buffer view was written or went since the last plan (and the entries
+    /// [`Picked::note_forgotten`] was told of: if it was told it does not
+    /// know, all slots are looked at); `sweep`: the records of all slots
+    /// held are compared and the parts of this pass are taken, and the pass
+    /// is counted (a plan without it is a round between passes); `all`:
+    /// every slot that holds a buffer view; `record`: a slot's record now;
+    /// `entry`: the table entry a record names, if it names one.
     pub(crate) fn plan(
         &mut self,
         changed: Vec<u32>,
+        sweep: bool,
         all: impl FnOnce() -> Vec<u32>,
         record: impl Fn(u32) -> Option<Record>,
         entry: impl Fn(Record) -> Option<u32>,
     ) -> Vec<u32> {
         let pass = self.passes;
-        self.passes += 1;
         let forgotten = self.forgotten.replace(Vec::new());
         self.whole = pass == 0 || (!self.full && forgotten.is_none());
+        if self.whole || sweep {
+            self.passes += 1;
+        }
         if self.whole {
             self.clear();
             return all();
         }
         let mut due = changed;
+        due.append(&mut self.carried);
         if self.full {
             // A part of every slot, and of the ones held.
             let part = |&s: &u32| in_part(s, pass, ORPHANS_EVERY);
@@ -137,30 +163,51 @@ impl<C: Clone> Picked<C> {
         } else {
             for e in forgotten.into_iter().flatten() {
                 if let Some(slots) = self.by_entry.remove(&e) {
-                    // Only those whose record still names the entry.
-                    due.extend(
-                        slots
-                            .into_iter()
-                            .filter(|s| self.record_of(*s).is_some_and(|r| entry(r) == Some(e))),
-                    );
+                    for s in slots {
+                        // Taken out from under the entry: noted again at
+                        // its next look.
+                        let seen = match (self.slots.get_mut(&s), self.orphans.get_mut(&s)) {
+                            (Some(kept), _) if kept.entry == Some(e) => {
+                                kept.entry = None;
+                                Some(kept.record)
+                            }
+                            (None, Some((seen, under))) if *under == Some(e) => {
+                                *under = None;
+                                Some(*seen)
+                            }
+                            _ => None,
+                        };
+                        // Only those whose record still names the entry.
+                        if seen.is_some_and(|r| entry(r) == Some(e)) {
+                            due.push(s);
+                        }
+                    }
                 }
             }
-            due.extend(
-                self.slots
-                    .iter()
-                    .filter(|&(&slot, kept)| in_part(slot, pass, FULL_EVERY) || record(slot) != Some(kept.record))
-                    .map(|(&slot, _)| slot),
-            );
-            due.extend(
-                self.orphans
-                    .iter()
-                    .filter(|&(&slot, &seen)| in_part(slot, pass, ORPHANS_EVERY) || record(slot) != Some(seen))
-                    .map(|(&slot, _)| slot),
-            );
+            if sweep {
+                due.extend(
+                    self.slots
+                        .iter()
+                        .filter(|&(&slot, kept)| in_part(slot, pass, FULL_EVERY) || record(slot) != Some(kept.record))
+                        .map(|(&slot, _)| slot),
+                );
+                due.extend(
+                    self.orphans
+                        .iter()
+                        .filter(|&(&slot, &(seen, _))| in_part(slot, pass, ORPHANS_EVERY) || record(slot) != Some(seen))
+                        .map(|(&slot, _)| slot),
+                );
+            }
         }
         due.sort_unstable();
         due.dedup();
         due
+    }
+
+    /// Slots of the last plan that were not looked at: the next plan has
+    /// them.
+    pub(crate) fn put_back(&mut self, slots: &[u32]) {
+        self.carried.extend_from_slice(slots);
     }
 
     /// Whether the last [`Picked::plan`] was every slot (what was held is
@@ -169,18 +216,12 @@ impl<C: Clone> Picked<C> {
         self.whole
     }
 
-    fn record_of(&self, slot: u32) -> Option<Record> {
-        self.slots
-            .get(&slot)
-            .map(|s| s.record)
-            .or_else(|| self.orphans.get(&slot).copied())
-    }
-
     fn clear(&mut self) {
         self.slots.clear();
         self.copies.clear();
         self.orphans.clear();
         self.by_entry.clear();
+        self.carried.clear();
     }
 
     /// What slot `slot` reads: its copy's identity and range; `None` for no
@@ -190,55 +231,62 @@ impl<C: Clone> Picked<C> {
         self.slots.get(&slot).map(|s| (s.copy, s.from, s.to))
     }
 
-    /// What slot `slot` held is let go (it is looked at now).
-    pub(crate) fn forget(&mut self, slot: u32) {
-        self.orphans.remove(&slot);
-        let Some(old) = self.slots.remove(&slot) else {
-            return;
-        };
+    /// What slot `slot` held is let go (it is looked at now). The entry
+    /// `by_entry` has it under, if any.
+    pub(crate) fn forget(&mut self, slot: u32) -> Option<u32> {
+        if let Some((_, under)) = self.orphans.remove(&slot) {
+            return under;
+        }
+        let old = self.slots.remove(&slot)?;
         if let Some(copy) = self.copies.get_mut(&old.copy) {
-            copy.slots.remove(&slot);
-            if copy.slots.is_empty() {
+            count_out(&mut copy.froms, old.from);
+            count_out(&mut copy.tos, old.to);
+            if copy.froms.is_empty() {
                 self.copies.remove(&old.copy);
-            } else if old.from <= copy.from || old.to >= copy.to {
-                copy.stale = true;
             }
         }
+        old.entry
     }
 
     /// Slot `slot` (with `record`, naming table entry `entry`) reads title
     /// memory `[from, to)` through host copy `copy` (`key`: its identity).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn keep(&mut self, slot: u32, key: usize, copy: &C, from: u64, to: u64, record: Record, entry: Option<u32>) {
-        self.forget(slot);
-        self.note_entry(slot, entry);
-        self.slots.insert(slot, Slot { copy: key, from, to, record });
+        let under = self.forget(slot);
+        let entry = self.note_entry(slot, under, entry);
+        self.slots.insert(slot, Slot { copy: key, from, to, record, entry });
         let c = self.copies.entry(key).or_insert_with(|| Copy {
             copy: copy.clone(),
-            slots: HashSet::new(),
-            from,
-            to,
-            stale: false,
+            froms: BTreeMap::new(),
+            tos: BTreeMap::new(),
         });
-        c.slots.insert(slot);
-        c.from = c.from.min(from);
-        c.to = c.to.max(to);
+        count_in(&mut c.froms, from);
+        count_in(&mut c.tos, to);
     }
 
     /// Slot `slot` holds a buffer view whose memory has no host copy yet,
     /// or one the pass leaves alone for now.
     pub(crate) fn orphan(&mut self, slot: u32, record: Record, entry: Option<u32>) {
-        self.forget(slot);
-        self.note_entry(slot, entry);
-        self.orphans.insert(slot, record);
+        let under = self.forget(slot);
+        let entry = self.note_entry(slot, under, entry);
+        self.orphans.insert(slot, (record, entry));
     }
 
-    fn note_entry(&mut self, slot: u32, entry: Option<u32>) {
+    /// The entry the slot is under from now on: put under `entry` unless
+    /// it is under it already (`under`).
+    fn note_entry(&mut self, slot: u32, under: Option<u32>, entry: Option<u32>) -> Option<u32> {
         // Only kept with the incremental pass (the old one does not use it).
-        if let Some(e) = entry
-            && !self.full
-        {
-            // (Maybe twice: the pass's set of due slots takes it once.)
-            self.by_entry.entry(e).or_default().push(slot);
+        if self.full {
+            return None;
+        }
+        match entry {
+            Some(e) if under != Some(e) => {
+                // Left under the old one: checked when that one is used.
+                self.by_entry.entry(e).or_default().push(slot);
+                Some(e)
+            }
+            Some(_) => under,
+            None => under,
         }
     }
 
@@ -248,7 +296,7 @@ impl<C: Clone> Picked<C> {
     }
 
     /// Per host copy, the span its views read: `(copy, from, to)`.
-    pub(crate) fn spans(&mut self) -> Vec<(C, u64, u64)> {
+    pub(crate) fn spans(&self) -> Vec<(C, u64, u64)> {
         if self.full {
             // As the old pass did: from every view, every pass.
             let mut spans: HashMap<usize, (u64, u64)> = HashMap::new();
@@ -262,21 +310,9 @@ impl<C: Clone> Picked<C> {
                 .filter_map(|(key, (from, to))| Some((self.copies.get(&key)?.copy.clone(), from, to)))
                 .collect();
         }
-        let slots = &self.slots;
         self.copies
-            .values_mut()
-            .map(|c| {
-                if c.stale {
-                    c.stale = false;
-                    let (mut from, mut to) = (u64::MAX, 0);
-                    for s in c.slots.iter().filter_map(|s| slots.get(s)) {
-                        from = from.min(s.from);
-                        to = to.max(s.to);
-                    }
-                    (c.from, c.to) = (from, to);
-                }
-                (c.copy.clone(), c.from, c.to)
-            })
+            .values()
+            .filter_map(|c| Some((c.copy.clone(), *c.froms.keys().next()?, *c.tos.keys().next_back()?)))
             .collect()
     }
 }
@@ -303,9 +339,15 @@ mod tests {
     /// One pass: plans, then "looks" at each due slot: a slot reads 16
     /// bytes from `slot * 16` of copy `slot / 4`.
     fn pass(p: &mut Picked<u32>, heap: &Heap, changed: Vec<u32>, forgotten: Vec<u32>) -> Vec<u32> {
+        round(p, heap, changed, forgotten, true)
+    }
+
+    /// The same with or without the sweep.
+    fn round(p: &mut Picked<u32>, heap: &Heap, changed: Vec<u32>, forgotten: Vec<u32>, sweep: bool) -> Vec<u32> {
         p.note_forgotten(Some(&forgotten));
         let due = p.plan(
             changed,
+            sweep,
             || {
                 let mut all: Vec<u32> = heap.records.keys().copied().collect();
                 all.sort_unstable();
@@ -389,13 +431,13 @@ mod tests {
             records: (0..4).map(|s| (s, [1, 100 + s, 1])).collect(),
         };
         let mut p: Picked<u32> = Picked::new(false);
-        let _ = p.plan(vec![], || vec![0, 1, 2, 3], |s| heap.record(s), entry);
+        let _ = p.plan(vec![], true, || vec![0, 1, 2, 3], |s| heap.record(s), entry);
         for s in 0..3 {
             p.keep(s, 0, &0, 0, 16, heap.record(s).unwrap(), None);
         }
         p.orphan(3, heap.record(3).unwrap(), None);
         for n in 1..2 * FULL_EVERY {
-            let due = p.plan(vec![], || vec![0, 1, 2, 3], |s| heap.record(s), entry);
+            let due = p.plan(vec![], true, || vec![0, 1, 2, 3], |s| heap.record(s), entry);
             let mut want: Vec<u32> = (0..3).filter(|&s| n % FULL_EVERY == u64::from(s)).collect();
             if n % ORPHANS_EVERY == 3 {
                 want.push(3);
@@ -411,15 +453,72 @@ mod tests {
         };
         let all = || (0..40).collect::<Vec<u32>>();
         let mut p: Picked<u32> = Picked::new(true);
-        assert_eq!(p.plan(vec![], all, |s| heap.record(s), entry), all());
+        assert_eq!(p.plan(vec![], true, all, |s| heap.record(s), entry), all());
         for n in 1..40u64 {
             p.note_forgotten(None);
-            let due = p.plan(vec![2], all, |s| heap.record(s), entry);
+            let due = p.plan(vec![2], true, all, |s| heap.record(s), entry);
             let mut want: Vec<u32> = all().into_iter().filter(|&s| u64::from(s) % ORPHANS_EVERY == n % ORPHANS_EVERY).collect();
             want.push(2);
             want.sort_unstable();
             want.dedup();
             assert_eq!(due, want, "pass {n}");
         }
+    }
+
+    #[test]
+    fn a_round_without_the_sweep_looks_only_at_written_and_freed_slots() {
+        let mut heap = heap(64);
+        let mut p = Picked::new(false);
+        pass(&mut p, &heap, vec![], vec![]);
+        // Written through the API, and copied past it.
+        heap.records.insert(slot(5), [1, 500, 1]);
+        heap.records.insert(slot(9), [1, 900, 1]);
+        assert_eq!(round(&mut p, &heap, vec![slot(5)], vec![117], false), vec![slot(5), slot(17)]);
+        // The sweep finds the copied one.
+        assert_eq!(pass(&mut p, &heap, vec![], vec![]), vec![slot(9)]);
+        // Rounds do not count passes: the parts stay where they were.
+        let passes = p.passes;
+        round(&mut p, &heap, vec![], vec![], false);
+        assert_eq!(p.passes, passes);
+    }
+
+    #[test]
+    fn slots_not_looked_at_are_planned_again() {
+        let heap = heap(8);
+        let mut p = Picked::new(false);
+        pass(&mut p, &heap, vec![], vec![]);
+        p.put_back(&[slot(3)]);
+        assert_eq!(round(&mut p, &heap, vec![slot(1)], vec![], false), vec![slot(1), slot(3)]);
+        assert!(round(&mut p, &heap, vec![], vec![], false).is_empty());
+    }
+
+    #[test]
+    fn a_slot_looked_at_again_is_under_its_entry_once() {
+        let heap = heap(4);
+        let mut p = Picked::new(false);
+        pass(&mut p, &heap, vec![], vec![]);
+        for _ in 0..10 {
+            pass(&mut p, &heap, vec![slot(2)], vec![]);
+        }
+        assert_eq!(p.by_entry[&102], vec![slot(2)]);
+        // Freed, looked at, and put under it again.
+        assert_eq!(pass(&mut p, &heap, vec![], vec![102]), vec![slot(2)]);
+        assert_eq!(p.by_entry[&102], vec![slot(2)]);
+    }
+
+    #[test]
+    fn spans_follow_views_that_come_and_go() {
+        let mut p: Picked<u32> = Picked::new(false);
+        let _ = p.plan(vec![], true, Vec::new, |_| None, entry);
+        p.keep(0, 7, &7, 100, 200, [0; 3], None);
+        p.keep(1, 7, &7, 100, 150, [0; 3], None);
+        p.keep(2, 7, &7, 50, 120, [0; 3], None);
+        assert_eq!(p.spans(), vec![(7, 50, 200)]);
+        p.forget(2);
+        assert_eq!(p.spans(), vec![(7, 100, 200)]);
+        p.forget(0);
+        assert_eq!(p.spans(), vec![(7, 100, 150)]);
+        p.keep(1, 8, &8, 0, 10, [0; 3], None);
+        assert_eq!(p.spans(), vec![(8, 0, 10)]);
     }
 }

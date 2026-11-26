@@ -485,8 +485,9 @@ pub(crate) static HEAP_VIEWS_ELSEWHERE: AtomicU64 = AtomicU64::new(0);
 /// index ([`State::heap_buffers`]), and the microseconds they took.
 pub(crate) static HEAP_BUFFER_PASSES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static HEAP_BUFFER_MICROS: AtomicU64 = AtomicU64::new(0);
-/// Of the passes, nanoseconds since the last frame line: looking at slots,
-/// the spans and refreshes of their copies, the texture side.
+/// Of the passes, nanoseconds since the last frame line: looking at slots
+/// (those the rounds ahead left), the spans and refreshes of their copies,
+/// the texture side.
 #[cfg(feature = "diagnostics")]
 pub(crate) static HEAP_SPLIT: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
@@ -624,23 +625,105 @@ fn set(roots: &mut Vec<Root>, slot: u32, root: Root) {
     roots[slot] = root;
 }
 
-/// The pass over the buffer views of `heap` that shaders pick by index
-/// ([`State::heap_buffers`]): their host slots are made, and the host copies
-/// they show are to be refreshed.
-fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::host::HostHeap, frame: u64) -> Vec<crate::host::aside::Refresh> {
-    let started = std::time::Instant::now();
-    // Per host heap: what each slot's buffer view reads, kept from pass to
-    // pass, and which slots are looked at again (`crate::heap_pass`).
-    type Picked = crate::heap_pass::Picked<std::sync::Arc<crate::shadow::Shadow>>;
-    static RANGES: std::sync::Mutex<Option<std::collections::HashMap<usize, Picked>>> = std::sync::Mutex::new(None);
+/// Per host heap: what each slot's buffer view reads, kept from pass to
+/// pass, and which slots are looked at again (`crate::heap_pass`).
+type Picked = crate::heap_pass::Picked<std::sync::Arc<crate::shadow::Shadow>>;
+
+struct Ranges {
+    heaps: std::collections::HashMap<usize, Picked>,
+    /// A round ahead made this frame's sweep (`Picked::plan`).
+    swept: bool,
+}
+
+static RANGES: std::sync::Mutex<Option<Ranges>> = std::sync::Mutex::new(None);
+/// A pass waits for [`RANGES`]: a round ahead stops at its next batch.
+static CLOSING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// The title heap of the last pass, for the rounds ahead (0: none yet).
+static AHEAD_HEAP: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Whether the slots written are looked at between passes as well
+/// ([`start_ahead`]; `VICTORY_HEAP_PASS_AHEAD=0`: no, the pass looks at
+/// all of them).
+fn heap_pass_ahead() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        !crate::heap_pass::full_pass()
+            && crate::host::aside::on()
+            && std::env::var_os("VICTORY_HEAP_PASS_AHEAD").is_none_or(|v| v != "0")
+    })
+}
+
+/// Starts the thread of the rounds ahead, once. After each round of the
+/// heap sync thread it looks at the buffer view slots written since, and
+/// once a frame makes the sweep, so that the pass a list's close waits for
+/// has left only what was written in the last few milliseconds. The pass
+/// used to look at all of them there: 112 ms waited at the close in play.
+fn start_ahead() {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        let made = std::thread::Builder::new().name("victory-heap-ahead".into()).spawn(|| {
+            let mut seen = 0;
+            loop {
+                // shortcut: 8 ms when the sync thread makes no rounds (it
+                // makes them every 4 ms while submissions come).
+                seen = crate::descriptor::sync_round_after(seen, std::time::Duration::from_millis(8));
+                let at = AHEAD_HEAP.load(Ordering::Relaxed);
+                if at == 0 || CLOSING.load(Ordering::Relaxed) {
+                    continue;
+                }
+                #[cfg(feature = "diagnostics")]
+                let started = std::time::Instant::now();
+                let looked = crate::descriptor::with_heap(at, |heap| heap.host().map(|host| heap_round(heap, host)))
+                    .flatten()
+                    .unwrap_or(0);
+                #[cfg(feature = "diagnostics")]
+                if looked > 0 {
+                    use crate::copystat::{C, add};
+                    add(C::HeapAheadRounds, 1);
+                    add(C::HeapAheadLooked, looked as u64);
+                    add(C::HeapAheadNs, started.elapsed().as_nanos() as u64);
+                }
+                #[cfg(not(feature = "diagnostics"))]
+                let _ = looked;
+            }
+        });
+        if made.is_err() {
+            tracing::warn!("no thread for the heap pass's rounds ahead: the pass looks at all slots");
+        }
+    });
+}
+
+/// A round ahead over `heap`: the slots looked at.
+fn heap_round(heap: &crate::descriptor::Heap, host: &crate::descriptor::host::HostHeap) -> usize {
     let mut kept = RANGES.lock().unwrap_or_else(|e| e.into_inner());
-    let heaps = kept.get_or_insert_with(Default::default);
+    if CLOSING.load(Ordering::Relaxed) {
+        return 0;
+    }
+    let ranges = kept.get_or_insert_with(|| Ranges { heaps: Default::default(), swept: false });
+    let sweep = !ranges.swept;
+    ranges.swept = true;
+    heap_looks(ranges, heap, host, crate::frame::current(), sweep, true)
+}
+
+/// Plans and looks at the slots of `heap` due ([`Picked::plan`], with or
+/// without the sweep), and keeps what they show. A round ahead (`ahead`)
+/// stops between batches when a pass waits, and leaves it the rest. The
+/// slots looked at.
+fn heap_looks(
+    ranges: &mut Ranges,
+    heap: &crate::descriptor::Heap,
+    host: &crate::descriptor::host::HostHeap,
+    frame: u64,
+    sweep: bool,
+    ahead: bool,
+) -> usize {
     // Freed table entries are told to every heap's pass.
     let forgotten = crate::descriptor::take_forgotten();
-    for picked in heaps.values_mut() {
+    for picked in ranges.heaps.values_mut() {
         picked.note_forgotten(forgotten.as_deref());
     }
-    let ranges = heaps
+    let ranges = ranges
+        .heaps
         .entry(std::ptr::from_ref(host) as usize)
         .or_insert_with(|| Picked::new(crate::heap_pass::full_pass()));
     let changed = host.buffer_changes();
@@ -648,6 +731,7 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
     let written = changed.len() as u64;
     let slots = ranges.plan(
         changed,
+        sweep,
         || host.buffer_slots(),
         |index| heap.handle(index).map(crate::descriptor::record_words),
         crate::descriptor::record_entry,
@@ -656,7 +740,6 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
     #[cfg(feature = "diagnostics")]
     {
         use crate::copystat::{C, add};
-        add(C::HeapLooked, slots.len() as u64);
         add(C::HeapLookedWritten, if all { 0 } else { written });
     }
     // Whether the device was there before the pass: a view that removes
@@ -711,64 +794,107 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
         let written = crate::picked::on() && view_kind(&view) == Some(ResourceType::Uav);
         (Some(record), Look::Shows((shadow, address, address + len), written))
     };
-    // Some slots at a time, on several threads.
+    // Some slots at a time, on several threads; a round ahead, a batch of
+    // them at a time.
+    // shortcut: 1024 a batch, a few milliseconds of the view threads that
+    // a pass may wait for.
     const AT_A_TIME: usize = 256;
-    let parts: Vec<&[u32]> = slots.chunks(AT_A_TIME).collect();
-    let found: Vec<std::sync::OnceLock<Vec<_>>> = parts.iter().map(|_| Default::default()).collect();
-    crate::land::each_view(false, parts.len(), &|n| {
-        let looked: Vec<_> = parts[n].iter().map(|&index| (index, look(index))).collect();
-        // (After each piece while the device lives: a cheap query.)
-        if alive
-            && let Some(why) = crate::descriptor::host::device_removed()
-            && !GONE.swap(true, Ordering::Relaxed)
-        {
-            let last: Vec<String> = parts[n]
-                .iter()
-                .filter_map(|&i| crate::descriptor::view(heap.handle(i)?).map(|v| format!("{i}: {v:?}")))
-                .map(|s| s.chars().take(200).collect())
-                .collect();
-            tracing::error!(why, "the host device went while buffer views of the heap were made; perhaps one of: {last:#?}");
-            crate::host::log_removal_context();
-        }
-        let _ = found[n].set(looked);
-    });
+    const BATCH: usize = 1024;
+    let mut looked = 0;
     #[cfg(feature = "diagnostics")]
     let mut same = 0u64;
-    for (index, (record, shows)) in found.into_iter().filter_map(std::sync::OnceLock::into_inner).flatten() {
-        #[cfg(feature = "diagnostics")]
-        if !all {
-            let before = ranges.held(index);
-            same += u64::from(match &shows {
-                Look::Shows((shadow, from, to), _) => {
-                    before == Some((std::sync::Arc::as_ptr(shadow) as usize, *from, *to))
-                }
-                _ => before.is_none(),
-            });
+    for (b, batch) in slots.chunks(if ahead { BATCH } else { slots.len().max(1) }).enumerate() {
+        if ahead && CLOSING.load(Ordering::Relaxed) {
+            let rest = &slots[b * BATCH..];
+            ranges.put_back(rest);
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::HeapCarried, rest.len() as u64);
+            break;
         }
-        let entry = record.and_then(crate::descriptor::record_entry);
-        match (record, shows) {
-            (Some(record), Look::Shows(range, written)) => {
-                let (shadow, from, to) = &range;
-                ranges.keep(index, std::sync::Arc::as_ptr(shadow) as usize, shadow, *from, *to, record, entry);
-                if written {
-                    unordered.push(range);
+        let parts: Vec<&[u32]> = batch.chunks(AT_A_TIME).collect();
+        let found: Vec<std::sync::OnceLock<Vec<_>>> = parts.iter().map(|_| Default::default()).collect();
+        crate::land::each_view(false, parts.len(), &|n| {
+            let looked: Vec<_> = parts[n].iter().map(|&index| (index, look(index))).collect();
+            // (After each piece while the device lives: a cheap query.)
+            if alive
+                && let Some(why) = crate::descriptor::host::device_removed()
+                && !GONE.swap(true, Ordering::Relaxed)
+            {
+                let last: Vec<String> = parts[n]
+                    .iter()
+                    .filter_map(|&i| crate::descriptor::view(heap.handle(i)?).map(|v| format!("{i}: {v:?}")))
+                    .map(|s| s.chars().take(200).collect())
+                    .collect();
+                tracing::error!(why, "the host device went while buffer views of the heap were made; perhaps one of: {last:#?}");
+                crate::host::log_removal_context();
+            }
+            let _ = found[n].set(looked);
+        });
+        looked += batch.len();
+        for (index, (record, shows)) in found.into_iter().filter_map(std::sync::OnceLock::into_inner).flatten() {
+            #[cfg(feature = "diagnostics")]
+            if !all {
+                let before = ranges.held(index);
+                same += u64::from(match &shows {
+                    Look::Shows((shadow, from, to), _) => {
+                        before == Some((std::sync::Arc::as_ptr(shadow) as usize, *from, *to))
+                    }
+                    _ => before.is_none(),
+                });
+            }
+            let entry = record.and_then(crate::descriptor::record_entry);
+            match (record, shows) {
+                (Some(record), Look::Shows(range, written)) => {
+                    let (shadow, from, to) = &range;
+                    ranges.keep(index, std::sync::Arc::as_ptr(shadow) as usize, shadow, *from, *to, record, entry);
+                    if written {
+                        unordered.push(range);
+                    }
+                }
+                (Some(record), Look::Later) => ranges.orphan(index, record, entry),
+                _ => {
+                    ranges.forget(index);
                 }
             }
-            (Some(record), Look::Later) => ranges.orphan(index, record, entry),
-            _ => ranges.forget(index),
         }
     }
     #[cfg(feature = "diagnostics")]
-    crate::copystat::add(crate::copystat::C::HeapSameAgain, same);
+    {
+        use crate::copystat::{C, add};
+        add(C::HeapLooked, looked as u64);
+        add(C::HeapSameAgain, same);
+    }
     if crate::picked::on() {
         crate::picked::shown(unordered, all);
     }
+    looked
+}
+
+/// The pass over the buffer views of `heap` that shaders pick by index
+/// ([`State::heap_buffers`]): their host slots are made, and the host copies
+/// they show are to be refreshed. What the rounds ahead left (or all that
+/// is due, without them) is looked at here.
+fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::host::HostHeap, frame: u64) -> Vec<crate::host::aside::Refresh> {
+    let started = std::time::Instant::now();
+    let ahead = heap_pass_ahead();
+    CLOSING.store(true, Ordering::Relaxed);
+    let mut kept = RANGES.lock().unwrap_or_else(|e| e.into_inner());
+    CLOSING.store(false, Ordering::Relaxed);
+    let ranges = kept.get_or_insert_with(|| Ranges { heaps: Default::default(), swept: false });
+    let sweep = !ranges.swept;
+    ranges.swept = false;
+    let slots = heap_looks(ranges, heap, host, frame, sweep, false);
     #[cfg(feature = "diagnostics")]
     let looked = std::time::Instant::now();
     // Per host copy, the span its picked views cover.
+    let ranges = &ranges.heaps[&(std::ptr::from_ref(host) as usize)];
     let views = ranges.views() as u32;
     let spans = ranges.spans();
     drop(kept);
+    if ahead {
+        AHEAD_HEAP.store(std::ptr::from_ref(heap) as usize, Ordering::Relaxed);
+        start_ahead();
+    }
     let bytes: u64 = spans.iter().map(|s| s.2 - s.1).sum();
     // Memory that is not write-watched is copied whole by every refresh.
     // It was once refreshed only every 120 frames (unmapped pages read
@@ -816,7 +942,7 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
     if u64::from(views) > seen + seen / 2 {
         LOGGED.store(u64::from(views), Ordering::Relaxed);
         tracing::info!(
-            slots = slots.len(),
+            slots,
             views,
             copies = spans.len(),
             mb = bytes >> 20,
