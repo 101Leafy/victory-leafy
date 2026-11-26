@@ -314,8 +314,8 @@ fn ds_swizzle_ends_a_run() {
 }
 
 #[test]
-fn ds_permute_ends_a_run() {
-    refused(&[0xDAC8_0000, 0x0400_010F], false); // ds_permute_b32 v4, v15, v1
+fn ds_bpermute_ends_a_run() {
+    refused(&[0xDACC_0000, 0x0400_010F], false); // ds_bpermute_b32 v4, v15, v1
 }
 
 #[test]
@@ -351,6 +351,7 @@ fn v_cmp_ends_a_run() {
 fn guarded_runs_and_float_selects_change_no_lane() {
     let fma = vop3(0x14B, 6, 0, [v(1), v(2), v(3)]);
     let body = [
+        vop2(0x08, 3, 1, 4),     // v_mul_f32 v3, s1, v4 (over a denormal born an integer)
         vop2(0x03, 1, v(1), 3),  // v_add_f32 v1, v1, v3
         vop2(0x08, 2, 1, 2),     // v_mul_f32 v2, s1, v2
         vop2(0x1D, 7, v(7), 1),  // v_xor_b32 v7, v7, v1
@@ -464,12 +465,13 @@ struct Lifted {
 }
 
 /// SGPRs and VGPRs `run` touches, or None when it reads a special register other than VCC
-/// and M0.
+/// and M0. EXEC, which every vector instruction reads, is the program's own.
 fn touched(run: &[ir::Inst]) -> Option<(BTreeSet<u8>, BTreeSet<u8>)> {
     let (mut s, mut v) = (BTreeSet::new(), BTreeSet::new());
     for i in run {
         for &(r, _) in i.reads.iter().chain(&i.writes) {
             match r {
+                Reg::S(c) if c == EXEC || c == EXEC + 1 => {}
                 Reg::S(c) if c <= ir::VCC + 1 || c == ir::M0 => {
                     s.insert(c);
                 }
