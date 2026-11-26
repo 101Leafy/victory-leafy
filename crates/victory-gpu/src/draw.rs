@@ -353,6 +353,11 @@ pub(crate) struct State {
     depth: usize,
     /// The host state the bound depth view needs ([`depth_state`]).
     depth_state: u32,
+    /// The host list's epoch once the last draw had its targets and depth
+    /// in their states, and the state it asked of the depth: while neither
+    /// moves, the next draw need not ask again. Dropped when other host
+    /// textures are bound ([`State::bind_targets`]).
+    ensured: Option<(u64, u32)>,
     /// The title's primitive topology (the host's may differ).
     topology: u32,
     /// What the title set that goes straight onto the host list, kept for
@@ -1303,6 +1308,7 @@ impl State {
             return;
         }
         self.host_targets = Some(now);
+        self.ensured = None;
         let rtvs: Vec<_> = views.iter().map(|(texture, desc)| host.rtv(*texture, desc.as_ref())).collect();
         let dsv = dsv.map(|(texture, t)| host.dsv(texture, t.desc.as_ref()));
         // SAFETY: an open list; the views were just made.
@@ -1645,28 +1651,41 @@ impl State {
         #[cfg(feature = "diagnostics")]
         let began = std::time::Instant::now();
         const RENDER_TARGET: u32 = 0x4;
-        for &t in &self.targets {
-            crate::list::ensure_state(list, t as This, RENDER_TARGET);
-        }
+        // A depth texture shaders also write: what they wrote, first.
         if self.depth != 0 {
-            // A depth texture shaders also write: what they wrote, first.
             list.twin_use(self.depth as This, false, true);
-            // A view that writes neither plane keeps the texture readable:
-            // the depth read state, together with the shader read states
-            // if this draw's shaders read the same texture (the write state
-            // put it out of the state those views need, and a move to it
-            // and back for every such draw).
-            let state = if self.depth_state == DEPTH_READ {
-                let (tested, read) = TESTED_DEPTH.get();
-                if read && tested == self.depth {
-                    DEPTH_READ | SHADER_RESOURCE
-                } else {
-                    DEPTH_READ
-                }
+        }
+        // A view that writes neither plane keeps the texture readable: the
+        // depth read state, together with the shader read states if this
+        // draw's shaders read the same texture (the write state put it out
+        // of the state those views need, and a move to it and back for
+        // every such draw).
+        let depth_state = if self.depth == 0 {
+            0
+        } else if self.depth_state == DEPTH_READ {
+            let (tested, read) = TESTED_DEPTH.get();
+            if read && tested == self.depth {
+                DEPTH_READ | SHADER_RESOURCE
             } else {
-                DEPTH_WRITE
-            };
-            crate::list::ensure_state(list, self.depth as This, state);
+                DEPTH_READ
+            }
+        } else {
+            DEPTH_WRITE
+        };
+        // Most draws bind the targets the last one left in their states,
+        // and each ask costs a host copy lookup and a hash entry to find
+        // that out. Every state the list changes moves its epoch; a host
+        // copy remade meanwhile (`crate::resource::want_level`) is not the
+        // texture the bound views name until the targets are bound again,
+        // and a copy the list holds is never let go as idle.
+        if self.ensured != Some((list.epoch(), depth_state)) {
+            for &t in &self.targets {
+                crate::list::ensure_state(list, t as This, RENDER_TARGET);
+            }
+            if self.depth != 0 {
+                crate::list::ensure_state(list, self.depth as This, depth_state);
+            }
+            self.ensured = Some((list.epoch(), depth_state));
         }
         #[cfg(feature = "diagnostics")]
         crate::copystat::lap(crate::copystat::C::DrawStatesNs, began);
