@@ -1441,6 +1441,11 @@ pub(crate) fn log(frames: f64) {
         "guards over several views of a page, since the start: {together} blocks guarded with their other views, \
          {written} views opened by a write through another, {mapped} ranges opened because a view of them was mapped"
     );
+    let [runs, in_runs, one_by_one] =
+        [0, 1, 2].map(|n| crate::watch::OPENS[n].load(std::sync::atomic::Ordering::Relaxed));
+    tracing::info!(
+        "guarded blocks opened, since the start: {runs} runs with one call each, {in_runs} blocks in them; {one_by_one} blocks one call each"
+    );
     tracing::info!(
         "waits for the write trackers' locks per frame, all threads (number, time): {}",
         crate::watch::lock_waits(frames as f64)
