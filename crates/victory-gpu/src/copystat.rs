@@ -131,6 +131,20 @@ pub(crate) enum C {
     IndirectBounded,
 }
 const COUNTERS: usize = 80;
+
+/// The counters' names, in the order of [`C`], for the frame recorder's columns.
+pub(crate) const NAMES: [&str; 71] = [
+    "Submissions", "Copies", "CopyBytes", "Refreshes", "RefreshBytes", "Skipped", "SkippedBytes", "Runs",
+    "RunUs", "Queries", "QueryUs", "MoveUs", "Unmapped", "Watches", "WatchUs", "Checked", "Unchanged",
+    "Fallbacks", "GuardFaults", "TexWatched", "TexHashed", "TexChanged", "TexHot", "Frames", "RecordCalls",
+    "RecordNs", "PipelineWaitUs", "DynamicAsked", "DynamicRefused", "DynamicNs", "NoteNs", "GpuWrites",
+    "SnapshotUs", "BackCompared", "SparseUs", "GuardUs", "WholeBytes", "BackSubmissions", "PaceWaits",
+    "PaceUs", "UntilRecordUs", "UntilSubmitUs", "TailUs", "ResetNs", "BackScanUs", "BackDiffer", "BackSyncUs",
+    "TexUploads", "TexSkipped", "Forced", "GpuWritesLeftOut", "GpuWritesLeftOutBytes", "WaitChecks",
+    "WaitCheckNs", "HostLists", "HostListNs", "PartsTogether", "WholeUs", "CardUnder2", "Card2To8",
+    "Card8To32", "CardOver32", "CardUnder2Us", "Card2To8Us", "Card8To32Us", "CardOver32Us", "NothingBack",
+    "NothingBackUs", "WaitsForGroups", "WaitsForBuffers", "IndirectBounded",
+];
 /// One of some sets of counters, each in lines of the processor's memory of
 /// its own: a set for all threads had them wait for each other's lines at
 /// every list call (what counts here is summed up for the log alone).
@@ -166,6 +180,11 @@ pub(crate) fn add(c: C, n: u64) {
 pub(crate) fn peek(c: C) -> u64 {
     let i = c as usize;
     COUNT.iter().map(|b| b.0[i].load(Relaxed)).sum()
+}
+
+/// Every counter of [`NAMES`], all sets together, as they are now.
+pub(crate) fn peek_all() -> [u64; NAMES.len()] {
+    std::array::from_fn(|i| COUNT.iter().map(|b| b.0[i].load(Relaxed)).sum())
 }
 
 /// Counter `i`, all sets together, from now on 0.
@@ -431,6 +450,15 @@ static HEAP: Counting = Counting;
 
 #[cfg(test)]
 mod command_tests {
+    /// Every counter has its name, the last one included.
+    #[test]
+    fn every_counter_is_named() {
+        use super::{C, COUNTERS, NAMES};
+        assert_eq!(C::IndirectBounded as usize + 1, NAMES.len());
+        assert_eq!(NAMES[C::Frames as usize], "Frames");
+        assert!(NAMES.len() <= COUNTERS);
+    }
+
     /// Commands are summed by pipeline and first word; those without a
     /// pipeline by their first two words.
     #[test]
