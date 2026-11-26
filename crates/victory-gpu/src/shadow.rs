@@ -1363,7 +1363,18 @@ fn pooled(n: usize) -> Vec<u8> {
         .map(|(i, _)| i);
     let mut v = match fit {
         Some(i) => pool.swap_remove(i),
-        None => Vec::with_capacity(n),
+        None => {
+            // `Vec::with_capacity` aborts when the allocation fails: try it
+            // first, and on failure free the idle buffers (none fits) before
+            // one last attempt, which still aborts if that fails too.
+            let mut v = Vec::new();
+            if v.try_reserve_exact(n).is_err() && !pool.is_empty() {
+                tracing::warn!(bytes = n, "snapshot allocation failed; freeing the idle pool");
+                pool.clear();
+            }
+            v.reserve_exact(n);
+            v
+        }
     };
     v.clear();
     v
@@ -2895,6 +2906,55 @@ mod stale_tests {
 /// Copies of windows outside buffers let go since the start, and their
 /// bytes.
 static LET_GO: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// Asks of draws on the 4 MiB grid that took a longer window of their cell
+/// there was already instead of making the cell's own, since the start, and
+/// the bytes of the windows not made ([`find_any`]). Each would have been
+/// more of the PC's memory shared with the card while both lived, and the
+/// same memory copied twice: the windows of play-g lay over 344 MB less title
+/// memory than they held.
+static TAKEN: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// For the memory line: [`TAKEN`], then what windows cut nearer to what is
+/// asked for would not hold of the windows alive ([`trim`]).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn window_trim() -> [u64; 5] {
+    let cut = {
+        let loose = LOOSE.write().unwrap_or_else(|e| e.into_inner());
+        trim(loose.iter().map(|(&(start, bytes), s)| {
+            let asked = [s.asked[0].load(Ordering::Relaxed), s.asked[1].load(Ordering::Relaxed)];
+            (start, bytes, asked, s.unsized_asks.load(Ordering::Relaxed) > 0)
+        }))
+    };
+    [TAKEN[0].load(Ordering::Relaxed), TAKEN[1].load(Ordering::Relaxed), cut[0], cut[1], cut[2]]
+}
+
+/// Of `windows` (start, bytes, the lowest and highest address asked for,
+/// whether an ask gave no length): the bytes below the tail step of the
+/// lowest ask ([`TAIL_STEP`]), memory nothing ever asked for; of them, those
+/// in windows asked for without a length, which `VICTORY_WINDOW_TAILS=1`
+/// would not make; and the bytes past the 1 MiB line above the highest ask
+/// in windows only asked for with a length, which `VICTORY_WINDOW_KB=1024`
+/// would not make. Root views read to their cell's end, so nothing is cut
+/// above theirs. Play-g ended with 4,492 MB of windows, 3,612 MB of them
+/// asked for without a length, and 3,481 MB of their pages ever copied.
+#[cfg_attr(not(any(test, feature = "diagnostics")), allow(dead_code))]
+fn trim(windows: impl Iterator<Item = (u64, u64, [u64; 2], bool)>) -> [u64; 3] {
+    let mut out = [0u64; 3];
+    for (start, bytes, [low, high], unsized_ask) in windows {
+        if low >= high {
+            continue;
+        }
+        let below = (low & !(TAIL_STEP - 1)).saturating_sub(start).min(bytes);
+        out[0] += below;
+        if unsized_ask {
+            out[1] += below;
+        } else {
+            out[2] += (start + bytes).saturating_sub(high.next_multiple_of(1 << 20).max(start + below));
+        }
+    }
+    out
+}
 
 /// For the memory line: the windows let go since the start and their
 /// bytes, and of the bytes of the windows alive, how many lie between the
@@ -5270,12 +5330,12 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
 /// (and copied) anew. Run 71, on a 256 KiB grid: 350 MB copied per frame
 /// against 120 MB, 7,087 write-watch askings against 2,600, and 5,263
 /// windows (4.5 GB) let go in two minutes against 393 in a whole run.
+///
+/// With whole windows (the default) the cell's own window is taken when it
+/// is there; when it is not, a window that begins in the cell and holds the
+/// range (made for an ask over more than one cell) is taken over making
+/// the cell's own ([`TAKEN`]).
 pub(crate) fn find_any(address: u64, len: u64) -> Option<Arc<Shadow>> {
-    // With whole windows (the default) there is one window to a cell and
-    // nothing to choose: exactly `find`.
-    if !fine() {
-        return find(address, len);
-    }
     lookup(address, len, true)
 }
 
@@ -5631,12 +5691,21 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     let (start, len) = if unsized_ask && tails() {
         let there = map.range((cell, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
         longest_tail(there, address, end).unwrap_or_else(|| tail_of(address, end))
-    } else if any && fine() && !unsized_ask {
+    } else if any && !unsized_ask {
         // The windows that begin in the ask's cell at or below the ask (one
         // that begins in a cell below and reaches this far is passed over:
         // the ask then makes its own).
         let there = map.range((cell, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
-        holder(there, address, end).unwrap_or(named)
+        let held = holder(there, address, end);
+        if !fine()
+            && let Some(held) = held
+            && held != named
+            && !map.contains_key(&named)
+        {
+            TAKEN[0].fetch_add(1, Ordering::Relaxed);
+            TAKEN[1].fetch_add(named.1, Ordering::Relaxed);
+        }
+        held.unwrap_or(named)
     } else {
         named
     };
@@ -5790,7 +5859,7 @@ pub(crate) fn exact_line(frames: f64) {
 mod window_tests {
     use super::{
         WINDOW, cover, default_card_limits_mb, grid, holder, longest_tail, resolve_card_limits,
-        tail_of, window_of,
+        tail_of, trim, window_of,
     };
 
     #[test]
@@ -5857,6 +5926,26 @@ mod window_tests {
             (0x24_0000, 0x4_0000),
         ];
         assert_eq!(cover(over.into_iter()), 0x18_0000);
+    }
+
+    /// What cut windows would not hold: below the lowest ask's step in every
+    /// window, above the highest ask's 1 MiB line only where every ask gave
+    /// a length; a window nothing asked for counts nothing.
+    #[test]
+    fn trim_counts_what_nothing_asked_for() {
+        let cell = 0xd_1200_0000u64;
+        // A root view 2.25 MiB into its cell: that much below, nothing above.
+        let root = (cell, WINDOW, [cell + 0x24_0000, cell + 0x24_0001], true);
+        assert_eq!(trim([root].into_iter()), [0x24_0000, 0x24_0000, 0]);
+        // Asks with a length from 1.1 MiB to 1.5 MiB: 1 MiB below, 2 MiB
+        // above the 2 MiB line.
+        let sized = (cell, WINDOW, [cell + 0x11_0000, cell + 0x18_0000], false);
+        assert_eq!(trim([sized].into_iter()), [0x10_0000, 0, 0x20_0000]);
+        // All of it asked for, and never asked for.
+        let whole = (cell, WINDOW, [cell, cell + WINDOW], false);
+        let none = (cell, WINDOW, [u64::MAX, 0], false);
+        assert_eq!(trim([whole, none].into_iter()), [0; 3]);
+        assert_eq!(trim([root, sized].into_iter()), [0x34_0000, 0x24_0000, 0x20_0000]);
     }
 
     /// A tail runs from the ask's page to the end of its 4 MiB cell, and an

@@ -1059,6 +1059,74 @@ mod tests {
         assert_eq!(super::title_ticks(1_000_000_000, 0), 100_000_000_000_000_000);
     }
 
+    /// A list's preludes: one a use took comes back once the submission it
+    /// was sent with is done, not before, and those of a later submission
+    /// stay queued.
+    #[test]
+    fn a_prelude_is_free_again_when_its_submission_is_done() {
+        let mut pool = super::Preludes::<u32>::default();
+        pool.free.push(1);
+        let first = pool.take(0).unwrap();
+        pool.flight.push((u64::MAX, first));
+        // A second use in the same submission: another one.
+        assert_eq!(pool.take(0), None);
+        pool.flight.push((u64::MAX, 2));
+        pool.sent(5);
+        pool.flight.push((u64::MAX, 3));
+        pool.sent(6);
+        assert_eq!(pool.take(4), None, "submission 5 is not done");
+        assert_eq!(pool.take(5).map(|p| p < 3), Some(true));
+        assert_eq!((pool.free.len(), pool.flight.len()), (1, 1));
+        assert_eq!(pool.take(6), Some(3));
+        assert_eq!(pool.take(6).map(|p| p < 3), Some(true));
+        assert!(pool.flight.is_empty());
+    }
+
+    /// A list named twice by one submission records each use's moves on a
+    /// prelude of its own: a reset of the first before it ran would lose
+    /// its barriers.
+    #[test]
+    fn a_second_use_gets_its_own_prelude() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+        let Some(host) = super::host() else { return };
+        let list = host.new_list().unwrap();
+        let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: 64,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let mut made: Option<ID3D12Resource> = None;
+        // SAFETY: plain creation; the out pointer is ours.
+        unsafe {
+            host.device
+                .CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut made)
+        }
+        .unwrap();
+        // The list starts with it as a copy destination and leaves it
+        // readable, its real state common: each use records a move.
+        let (start, leave) = (D3D12_RESOURCE_STATE_COPY_DEST.0 as u32, D3D12_RESOURCE_STATE_GENERIC_READ.0 as u32);
+        let texture = std::sync::Arc::new(crate::resource::HostTexture::new(made.unwrap(), 0));
+        let key = std::sync::Arc::as_ptr(&texture) as usize;
+        list.states.lock().unwrap().insert(key, (start, leave, texture.clone()));
+        let first = list.prelude().expect("a move is recorded");
+        let second = list.prelude().expect("the second use records a move too");
+        assert_ne!(
+            windows::core::Interface::as_raw(&first),
+            windows::core::Interface::as_raw(&second),
+            "the second use must not reset the list the first recorded on"
+        );
+        assert_eq!(texture.state.load(std::sync::atomic::Ordering::Relaxed), leave);
+        let preludes = list.preludes.lock().unwrap();
+        assert_eq!((preludes.free.len(), preludes.flight.len()), (0, 2));
+    }
+
     /// A list of ours is found by its name, with the debug layer's note or not.
     #[cfg(feature = "diagnostics")]
     #[test]
@@ -1355,9 +1423,10 @@ pub(crate) struct HostList {
     /// What the list does with depth textures that have a colour twin, by
     /// twin ([`TwinUse`]).
     twins: Mutex<std::collections::HashMap<usize, TwinUse>>,
-    /// The list that runs those transitions just before this one, made
-    /// when the list first has such transitions ([`lazy_prelude`]).
-    prelude: OnceLock<Option<Prelude>>,
+    /// The lists that run those transitions just before this one, one per
+    /// use ([`Preludes`]); the first made when the list first has such
+    /// transitions ([`lazy_prelude`]).
+    preludes: Mutex<Preludes>,
     /// The pipelines the list binds, for reports of slow submissions.
     pipelines: std::sync::Arc<Mutex<std::collections::BTreeSet<String>>>,
     /// What its indirect executions ran, for the report of a removed device.
@@ -1401,6 +1470,48 @@ pub(crate) struct HostList {
 
 /// A list's prelude: an allocator and a closed list.
 type Prelude = (ID3D12CommandAllocator, ID3D12GraphicsCommandList);
+
+/// A host list's preludes: those free to record on, and those queued, with
+/// the fence value of the submission that runs them (`u64::MAX` until it is
+/// sent). A submission may name a list twice, and a list sent ahead
+/// ([`late`]) may be named again while it is in the air: each use records
+/// on one of its own, and a reset of one still queued would lose its
+/// barriers.
+struct Preludes<T = Prelude> {
+    free: Vec<T>,
+    flight: Vec<(u64, T)>,
+}
+
+impl<T> Default for Preludes<T> {
+    fn default() -> Self {
+        Preludes { free: Vec::new(), flight: Vec::new() }
+    }
+}
+
+impl<T> Preludes<T> {
+    /// One free to record on, those whose submission the fence has passed
+    /// (`done`) back in the pool first.
+    fn take(&mut self, done: u64) -> Option<T> {
+        for (number, prelude) in std::mem::take(&mut self.flight) {
+            if number <= done {
+                self.free.push(prelude);
+            } else {
+                self.flight.push((number, prelude));
+            }
+        }
+        self.free.pop()
+    }
+
+    /// Those recorded since the last submission are run by submission
+    /// `number`.
+    fn sent(&mut self, number: u64) {
+        for (n, _) in &mut self.flight {
+            if *n == u64::MAX {
+                *n = number;
+            }
+        }
+    }
+}
 
 /// Whether a host list's prelude is made when the list first needs one. A
 /// prelude runs the texture transitions and twin copies a list needs before
@@ -2495,7 +2606,7 @@ struct Deferred {
     /// wrote title memory (source, bytes): its host address.
     filled: std::collections::HashMap<(usize, usize), u64, std::hash::BuildHasherDefault<AddressHash>>,
     /// Textures whose contents the list brings up to date.
-    textures: std::collections::HashSet<usize>,
+    textures: std::collections::HashSet<usize, std::hash::BuildHasherDefault<AddressHash>>,
     /// Last GPU source copied into each aliased host texture in this list.
     texture_aliases: std::collections::HashMap<usize, usize>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
@@ -4379,9 +4490,9 @@ impl Host {
                 &allocator,
                 None,
             )?;
-            let prelude = OnceLock::new();
+            let mut preludes = Preludes::default();
             if !lazy_prelude() {
-                let _ = prelude.set(self.make_prelude());
+                preludes.free.extend(self.make_prelude());
             }
             #[cfg(feature = "diagnostics")]
             let notes = std::sync::Arc::<Mutex<Vec<Note>>>::default();
@@ -4414,7 +4525,7 @@ impl Host {
                 readbacks: Mutex::default(),
                 states: Mutex::default(),
                 twins: Mutex::default(),
-                prelude,
+                preludes: Mutex::new(preludes),
                 pipelines,
                 #[cfg(feature = "diagnostics")]
                 indirects,
@@ -6021,6 +6132,9 @@ impl Host {
         let sending = crate::timeline::ticks();
         if late {
             *submitted += 1;
+            for list in runs {
+                list.preludes_sent(*submitted);
+            }
             #[cfg(feature = "diagnostics")]
             if let Some([front, behind]) = self.span_lists() {
                 lists.insert(0, Some(front));
@@ -6082,6 +6196,9 @@ impl Host {
         #[cfg(not(feature = "diagnostics"))]
         let groups = [&lists[..]];
         submitting(2, runs.len());
+        for list in runs {
+            list.preludes_sent(*submitted + groups.len() as u64);
+        }
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
             let started = std::time::Instant::now();
@@ -6966,23 +7083,22 @@ impl HostList {
         if barriers.is_empty() && syncs.is_empty() {
             return None;
         }
-        let Some((allocator, list)) = self
-            .prelude
-            .get_or_init(|| host().and_then(|h| h.make_prelude()))
-            .as_ref()
-        else {
+        // SAFETY: a plain query.
+        let done = host().map_or(0, |h| unsafe { h.fence.GetCompletedValue() });
+        let free = self.preludes.lock().unwrap_or_else(|e| e.into_inner()).take(done);
+        let Some((allocator, list)) = free.or_else(|| host().and_then(|h| h.make_prelude())) else {
             fail(format_args!("no host list for a state prelude"));
         };
-        // SAFETY: the prelude is not executing (every submission is waited
-        // for); the textures are live.
+        // SAFETY: the prelude is not executing (never queued, or the
+        // submission that ran it is done); the textures are live.
         let recorded = unsafe {
             allocator.Reset().and_then(|()| {
-                list.Reset(allocator, None)?;
+                list.Reset(&allocator, None)?;
                 if !to_copy.is_empty() {
                     list.ResourceBarrier(&to_copy);
                 }
                 for (depth, twin, colour) in &syncs {
-                    record_twin_copy(list, &depth.texture, twin, *colour);
+                    record_twin_copy(&list, &depth.texture, twin, *colour);
                 }
                 if !barriers.is_empty() {
                     list.ResourceBarrier(&barriers);
@@ -6993,7 +7109,15 @@ impl HostList {
         if let Err(e) = recorded {
             fail(format_args!("a host state prelude did not record ({e})"));
         }
-        list.cast().ok()
+        let queued = list.cast().ok();
+        self.preludes.lock().unwrap_or_else(|e| e.into_inner()).flight.push((u64::MAX, (allocator, list)));
+        queued
+    }
+
+    /// The preludes recorded for this submission are run by submission
+    /// `number` ([`Preludes::sent`]).
+    fn preludes_sent(&self, number: u64) {
+        self.preludes.lock().unwrap_or_else(|e| e.into_inner()).sent(number);
     }
 
     /// Notes what the command about to be recorded does, as a marker
@@ -7991,8 +8115,9 @@ mod wide_refresh_tests {
 }
 
 /// A submission's refreshes not done yet, merged per buffer copy into the
-/// range that covers them: done before a step that writes title memory or
-/// gives a range to shaders, and before the lists run.
+/// range that covers them, or into ranges more than a page apart
+/// ([`apart`]): done before a step that writes title memory or gives a
+/// range to shaders, and before the lists run.
 ///
 /// Also the textures brought up to date in the submission so far: most
 /// lists of a world submission sample the same textures, and a texture in
@@ -8000,7 +8125,7 @@ mod wide_refresh_tests {
 /// once, it is checked again only after a step that writes title memory.
 #[derive(Default)]
 struct Batch {
-    refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    refreshes: Vec<Refresh>,
     /// Where each copy (by address) is in `refreshes`: the list that makes
     /// the heap's buffers ready adds some 4,100 copies, and searching them
     /// for every refresh of a submission was tens of millions of
@@ -8008,7 +8133,7 @@ struct Batch {
     index: ByCopy<usize>,
     /// Staging buffers (by address) refreshed since the last title write,
     /// or due to be.
-    textures: std::collections::HashSet<usize>,
+    textures: std::collections::HashSet<usize, std::hash::BuildHasherDefault<AddressHash>>,
     /// Those due ([`Batch::refresh_textures`]).
     due: Vec<std::sync::Arc<crate::texture::Staging>>,
     /// What copies at their place in the submission's lists put into title
@@ -8022,6 +8147,76 @@ struct Batch {
     /// `ahead` holds everything the submission refreshes
     /// ([`Batch::refresh_front`]).
     front: bool,
+}
+
+/// A copy's refresh: the range (from, to), and with [`apart`] the ranges of
+/// it more than a page from that one and from each other, copied on their
+/// own instead of with the span between them.
+type Refresh = (std::sync::Arc<crate::shadow::Shadow>, usize, usize, Vec<(usize, usize)>);
+
+/// Each range of `refresh`.
+fn ranges(refresh: &Refresh) -> impl Iterator<Item = (usize, usize)> + '_ {
+    std::iter::once((refresh.1, refresh.2)).chain(refresh.3.iter().copied())
+}
+
+/// Whether a copy's refreshes more than a page apart are copied apart
+/// (`VICTORY_REFRESH_APART=0`: the span that covers them, as before). A
+/// copy asked for at both ends copied all between them.
+fn apart() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_REFRESH_APART").is_none_or(|v| v != "0"))
+}
+
+/// Ranges up to this far apart are copied as one: a copy of the page between
+/// costs less than another call.
+const COALESCE: usize = crate::watch::PAGE;
+
+/// `[from, to)` joined to a copy's refresh ranges: the range (`span`) and
+/// those apart from it and each other by more than [`COALESCE`] (`others`).
+/// What it lies near merges with it; the merged range is the span.
+fn join(span: &mut (usize, usize), others: &mut Vec<(usize, usize)>, from: usize, to: usize) {
+    let near = |(a, e): (usize, usize), from: usize, to: usize| {
+        a <= to.saturating_add(COALESCE) && from <= e.saturating_add(COALESCE)
+    };
+    if others.is_empty() {
+        if near(*span, from, to) {
+            *span = (span.0.min(from), span.1.max(to));
+        } else {
+            others.push((from, to));
+        }
+        return;
+    }
+    // Every two of them are further apart than that: what is near the
+    // merged range was near one of its parts.
+    let (mut from, mut to) = (from, to);
+    others.push(*span);
+    let mut i = 0;
+    while i < others.len() {
+        if near(others[i], from, to) {
+            let (a, e) = others.swap_remove(i);
+            (from, to) = (from.min(a), to.max(e));
+        } else {
+            i += 1;
+        }
+    }
+    *span = (from, to);
+}
+
+/// Of `refresh`, the ranges that `nothing_new` says hold nothing new are let
+/// go; whether any is left.
+fn keep_new(refresh: &mut Refresh) -> bool {
+    let (shadow, from, to, others) = refresh;
+    others.retain(|&(a, e)| !shadow.nothing_new(a, e - a));
+    if !shadow.nothing_new(*from, *to - *from) {
+        return true;
+    }
+    match others.pop() {
+        Some((a, e)) => {
+            (*from, *to) = (a, e);
+            true
+        }
+        None => false,
+    }
 }
 
 /// Whether the copies that a submission's shaders write are brought up to
@@ -8252,16 +8447,30 @@ impl Batch {
         match self.index.get(&key) {
             Some(&at) => {
                 let r = &mut self.refreshes[at];
+                if !apart() {
+                    #[cfg(feature = "diagnostics")]
+                    crate::copystat::add(
+                        crate::copystat::C::RefreshGapBytes,
+                        address.saturating_sub(r.2).max(r.1.saturating_sub(end)) as u64,
+                    );
+                    (r.1, r.2) = (r.1.min(address), r.2.max(end));
+                    return;
+                }
+                let mut span = (r.1, r.2);
                 #[cfg(feature = "diagnostics")]
-                crate::copystat::add(
-                    crate::copystat::C::RefreshGapBytes,
-                    address.saturating_sub(r.2).max(r.1.saturating_sub(end)) as u64,
-                );
-                (r.1, r.2) = (r.1.min(address), r.2.max(end));
+                let gap = ranges(r)
+                    .map(|(a, e)| address.saturating_sub(e).max(a.saturating_sub(end)))
+                    .min()
+                    .filter(|&gap| gap <= COALESCE)
+                    .unwrap_or(0);
+                join(&mut span, &mut r.3, address, end);
+                (r.1, r.2) = span;
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::RefreshGapBytes, gap as u64);
             }
             None => {
                 self.index.insert(key, self.refreshes.len());
-                self.refreshes.push((shadow.clone(), address, end));
+                self.refreshes.push((shadow.clone(), address, end, Vec::new()));
             }
         }
     }
@@ -8277,15 +8486,18 @@ impl Batch {
         let Some(at) = self.index.remove(&(std::sync::Arc::as_ptr(shadow) as usize)) else {
             return;
         };
-        let (shadow, from, to) = self.refreshes.swap_remove(at);
+        let refresh = self.refreshes.swap_remove(at);
         // The last entry took its place.
         if let Some(moved) = self.refreshes.get(at) {
             self.index.insert(std::sync::Arc::as_ptr(&moved.0) as usize, at);
         }
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
-        if !(crate::watch::light() && shadow.nothing_new(from, to - from)) {
-            Self::update(&shadow, from, to);
+        let shadow = &refresh.0;
+        for (from, to) in ranges(&refresh) {
+            if !(crate::watch::light() && shadow.nothing_new(from, to - from)) {
+                Self::update(shadow, from, to);
+            }
         }
         #[cfg(feature = "diagnostics")]
         {
@@ -8547,7 +8759,7 @@ impl Batch {
             let started = std::time::Instant::now();
             #[cfg(feature = "diagnostics")]
             let all = self.refreshes.len();
-            self.refreshes.retain(|(shadow, from, to)| !shadow.nothing_new(*from, *to - *from));
+            self.refreshes.retain_mut(keep_new);
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             FLUSHES[2].fetch_add((all - self.refreshes.len()) as u64, Ordering::Relaxed);
@@ -8561,7 +8773,7 @@ impl Batch {
                 .refreshes
                 .iter()
                 .filter(|r| r.0.asked_ahead())
-                .map(|r| (r.1, r.2))
+                .flat_map(ranges)
                 .collect();
             crate::watch::ask_ahead(&ranges);
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
@@ -8578,27 +8790,32 @@ impl Batch {
                 // A number to a free thread, not a job to each copy.
                 let refreshes = std::mem::take(&mut self.refreshes);
                 crate::shadow::wide_each(refreshes.len(), move |i| {
-                    let (shadow, from, to) = &refreshes[i];
-                    if refreshes.len() > FEW && shadow.nothing_new(*from, *to - *from) {
-                        #[cfg(feature = "diagnostics")]
-                        FLUSHES[2].fetch_add(1, Ordering::Relaxed);
-                        return;
+                    let shadow = &refreshes[i].0;
+                    for (from, to) in ranges(&refreshes[i]) {
+                        if refreshes.len() > FEW && shadow.nothing_new(from, to - from) {
+                            #[cfg(feature = "diagnostics")]
+                            FLUSHES[2].fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
+                        Self::update(shadow, from, to);
                     }
-                    Self::update(shadow, *from, *to);
                 });
             } else {
                 let jobs: Vec<Box<dyn FnOnce() + Send>> = self
                     .refreshes
                     .drain(..)
-                    .map(|(shadow, from, to)| Box::new(move || Self::update(&shadow, from, to)) as Box<dyn FnOnce() + Send>)
+                    .map(|r| {
+                        Box::new(move || ranges(&r).for_each(|(from, to)| Self::update(&r.0, from, to)))
+                            as Box<dyn FnOnce() + Send>
+                    })
                     .collect();
                 crate::shadow::wide_run(jobs);
             }
             let summed = PREPARING[0].load(Ordering::Relaxed).saturating_sub(before);
             PREPARING[0].fetch_sub(summed.saturating_sub(started.elapsed().as_micros() as u64), Ordering::Relaxed);
         } else {
-            for (shadow, from, to) in self.refreshes.drain(..) {
-                Self::update(&shadow, from, to);
+            for r in self.refreshes.drain(..) {
+                ranges(&r).for_each(|(from, to)| Self::update(&r.0, from, to));
             }
         }
         if ahead {
@@ -10921,8 +11138,38 @@ mod refresh_tests {
 
 #[cfg(test)]
 mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at the top of this file
-    use super::Batch;
+    use super::{Batch, COALESCE, join};
     use std::sync::Arc;
+
+    /// A copy's refreshes: what lies within a page of the others merges
+    /// with them, what is further stays apart, and a range between two
+    /// joins them.
+    #[test]
+    fn refreshes_further_than_a_page_apart_stay_apart() {
+        let (mut span, mut others) = ((0x1_0000, 0x1_1000), Vec::new());
+        join(&mut span, &mut others, 0x40_0000, 0x40_1000);
+        assert_eq!((span, &others[..]), ((0x1_0000, 0x1_1000), &[(0x40_0000, 0x40_1000)][..]));
+        assert!(others.capacity() > 0);
+        // A page's gap merges ...
+        join(&mut span, &mut others, 0x1_1000 + COALESCE, 0x1_2000 + COALESCE);
+        assert_eq!(span, (0x1_0000, 0x1_2000 + COALESCE));
+        assert_eq!(others, [(0x40_0000, 0x40_1000)]);
+        // ... a byte more does not.
+        join(&mut span, &mut others, 0x1_2001 + 2 * COALESCE, 0x1_3000 + 2 * COALESCE);
+        assert_eq!(others.len(), 2);
+        // Near the one apart: merged with it, it is now the span.
+        join(&mut span, &mut others, 0x40_1000, 0x40_2000);
+        assert_eq!(span, (0x40_0000, 0x40_2000));
+        assert_eq!(others.len(), 2);
+        // Over all of them: one range.
+        join(&mut span, &mut others, 0x1_1000, 0x40_0000);
+        assert_eq!((span, others.len()), ((0x1_0000, 0x40_2000), 0));
+        // Ranges of one copy near each other never take memory for others.
+        let (mut span, mut others) = ((0, 0x1000), Vec::new());
+        join(&mut span, &mut others, 0x1000, 0x3000);
+        join(&mut span, &mut others, 0x100, 0x200);
+        assert_eq!((span, others.capacity()), ((0, 0x3000), 0));
+    }
 
     #[test]
     fn a_texture_is_checked_once_per_submission() {
