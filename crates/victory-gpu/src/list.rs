@@ -1099,6 +1099,9 @@ pub fn copy_texture_top_left(list: *const Object, dst: *const Object, src: *cons
         if unsafe { to.GetDesc().Format != from.GetDesc().Format } {
             return false;
         }
+        if host_list(list).is_none() {
+            return thin::stand_in(list, dst, src, width, height, false);
+        }
     }
     let at = |resource: This| CopyLocation {
         resource,
@@ -1133,6 +1136,9 @@ thread_local! {
 pub fn stretch_texture(list: *const Object, dst: *const Object, src: *const Object, width: u32, height: u32) -> bool {
     #[cfg(windows)]
     {
+        if host_list(list).is_none() {
+            return thin::stand_in(list, dst, src, width, height, true);
+        }
         stretch::record(list, dst, src, width, height).is_some()
     }
     #[cfg(not(windows))]
