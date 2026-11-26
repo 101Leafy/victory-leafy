@@ -2,9 +2,9 @@
 //! of cores. `cpu_sets` and `keep_on_fast_cores` are fxceless/victory-fork's
 //! (`framelog.rs`, commit 0b0074e0, GPL-3.0-or-later, as this).
 
-/// The system's processor sets of group 0: each one's id and its efficiency
-/// class (higher is faster).
-fn cpu_sets() -> Vec<(u32, u8)> {
+/// The system's processor sets of group 0: each one's id, its efficiency
+/// class (higher is faster), and its logical processor.
+fn cpu_sets() -> Vec<(u32, u8, u8)> {
     use windows_sys::Win32::System::SystemInformation::{GetSystemCpuSetInformation, SYSTEM_CPU_SET_INFORMATION};
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let mut bytes = 0u32;
@@ -24,18 +24,21 @@ fn cpu_sets() -> Vec<(u32, u8)> {
         // SAFETY: the record's type is CpuSet (the only one there is).
         let set = unsafe { &info.Anonymous.CpuSet };
         if set.Group == 0 {
-            sets.push((set.Id, set.EfficiencyClass));
+            sets.push((set.Id, set.EfficiencyClass, set.LogicalProcessorIndex));
         }
         at += info.Size as usize;
     }
     sets
 }
 
-/// The sets of the fastest class, if there are slower ones too.
-fn fast_of(sets: &[(u32, u8)]) -> Vec<u32> {
+/// The sets of the fastest class from logical processor `from` on, if there
+/// are slower ones too.
+fn fast_of(sets: &[(u32, u8, u8)], from: u8) -> Vec<u32> {
     let best = sets.iter().map(|c| c.1).max().unwrap_or(0);
-    let fast: Vec<u32> = sets.iter().filter(|c| c.1 == best).map(|c| c.0).collect();
-    if fast.len() == sets.len() { Vec::new() } else { fast }
+    if sets.iter().all(|c| c.1 == best) {
+        return Vec::new();
+    }
+    sets.iter().filter(|c| c.1 == best && c.2 >= from).map(|c| c.0).collect()
 }
 
 /// `VICTORY_FAST_CORES`: 0: no thread asks; 1: the threads a frame waits for
@@ -77,7 +80,7 @@ fn ask(what: &str, from: u32) {
     static FAST: std::sync::OnceLock<(Vec<u32>, usize)> = std::sync::OnceLock::new();
     let (fast, of) = FAST.get_or_init(|| {
         let sets = cpu_sets();
-        (fast_of(&sets), sets.len())
+        (fast_of(&sets, 0), sets.len())
     });
     // All alike (or nothing known): nothing to ask for.
     if fast.is_empty() {
@@ -92,16 +95,53 @@ fn ask(what: &str, from: u32) {
     }
 }
 
+/// `VICTORY_PIPELINE_FAST_CORES=1`: a pipeline worker making one that took
+/// 10 s or more before (the slow list's time) is kept on the fast cores past
+/// the first four logical processors while it makes it, and let go after.
+/// The XCL stream guard keeps processors 0 to 3 for OBS. In play-cold a
+/// 130 s compute program went from processor 7 to 30 (a slow core).
+pub(crate) fn hold_long_on_fast_cores() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_FAST_CORES").is_some_and(|v| v == "1"))
+}
+
+/// Keeps the calling thread on those cores (`hold`), or lets it go.
+pub(crate) fn hold_on_fast_cores(hold: bool) {
+    use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadSelectedCpuSets};
+    static FAST: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();
+    let fast = FAST.get_or_init(|| {
+        let fast = fast_of(&cpu_sets(), 4);
+        tracing::info!(fast = fast.len(), "long pipelines are kept on the fast cores past processor 3");
+        fast
+    });
+    if fast.is_empty() {
+        return;
+    }
+    let (list, n) = if hold { (fast.as_ptr(), fast.len() as u32) } else { (std::ptr::null(), 0) };
+    // SAFETY: our own thread and a list of the system's own set ids (or none,
+    // which clears the selection).
+    if unsafe { SetThreadSelectedCpuSets(GetCurrentThread(), list, n) } == 0 {
+        tracing::warn!(hold, error = %std::io::Error::last_os_error(), "the pipeline worker's processors could not be set");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn the_fast_cores_are_those_of_the_best_class_if_there_is_a_worse_one() {
-        assert_eq!(fast_of(&[(256, 1), (257, 1), (258, 0)]), [256, 257]);
-        assert!(fast_of(&[(256, 0), (257, 0)]).is_empty());
-        assert!(fast_of(&[]).is_empty());
+        assert_eq!(fast_of(&[(256, 1, 0), (257, 1, 1), (258, 0, 2)], 0), [256, 257]);
+        assert_eq!(fast_of(&[(256, 1, 0), (257, 1, 4), (258, 0, 16)], 4), [257]);
+        assert!(fast_of(&[(256, 0, 0), (257, 0, 1)], 0).is_empty());
+        assert!(fast_of(&[], 0).is_empty());
         assert!(!cpu_sets().is_empty());
         std::thread::spawn(|| keep_on_fast_cores("test")).join().unwrap();
+        std::thread::spawn(|| {
+            hold_on_fast_cores(true);
+            hold_on_fast_cores(false);
+        })
+        .join()
+        .unwrap();
     }
 }

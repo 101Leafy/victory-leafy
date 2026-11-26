@@ -1404,6 +1404,21 @@ fn log_memory() {
         mb(below_unsized),
         mb(above),
     );
+    let [ownerless, cap, freed] = crate::descriptor::ownerless_kept();
+    tracing::info!(
+        "memory, view entries no resource owns: {} kept (at most {}, 0: all; VICTORY_OWNERLESS_VIEWS), \
+         {} of them freed under the cap so far",
+        ownerless,
+        cap,
+        freed,
+    );
+    tracing::info!(
+        "placed texture views: slots showing an older texture now {}, made null for want of room so far {} \
+         (VICTORY_KEPT_VIEWS_YIELD=1: {})",
+        crate::descriptor::host::KEEPING_NOW.load(std::sync::atomic::Ordering::Relaxed),
+        crate::descriptor::host::KEPT_YIELDED.load(std::sync::atomic::Ordering::Relaxed),
+        if crate::descriptor::host::kept_views_yield() { "on" } else { "off" },
+    );
 }
 
 /// Microseconds since the first call.
@@ -1700,7 +1715,12 @@ pub(crate) fn log(frames: f64) {
     tracing::info!(
         "guarded runs made read-only with the guards' lock let go (VICTORY_PROTECT_LATER=0 for none), since the start: \
          {runs} runs, {blocks} blocks; {reopened} blocks opened meanwhile and made writable again; \
-         {failed} runs guarded under the lock after"
+         {failed} runs guarded under the lock after (block by block with it let go: VICTORY_GUARD_FALLBACK_LATER=1)"
+    );
+    let [aliases, failed] = [0, 1].map(|n| crate::watch::ALIAS_LATER[n].load(std::sync::atomic::Ordering::Relaxed));
+    tracing::info!(
+        "other views of guarded pages made read-only with the guards' lock let go (VICTORY_ALIAS_LATER=1), \
+         since the start: {aliases}; {failed} failed or opened meanwhile"
     );
     let [blocks, bytes, freed] =
         [0, 1, 2].map(|n| crate::watch::GRAPHICS_BLOCKS[n].load(std::sync::atomic::Ordering::Relaxed));

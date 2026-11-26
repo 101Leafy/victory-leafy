@@ -6,7 +6,7 @@
 //! emitter cannot express is `Missing` with a reason, and only fails the
 //! program when something with an effect (an export, a branch) needs it.
 
-use std::cell::Cell;
+use std::cell::{Cell, OnceCell};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::thread::LocalKey;
 
@@ -17,7 +17,7 @@ use super::shader::{Shader, flags};
 use crate::ShaderError;
 use crate::gfx10::{Dpp, Fields, NULL, Operand};
 use crate::io::{Barycentric, Export, Input, Interp, Io, Target};
-use crate::ir::{EXEC, Exit, Inst, Program, Reg, Value};
+use crate::ir::{EXEC, Exit, Inst, Program, Reg, VCC, Value};
 use crate::native::{HwStage, NativeProgram, ResourceType, RootType, StageIo, Usage, UsedResource};
 use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source};
 use crate::structure::{Atom, Bool, LaneExit, Structured};
@@ -54,6 +54,17 @@ mod interp_guard_tests;
 #[cfg(test)]
 #[path = "wave_prefix_tests.rs"]
 mod wave_prefix_tests;
+
+#[cfg(all(test, windows))]
+#[path = "guard_run_tests.rs"]
+mod guard_run_tests;
+
+#[cfg(test)]
+thread_local! {
+    /// The instructions of each run [`Lower::guarded_run`] lowers on this thread, while a test
+    /// keeps a list here.
+    static RUNS_SEEN: std::cell::RefCell<Option<Vec<Vec<Inst>>>> = const { std::cell::RefCell::new(None) };
+}
 
 type Why = &'static str;
 
@@ -114,6 +125,9 @@ pub(crate) struct Lowered {
     pub wave_prefix_f32_args: Vec<Vec<Option<i64>>>,
     #[cfg(test)]
     pub wave_prefix_i32_args: Vec<Vec<Option<i64>>>,
+    /// Runs lowered in every lane ([`Lower::guarded_run`]): block, first and end index.
+    #[cfg(test)]
+    pub guard_runs: Vec<(usize, usize, usize)>,
 }
 
 /// `DB_SHADER_CONTROL.DEPTH_BEFORE_SHADER` (AMD's register headers, as in
@@ -367,6 +381,11 @@ struct Lower<'a> {
     samplers: Vec<[u32; 4]>,
     descriptors: HashMap<(Site, bool), &'a Source>,
     scalar: HashMap<Site, Address>,
+    /// Values a scalar or vector instruction or a phi reads, made on first use
+    /// ([`Self::read_as_number`]).
+    numbers: OnceCell<HashSet<Value>>,
+    /// The instructions reading each value, made on first use ([`Self::computed_with`]).
+    readers: OnceCell<HashMap<Value, Vec<&'a Inst>>>,
     exports: HashMap<Site, &'a Export>,
     interps: HashMap<Site, &'a Interp>,
     handles: HashMap<(usize, Site, u8, bool, (u32, u32)), V>,
@@ -459,6 +478,14 @@ struct Lower<'a> {
     cur_ir: usize,
     /// Whole-wave sections by block and start index.
     sections: HashMap<usize, HashMap<usize, super::wave::Section>>,
+    /// The run of guarded VALU work being lowered in every lane
+    /// ([`Self::guarded_run`]): block, first and end index.
+    spec: Option<(usize, usize, usize)>,
+    /// With [`super::guard_runs`]: per value, the last instruction of its own
+    /// block that reads it, none where a phi or another block reads it.
+    last_read: HashMap<Value, Option<usize>>,
+    #[cfg(test)]
+    runs_taken: Vec<(usize, usize, usize)>,
     /// Values written in a section that code outside it reads.
     section_out: HashSet<Value>,
     /// The program's constant table (the code from the first byte read
@@ -1228,11 +1255,12 @@ pub(super) fn with_local_waves<R>(f: impl FnOnce() -> R) -> R {
 }
 
 /// `VICTORY_F16_NEAREST=1`: the results of 16-bit float operations (`v_add_f16`,
-/// `v_mul_f16`, `v_cvt_f16_f32` ...) are rounded to nearest as the console rounds them
-/// ([`Lower::f16_nearest`]) instead of as the host's `f32tof16` does (toward zero on NVIDIA:
-/// the last place of a result that is not exact is then one lower than the console's).
-/// Off by default: it is exact but untried in a game run, and adds instructions to every
-/// such operation. The wave sum of 16-bit floats ([`Lower::half_sum`]) is always exact.
+/// `v_mul_f16`, `v_cvt_f16_f32` ..., `v_pk_*_f16`, `v_fma_mix*_f16`) and d16 float loads are
+/// rounded to nearest as the console rounds them ([`Lower::to_half`]) instead of as the
+/// host's `f32tof16` does (toward zero on NVIDIA: the last place of a result that is not
+/// exact is then one lower than the console's). Off by default: it is exact but untried in
+/// a game run, and adds 23 instructions to every such result. 16-bit interpolants keep the
+/// host's conversion. The wave sum of 16-bit floats ([`Lower::half_sum`]) is always exact.
 fn f16_nearest_on() -> bool {
     #[cfg(test)]
     if let Some(on) = TEST_F16_NEAREST.get() {
@@ -1580,6 +1608,10 @@ pub(super) fn sets_pops_packer(i: &Inst) -> bool {
     matches!(i.name(), "s_setreg_b32" | "s_setreg_imm32_b32")
         && matches!(i.fields, Fields::Sop { imm: Some(imm), .. } if imm & 0x3F == 25)
 }
+
+/// The shortest run [`Lower::guarded_runs`] takes (one instruction is a
+/// select either way).
+const RUN_MIN: usize = 2;
 
 fn unsupported(offset: usize, what: Why) -> Stop {
     Stop::Fail(ShaderError::Unsupported { offset, what })
@@ -1936,6 +1968,8 @@ impl<'a> Lower<'a> {
                 .map(|d| ((d.site, d.role == Role::Sampler), &d.source))
                 .collect(),
             scalar: x.res.scalar.iter().copied().collect(),
+            numbers: OnceCell::new(),
+            readers: OnceCell::new(),
             exports: x.io.exports.iter().map(|e| (e.site, e)).collect(),
             interps: {
                 let mut m: HashMap<Site, &Interp> = x.io.interps.iter().map(|(s, i)| (*s, i)).collect();
@@ -2015,6 +2049,10 @@ impl<'a> Lower<'a> {
                 .collect(),
             cur_ir: 0,
             sections: HashMap::new(),
+            spec: None,
+            last_read: HashMap::new(),
+            #[cfg(test)]
+            runs_taken: Vec::new(),
             section_out: HashSet::new(),
             code_table: None,
             #[cfg(test)]
@@ -2817,6 +2855,9 @@ impl<'a> Lower<'a> {
             ));
         }
         self.find_sections();
+        if super::guard_runs() && self.twin.is_none() {
+            self.last_read = self.last_reads();
+        }
         self.inputs()?;
         if self.twin.is_some() {
             // (the upper lanes' inputs: their own thread ids)
@@ -2849,8 +2890,14 @@ impl<'a> Lower<'a> {
                 self.lds_meeting();
             }
             self.lds_last = None;
+            let runs = self.guarded_runs(b);
             let mut i = 0;
             while i < p.blocks[b].insts.len() {
+                if let Some(&end) = runs.get(&i) {
+                    self.guarded_run(b, i, end)?;
+                    i = end;
+                    continue;
+                }
                 if self.twin.is_some() {
                     self.paired_inst(b, i)?;
                 } else {
@@ -2937,6 +2984,8 @@ impl<'a> Lower<'a> {
             wave_prefix_f32_args: self.s.m.written_call_int_args("dx.op.wavePrefixOp.f32"),
             #[cfg(test)]
             wave_prefix_i32_args: self.s.m.written_call_int_args("dx.op.wavePrefixOp.i32"),
+            #[cfg(test)]
+            guard_runs: self.runs_taken,
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -3447,13 +3496,19 @@ impl<'a> Lower<'a> {
     /// Whether some instruction reads `v` as a number (or may, through a
     /// join), rather than in a descriptor operand.
     fn read_as_number(&self, v: Value) -> bool {
-        self.x.p.blocks.iter().any(|b| {
-            b.phis.iter().any(|p| p.args.contains(&v))
-                || b.insts.iter().any(|i| {
-                    matches!(i.fields, Fields::Sop { .. } | Fields::Valu(_))
-                        && i.reads.iter().any(|r| r.1 == v)
-                })
-        })
+        let numbers = self.numbers.get_or_init(|| {
+            let mut read = HashSet::new();
+            for b in &self.x.p.blocks {
+                read.extend(b.phis.iter().flat_map(|p| p.args.iter().copied()));
+                for i in &b.insts {
+                    if matches!(i.fields, Fields::Sop { .. } | Fields::Valu(_)) {
+                        read.extend(i.reads.iter().map(|r| r.1));
+                    }
+                }
+            }
+            read
+        });
+        numbers.contains(&v)
     }
 
     /// Whether some instruction computes with `v` (scalar or vector
@@ -3462,10 +3517,21 @@ impl<'a> Lower<'a> {
     /// waterfall loop keeps a descriptor's dwords per lane, reads the first
     /// lane's back and compares the lanes' with them.
     fn computed_with(&self, v: Value, depth: u32) -> bool {
-        self.x.p.blocks.iter().flat_map(|b| &b.insts).any(|i| {
-            if !i.reads.iter().any(|r| r.1 == v) {
-                return false;
+        // Indexed: a scan of the whole program per call, again for each move it follows,
+        // took 39f0e9aeb156a61c (13890 blocks, 2453 descriptor loads) 25-45 s.
+        let readers = self.readers.get_or_init(|| {
+            let mut readers: HashMap<Value, Vec<&'a Inst>> = HashMap::new();
+            for i in self.x.p.blocks.iter().flat_map(|b| &b.insts) {
+                for r in &i.reads {
+                    let at = readers.entry(r.1).or_default();
+                    if !at.last().is_some_and(|&l| std::ptr::eq(l, i)) {
+                        at.push(i);
+                    }
+                }
             }
+            readers
+        });
+        readers.get(&v).into_iter().flatten().any(|i| {
             let name = i.name();
             let moves = matches!(
                 name,
@@ -4339,6 +4405,11 @@ impl<'a> Lower<'a> {
     /// conversion, one step back toward zero where it rounded away (which
     /// also turns an overflow to infinity into the largest finite half).
     fn f16_toward_zero(&mut self, f: V) -> V {
+        self.f16_toward_zero_and_size(f).0
+    }
+
+    /// [`Self::f16_toward_zero`] and `|f|`, which [`Self::f16_nearest`] needs as well.
+    fn f16_toward_zero_and_size(&mut self, f: V) -> (V, V) {
         let c = self.cur;
         let i32t = self.s.t.i32;
         let h = self
@@ -4352,7 +4423,7 @@ impl<'a> Lower<'a> {
         let away = self.s.m.cmp(c, pred::OGT, ba, fa);
         let one = self.s.m.i32(1);
         let stepped = self.s.m.bin(c, Bin::Sub, h, one);
-        self.s.m.select(c, away, stepped, h)
+        (self.s.m.select(c, away, stepped, h), fa)
     }
 
     /// `f` as an f16 in the low bits, rounded to nearest, ties to even, as the console's
@@ -4366,7 +4437,7 @@ impl<'a> Lower<'a> {
     fn f16_nearest(&mut self, f: V) -> V {
         let c = self.cur;
         let f32t = self.s.t.f32;
-        let lo = self.f16_toward_zero(f);
+        let (lo, fa) = self.f16_toward_zero_and_size(f);
         let (one, zero) = (self.s.m.i32(1), self.s.m.i32(0));
         let hi = self.s.m.bin(c, Bin::Add, lo, one);
         let size = |l: &mut Self, h: V| {
@@ -4379,7 +4450,6 @@ impl<'a> Lower<'a> {
         let top = self.s.m.cmp(c, pred::EQ, m, infinity);
         let bound = self.s.m.f32(65536.0f32.to_bits());
         let above = self.s.m.select(c, top, bound, above);
-        let fa = self.unary(6, f);
         // (both differences are exact: the three values lie within one half's step)
         let under = self.s.m.bin(c, Bin::Sub, fa, below);
         let over = self.s.m.bin(c, Bin::Sub, above, fa);
@@ -4391,6 +4461,20 @@ impl<'a> Lower<'a> {
         let tie = self.s.m.bin(c, Bin::And, tie, odd);
         let up = self.s.m.bin(c, Bin::Or, nearer, tie);
         self.s.m.select(c, up, hi, lo)
+    }
+
+    /// `f` as an f16 in the low bits for a 16-bit float result: [`Self::f16_nearest`] with
+    /// `VICTORY_F16_NEAREST=1` ([`f16_nearest_on`], 24 instructions), else the host's
+    /// conversion (one). (A fused result such as `v_fma_mix*`'s is an f32 already rounded
+    /// once, so a tie there may round the other way from the console's single rounding.)
+    fn to_half(&mut self, f: V) -> V {
+        if f16_nearest_on() {
+            self.f16_nearest(f)
+        } else {
+            let i32t = self.s.t.i32;
+            self.s
+                .op(self.cur, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f])
+        }
     }
 
     /// `(a >> off[4:0]) & ((1 << width) - 1)`, sign-extended from the field's
@@ -5231,10 +5315,170 @@ impl<'a> Lower<'a> {
     }
 
     fn guard(&mut self, b: usize, i: usize) -> Result<Option<V>, Why> {
+        if self.spec.is_some_and(|(sb, start, end)| sb == b && (start..end).contains(&i)) {
+            return Ok(None);
+        }
         match self.x.st.guards[b][i] {
             None => Ok(None),
             Some(g) => Ok(Some(self.boolean(g, self.cur)?)),
         }
+    }
+
+    /// Whether instruction `i` of block `b` may join a run lowered in every
+    /// lane ([`Self::guarded_runs`]): plain VALU work that reads no other
+    /// lane (no DPP, lane reads or writes, lane counts), no EXEC operand
+    /// (vccz and execz too), no lane mask but a `v_cndmask` selector, and
+    /// writes VGPRs only.
+    fn runs_alone(&self, b: usize, i: usize) -> bool {
+        let inst = &self.x.p.blocks[b].insts[i];
+        let Fields::Valu(v) = &inst.fields else {
+            return false;
+        };
+        let name = inst.name();
+        if v.dpp.is_some()
+            || name.starts_with("v_cmp")
+            || name.starts_with("v_interp")
+            || name.starts_with("v_mbcnt")
+            || name.starts_with("v_movrel")
+            || name.contains("lane")
+            || self.x.res.waterfall.compares.contains(&(b, i))
+            || !inst.writes.iter().all(|w| matches!(w.0, Reg::V(_)))
+            || v.src.iter().any(|o| match *o {
+                Operand::Scalar { code, dwords } => code < EXEC + 2 && u16::from(code) + u16::from(dwords) > u16::from(EXEC),
+                Operand::Const(c) => c == 251 || c == 252,
+                _ => false,
+            })
+        {
+            return false;
+        }
+        let selector = if !name.starts_with("v_cndmask") {
+            None
+        } else {
+            match v.src.get(2) {
+                Some(&Operand::Scalar { code, .. }) => Some(code),
+                None => Some(VCC),
+                _ => None,
+            }
+        };
+        inst.reads.iter().all(|&(r, x)| match r {
+            // (every vector instruction reads EXEC for the lanes it keeps)
+            Reg::S(c) if c == EXEC || c == EXEC + 1 => true,
+            Reg::S(c) if self.x.st.masks.contains_key(&x) || self.x.st.highs.contains_key(&x) => {
+                selector.is_some_and(|s| c == s || c == s + 1)
+            }
+            _ => true,
+        })
+    }
+
+    /// Runs of block `b`: VALU instructions in a row under one lane guard
+    /// that [`Self::runs_alone`] takes, by first index (the end each).
+    fn guarded_runs(&self, b: usize) -> HashMap<usize, usize> {
+        let mut runs = HashMap::new();
+        if self.last_read.is_empty() || self.twin.is_some() || self.x.p.blocks[b].exit == Exit::Indirect {
+            return runs;
+        }
+        let guards = &self.x.st.guards[b];
+        let section = |k: usize| self.sections.get(&b).is_some_and(|s| s.contains_key(&k));
+        let mut i = 0;
+        while i < guards.len() {
+            let Some(g) = guards[i] else {
+                i += 1;
+                continue;
+            };
+            let mut end = i;
+            while end < guards.len() && guards[end] == Some(g) && !section(end) && self.runs_alone(b, end) {
+                end += 1;
+            }
+            if end - i >= RUN_MIN {
+                runs.insert(i, end);
+            }
+            i = end.max(i + 1);
+        }
+        runs
+    }
+
+    /// Lowers a run from [`Self::guarded_runs`] in every lane. No other lane
+    /// and nothing outside the run reads what it computes in between, so
+    /// only the values it leaves take the guard: one select per register
+    /// where each write had one. The lanes outside it keep what the
+    /// registers held before the run.
+    fn guarded_run(&mut self, b: usize, start: usize, end: usize) -> Result<(), Stop> {
+        let p = self.x.p;
+        let offset = p.blocks[b].insts[start].machine.offset;
+        let g = self.guard(b, start).map_err(|w| unsupported(offset, w))?.expect("a guarded run");
+        self.spec = Some((b, start, end));
+        #[cfg(test)]
+        self.runs_taken.push((b, start, end));
+        #[cfg(test)]
+        RUNS_SEEN.with_borrow_mut(|seen| {
+            if let Some(seen) = seen {
+                seen.push(p.blocks[b].insts[start..end].to_vec());
+            }
+        });
+        let r = (start..end).try_for_each(|i| self.inst(b, i));
+        self.spec = None;
+        r?;
+        let mut before: HashMap<Reg, Option<Value>> = HashMap::new();
+        for inst in &p.blocks[b].insts[start..end] {
+            for &(reg, w) in &inst.writes {
+                let old = *before.entry(reg).or_insert_with(|| inst.read(reg));
+                if self.last_read.get(&w).is_some_and(|k| k.is_some_and(|k| k < end))
+                    || matches!(self.vals.get(&w), None | Some(Val::Missing(_)))
+                {
+                    continue;
+                }
+                // A float select only where the old value is a float too: one
+                // born an integer may be a denormal or NaN pattern, which a
+                // float select on the host need not keep bit for bit.
+                match self.floats.get(&w).copied() {
+                    Some(f) if super::guard_float() && old.is_none_or(|o| self.floats.contains_key(&o)) => {
+                        let o = match old.map(|o| self.float_of(o)) {
+                            Some(Ok(o)) => o,
+                            _ => self.s.m.f32(0),
+                        };
+                        let f = self.s.m.select(self.cur, g, f, o);
+                        self.s.m.tag(f, Tag::Guard);
+                        let x = self.as_int(f);
+                        self.vals.insert(w, Val::I32(x));
+                        self.floats.insert(w, f);
+                    }
+                    _ => {
+                        self.floats.remove(&w);
+                        let x = self.i32_of(w).map_err(|why| unsupported(offset, why))?;
+                        let o = match old.map(|o| self.i32_of(o)) {
+                            Some(Ok(o)) => o,
+                            _ => self.s.m.i32(0),
+                        };
+                        let x = self.s.m.select(self.cur, g, x, o);
+                        self.s.m.tag(x, Tag::Guard);
+                        self.vals.insert(w, Val::I32(x));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// See [`Self::last_read`].
+    fn last_reads(&self) -> HashMap<Value, Option<usize>> {
+        let mut last: HashMap<Value, Option<usize>> = HashMap::new();
+        for (b, block) in self.x.p.blocks.iter().enumerate() {
+            for phi in &block.phis {
+                for &a in &phi.args {
+                    last.insert(a, None);
+                }
+            }
+            for (i, inst) in block.insts.iter().enumerate() {
+                for &(_, v) in &inst.reads {
+                    if self.def_block.get(&v) != Some(&b) {
+                        last.insert(v, None);
+                    } else {
+                        last.entry(v).and_modify(|k| *k = k.map(|k| k.max(i))).or_insert(Some(i));
+                    }
+                }
+            }
+        }
+        last
     }
 
     // ---- results ----
@@ -5341,6 +5585,23 @@ impl<'a> Lower<'a> {
         let Some(Operand::Vector { reg, .. }) = v.dst else {
             return Err("a float result outside a VGPR");
         };
+        if let Some(g) = guard
+            && super::guard_float()
+            && Self::sdwa_dst(inst).is_none()
+            && let Some(new) = inst.write(Reg::V(reg))
+            && inst.read(Reg::V(reg)).is_none_or(|o| self.floats.contains_key(&o))
+        {
+            let old = match inst.read(Reg::V(reg)).map(|o| self.float_of(o)) {
+                Some(Ok(o)) => o,
+                _ => self.s.m.f32(0),
+            };
+            let f = self.s.m.select(self.cur, g, f, old);
+            self.s.m.tag(f, Tag::Guard);
+            let x = self.as_int(f);
+            self.vals.insert(new, Val::I32(x));
+            self.floats.insert(new, f);
+            return Ok(());
+        }
         let x = self.as_int(f);
         self.write(inst, Reg::V(reg), x, guard);
         if guard.is_none()
@@ -7813,9 +8074,8 @@ impl<'a> Lower<'a> {
                 let m = self.s.m.i32(0xFFFF);
                 self.s.m.bin(c, Bin::And, x, m)
             } else {
-                let (f, i32t) = (self.as_float(x), self.s.t.i32);
-                self.s
-                    .op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f])
+                let f = self.as_float(x);
+                self.to_half(f)
             });
         }
         let mut out = Vec::new();
@@ -9331,9 +9591,7 @@ impl<'a> Lower<'a> {
                     Some(Err(FIRST_HALF)) | None => self.s.m.i32(0),
                     Some(Err(why)) => return Err(why),
                 };
-                let h = self
-                    .s
-                    .op(c, "legacyF32ToF16", Attr::ReadNone, self.s.t.i32, 130, &[r]);
+                let h = self.to_half(r);
                 let (keep, h) = if name == "v_fma_mixhi_f16" {
                     let k16 = self.s.m.i32(16);
                     (0xFFFF, self.s.m.bin(c, Bin::Shl, h, k16))
@@ -9911,7 +10169,8 @@ impl<'a> Lower<'a> {
             let f = self.half_fsrc(inst, 0)?;
             return self.write_f(inst, f, guard);
         }
-        let float_result = |l: &mut Self, mut f: V| -> Result<(), Why> {
+        // `nan`: lanes that take RDNA2's 0xfe00 instead (unless clamped, which makes NaN 0).
+        let float_result = |l: &mut Self, mut f: V, nan: Option<V>| -> Result<(), Why> {
             match v.omod {
                 0 => {}
                 k => {
@@ -9926,17 +10185,21 @@ impl<'a> Lower<'a> {
             // The console rounds to nearest; the host's conversion may round toward zero
             // (NVIDIA's does), one step of the last place lower where the two differ.
             // shortcut: the host's conversion unless `VICTORY_F16_NEAREST=1`
-            // ([`f16_nearest_on`]), which costs a dozen instructions per result.
-            let h = if f16_nearest_on() {
-                l.f16_nearest(f)
-            } else {
-                l.s.op(l.cur, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f])
+            // ([`f16_nearest_on`]), which costs 24 instructions per result instead of one.
+            let h = l.to_half(f);
+            // After the conversion: a NaN's bits through it are the host's (0x7fff on NVIDIA).
+            let h = match nan {
+                Some(n) if !v.clamp => {
+                    let k = l.s.m.i32(0xFE00);
+                    l.s.m.select(l.cur, n, k, h)
+                }
+                _ => h,
             };
             l.write_half(inst, h, guard)
         };
         if name == "v_cvt_f16_f32" {
             let f = self.fsrc(inst, 0)?;
-            return float_result(self, f);
+            return float_result(self, f, None);
         }
         if float2.contains(&name) {
             let (a, b) = (self.half_fsrc(inst, 0)?, self.half_fsrc(inst, 1)?);
@@ -9948,7 +10211,7 @@ impl<'a> Lower<'a> {
                 "v_max_f16" => self.max_min(true, a, b),
                 _ => self.max_min(false, a, b),
             };
-            return float_result(self, r);
+            return float_result(self, r, None);
         }
         if float3.contains(&name) {
             let (a, b) = (self.half_fsrc(inst, 0)?, self.half_fsrc(inst, 1)?);
@@ -9995,9 +10258,10 @@ impl<'a> Lower<'a> {
                 "v_div_fixup_f16" => self.div_fixup(a, b, acc),
                 _ => self.med3(a, b, acc),
             };
-            return float_result(self, r);
+            return float_result(self, r, None);
         }
         if float1.contains(&name) {
+            let mut nan = None;
             let r = match name {
                 "v_cvt_f16_u16" | "v_cvt_f16_i16" => {
                     let mut x = self.half_src(inst, 0)?;
@@ -10036,19 +10300,17 @@ impl<'a> Lower<'a> {
                         // Any f16 in (-2^-11, 0) has fract >= 1 - 2^-12; clamp to 0x3bff (1 - 2^-11).
                         22 => self.fract(a, 1.0 - 1.0 / 4096.0, 1.0 - 1.0 / 2048.0),
                         // RDNA2 gives 0xfe00 for negative nonzero inputs,
-                        // including -infinity. The host chooses the NaN bits.
+                        // including -infinity.
                         23 => {
-                            let log = self.unary(op, a);
                             let zero = self.s.m.f32(0);
-                            let negative = self.s.m.cmp(c, pred::OLT, a, zero);
-                            let nan = self.s.m.f32(0xFFC0_0000);
-                            self.s.m.select(c, negative, nan, log)
+                            nan = Some(self.s.m.cmp(c, pred::OLT, a, zero));
+                            self.unary(op, a)
                         }
                         _ => self.unary(op, a),
                     }
                 }
             };
-            return float_result(self, r);
+            return float_result(self, r, nan);
         }
         if matches!(name, "v_cvt_u16_f16" | "v_cvt_i16_f16") {
             if v.clamp || v.omod != 0 {
@@ -10319,7 +10581,7 @@ impl<'a> Lower<'a> {
             return Err("modifiers on a packed integer operation");
         }
         let c = self.cur;
-        let (i32t, f32t) = (self.s.t.i32, self.s.t.f32);
+        let f32t = self.s.t.f32;
         let mut halves = Vec::new();
         for high in [false, true] {
             let mut xs = Vec::new();
@@ -10355,8 +10617,7 @@ impl<'a> Lower<'a> {
                 if v.clamp {
                     f = self.unary(7, f);
                 }
-                self.s
-                    .op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f])
+                self.to_half(f)
             } else {
                 let k16 = self.s.m.i32(16);
                 let sext = |l: &mut Self, x: V| {
@@ -12153,11 +12414,9 @@ impl<'a> Lower<'a> {
                 None => self.s.m.extract(c, r, ch),
             };
             xs.push(if *d16 {
-                // shortcut: d16 results are taken as floats (rounded to
-                // nearest even); integer formats would keep 16 bits.
-                let i32t = self.s.t.i32;
-                self.s
-                    .op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[x])
+                // shortcut: d16 results are taken as floats ([`Self::to_half`]);
+                // integer formats would keep 16 bits.
+                self.to_half(x)
             } else {
                 self.as_int(x)
             });
@@ -12720,14 +12979,11 @@ impl<'a> Lower<'a> {
             // 16 bits of an integer view's (see the stores above).
             let integer = if typed { self.integer_view(src)? } else { None };
             let k16 = self.s.m.i32(16);
-            let i32t = self.s.t.i32;
             for k in 0..count.div_ceil(2) {
                 let mut x = None;
                 for ch in (2 * k..(2 * k + 2).min(count)).rev() {
                     let f = self.s.m.extract(c, r, ch);
-                    let mut h = self
-                        .s
-                        .op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f]);
+                    let mut h = self.to_half(f);
                     if let Some((int, _)) = integer {
                         let bits = self.as_int(f);
                         let low = self.s.m.i32(0xFFFF);

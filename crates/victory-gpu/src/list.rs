@@ -998,7 +998,8 @@ fn sync_copy_source(
     src: This,
     texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
 ) {
-    let aliased = crate::resource::alias_of(src).is_some_and(|source| crate::texture::alias(list, src, source));
+    let aliased = crate::resource::held_alias_of(src)
+        .is_some_and(|source| crate::texture::alias(list, src, source.as_ptr()));
     if !aliased && crate::texture::title_written(texture) {
         crate::texture::upload(list, src, texture);
     }
@@ -1099,6 +1100,9 @@ pub fn copy_texture_top_left(list: *const Object, dst: *const Object, src: *cons
         if unsafe { to.GetDesc().Format != from.GetDesc().Format } {
             return false;
         }
+        if host_list(list).is_none() {
+            return thin::stand_in(list, dst, src, width, height, false);
+        }
     }
     let at = |resource: This| CopyLocation {
         resource,
@@ -1133,6 +1137,9 @@ thread_local! {
 pub fn stretch_texture(list: *const Object, dst: *const Object, src: *const Object, width: u32, height: u32) -> bool {
     #[cfg(windows)]
     {
+        if host_list(list).is_none() {
+            return thin::stand_in(list, dst, src, width, height, true);
+        }
         stretch::record(list, dst, src, width, height).is_some()
     }
     #[cfg(not(windows))]

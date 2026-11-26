@@ -54,19 +54,33 @@ fn parts_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_PAGE_PARTS").is_none_or(|v| v != "0"))
 }
 
-impl Journal {
+impl Shard {
+    const fn new() -> Shard {
+        Shard { written: BTreeMap::new(), parts: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()) }
+    }
+
     /// Page `page` was found written by asking `now`: the parts in `parts`
     /// (a bit each). The asking that found it written before (0: none).
+    ///
+    /// A page's notes only go up: with the journal held alone `now` is the
+    /// newest number there is, as it always was; noted under the shared lock
+    /// (renderer port #7) another asking with a higher number may have
+    /// noted it first.
     fn note(&mut self, page: usize, parts: u16, now: u64) -> u64 {
-        let before = self.written.insert(page, now).unwrap_or(0);
+        let before = self.written.get(&page).copied().unwrap_or(0);
+        self.written.insert(page, before.max(now));
         if parts == WHOLE || !parts_on() {
-            self.parts.remove(&page);
+            if now >= before {
+                self.parts.remove(&page);
+            } else if let Some(all) = self.parts.get_mut(&page) {
+                all.iter_mut().for_each(|at| *at = (*at).max(now));
+            }
             return before;
         }
         let all = self.parts.entry(page).or_insert([before; PARTS]);
         for (k, at) in all.iter_mut().enumerate() {
             if parts >> k & 1 != 0 {
-                *at = now;
+                *at = (*at).max(now);
             }
         }
         before
@@ -81,12 +95,206 @@ impl Journal {
     }
 }
 
+/// The pages of a part of the journal ([`Notes`]): pieces of
+/// `1 << SHARD_SHIFT` pages (64 MiB), every [`SHARDS`]th piece in one part.
+const SHARD_SHIFT: u32 = 10;
+/// The parts: a bit each in a `u64` ([`shards_of`]).
+const SHARDS: usize = 64;
+
+fn shard_of(page: usize) -> usize {
+    (page >> SHARD_SHIFT) % SHARDS
+}
+
+/// The parts that hold pages `[first, last)`, a bit each.
+fn shards_of(first: usize, last: usize) -> u64 {
+    if first >= last {
+        return 0;
+    }
+    let (a, b) = (first >> SHARD_SHIFT, (last - 1) >> SHARD_SHIFT);
+    if b - a + 1 >= SHARDS {
+        return u64::MAX;
+    }
+    (a..=b).fold(0, |m, piece| m | 1 << (piece % SHARDS))
+}
+
+/// The parts that hold `pages`, a bit each.
+fn shards_of_pages(pages: impl IntoIterator<Item = usize>) -> u64 {
+    pages.into_iter().fold(0, |m, page| m | 1 << shard_of(page))
+}
+
+/// The pages' notes, in parts of their own, each under a lock of its own
+/// (renderer port #7). Only reached through [`JOURNAL`]: held alone, its
+/// holder changes them with no part's lock; held shared, a reader reads a
+/// part at a time, and who notes or needs a number that counts holds the
+/// parts it touches ([`Notes::hold`]).
+struct Notes([RwLock<Shard>; SHARDS]);
+
+/// A part of [`Notes`].
+struct Shard {
+    /// Page number → the asking that last found it written.
+    written: BTreeMap<usize, u64>,
+    /// The same for each of a page's sixteen parts ([`KERNEL_PAGE`]), where
+    /// the parts are known ([`parts_on`]); a page that is not here was
+    /// written whole, as far as anyone knows.
+    parts: std::collections::HashMap<usize, [u64; PARTS], std::hash::BuildHasherDefault<PageHash>>,
+}
+
+impl Notes {
+    const fn new() -> Notes {
+        Notes([const { RwLock::new(Shard::new()) }; SHARDS])
+    }
+
+    /// The part of `page`, with the journal held alone.
+    fn shard_mut(&mut self, page: usize) -> &mut Shard {
+        self.0[shard_of(page)].get_mut().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// A part to read, the journal held shared or alone.
+    fn read(&self, shard: usize) -> std::sync::RwLockReadGuard<'_, Shard> {
+        if let Ok(s) = self.0[shard].try_read() {
+            return s;
+        }
+        let began = std::time::Instant::now();
+        let s = self.0[shard].read().unwrap_or_else(|e| e.into_inner());
+        port7_waited(P7_PART_WAITS, began);
+        s
+    }
+
+    /// See [`Shard::note`]; the journal held alone.
+    fn note(&mut self, page: usize, parts: u16, now: u64) -> u64 {
+        self.shard_mut(page).note(page, parts, now)
+    }
+
+    /// See [`Shard::parts_since`].
+    fn parts_since(&self, page: usize, taken: u64) -> u16 {
+        self.read(shard_of(page)).parts_since(page, taken)
+    }
+
+    /// The notes of pages `[first, last)` in page order, `each` of them
+    /// until it says no: whether it never did. A part at a time.
+    fn each(&self, first: usize, last: usize, mut each: impl FnMut(usize, u64) -> bool) -> bool {
+        match pieces(first, last) {
+            Some(pieces) => pieces.into_iter().all(|(from, to)| {
+                let s = self.read(shard_of(from));
+                s.written.range(from..to).all(|(&p, &w)| each(p, w))
+            }),
+            None => {
+                let mut all: Vec<(usize, u64)> = Vec::new();
+                for shard in 0..SHARDS {
+                    all.extend(self.read(shard).written.range(first..last).map(|(&p, &w)| (p, w)));
+                }
+                all.sort_unstable();
+                all.into_iter().all(|(p, w)| each(p, w))
+            }
+        }
+    }
+
+    /// The notes of pages `[first, last)` in page order. A part at a time.
+    fn range(&self, first: usize, last: usize) -> Vec<(usize, u64)> {
+        let mut out = Vec::new();
+        self.each(first, last, |p, w| {
+            out.push((p, w));
+            true
+        });
+        out
+    }
+
+    /// The parts `shards` (a bit each), held until dropped: for writing
+    /// (`write`) or reading. Taken in order: whoever waits for a part holds
+    /// only lower ones, so no two holders wait for each other.
+    fn hold(&self, shards: u64, write: bool) -> Held<'_> {
+        let mut held = Held { shards, read: Vec::new(), write: Vec::new() };
+        let mut m = shards;
+        while m != 0 {
+            let shard = m.trailing_zeros() as usize;
+            m &= m - 1;
+            let lock = &self.0[shard];
+            if write {
+                let guard = match lock.try_write() {
+                    Ok(g) => g,
+                    Err(_) => {
+                        let began = std::time::Instant::now();
+                        let g = lock.write().unwrap_or_else(|e| e.into_inner());
+                        port7_waited(P7_PART_WAITS, began);
+                        g
+                    }
+                };
+                held.write.push(guard);
+            } else {
+                held.read.push(self.read(shard));
+            }
+        }
+        held
+    }
+}
+
+/// The pieces of pages `[first, last)` in page order, each in one part;
+/// `None` for a range of more pieces than is worth walking (then each part
+/// is looked at once).
+fn pieces(first: usize, last: usize) -> Option<Vec<(usize, usize)>> {
+    if first >= last {
+        return Some(Vec::new());
+    }
+    let (a, b) = (first >> SHARD_SHIFT, (last - 1) >> SHARD_SHIFT);
+    if b - a >= 4 * SHARDS {
+        return None;
+    }
+    Some((a..=b).map(|piece| (first.max(piece << SHARD_SHIFT), last.min((piece + 1) << SHARD_SHIFT))).collect())
+}
+
+/// Parts of [`Notes`] held ([`Notes::hold`]).
+struct Held<'a> {
+    shards: u64,
+    read: Vec<std::sync::RwLockReadGuard<'a, Shard>>,
+    write: Vec<std::sync::RwLockWriteGuard<'a, Shard>>,
+}
+
+impl Held<'_> {
+    /// The place among those held of the part of `page`.
+    fn place(&self, page: usize) -> usize {
+        let shard = shard_of(page);
+        assert!(self.shards >> shard & 1 != 0, "page {page:#x}: its part is not held");
+        (self.shards & ((1u64 << shard) - 1)).count_ones() as usize
+    }
+
+    fn shard(&self, page: usize) -> &Shard {
+        let at = self.place(page);
+        if self.write.is_empty() { &self.read[at] } else { &self.write[at] }
+    }
+
+    /// See [`Shard::note`]; held for writing.
+    fn note(&mut self, page: usize, parts: u16, now: u64) -> u64 {
+        let at = self.place(page);
+        self.write[at].note(page, parts, now)
+    }
+
+    /// The notes of pages `[first, last)` in page order; their parts held.
+    fn range(&self, first: usize, last: usize) -> Vec<(usize, u64)> {
+        match pieces(first, last) {
+            Some(pieces) => pieces
+                .into_iter()
+                .flat_map(|(from, to)| self.shard(from).written.range(from..to).map(|(&p, &w)| (p, w)))
+                .collect(),
+            None => {
+                let all = if self.write.is_empty() {
+                    self.read.iter().flat_map(|s| s.written.range(first..last)).map(|(&p, &w)| (p, w)).collect::<Vec<_>>()
+                } else {
+                    self.write.iter().flat_map(|s| s.written.range(first..last)).map(|(&p, &w)| (p, w)).collect::<Vec<_>>()
+                };
+                let mut all = all;
+                all.sort_unstable();
+                all
+            }
+        }
+    }
+}
+
 /// Of the pages of a copy that were written after it took them (page number,
 /// the asking it took the page at): the parts to take again, a bit for each
 /// 4 KiB, in the same order.
 pub(crate) fn parts_written(pages: &[(usize, u64)]) -> Vec<u16> {
     let j = journal();
-    pages.iter().map(|&(page, taken)| j.parts_since(page, taken)).collect()
+    pages.iter().map(|&(page, taken)| j.notes.parts_since(page, taken)).collect()
 }
 
 /// Numbers the askings; 0 is "never". Counted up with the journal held
@@ -122,12 +330,9 @@ pub(crate) fn track(start: usize, len: usize, views: bool) -> Option<Tracked> {
 }
 
 struct Journal {
-    /// Page number → the asking that last found it written.
-    written: BTreeMap<usize, u64>,
-    /// The same for each of a page's sixteen parts ([`KERNEL_PAGE`]), where
-    /// the parts are known ([`parts_on`]); a page that is not here was
-    /// written whole, as far as anyone knows.
-    parts: std::collections::HashMap<usize, [u64; PARTS], std::hash::BuildHasherDefault<PageHash>>,
+    /// Per page, the asking that last found it written, and its parts'
+    /// ([`Shard`]).
+    notes: Notes,
     /// Page ranges asked ahead for a submission's refreshes ([`ask_ahead`])
     /// and the asking that did: `writes` answers for a range inside one
     /// from the journal, without another kernel call.
@@ -146,8 +351,7 @@ struct Journal {
 /// the submitting thread, and one in six of those at the six threads beside
 /// it, found it waiting for that lock (run pooloff1).
 static JOURNAL: RwLock<Journal> = RwLock::new(Journal {
-    written: BTreeMap::new(),
-    parts: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()),
+    notes: Notes::new(),
     ahead: Vec::new(),
     ahead_asked: 0,
     kept: false,
@@ -157,14 +361,143 @@ fn journal() -> std::sync::RwLockReadGuard<'static, Journal> {
     if let Ok(j) = JOURNAL.try_read() {
         return j;
     }
-    waited(1, || JOURNAL.read().unwrap_or_else(|e| e.into_inner()))
+    let began = std::time::Instant::now();
+    let j = waited(1, || JOURNAL.read().unwrap_or_else(|e| e.into_inner()));
+    port7_waited(P7_READ_WAITS, began);
+    j
 }
 
 fn journal_mut() -> std::sync::RwLockWriteGuard<'static, Journal> {
+    port7_count(P7_ALONE, 1);
     if let Ok(j) = JOURNAL.try_write() {
         return j;
     }
-    waited(2, || JOURNAL.write().unwrap_or_else(|e| e.into_inner()))
+    let began = std::time::Instant::now();
+    let j = waited(2, || JOURNAL.write().unwrap_or_else(|e| e.into_inner()));
+    port7_waited(P7_ALONE_WAITS, began);
+    j
+}
+
+/// Renderer port #7 (`VICTORY_PORT_JOURNAL=1`, off by default; read here,
+/// and A/B-able in one run with `VICTORY_AB=<s>,VICTORY_PORT_JOURNAL`): the
+/// journal's lock no longer makes the threads that read it wait for those
+/// that note in it, nor those for each other, unless the standing asking
+/// changes. (The switch also covers `crate::port_journal`'s heaps' records.)
+///
+/// What it was (runs guard-4, merge-4; ports 1, 2, 5, 6 on): every note in
+/// the journal ([`JOURNAL`]) took it alone: the answers of askings found
+/// written (`writes`, a submission's one asking, what shaders put in beside a
+/// guard), and also what has nothing to change: each title buffer copy told
+/// ([`wrote`]) with no asking standing, every flush's [`ask_ahead_done`] and
+/// [`ask_once_end`]. 200 such takings a frame waited, 3-3.6 ms; the readers
+/// (a refresh's every look, ~10,000 a frame on seven threads) waited 480
+/// times, 5.4-5.9 ms; ~2.8 ms of it was the submitting thread's.
+///
+/// What it is with the switch: the pages' notes are in [`SHARDS`] parts of
+/// their own ([`Notes`]), each with a lock of its own. What changes the
+/// standing asking (its ranges, its number, whether it stands) still takes
+/// the journal alone, and so does what our steps write while it stands
+/// ([`wrote`], which moves its number). Noting an answer takes the journal
+/// shared and the parts of its pages for writing ([`Notes::hold`]): an
+/// asking about a range (`writes`), what shaders put in beside a guard
+/// ([`landed_beside`]), and the pages a submission's asking found (noted
+/// before its ranges and number are set, alone and briefly). What has
+/// nothing to change looks first under the shared lock.
+///
+/// Why nothing is lost: an answer `(number, pages)` must hold every note of
+/// a lower number of those pages. A number is taken only holding the parts
+/// of the pages it notes or answers for (who takes a fresh number to answer
+/// with holds the parts of its range for reading, switch or not), so a note
+/// of a lower number is in, or its number is higher. The standing asking's
+/// number is set with the journal held alone, after every shared holder that
+/// took a lower one let go. A page's note only goes up ([`Shard::note`]).
+/// Parts are taken in order, the journal's lock before them and never while
+/// holding them, and no holder of a part waits for anything else: no two
+/// wait for each other. Tests: `port7_tests`.
+pub(crate) fn port_journal() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_PORT_JOURNAL") {
+        return on;
+    }
+    #[cfg(test)]
+    if PORT_JOURNAL_IN_TEST.get() {
+        return true;
+    }
+    // Read here: the switch of renderer port #7.
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_PORT_JOURNAL").is_ok_and(|v| v.trim() == "1"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// [`port_journal`], for what this thread does.
+    pub(crate) static PORT_JOURNAL_IN_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+thread_local! {
+    /// Whether this thread is the submitting lane ("victory-submit").
+    static ON_LANE: bool = std::thread::current().name() == Some("victory-submit");
+}
+
+/// Renderer port #7's counts since the last line: takings of the journal
+/// alone; of them, those that waited and nanoseconds; waits for it shared
+/// and nanoseconds; the lane's waits for it (both kinds) and nanoseconds;
+/// takings alone found needless and left out; notings done shared; waits for
+/// a part and nanoseconds.
+static PORT7: [std::sync::atomic::AtomicU64; 12] = [const { std::sync::atomic::AtomicU64::new(0) }; 12];
+const P7_ALONE: usize = 0;
+/// (A count and its nanoseconds next to it, as the others below.)
+const P7_ALONE_WAITS: usize = 1;
+const P7_READ_WAITS: usize = 3;
+const P7_LANE_WAITS: usize = 5;
+const P7_SKIPPED: usize = 7;
+const P7_SHARED_NOTES: usize = 8;
+const P7_PART_WAITS: usize = 9;
+
+fn port7_count(what: usize, n: u64) {
+    PORT7[what].fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// A wait of kind `what` (a count, its nanoseconds next) that began then.
+fn port7_waited(what: usize, began: std::time::Instant) {
+    let ns = began.elapsed().as_nanos() as u64;
+    port7_count(what, 1);
+    port7_count(what + 1, ns);
+    if what != P7_PART_WAITS && ON_LANE.with(|l| *l) {
+        port7_count(P7_LANE_WAITS, 1);
+        port7_count(P7_LANE_WAITS + 1, ns);
+    }
+}
+
+/// Renderer port #7's journal counts, taken ([`crate::port_journal::line`]).
+pub(crate) struct Port7Counts([u64; 12]);
+
+pub(crate) fn port_journal_counts() -> Port7Counts {
+    Port7Counts(std::array::from_fn(|i| PORT7[i].swap(0, std::sync::atomic::Ordering::Relaxed)))
+}
+
+impl Port7Counts {
+    /// For the line, per frame.
+    pub(crate) fn per_frame(&self, frames: f64) -> String {
+        let n = |i: usize| self.0[i] as f64 / frames;
+        let ms = |i: usize| self.0[i] as f64 / 1e6 / frames;
+        format!(
+            "the lane waited for its lock {:.1} times, {:.2} ms; all threads waited to take it alone {:.1} times ({:.2} ms) of {:.1} \
+             takings alone, shared {:.1} times ({:.2} ms); {:.1} takings alone found needless, {:.1} notings done shared, {:.1} waits \
+             for a part ({:.2} ms)",
+            n(P7_LANE_WAITS),
+            ms(P7_LANE_WAITS + 1),
+            n(P7_ALONE_WAITS),
+            ms(P7_ALONE_WAITS + 1),
+            n(P7_ALONE),
+            n(P7_READ_WAITS),
+            ms(P7_READ_WAITS + 1),
+            n(P7_SKIPPED),
+            n(P7_SHARED_NOTES),
+            n(P7_PART_WAITS),
+            ms(P7_PART_WAITS + 1),
+        )
+    }
 }
 
 /// Since the last line: waits and nanoseconds of waiting, of all threads, for
@@ -417,13 +750,37 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
         i = k;
     }
     note_hot(&written);
+    if port_journal() {
+        // Renderer port #7: the pages noted shared, under their parts; then
+        // the number and the ranges, alone (no shared holder with a lower
+        // number is left by then).
+        let now = note_shared(&written);
+        let mut j = journal_mut();
+        j.ahead_asked = now;
+        j.ahead = asked;
+        return;
+    }
     let mut j = journal_mut();
     j.ahead_asked = next_asking();
     j.ahead = asked;
     let now = j.ahead_asked;
     for (page, parts) in written {
-        j.note(page, parts, now);
+        j.notes.note(page, parts, now);
     }
+}
+
+/// Renderer port #7: notes `written` (pages and their parts) as found by an
+/// asking with a number taken now, holding the journal shared and their
+/// parts for writing; the number.
+fn note_shared(written: &[(usize, u16)]) -> u64 {
+    let j = journal();
+    let mut held = j.notes.hold(shards_of_pages(written.iter().map(|w| w.0)), true);
+    let now = next_asking();
+    for &(page, parts) in written {
+        held.note(page, parts, now);
+    }
+    port7_count(P7_SHARED_NOTES, 1);
+    now
 }
 
 /// Since the last frame line: the kernel askings that took a millisecond
@@ -564,6 +921,14 @@ fn ask_early(every: std::time::Duration) {
 
 /// The submission's refreshes are done: `writes` asks the kernel again.
 pub(crate) fn ask_ahead_done() {
+    // Renderer port #7: nothing to change is seen shared.
+    if port_journal() {
+        let j = journal();
+        if j.kept || j.ahead.is_empty() {
+            port7_count(P7_SKIPPED, 1);
+            return;
+        }
+    }
     let mut j = journal_mut();
     if !j.kept {
         j.ahead.clear();
@@ -633,15 +998,24 @@ fn ask_rest(ranges: &[(usize, usize)]) {
         }
     }
     note_hot(&written);
-    let mut j = journal_mut();
     // A number of its own, and the one this asking stands under: between
     // the two parts another thread may have asked about a range of the
     // second, copied it, and the title written it since. Under the first
     // part's number that write was older than the copy, and never copied.
+    if port_journal() {
+        // Renderer port #7: noted shared first (see `ask_ahead`).
+        let now = note_shared(&written);
+        let mut j = journal_mut();
+        j.ahead_asked = now;
+        j.kept = !ahead.is_empty();
+        j.ahead = ahead;
+        return;
+    }
+    let mut j = journal_mut();
     let now = next_asking();
     j.ahead_asked = now;
     for (page, parts) in written {
-        j.note(page, parts, now);
+        j.notes.note(page, parts, now);
     }
     j.kept = !ahead.is_empty();
     j.ahead = ahead;
@@ -650,6 +1024,11 @@ fn ask_rest(ranges: &[(usize, usize)]) {
 /// The submission's one asking stands no longer: its refreshes are done,
 /// or title memory was written in a way the journal was not told.
 pub(crate) fn ask_once_end() {
+    // Renderer port #7: none standing is seen shared.
+    if port_journal() && !journal().kept {
+        port7_count(P7_SKIPPED, 1);
+        return;
+    }
     let mut j = journal_mut();
     if j.kept {
         j.kept = false;
@@ -657,12 +1036,18 @@ pub(crate) fn ask_once_end() {
     }
 }
 
-/// We wrote title memory `[at, at + len)` while a submission's one asking
-/// stands (the title's buffer copies, done at submission): its pages count
-/// as written after that asking, so the refreshes that follow copy them.
+/// We wrote title memory `[at, at + len)` (the title's buffer copies, done at submission): its
+/// pages count as written after that asking, so the refreshes that follow copy them. Told while a
+/// submission's one asking stands, or at all while [`noting`] is on.
 pub(crate) fn wrote(at: usize, len: usize) {
+    // Renderer port #7: with no asking standing there is nothing to note,
+    // which is seen shared. (Standing, its number moves: alone, as before.)
+    if port_journal() && (len == 0 || !journal().kept) {
+        port7_count(P7_SKIPPED, 1);
+        return;
+    }
     let mut j = journal_mut();
-    if !j.kept || len == 0 {
+    if (!j.kept && !noting()) || len == 0 {
         return;
     }
     let now = next_asking();
@@ -671,13 +1056,47 @@ pub(crate) fn wrote(at: usize, len: usize) {
     // until the next asking copy the pages again.
     j.ahead_asked = now;
     for page in at / PAGE..at.saturating_add(len).div_ceil(PAGE) {
-        j.note(page, WHOLE, now);
+        j.notes.note(page, WHOLE, now);
     }
     for (_, others) in elsewhere(at, len) {
         for other in others {
-            j.note(other / PAGE, WHOLE, now);
+            j.notes.note(other / PAGE, WHOLE, now);
         }
     }
+}
+
+/// Our writes into title memory `spans` (address, bytes), whose bytes are in, are told to the
+/// journal exactly, by 4 KiB, whether or not an asking stands: a copy that took those pages before
+/// is refreshed after them, and a refresh answered from the journal sees them. What shaders wrote
+/// (landed by the shadow copies) and read-backs are told this way.
+/// `VICTORY_NOTE_WRITES=0`: not told, as before ([`noting`]).
+pub(crate) fn told(spans: &[(usize, usize)]) {
+    if spans.is_empty() || !noting() {
+        return;
+    }
+    let elsewhere: Vec<(usize, Vec<usize>)> = spans.iter().flat_map(|&(at, len)| elsewhere(at, len)).collect();
+    let mut j = journal_mut();
+    let now = next_asking();
+    j.ahead_asked = now;
+    for &(at, len) in spans.iter().filter(|s| s.1 > 0) {
+        for page in at / KERNEL_PAGE..(at + len - 1) / KERNEL_PAGE + 1 {
+            j.notes.note(page / PARTS, 1u16 << (page % PARTS), now);
+        }
+    }
+    for (_, others) in &elsewhere {
+        for &other in others {
+            j.notes.note(other / PAGE, WHOLE, now);
+        }
+    }
+}
+
+/// Whether our writes into title memory are told to the journal whether or not an asking stands
+/// ([`wrote`], [`told`]). On by default; `VICTORY_NOTE_WRITES=0` tells [`wrote`] only while an
+/// asking stands and [`told`] nothing, as before. Each note takes the journal's lock: this switch
+/// measures that cost.
+pub(crate) fn noting() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var_os("VICTORY_NOTE_WRITES").is_none_or(|v| v != "0"));
+    *ON
 }
 
 /// The blocks of `[at, at + len)` whose pages the title shows at other
@@ -717,10 +1136,7 @@ fn ask_run(pieces: &[(usize, usize)], asked: &mut Vec<(usize, usize)>, written: 
 pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)> {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let j = journal();
-    j.ahead
-        .iter()
-        .any(|&(a, b)| a <= first && last <= b)
-        .then(|| (j.ahead_asked, j.written.range(first..last).map(|(&p, &w)| (p, w)).collect()))
+    j.ahead.iter().any(|&(a, b)| a <= first && last <= b).then(|| (j.ahead_asked, j.notes.range(first, last)))
 }
 
 /// The pages of `[start, end)` (whole pages) as last written, for pages
@@ -730,9 +1146,18 @@ pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)
 /// with `guarded`, view memory, which is then guarded).
 pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-    let of = |j: &Journal| -> Vec<(usize, u64)> { j.written.range(first..last).map(|(&p, &w)| (p, w)).collect() };
     // Asked ahead with the submission's other ranges: the journal has it.
-    let ahead = |j: &Journal| j.ahead.iter().any(|&(a, b)| a <= first && last <= b).then(|| (j.ahead_asked, of(j)));
+    // (The standing number changes only with the journal held alone, so its
+    // notes are all in: a part at a time will do.)
+    let ahead = |j: &Journal| j.ahead.iter().any(|&(a, b)| a <= first && last <= b).then(|| (j.ahead_asked, j.notes.range(first, last)));
+    // A fresh number and the notes of the range, its parts held meanwhile
+    // (renderer port #7, switch or not: who notes shared takes its number
+    // holding the parts it notes in).
+    let fresh = || {
+        let j = journal();
+        let held = j.notes.hold(shards_of(first, last), false);
+        (next_asking(), held.range(first, last))
+    };
     if let Some(known) = ahead(&journal()) {
         return Some(known);
     }
@@ -743,8 +1168,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
             tally(2, 1);
             crate::faultbook::note(crate::faultbook::What::Known, first, last, 0);
         }
-        let j = journal();
-        return Some((next_asking(), of(&j)));
+        return Some(fresh());
     }
     // Asked, and the answer noted, with the range held: nothing else asks
     // about any of it in between.
@@ -781,16 +1205,26 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     };
     if pages.is_empty() {
         // Nothing to note: the others may go on reading.
-        let j = journal();
-        return Some((next_asking(), of(&j)));
+        return Some(fresh());
     }
-    let answer = {
+    let answer = if port_journal() {
+        // Renderer port #7: shared, the range's parts held for writing (the
+        // range is held too: no other asking notes any of it meanwhile).
+        let j = journal();
+        let mut held = j.notes.hold(shards_of(first, last) | shards_of_pages(pages.iter().map(|p| p.0)), true);
+        let now = next_asking();
+        for &(page, parts) in &pages {
+            held.note(page, parts, now);
+        }
+        port7_count(P7_SHARED_NOTES, 1);
+        (now, held.range(first, last))
+    } else {
         let mut j = journal_mut();
         let now = next_asking();
         for &(page, parts) in &pages {
-            j.note(page, parts, now);
+            j.notes.note(page, parts, now);
         }
-        (now, of(&j))
+        (now, j.notes.range(first, last))
     };
     // Noted: what the guards made clean of it is known by its bits from
     // now on. (The range is still held: no other asking of any of it came
@@ -823,7 +1257,7 @@ pub(crate) fn nothing_new(start: usize, end: usize, base: usize, copied: &[u64],
         return false;
     };
     (ranged != 0 || taken.iter().all(|&at| at != 0))
-        && j.written.range(first..last).all(|(&page, &write)| write <= taken[page - first].max(ranged))
+        && j.notes.each(first, last, |page, write| write <= taken[page - first].max(ranged))
 }
 
 impl Tracked {
@@ -1605,10 +2039,11 @@ impl Guards {
 
     /// A write fault opened `block`.
     fn opened(&mut self, block: usize) {
-        const MANY: usize = 1 << 13;
-        if self.opened.len() >= MANY {
+        // (Mapped views rest too with `map_rest`: thousands of blocks a frame.)
+        let many: usize = if map_rest() { 1 << 16 } else { 1 << 13 };
+        if self.opened.len() >= many {
             self.opened.retain(|_, at| at.elapsed().as_millis() < 50);
-            if self.opened.len() >= MANY {
+            if self.opened.len() >= many {
                 self.opened.clear();
             }
         }
@@ -1775,9 +2210,6 @@ pub(crate) fn landed_beside(pages: &[usize], spans: &[(usize, usize)]) -> (u64, 
         }
     }
     {
-        let mut j = journal_mut();
-        let now = next_asking();
-        noted = now;
         let mut blocks: Vec<(usize, u16)> = Vec::with_capacity(spans.len());
         for &page in pages {
             let (block, part) = (page / PARTS, 1u16 << (page % PARTS));
@@ -1786,12 +2218,29 @@ pub(crate) fn landed_beside(pages: &[usize], spans: &[(usize, usize)]) -> (u64, 
                 _ => blocks.push((block, part)),
             }
         }
-        for (block, parts) in blocks {
-            before.push((block, j.note(block, parts, now)));
-        }
-        for (_, others) in &elsewhere {
-            for other in others {
-                j.note(other / PAGE, WHOLE, now);
+        let others = || elsewhere.iter().flat_map(|(_, others)| others.iter().map(|other| other / PAGE));
+        if port_journal() {
+            // Renderer port #7: shared, the parts of its pages held.
+            let j = journal();
+            let mut held = j.notes.hold(shards_of_pages(blocks.iter().map(|b| b.0).chain(others())), true);
+            let now = next_asking();
+            noted = now;
+            for (block, parts) in blocks {
+                before.push((block, held.note(block, parts, now)));
+            }
+            for other in others() {
+                held.note(other, WHOLE, now);
+            }
+            port7_count(P7_SHARED_NOTES, 1);
+        } else {
+            let mut j = journal_mut();
+            let now = next_asking();
+            noted = now;
+            for (block, parts) in blocks {
+                before.push((block, j.notes.note(block, parts, now)));
+            }
+            for other in others() {
+                j.notes.note(other, WHOLE, now);
             }
         }
     }
@@ -1922,6 +2371,7 @@ fn guard_parts(start: usize, end: usize) -> Option<Vec<(usize, u16)>> {
     let mut parts = vec![WHOLE; written.len()];
     let mut run: Option<(usize, usize)> = None;
     let mut later = Vec::new();
+    let mut aliases = Aliases::default();
     for (i, &block) in written.iter().enumerate() {
         if let Some((from, to)) = run
             && to != block
@@ -1957,6 +2407,10 @@ fn guard_parts(start: usize, end: usize) -> Option<Vec<(usize, u16)>> {
             if g.clean.contains(block) {
                 continue;
             }
+            if alias_later() && PENDING.any(block, block + 1) {
+                // Another asking's: another view of it is not read-only yet.
+                continue;
+            }
             if let Some(open) = g.parted.remove(&block) {
                 // Read-only again before the caller reads the parts.
                 if !close(block) {
@@ -1973,8 +2427,19 @@ fn guard_parts(start: usize, end: usize) -> Option<Vec<(usize, u16)>> {
                     add(C::GuardPartParts, u64::from(open.count_ones()));
                 }
             }
-            if cover(&mut g, block, block + 1) {
-                g.clean.insert(block);
+            if !alias_later() {
+                if cover(&mut g, block, block + 1) {
+                    g.clean.insert(block);
+                }
+                continue;
+            }
+            let relied = aliases.relies.len();
+            if cover_as(&mut g, block, block + 1, Some(&mut aliases)) {
+                if aliases.relies.len() == relied {
+                    g.clean.insert(block);
+                } else {
+                    aliases.clean.push(block);
+                }
             }
         } else if !g.foreign.contains(&block)
             && !g.left_alone(block)
@@ -1992,11 +2457,27 @@ fn guard_parts(start: usize, end: usize) -> Option<Vec<(usize, u16)>> {
         pend(&mut g, from, to, &mut later);
     }
     drop(g);
-    if !later.is_empty() {
-        let done: Vec<bool> = later.iter().map(|&(from, to)| read_only(from, to)).collect();
+    if !later.is_empty() || !aliases.blocks.is_empty() {
+        let fared: Vec<Fared> = later
+            .iter()
+            .map(|&(from, to)| {
+                if read_only(from, to) {
+                    Fared::Whole
+                } else if fallback_later() {
+                    Fared::Blocks(read_only_blocks(from, to))
+                } else {
+                    Fared::Not
+                }
+            })
+            .collect();
         let mut g = guards_timed();
-        for (&(from, to), done) in later.iter().zip(done) {
-            protected_later(&mut g, from, to, done);
+        for (&(from, to), fared) in later.iter().zip(fared) {
+            protected_later_as(&mut g, from, to, fared, alias_later().then_some(&mut aliases));
+        }
+        if !aliases.blocks.is_empty() {
+            drop(g);
+            let done: Vec<bool> = aliases.blocks.iter().map(|&block| read_only(block, block + 1)).collect();
+            aliases_done(&mut guards_timed(), &aliases, done);
         }
     }
     #[cfg(feature = "diagnostics")]
@@ -2086,6 +2567,40 @@ fn protect_later() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_PROTECT_LATER").is_none_or(|v| v != "0"))
 }
 
+/// Whether a run of [`pend`]'s that [`read_only`] could not make read-only
+/// in one call (it spans views) is done block by block with the lock let
+/// go too (`VICTORY_GUARD_FALLBACK_LATER=1`; off: under the lock, as
+/// before).
+///
+/// 32% of these runs failed, some 210 `VirtualProtect` calls a frame made
+/// under the lock after, 11.5 us each (a5c442eec).
+fn fallback_later() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_GUARD_FALLBACK_LATER"))
+}
+
+/// Whether [`guard_parts`] makes the other views of its pages read-only
+/// with the lock let go too (`VICTORY_ALIAS_LATER=1`; off: one
+/// `VirtualProtect` each under the lock, [`protect_alias`], as before).
+///
+/// Some 1000 such calls a frame were made under the lock (a5c442eec).
+fn alias_later() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_ALIAS_LATER"))
+}
+
+/// Whether the blocks a mapped view opens rest as those a write fault
+/// opened do ([`Guards::rests`], `VICTORY_MAP_REST=1`; off: guarded again at
+/// the next asking, as before).
+///
+/// The spikes follow `views_mapped` storms: about 1967 blocks made
+/// read-only again a frame, most of them opened by a mapping just before
+/// (a5c442eec).
+fn map_rest() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_MAP_REST"))
+}
+
 /// Diagnostics: runs of guarded blocks made read-only with the guards' lock
 /// let go ([`pend`]), the blocks in them, blocks opened meanwhile and made
 /// writable again, and runs that failed and were guarded under the lock
@@ -2132,11 +2647,61 @@ fn pend(g: &mut Guards, from: usize, to: usize, later: &mut Vec<(usize, usize)>)
     later.push((from, to));
 }
 
+/// How [`read_only`] fared with a run of [`pend`]'s.
+enum Fared {
+    Whole,
+    /// Failed, nothing changed: guarded block by block under the lock.
+    Not,
+    /// Failed, and done block by block with the lock let go
+    /// ([`fallback_later`]).
+    Blocks(Vec<Took>),
+}
+
+/// How [`read_only_blocks`] fared with one block.
+enum Took {
+    ReadOnly,
+    /// Not committed (unmapped); `held` if a placeholder holds it.
+    Absent { held: bool },
+    Not,
+}
+
+/// [`protect_here`]'s block by block part for a run, with no notes: those
+/// are made under the lock after ([`protected_later_as`]).
+fn read_only_blocks(from: usize, to: usize) -> Vec<Took> {
+    let mut took = Vec::with_capacity(to - from);
+    let mut uncommitted_until = from;
+    for block in from..to {
+        if block >= uncommitted_until && read_only(block, block + 1) {
+            took.push(Took::ReadOnly);
+            continue;
+        }
+        if block >= uncommitted_until {
+            uncommitted_until = uncommitted_end(block);
+            #[cfg(feature = "diagnostics")]
+            tally(9, 1);
+        }
+        took.push(if block < uncommitted_until {
+            Took::Absent { held: known_holes() && placeholder(block) }
+        } else {
+            Took::Not
+        });
+    }
+    took
+}
+
 /// After [`read_only`] of [`pend`]'s run `[from, to)`, under the lock again.
 /// A block [`open`] opened in between (notes gone, `PROTECTED` cleared) is
 /// made writable again; a run that failed (`!done`, nothing changed) is
 /// guarded block by block as before. Then the other views of its pages.
+#[cfg(test)]
 fn protected_later(g: &mut Guards, from: usize, to: usize, done: bool) {
+    protected_later_as(g, from, to, if done { Fared::Whole } else { Fared::Not }, None);
+}
+
+/// [`protected_later`], with the run done block by block already if it
+/// failed ([`Fared::Blocks`]), and the other views of its pages left in
+/// `plan` to make read-only with the lock let go ([`alias_later`]).
+fn protected_later_as(g: &mut Guards, from: usize, to: usize, fared: Fared, mut plan: Option<&mut Aliases>) {
     for block in from..to {
         PENDING.clear(block);
     }
@@ -2146,6 +2711,42 @@ fn protected_later(g: &mut Guards, from: usize, to: usize, done: bool) {
         LATER[0].fetch_add(1, Relaxed);
         LATER[1].fetch_add((to - from) as u64, Relaxed);
     }
+    let done = match fared {
+        Fared::Whole => true,
+        Fared::Not => false,
+        Fared::Blocks(took) => {
+            for (block, took) in (from..to).zip(took) {
+                let ours = PROTECTED.any(block, block + 1) && g.protected.contains(block);
+                match took {
+                    Took::ReadOnly => {
+                        // (As below, for a run done whole.)
+                        if !PROTECTED.any(block, block + 1) && !g.protected.contains(block) {
+                            open_block(block);
+                            #[cfg(feature = "diagnostics")]
+                            LATER[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                    // Those opened or let go meanwhile stay as that left them.
+                    _ if !ours => {}
+                    took => {
+                        g.protected.remove(block);
+                        g.clean.remove(block);
+                        PROTECTED.clear(block);
+                        if let Took::Absent { held } = took {
+                            g.absent.insert(block);
+                            if held {
+                                g.held.insert(block);
+                            }
+                        }
+                    }
+                }
+            }
+            cover_as(g, from, to, plan);
+            #[cfg(feature = "diagnostics")]
+            LATER[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return;
+        }
+    };
     if !done {
         // Those opened or let go meanwhile stay as that left them (a range
         // the kernel writes now among them).
@@ -2158,7 +2759,7 @@ fn protected_later(g: &mut Guards, from: usize, to: usize, done: bool) {
                 PROTECTED.clear(block);
             }
             protect_here(g, from, to);
-            cover(g, from, to);
+            cover_as(g, from, to, plan.as_deref_mut());
         }
         #[cfg(feature = "diagnostics")]
         LATER[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2172,7 +2773,78 @@ fn protected_later(g: &mut Guards, from: usize, to: usize, done: bool) {
             LATER[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
     }
-    cover(g, from, to);
+    cover_as(g, from, to, plan);
+}
+
+/// Other views of guarded pages left by [`cover_as`] for [`guard_parts`] to
+/// make read-only with the lock let go ([`alias_later`]), and
+/// [`aliases_done`] to note after. Each is noted guarded and [`PENDING`]
+/// meanwhile, and so is each block that relies on one (in `relies`): who
+/// asks about those tells them as written until then.
+#[derive(Default)]
+struct Aliases {
+    blocks: Vec<usize>,
+    planned: std::collections::HashSet<usize>,
+    /// (block, other view of its page)
+    relies: Vec<(usize, usize)>,
+    /// Blocks to note clean if all they rely on is made read-only.
+    clean: Vec<usize>,
+}
+
+/// Diagnostics: other views of guarded pages made read-only with the
+/// guards' lock let go ([`alias_later`]), and those that failed or were
+/// opened meanwhile; since the start.
+#[cfg(feature = "diagnostics")]
+pub(crate) static ALIAS_LATER: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// After [`read_only`] of each of `aliases.blocks` (`done`), under the lock
+/// again. One opened in between is made writable again, as in
+/// [`protected_later`]; one that failed is not guarded. A block that relied
+/// on either is not clean.
+fn aliases_done(g: &mut Guards, aliases: &Aliases, done: Vec<bool>) {
+    let mut failed = std::collections::HashSet::new();
+    for (&block, done) in aliases.blocks.iter().zip(done) {
+        PENDING.clear(block);
+        let ours = PROTECTED.any(block, block + 1) && g.protected.contains(block);
+        if done && ours {
+            #[cfg(feature = "diagnostics")]
+            crate::faultbook::note(crate::faultbook::What::Alias, block, 0, 0);
+            continue;
+        }
+        if done {
+            // (One a fault opened with no lock is still in the notes.)
+            if !PROTECTED.any(block, block + 1) && !g.protected.contains(block) {
+                open_block(block);
+            }
+        } else if ours {
+            g.protected.remove(block);
+            PROTECTED.clear(block);
+        }
+        failed.insert(block);
+    }
+    #[cfg(feature = "diagnostics")]
+    {
+        use std::sync::atomic::Ordering::Relaxed;
+        ALIAS_LATER[0].fetch_add(aliases.blocks.len() as u64, Relaxed);
+        ALIAS_LATER[1].fetch_add(failed.len() as u64, Relaxed);
+    }
+    let mut short = std::collections::HashSet::new();
+    for &(block, other) in &aliases.relies {
+        PENDING.clear(block);
+        if failed.contains(&other) {
+            short.insert(block);
+            g.clean.remove(block);
+        }
+    }
+    for &block in &aliases.clean {
+        if !short.contains(&block)
+            && g.protected.contains(block)
+            && PROTECTED.any(block, block + 1)
+            && !LOOSE.any(block, block + 1)
+        {
+            g.clean.insert(block);
+        }
+    }
 }
 
 /// Views of one page past which its views are not guarded together.
@@ -2202,6 +2874,13 @@ pub(crate) static OPENS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync:
 /// it), a write through it would not be seen: that block is not clean, and
 /// told as written at every asking, until it can. Whether all are covered.
 fn cover(g: &mut Guards, from: usize, to: usize) -> bool {
+    cover_as(g, from, to, None)
+}
+
+/// [`cover`], with the views to make read-only left in `plan`
+/// ([`alias_later`]): they count as covered, and the block is
+/// [`PENDING`] until they are done.
+fn cover_as(g: &mut Guards, from: usize, to: usize, mut plan: Option<&mut Aliases>) -> bool {
     let mut all = true;
     for (page, others) in elsewhere(from * BLOCK, (to - from) * BLOCK) {
         let block = page / BLOCK;
@@ -2219,8 +2898,12 @@ fn cover(g: &mut Guards, from: usize, to: usize) -> bool {
             continue;
         }
         let mut covered = true;
+        let relied = plan.as_ref().map_or(0, |a| a.relies.len());
         for other in others {
-            covered &= protect_alias(g, other / BLOCK);
+            covered &= protect_alias(g, other / BLOCK, plan.as_deref_mut().map(|a| (a, block)));
+        }
+        if plan.as_ref().is_some_and(|a| a.relies.len() != relied) {
+            PENDING.set(block);
         }
         if !covered {
             all = false;
@@ -2236,10 +2919,25 @@ fn cover(g: &mut Guards, from: usize, to: usize) -> bool {
 /// page ([`guard_parts`] tells such a block as written, then notes it clean).
 /// One that is clean stays so: had the page been written since its copies
 /// took it, [`open`] would have opened it. Whether it is read-only now.
-fn protect_alias(g: &mut Guards, block: usize) -> bool {
+///
+/// With `plan` ([`alias_later`]) the `VirtualProtect` is left there for
+/// [`guard_parts`] to make with the lock let go: `block` is noted guarded
+/// and [`PENDING`] now, the block whose page it is a view of relies on it,
+/// and it counts as read-only.
+fn protect_alias(g: &mut Guards, block: usize, plan: Option<(&mut Aliases, usize)>) -> bool {
     use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE, VirtualProtect};
     g.aliased.insert(block);
     ALIASED.set(block);
+    if alias_later() && PENDING.any(block, block + 1) {
+        // Not read-only yet: covered only once this asking makes it so.
+        return match plan {
+            Some((aliases, of)) if aliases.planned.contains(&block) => {
+                aliases.relies.push((of, block));
+                true
+            }
+            _ => false,
+        };
+    }
     if loose(g, block) && g.protected.contains(block) {
         // A fault is opening it.
         return false;
@@ -2259,6 +2957,16 @@ fn protect_alias(g: &mut Guards, block: usize) -> bool {
     }
     // Ahead of the protection.
     PROTECTED.set(block);
+    if let Some((aliases, of)) = plan {
+        // Noted guarded now, so that one who opens it meanwhile opens it
+        // as any other (`aliases_done` makes it writable again after).
+        PENDING.set(block);
+        g.protected.insert(block);
+        aliases.planned.insert(block);
+        aliases.blocks.push(block);
+        aliases.relies.push((of, block));
+        return true;
+    }
     let mut old = 0;
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
@@ -2754,6 +3462,11 @@ pub(crate) fn views_mapped(section: usize, offset: u64, len: usize) {
     #[cfg(feature = "diagnostics")]
     ALIASES[2].fetch_add(blocks.len() as u64, std::sync::atomic::Ordering::Relaxed);
     unguard(&mut g, &blocks);
+    if map_rest() {
+        for block in blocks {
+            g.opened(block);
+        }
+    }
 }
 
 /// The runtime is about to unmap a view of which it maps a part again at
@@ -2776,6 +3489,9 @@ pub fn title_memory_splitting(at: usize, len: usize) {
     open(&mut g, at, at.saturating_add(len));
     for other in others {
         open(&mut g, other, other + BLOCK);
+        if map_rest() {
+            g.opened(other / BLOCK);
+        }
         if CHANGING.get().0 {
             CHANGING.set((true, true));
             g.changing.push((other / BLOCK, other / BLOCK + 1));
@@ -3245,13 +3961,7 @@ mod parts_tests {
 
     #[test]
     fn the_parts_of_a_page_written_since_it_was_taken() {
-        let mut j = Journal {
-            written: BTreeMap::new(),
-            parts: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()),
-            ahead: Vec::new(),
-            ahead_asked: 0,
-            kept: false,
-        };
+        let mut j = Shard::new();
         assert_eq!(j.parts_since(7, 0), WHOLE);
         assert_eq!(j.note(7, WHOLE, 3), 0);
         // Parts 0 and 5 at 4, part 5 again at 6: at 2 the whole page is due.
@@ -3315,6 +4025,35 @@ mod tests {
         );
         // SAFETY: our allocation.
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// Our write into title memory after the asking that found it has ended is in the journal: the
+    /// next submission's asking, answered from the journal, reports it. (`wrote` told the journal
+    /// only while an asking stood.)
+    #[test]
+    fn our_write_between_two_askings_is_copied() {
+        const MIB: usize = 1 << 20;
+        // SAFETY: a fresh write-watched allocation, kept.
+        let p = unsafe { VirtualAlloc(std::ptr::null(), 2 * MIB, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) } as usize;
+        assert_ne!(p, 0);
+        let a = p.next_multiple_of(MIB);
+        let (start, end) = (a, a + MIB);
+        ask_once(&[(start, end)]);
+        let (asked, _) = writes(start, end, false).expect("watched");
+        ask_once_end();
+        // A Copy step: our bytes go into title memory, and then the journal is told.
+        // SAFETY: a committed page of ours.
+        unsafe { ((a + 3 * PAGE + 8) as *mut u8).write(1) };
+        wrote(a + 3 * PAGE, PAGE);
+        // The next submission's asking: the write is in the journal.
+        ask_once(&[(start, end)]);
+        let (_, after) = writes(start, end, false).expect("watched");
+        ask_once_end();
+        // Not freed: the asking made the piece hot, and the early asker may
+        // still ask it; a refusal there is kept for the frame, and a later
+        // test's memory at this address would be refused.
+        let page = (a + 3 * PAGE) / PAGE;
+        assert!(after.iter().any(|&(p, w)| p == page && w > asked), "our write is not in the journal: {after:?} (asked {asked})");
     }
 
     /// A kernel read into a guarded view block fails; opened first, it
@@ -3710,7 +4449,7 @@ mod tests {
         // SAFETY: committed pages of ours.
         unsafe { ((p + PAGE) as *mut u8).write_volatile(1) };
         ask_rest(&ranges);
-        let last = journal().written.get(&(p / PAGE + 1)).copied();
+        let last = journal().notes.range(p / PAGE + 1, p / PAGE + 2).first().map(|n| n.1);
         ask_once_end();
         assert!(last.is_some_and(|last| last > copied), "{last:?} is not after {copied}");
         // SAFETY: our allocation.
@@ -5221,3 +5960,255 @@ mod many_askers_tests {
         assert!(!BITS.all(1 << 40, (1 << 40) + 1), "outside the address space");
     }
 }
+
+/// Renderer port #7 ([`port_journal`]): the journal's notes in parts.
+#[cfg(test)]
+mod port7_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    use windows_sys::Win32::System::Memory::*;
+
+    fn rng(seed: &mut u64, n: usize) -> usize {
+        *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (*seed >> 33) as usize % n.max(1)
+    }
+
+    /// The parts of a range, its pieces, and what is read of it a part at a
+    /// time or holding its parts, over ranges across the parts' bounds.
+    #[test]
+    fn parts_pieces_and_ranges_agree() {
+        const P: usize = 1 << SHARD_SHIFT;
+        assert_eq!(shards_of(0, 0), 0);
+        assert_eq!(shards_of(0, 1), 1);
+        assert_eq!(shards_of(P - 1, P + 1), 0b11);
+        assert_eq!(shards_of(63 * P, 65 * P), 1 << 63 | 1);
+        assert_eq!(shards_of(5, 5 + SHARDS * P), u64::MAX);
+        assert_eq!(pieces(P - 2, 2 * P + 3), Some(vec![(P - 2, P), (P, 2 * P), (2 * P, 2 * P + 3)]));
+        assert_eq!(pieces(0, 1 << 40), None);
+        let notes = Notes::new();
+        let mut want: BTreeMap<usize, u64> = BTreeMap::new();
+        let mut seed = 7;
+        for n in 1..4000u64 {
+            let page = rng(&mut seed, 70 * P);
+            let mut held = notes.hold(shards_of_pages([page]), true);
+            held.note(page, WHOLE, n);
+            want.insert(page, n);
+        }
+        for _ in 0..500 {
+            let first = rng(&mut seed, 70 * P);
+            let last = first + rng(&mut seed, 3 * P);
+            let expected: Vec<(usize, u64)> = want.range(first..last).map(|(&p, &w)| (p, w)).collect();
+            assert_eq!(notes.range(first, last), expected, "{first}..{last} a part at a time");
+            assert_eq!(notes.hold(shards_of(first, last), false).range(first, last), expected, "{first}..{last} held");
+        }
+        // The whole space: each part once.
+        assert_eq!(notes.range(0, usize::MAX / 2), want.iter().map(|(&p, &w)| (p, w)).collect::<Vec<_>>());
+        assert_eq!(notes.hold(u64::MAX, false).range(0, usize::MAX / 2).len(), want.len());
+    }
+
+    /// Noted out of order (shared noters' numbers may come in any order): a
+    /// page's note, and its parts', only go up.
+    #[test]
+    fn notes_only_go_up() {
+        let mut s = Shard::new();
+        assert_eq!(s.note(3, WHOLE, 9), 0);
+        assert_eq!(s.note(3, 0b11, 5), 9);
+        assert_eq!(s.written[&3], 9);
+        assert_eq!(s.parts_since(3, 8), WHOLE, "all of it at 9");
+        assert_eq!(s.note(3, 0b100, 12), 9);
+        assert_eq!(s.parts_since(3, 9), 0b100);
+        // An older whole note leaves the newer part as it is.
+        assert_eq!(s.note(3, WHOLE, 10), 12);
+        assert_eq!(s.parts_since(3, 10), 0b100);
+        assert_eq!(s.parts_since(3, 9), WHOLE);
+        assert_eq!(s.written[&3], 12);
+    }
+
+    /// Many threads note pages (holding their parts for writing, a number
+    /// taken under them) and read ranges with a fresh number (holding their
+    /// parts for reading), the parts taken in any mix: every reader sees
+    /// every note of a lower number of its range's pages (what keeps a write
+    /// from being lost), and nobody waits for ever. (A watchdog fails the
+    /// test after 60 s.)
+    #[test]
+    fn a_fresh_number_sees_every_lower_note_and_nobody_deadlocks() {
+        const P: usize = 1 << SHARD_SHIFT;
+        const THREADS: usize = 8;
+        const ROUNDS: usize = 3000;
+        static NOTES: Notes = Notes::new();
+        static NUMBER: AtomicU64 = AtomicU64::new(0);
+        let (done, wait) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            // Per thread: what it noted (page, number) and what it read
+            // (first, last, number, the notes read).
+            type Read = (usize, usize, u64, Vec<(usize, u64)>);
+            let logs: Vec<(Vec<(usize, u64)>, Vec<Read>)> = std::thread::scope(|s| {
+                let all: Vec<_> = (0..THREADS)
+                    .map(|t| {
+                        s.spawn(move || {
+                            let mut seed = t as u64 * 104_729 + 3;
+                            let (mut noted, mut read) = (Vec::new(), Vec::new());
+                            for _ in 0..ROUNDS {
+                                let first = rng(&mut seed, 200 * P);
+                                if rng(&mut seed, 2) == 0 {
+                                    // A few pages, some far apart.
+                                    let mut pages: Vec<usize> =
+                                        (0..1 + rng(&mut seed, 6)).map(|_| first + rng(&mut seed, 3 * P)).collect();
+                                    if rng(&mut seed, 4) == 0 {
+                                        pages.push(rng(&mut seed, 200 * P));
+                                    }
+                                    let mut held = NOTES.hold(shards_of_pages(pages.iter().copied()), true);
+                                    let now = NUMBER.fetch_add(1, Relaxed) + 1;
+                                    for &p in &pages {
+                                        held.note(p, WHOLE, now);
+                                        noted.push((p, now));
+                                    }
+                                } else {
+                                    let last = first + 1 + rng(&mut seed, 3 * P);
+                                    let held = NOTES.hold(shards_of(first, last), false);
+                                    let now = NUMBER.fetch_add(1, Relaxed) + 1;
+                                    read.push((first, last, now, held.range(first, last)));
+                                }
+                            }
+                            (noted, read)
+                        })
+                    })
+                    .collect();
+                all.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+            let mut by_page: std::collections::HashMap<usize, Vec<u64>> = Default::default();
+            for (noted, _) in &logs {
+                for &(p, n) in noted {
+                    by_page.entry(p).or_default().push(n);
+                }
+            }
+            by_page.values_mut().for_each(|v| v.sort_unstable());
+            let mut checked = 0;
+            for (_, read) in &logs {
+                for (first, last, now, seen) in read {
+                    let seen: std::collections::HashMap<usize, u64> = seen.iter().copied().collect();
+                    for (&p, ns) in by_page.iter().filter(|(p, _)| (*first..*last).contains(*p)) {
+                        // The highest note below the reader's number.
+                        let below = ns.partition_point(|n| n < now);
+                        if below > 0 {
+                            let wanted = ns[below - 1];
+                            let got = seen.get(&p).copied().unwrap_or(0);
+                            assert!(got >= wanted, "page {p}: read {got} with number {now}, note {wanted} missed");
+                            checked += 1;
+                        }
+                    }
+                }
+            }
+            assert!(checked > 1000, "only {checked} checks");
+            done.send(()).unwrap();
+        });
+        wait.recv_timeout(std::time::Duration::from_secs(60)).expect("the parts' holders deadlocked (or a check failed)");
+    }
+
+    /// The journal's functions themselves, with the switch on in all threads
+    /// and in every other one (as in an A/B run): writers and askers of one
+    /// region; a submission's one asking standing over another region, its
+    /// thread writing there (told with `wrote` or found by its asking), and
+    /// other threads asking about that region meanwhile. Whoever wrote a page
+    /// before asking is told of that write.
+    #[test]
+    fn no_write_is_lost_with_port_7() {
+        askers_and_a_submission(1);
+        askers_and_a_submission(2);
+    }
+
+    /// `port`: 1, renderer port #7 on in all threads; 2, in every other.
+    fn askers_and_a_submission(port: u8) {
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        const PAGES: usize = 48;
+        const HALF: usize = PAGES / 2;
+        const THREADS: usize = 6;
+        // SAFETY: a reservation of our own, freed at the end.
+        let at = unsafe {
+            VirtualAlloc(std::ptr::null(), PAGES * PAGE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE)
+        } as usize;
+        assert!(at != 0 && at.is_multiple_of(PAGE));
+        let shared_before = PORT7[P7_SHARED_NOTES].load(Relaxed);
+        let skipped_before = PORT7[P7_SKIPPED].load(Relaxed);
+        std::thread::scope(|s| {
+            // Writers and askers of the first half.
+            for t in 0..THREADS {
+                s.spawn(move || {
+                    PORT_JOURNAL_IN_TEST.set(port == 1 || t % 2 == 0);
+                    let mut last = [0u64; HALF];
+                    let mut seed = t as u64 * 7919 + 1;
+                    for _ in 0..2500 {
+                        let page = rng(&mut seed, HALF);
+                        let from = page - rng(&mut seed, page.min(8) + 1);
+                        let to = page + 1 + rng(&mut seed, (HALF - page).min(8));
+                        // SAFETY: committed memory of ours.
+                        unsafe { ((at + page * PAGE + t * 8) as *mut u64).write_volatile(1) };
+                        let (now, written) = writes(at + from * PAGE, at + to * PAGE, false).expect("write-watched");
+                        let number = written.iter().find(|w| w.0 == at / PAGE + page).map_or(0, |w| w.1);
+                        assert!(number > last[page], "page {page}: {number} is not after {}", last[page]);
+                        for l in &mut last[from..to] {
+                            *l = now;
+                        }
+                        // Now and then a no-op of the standing asking's.
+                        if rng(&mut seed, 16) == 0 {
+                            wrote(at + page * PAGE, 8);
+                            ask_ahead_done();
+                        }
+                    }
+                });
+            }
+            // Askers of the second half that write nothing there: they take
+            // the kernel's answers from the submission's thread.
+            for t in 0..2 {
+                s.spawn(move || {
+                    PORT_JOURNAL_IN_TEST.set(port == 1 || t == 0);
+                    let mut seed = t as u64 * 31 + 5;
+                    for _ in 0..3000 {
+                        let page = HALF + rng(&mut seed, HALF);
+                        let to = (page + 1 + rng(&mut seed, 4)).min(PAGES);
+                        let _ = writes(at + page * PAGE, at + to * PAGE, false);
+                    }
+                });
+            }
+            // The submission: writes pages of the second half, asks once over
+            // all of it, writes more and tells `wrote`, reads everything from
+            // the standing asking, ends it.
+            s.spawn(move || {
+                let mut last = [0u64; HALF];
+                let mut seed = 99;
+                for round in 0..400 {
+                    PORT_JOURNAL_IN_TEST.set(port == 1 || round % 2 == 0);
+                    let before: Vec<usize> = (0..3).map(|_| rng(&mut seed, HALF)).collect();
+                    for &p in &before {
+                        // SAFETY: committed memory of ours.
+                        unsafe { ((at + (HALF + p) * PAGE) as *mut u64).write_volatile(round) };
+                    }
+                    let ranges: Vec<(usize, usize)> =
+                        (0..4).map(|k| (at + (HALF + k * 6) * PAGE, at + (HALF + k * 6 + 6) * PAGE)).collect();
+                    ask_once(&ranges);
+                    let told = rng(&mut seed, HALF);
+                    // SAFETY: committed memory of ours.
+                    unsafe { ((at + (HALF + told) * PAGE + 64) as *mut u64).write_volatile(round) };
+                    wrote(at + (HALF + told) * PAGE + 64, 8);
+                    let mut read: Vec<usize> = before.iter().copied().chain([told]).collect();
+                    read.sort_unstable();
+                    read.dedup();
+                    for p in read {
+                        let (now, written) =
+                            writes(at + (HALF + p) * PAGE, at + (HALF + p + 1) * PAGE, false).expect("write-watched");
+                        let number = written.iter().find(|w| w.0 == at / PAGE + HALF + p).map_or(0, |w| w.1);
+                        assert!(number > last[p], "round {round}, page {p}: {number} is not after {}", last[p]);
+                        last[p] = now;
+                    }
+                    ask_ahead_done();
+                    ask_once_end();
+                }
+            });
+        });
+        assert!(PORT7[P7_SHARED_NOTES].load(Relaxed) > shared_before, "the shared notings ran");
+        assert!(PORT7[P7_SKIPPED].load(Relaxed) > skipped_before, "needless takings alone were left out");
+        // SAFETY: the reservation made above.
+        unsafe { VirtualFree(at as *mut _, 0, MEM_RELEASE) };
+    }
+}
+
