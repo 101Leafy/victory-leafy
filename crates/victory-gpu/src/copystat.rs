@@ -349,11 +349,20 @@ pub(crate) enum C {
     SettleTablesNs,
     SettleResultsNs,
     SettleListsNs,
+    /// The submission lock held by others than the submitting thread: the
+    /// late thread's settle once the card is done (`WHY_CARD_DONE`), and
+    /// `settle_now` (a present, a fence, descriptor slots run out).
+    SubmitLockDoneNs,
+    SubmitLockSettleNs,
+    /// Read-back buffers: the wait for the pool's lock, and the making of
+    /// the ones the pool had none idle for.
+    ReadBackPoolNs,
+    ReadBacksMadeNs,
 }
-const COUNTERS: usize = 192;
+const COUNTERS: usize = 256;
 
 /// The counters' names, in the order of [`C`], for the frame recorder's columns.
-pub(crate) const NAMES: [&str; 189] = [
+pub(crate) const NAMES: [&str; 193] = [
     "Submissions", "Copies", "CopyBytes", "Refreshes", "RefreshBytes", "Skipped", "SkippedBytes", "Runs",
     "RunUs", "Queries", "QueryUs", "MoveUs", "Unmapped", "Watches", "WatchUs", "Checked", "Unchanged",
     "Fallbacks", "GuardFaults", "TexWatched", "TexHashed", "TexChanged", "TexHot", "Frames", "RecordCalls",
@@ -388,6 +397,8 @@ pub(crate) const NAMES: [&str; 189] = [
     "HeapTexDueNs", "HeapTexLoopNs", "HeapTexLooks", "HeapTexCheckNs", "HeapTexMappedNs", "HeapTexSameNs",
     "HeapTexUploadNs",
     "SettleTablesNs", "SettleResultsNs", "SettleListsNs",
+    "SubmitLockDoneNs", "SubmitLockSettleNs",
+    "ReadBackPoolNs", "ReadBacksMadeNs",
 ];
 /// One of some sets of counters, each in lines of the processor's memory of
 /// its own: a set for all threads had them wait for each other's lines at
@@ -1068,6 +1079,19 @@ fn log_memory() {
     {
         let [textures, staging] = crate::pool::memory();
         tracing::info!("memory in blocks (VICTORY_TEXTURE_POOL=0 turns them off): {textures} MB of textures, {staging} MB of their staging buffers");
+        let (blocks, free, let_go, fullest) = crate::pool::fill();
+        tracing::info!(
+            "texture blocks by how much is taken (VICTORY_POOL_FULLEST={}): {} empty, {} under a quarter with {} MB free, {} under half with {} MB free, {} half or more with {} MB free; {} let go so far",
+            u8::from(fullest),
+            blocks[0],
+            blocks[1],
+            free[1],
+            blocks[2],
+            free[2],
+            blocks[3],
+            free[3],
+            let_go
+        );
     }
     let targets = crate::resource::targets_census();
     tracing::info!(
@@ -1085,6 +1109,32 @@ fn log_memory() {
         targets[8],
         mb(targets[9]),
     );
+    {
+        use std::sync::atomic::Ordering::Relaxed;
+        let gone = &crate::resource::UNMAPPED_GONE;
+        tracing::info!(
+            "host copies of placed textures let go 1.5 s after their title memory was not mapped (VICTORY_SWEEP_UNMAPPED=0: as the rest), since the start: {} of {:.0} MB, {} title textures asked about",
+            gone[0].load(Relaxed),
+            mb(gone[1].load(Relaxed)),
+            gone[2].load(Relaxed)
+        );
+    }
+    {
+        let sides = crate::shadow::card_sides_census();
+        tracing::info!(
+            "the CPU's sides of copies in the card's memory, as big as their card sides: {} written by shaders {:.0} MB, {} sending changed dwords only {:.0} MB, {} passing title memory on {:.0} MB, of them nothing sent for 10 s {} {:.0} MB, for 60 s {} {:.0} MB",
+            sides[0],
+            mb(sides[1]),
+            sides[2],
+            mb(sides[3]),
+            sides[4],
+            mb(sides[5]),
+            sides[6],
+            mb(sides[7]),
+            sides[8],
+            mb(sides[9])
+        );
+    }
     tracing::info!(
         "memory let go since the start: {} windows outside buffers {:.0} MB, {} staging buffers \
          {:.0} MB; of the windows alive, {:.0} MB lie between the lowest and highest address \
@@ -1486,6 +1536,31 @@ pub(crate) fn log(frames: f64) {
     tracing::info!(
         "guards over several views of a page, since the start: {together} blocks guarded with their other views, \
          {written} views opened by a write through another, {mapped} ranges opened because a view of them was mapped"
+    );
+    let [runs, in_runs, one_by_one] =
+        [0, 1, 2].map(|n| crate::watch::OPENS[n].load(std::sync::atomic::Ordering::Relaxed));
+    tracing::info!(
+        "guarded blocks opened, since the start: {runs} runs with one call each, {in_runs} blocks in them; {one_by_one} blocks one call each"
+    );
+    let [loose, to_lock, taken] =
+        [0, 1, 2].map(|n| crate::watch::LOOSE_OPENS[n].load(std::sync::atomic::Ordering::Relaxed));
+    tracing::info!(
+        "write faults that opened their block with no lock (VICTORY_LOOSE_FAULTS=0 for none), since the start: {loose}; \
+         {to_lock} went on to the lock; {taken} taken into the notes after"
+    );
+    let [runs, blocks, reopened, failed] =
+        [0, 1, 2, 3].map(|n| crate::watch::LATER[n].load(std::sync::atomic::Ordering::Relaxed));
+    tracing::info!(
+        "guarded runs made read-only with the guards' lock let go (VICTORY_PROTECT_LATER=0 for none), since the start: \
+         {runs} runs, {blocks} blocks; {reopened} blocks opened meanwhile and made writable again; \
+         {failed} runs guarded under the lock after"
+    );
+    let [blocks, bytes, freed] =
+        [0, 1, 2].map(|n| crate::watch::GRAPHICS_BLOCKS[n].load(std::sync::atomic::Ordering::Relaxed));
+    tracing::info!(
+        "graphics blocks given write-watched memory of their own (VICTORY_XMEM_WATCHED=0 for none), since the start: \
+         {blocks} blocks, {} MB; {freed} given back",
+        bytes >> 20
     );
     tracing::info!(
         "waits for the write trackers' locks per frame, all threads (number, time): {}",

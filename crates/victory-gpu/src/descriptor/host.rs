@@ -112,6 +112,12 @@ impl Made {
 }
 
 pub(crate) struct HostHeap {
+    /// Its number, never another heap's in the run: what is kept for it
+    /// elsewhere is not found by a heap made later at its address (codec_d
+    /// 18bdf7932).
+    pub(crate) serial: u64,
+    /// The frame of its last heap pass ([`crate::draw`]'s `heap_buffers`).
+    pub(crate) buffer_frame: std::sync::atomic::AtomicU64,
     pub(crate) heap: ID3D12DescriptorHeap,
     cpu: usize,
     step: u32,
@@ -424,6 +430,49 @@ fn neutral_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<ID3D12Res
 
 static FLIPS: Mutex<Vec<Flip>> = Mutex::new(Vec::new());
 
+/// Deferred slot flips recorded into an open or not-yet-submitted command
+/// list (`HostHeap::flip`), tracked so a one-shot decoration bake draw can
+/// promote them out of the `neutral()` gray stand-in before sampling them.
+pub(crate) struct PendingListFlip {
+    id: u64,
+    pub(crate) origin: (usize, u64),
+    flip: Flip,
+}
+
+impl PendingListFlip {
+    pub(crate) fn index(&self) -> u32 {
+        self.flip.index
+    }
+
+    pub(crate) fn handle(&self) -> u64 {
+        self.flip.handle
+    }
+
+    pub(crate) fn key(&self) -> u64 {
+        self.flip.key
+    }
+}
+
+static NEXT_PENDING_FLIP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+static PENDING_LIST_FLIPS: Mutex<Vec<PendingListFlip>> = Mutex::new(Vec::new());
+static PENDING_LIST_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn take_pending_list_flip(id: u64) -> Option<Flip> {
+    if PENDING_LIST_COUNT.load(std::sync::atomic::Ordering::Acquire) == 0 {
+        return None;
+    }
+    let mut pending = PENDING_LIST_FLIPS.lock().unwrap_or_else(|e| e.into_inner());
+    let pos = pending.iter().position(|p| p.id == id)?;
+    let entry = pending.swap_remove(pos);
+    PENDING_LIST_COUNT.store(pending.len(), std::sync::atomic::Ordering::Release);
+    Some(entry.flip)
+}
+
+fn remove_pending_list_flip(id: u64) {
+    let _ = take_pending_list_flip(id);
+}
+
+
 /// Makes the slots whose new texture's upload has run
 /// ([`HostHeap::texture_slots_flip`]); on any thread. Not if the heap is at
 /// something else: the next texture pass does.
@@ -712,6 +761,11 @@ impl Spans {
 /// pass last took the ranges ([`page_written`]). Kept apart from
 /// [`REMAPPED`] so that what such writes do is counted by itself.
 static PAGE_WRITTEN: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
+/// With `VICTORY_BAKE_SYNC=1` and `VICTORY_PAGE_WRITES` bit 2 off, the
+/// ranges of [`PAGE_WRITTEN`] kept for the next one-shot bake draw
+/// ([`HostHeap::texture_slots_bake_written`]): it sees bytes streamed in
+/// since at once, other frames leave them as they are.
+static BAKE_PAGE_WRITTEN: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
 
 /// Since the start: such ranges kept for a pass; ranges dropped because no
 /// pass took them; slots of placed textures that held bytes of them when a
@@ -1197,6 +1251,12 @@ pub(crate) fn device_removed() -> Option<String> {
 pub(crate) static PLACED_TEXTURE_SLOTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub(crate) static OBJECT_TEXTURE_SLOTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// The word the table of strides holds for `view`: [`view_stride`] and
+/// [`view_kind`].
+fn view_stride_word(view: &View) -> u32 {
+    view_stride(view).unwrap_or(0) | view_kind(view)
+}
+
 /// Bytes per element of a buffer view, as the console's descriptor holds
 /// them for indexed reads (structured: the stride; raw: 1, the index is the
 /// byte; typed: the format's); `None` if `view` is not a buffer view.
@@ -1653,7 +1713,10 @@ impl HostHeap {
                 Some((buffer, gpu, data as usize))
             })
             .flatten();
+        static SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let h = HostHeap {
+            serial: SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            buffer_frame: std::sync::atomic::AtomicU64::new(u64::MAX),
             heap,
             cpu,
             step,
@@ -1866,7 +1929,7 @@ impl HostHeap {
     pub(crate) fn texture_news(&self) -> (u64, bool) {
         let writes = self.textures.lock().unwrap_or_else(|e| e.into_inner()).writes;
         let noted = |ranges: &Mutex<Vec<(u64, u64)>>| !ranges.lock().unwrap_or_else(|e| e.into_inner()).is_empty();
-        (writes, noted(&REMAPPED) || noted(&PAGE_WRITTEN))
+        (writes, noted(&REMAPPED) || noted(&PAGE_WRITTEN) || noted(&BAKE_PAGE_WRITTEN))
     }
 
     /// Every title slot of the queue that is due at `frame`, and whether
@@ -2037,7 +2100,46 @@ impl HostHeap {
         if let AfterWrite::Settle(now) = then {
             due += self.slots_settled(frame, now, quiet);
         }
+        if matches!(then, AfterWrite::Leave) && !ranges.is_empty() && crate::draw::bake_sync() {
+            let mut kept = BAKE_PAGE_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+            kept.extend(ranges);
+            if kept.len() > 256 {
+                join(&mut kept);
+                const MOST: usize = 1 << 14;
+                if kept.len() > MOST {
+                    let drop_n = kept.len() - MOST;
+                    kept.drain(..drop_n);
+                }
+            }
+        }
         due
+    }
+
+    /// Wakes uploaded placed-texture slots touched by recent physical-page
+    /// writes (DirectStorage completions) immediately (`due = frame`) right
+    /// before a one-shot ped/decoration bake draw.
+    pub(crate) fn texture_slots_bake_written(&self, frame: u64) -> usize {
+        let mut ranges = std::mem::take(&mut *BAKE_PAGE_WRITTEN.lock().unwrap_or_else(|e| e.into_inner()));
+        if ranges.is_empty() {
+            return 0;
+        }
+        join(&mut ranges);
+        let mut slots: Vec<u32> = {
+            let placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
+            ranges.iter().flat_map(|&(start, end)| placed.slots_holding(start, end)).collect()
+        };
+        if slots.is_empty() {
+            return 0;
+        }
+        slots.sort_unstable();
+        slots.dedup();
+        slots.retain(|&slot| !self.tabled_lately(slot, frame));
+        let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+        slots.retain(|slot| textures.slots.get(slot).is_none_or(|w| w.mapped > 0 || w.checked.2 != 0));
+        for &slot in &slots {
+            textures.changed(slot, frame, frame);
+        }
+        slots.len()
     }
 
     /// [`HostHeap::texture_slots_page_written`] for `ranges` (start, end):
@@ -2363,6 +2465,7 @@ impl HostHeap {
     /// reads the table's dynamic slots).
     pub(crate) fn mirror_after(&self, list: &crate::host::HostList, index: u32, handle: u64) {
         if show_after()
+            && !(crate::texture::BAKING.get() && crate::draw::bake_sync())
             && index < self.count
             && !self.texture_slot_made_from(index, handle)
             && let Some(view) = super::view(handle)
@@ -2378,11 +2481,144 @@ impl HostHeap {
 
     fn flip(&self, list: &crate::host::HostList, index: u32, handle: u64, late: Option<u64>) {
         let (heap, key) = (std::ptr::from_ref(self) as usize, record_key(handle));
+        if !crate::draw::bake_sync() {
+            list.defer_host(move || {
+                let after = crate::host::submissions().0;
+                let flip = Flip { after, heap, index, handle, key, late };
+                FLIPS.lock().unwrap_or_else(|e| e.into_inner()).push(flip);
+            });
+            return;
+        }
+        use std::sync::atomic::Ordering::{Relaxed, Release};
+        let id = NEXT_PENDING_FLIP.fetch_add(1, Relaxed);
+        let origin = (std::ptr::from_ref(list) as usize, list.epoch());
+        {
+            let mut pending = PENDING_LIST_FLIPS.lock().unwrap_or_else(|e| e.into_inner());
+            pending.push(PendingListFlip { id, origin, flip: Flip { after: 0, heap, index, handle, key, late } });
+            PENDING_LIST_COUNT.store(pending.len(), Release);
+        }
+        struct PendingGuard(u64);
+        impl PendingGuard {
+            fn id(&self) -> u64 {
+                self.0
+            }
+        }
+        impl Drop for PendingGuard {
+            fn drop(&mut self) {
+                remove_pending_list_flip(self.0);
+            }
+        }
+        let guard = PendingGuard(id);
         list.defer_host(move || {
-            let after = crate::host::submissions().0;
-            let flip = Flip { after, heap, index, handle, key, late };
+            // A method call, so the closure takes the whole guard and not
+            // only `guard.0`.
+            let Some(mut flip) = take_pending_list_flip(guard.id()) else {
+                return;
+            };
+            flip.after = crate::host::submissions().0;
             FLIPS.lock().unwrap_or_else(|e| e.into_inner()).push(flip);
         });
+    }
+
+
+    /// Whether any deferred slot flip or view remake for this heap requires
+    /// settling in-flight GPU submissions before exposing real textures to a
+    /// one-shot decoration bake draw.
+    pub(crate) fn needs_gpu_settle_for_bake(&self) -> bool {
+        let own = std::ptr::from_ref(self) as usize;
+        let finished = crate::host::submissions().1;
+        if PENDING_LIST_COUNT.load(std::sync::atomic::Ordering::Acquire) > 0 {
+            let pending = PENDING_LIST_FLIPS.lock().unwrap_or_else(|e| e.into_inner());
+            if pending.iter().any(|p| p.flip.heap == own) {
+                return true;
+            }
+        }
+        {
+            let flips = FLIPS.lock().unwrap_or_else(|e| e.into_inner());
+            if flips.iter().any(|f| f.heap == own && f.after > finished) {
+                return true;
+            }
+        }
+        let after = RESHOWN_AFTER.lock().unwrap_or_else(|e| e.into_inner());
+        after.iter().any(|&(at, _)| at > finished)
+    }
+
+    /// Drains deferred flips still sitting in unsubmitted command lists for
+    /// this heap so a decoration bake can mirror them out of `neutral()`.
+    /// Entries that cannot be promoted yet (unmapped memory or deferred
+    /// staging) must be returned via [`HostHeap::restore_pending_list_flip`].
+    pub(crate) fn take_pending_list_flips(&self) -> Vec<PendingListFlip> {
+        if PENDING_LIST_COUNT.load(std::sync::atomic::Ordering::Acquire) == 0 {
+            return Vec::new();
+        }
+        let own = std::ptr::from_ref(self) as usize;
+        let mut pending = PENDING_LIST_FLIPS.lock().unwrap_or_else(|e| e.into_inner());
+        let (mine, rest): (Vec<PendingListFlip>, Vec<PendingListFlip>) =
+            pending.drain(..).partition(|p| p.flip.heap == own);
+        *pending = rest;
+        PENDING_LIST_COUNT.store(pending.len(), std::sync::atomic::Ordering::Release);
+        mine
+    }
+
+    /// Re-queues an unpromoted deferred flip drained by
+    /// [`HostHeap::take_pending_list_flips`] so its originating command list
+    /// still flips it out of `neutral()` once submitted.
+    pub(crate) fn restore_pending_list_flip(&self, item: PendingListFlip) {
+        let mut pending = PENDING_LIST_FLIPS.lock().unwrap_or_else(|e| e.into_inner());
+        pending.push(item);
+        PENDING_LIST_COUNT.store(pending.len(), std::sync::atomic::Ordering::Release);
+    }
+
+    /// Whether title descriptor slot `handle` still holds record `key`.
+    pub(crate) fn slot_still_at(&self, handle: u64, key: u64) -> bool {
+        key != 0 && record_key(handle) == key
+    }
+
+    /// Looks up `(view, key)` for slot `index` prior to a synchronous bake
+    /// upload without replacing its current host descriptor with `neutral()`;
+    /// [`HostHeap::publish_uploaded_slot`] exposes the real descriptor and
+    /// updates `Spans`/stride tracking once the GPU copy finishes.
+    pub(crate) fn prepare_bake_slot(&self, index: u32, handle: u64) -> Option<(View, u64)> {
+        if index >= self.count {
+            return None;
+        }
+        let key = record_key(handle);
+        let view = (key != 0).then(|| view_at(key as u32, (key >> 32) as u32)).flatten()?;
+        Some((view, key))
+    }
+
+    /// Exposes the real host descriptor for slot `index` after its synchronous
+    /// bake upload has completed on the GPU, updating `Spans`/stride tracking
+    /// without re-queuing the slot in `TextureQueue`.
+    pub(crate) fn publish_uploaded_slot(&self, index: u32, handle: u64, key: u64) -> bool {
+        if index >= self.count || key == 0 {
+            return false;
+        }
+        let (published, stale) = {
+            let _made = self.made.lock(index);
+            if self.made.get(index) == Some(key) {
+                return false;
+            }
+            if record_key(handle) != key {
+                return false;
+            }
+            let Some(view) = view_at(key as u32, (key >> 32) as u32) else {
+                return false;
+            };
+            let stale = self.note_buffer(index, Some(&view), true);
+            if let Some(kept) = make(&view, self.at(index)) {
+                self.put(index);
+                self.quick_is(index, 0);
+                self.clear_twin(index);
+                self.made.set(index, key);
+                self.keep(index, kept);
+                (true, stale)
+            } else {
+                (false, stale)
+            }
+        };
+        self.unmake_stale(index, stale);
+        published
     }
 
     /// Makes the slots whose new view's upload has run
@@ -2491,6 +2727,7 @@ impl HostHeap {
         }
         self.put(index);
         self.clear_twin(index);
+        self.write_stride(index, 0);
         self.keep(index, None);
     }
 
@@ -2694,13 +2931,7 @@ impl HostHeap {
         }
         let stride = view.and_then(view_stride);
         let kind = view.map_or(0, view_kind);
-        if let Some((_, _, data)) = &self.strides
-            && index < victory_shader::emit::SLOT_STRIDES_COUNT
-        {
-            // SAFETY: inside the mapping; shaders read it while we write (a
-            // dword, either value is one the slot had).
-            unsafe { (*data as *mut u32).add(index as usize).write_volatile(stride.unwrap_or(0) | kind) };
-        }
+        self.write_stride(index, stride.unwrap_or(0) | kind);
         let was = if stride.is_some() {
             self.buffers.put(index);
             true
@@ -2716,6 +2947,26 @@ impl HostHeap {
             }
         }
         stale
+    }
+
+    /// Writes `word` for slot `index` in the table of strides.
+    fn write_stride(&self, index: u32, word: u32) {
+        if let Some((_, _, data)) = &self.strides
+            && index < victory_shader::emit::SLOT_STRIDES_COUNT
+        {
+            // SAFETY: inside the mapping; shaders read it while we write (a
+            // dword, either value is one the slot had).
+            unsafe { (*data as *mut u32).add(index as usize).write_volatile(word) };
+        }
+    }
+
+    /// [`HostHeap::write_stride`] for a dynamic slot, which a shader reads
+    /// through its tables (`victory_shader::emit::SLOT_TABLE_STRIDES`); the
+    /// title's own slots have theirs from [`HostHeap::note_buffer`].
+    fn dynamic_stride(&self, index: u32, word: u32) {
+        if index >= self.count {
+            self.write_stride(index, word);
+        }
     }
 
     /// Gives back `n` dynamic slots from `first` (an index [`dynamic`]
@@ -2744,6 +2995,7 @@ impl HostHeap {
         }
         self.put(index);
         self.twin_made(index, kept.is_some() && twinned(view));
+        self.dynamic_stride(index, if kept.is_some() { view_stride_word(view) } else { 0 });
         self.keep(index, kept.flatten());
     }
 
@@ -2776,13 +3028,14 @@ impl HostHeap {
                 }
                 let twin = twinned(&view);
                 let kept = make_twinned(&view, views.slot(at), Some(views.slot(at + 1)))?;
+                let stride = view_stride_word(&view);
                 let listed = Listed {
                     kind: crate::draw::view_kind(&view),
                     texture: is_texture_view(&view),
                     ready: (0, 0, false),
                     tabled: None,
                 };
-                views.made.insert(words, ListView { view, at, twin, kept, listed });
+                views.made.insert(words, ListView { view, at, twin, stride, kept, listed });
             }
             let made = &views.made[&words];
             self.copy_from(index, views.slot(made.at));
@@ -2792,6 +3045,7 @@ impl HostHeap {
             } else {
                 self.clear_twin(index);
             }
+            self.dynamic_stride(index, made.stride);
             self.keep(index, made.kept.clone());
             Some(made.listed)
         })
@@ -2816,6 +3070,7 @@ impl HostHeap {
         } else {
             null_view(self.at(index));
             self.put(index);
+            self.dynamic_stride(index, 0);
         }
         self.clear_twin(index);
         self.keep(index, None);
@@ -2902,6 +3157,7 @@ impl HostHeap {
         self.put(index);
         // (Bound by its handle, not read by index.)
         self.clear_twin(index);
+        self.dynamic_stride(index, 1);
         self.keep(index, Some(buffer.clone()));
     }
 
@@ -2911,6 +3167,7 @@ impl HostHeap {
         null_buffer_view(self.at(index));
         self.put(index);
         self.clear_twin(index);
+        self.dynamic_stride(index, 0);
         self.keep(index, None);
     }
 
@@ -2945,6 +3202,7 @@ impl HostHeap {
         };
         self.put(index);
         self.clear_twin(index);
+        self.dynamic_stride(index, 1);
         self.keep(index, Some(buffer.clone()));
     }
 
@@ -2974,6 +3232,7 @@ impl HostHeap {
         };
         self.put(index);
         self.clear_twin(index);
+        self.dynamic_stride(index, 0);
         self.keep(index, None);
     }
 
@@ -3033,6 +3292,7 @@ impl HostHeap {
         self.twin_made(index, twin.is_some());
         // After the descriptor: what it showed is let go when nothing shows
         // it any more.
+        self.dynamic_stride(index, 0);
         self.keep(index, holds.then(|| buffer.clone()));
     }
 
@@ -5764,6 +6024,72 @@ mod tests {
         heap.release(last, 1);
         assert_eq!(heap.dynamic(2), None);
     }
+
+
+    #[test]
+    fn dynamic_slots_populate_and_clear_stride_table() {
+        use victory_shader::emit::{VIEW_INTEGER, VIEW_SIGNED};
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return; // no host GPU
+        };
+        let Some((_, _, data)) = heap.strides else {
+            panic!("view heap should allocate strides table");
+        };
+        let read_stride = |slot: u32| -> u32 {
+            // SAFETY: inside `SLOT_STRIDES_COUNT` mapping of `heap.strides`.
+            unsafe { *(data as *const u32).add(slot as usize) }
+        };
+        let memory = vec![0u64; 1 << 11];
+        let addr = (memory.as_ptr() as u64).next_multiple_of(4096);
+        let placed_typed = |uav: bool, dxgi_fmt: u32, elems: u32| {
+            let resource: [u32; 14] = [1, 0, 0, 0, 4096, 0, 1, 1 | 1 << 16, 0, 1, 0, 1, 0, 0];
+            let mut desc = [0u32; 16];
+            // [format, dim=1 (buffer), mapping/pad, ..., num_elements @6, stride @7, flags @8]
+            let words = if uav {
+                [dxgi_fmt, 1, 0, 0, elems, 0, 0, 0, 0, 0]
+            } else {
+                [dxgi_fmt, 1, 5768, 0, 0, 0, elems, 0, 0, 0]
+            };
+            desc[..10].copy_from_slice(&words);
+            (desc[10], desc[11]) = (addr as u32, (addr >> 32) as u32);
+            View::Placed(uav, resource, desc)
+        };
+
+        let s0 = heap.dynamic(4).unwrap();
+        // R16G16B16A16_UINT (12): 8 bytes + VIEW_INTEGER
+        let u16x4 = placed_typed(true, 12, 64);
+        heap.make_at(s0, &u16x4);
+        assert_eq!(read_stride(s0), 8 | VIEW_INTEGER);
+
+        // R16_SINT (59): 2 bytes + VIEW_INTEGER | VIEW_SIGNED
+        let s16 = placed_typed(false, 59, 64);
+        heap.make_at(s0 + 1, &s16);
+        assert_eq!(read_stride(s0 + 1), 2 | VIEW_INTEGER | VIEW_SIGNED);
+
+        // R16G16B16A16_FLOAT (10): 8 bytes, no integer bits
+        let f16x4 = placed_typed(true, 10, 64);
+        heap.make_at(s0 + 2, &f16x4);
+        assert_eq!(read_stride(s0 + 2), 8);
+
+        // Clearing / nulling / raw views overwrite stale bits cleanly.
+        heap.make_null(s0);
+        assert_eq!(read_stride(s0), 0);
+        heap.null_raw_at(s0 + 1);
+        assert_eq!(read_stride(s0 + 1), 0);
+        heap.null_raw_uav_at(s0 + 2);
+        assert_eq!(read_stride(s0 + 2), 0);
+
+        // `make_listed` (both cold creation and cached copy hit) must populate strides.
+        let mut slot_mem = [0u32; 8];
+        crate::descriptor::record(slot_mem.as_mut_ptr() as u64, u16x4);
+        let rec = [slot_mem[0], slot_mem[1], slot_mem[2]];
+        assert!(heap.make_listed(0x1234, rec, s0).is_some());
+        assert_eq!(read_stride(s0), 8 | VIEW_INTEGER);
+        heap.make_null(s0 + 3);
+        assert_eq!(read_stride(s0 + 3), 0);
+        assert!(heap.make_listed(0x1234, rec, s0 + 3).is_some());
+        assert_eq!(read_stride(s0 + 3), 8 | VIEW_INTEGER);
+    }
 }
 
 /// What is known of a record a list's tables hold, in that recording of the
@@ -5784,6 +6110,8 @@ struct ListView {
     /// Its descriptor's slot in [`ListViews`]; its raw twin's is the next.
     at: u32,
     twin: bool,
+    /// Its word in the table of strides ([`view_stride_word`]).
+    stride: u32,
     kept: Kept,
     listed: Listed,
 }
@@ -5866,4 +6194,75 @@ pub(crate) fn note_listed(recording: u64, words: [u32; 3], listed: Listed) {
 /// for every table).
 pub(crate) fn list_views() -> bool {
     crate::toggled!("VICTORY_LIST_VIEWS")
+}
+
+#[cfg(test)]
+mod bake_flip_tests {
+    use super::*;
+
+    #[test]
+    fn pending_list_flips_promote_once_and_clean_up() {
+        let heap = 0xdead_beefusize;
+        let id1 = NEXT_PENDING_FLIP.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let id2 = NEXT_PENDING_FLIP.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        {
+            let mut pending = PENDING_LIST_FLIPS.lock().unwrap_or_else(|e| e.into_inner());
+            pending.push(PendingListFlip {
+                id: id1,
+                origin: (1, 1),
+                flip: Flip { after: 0, heap, index: 7, handle: 0, key: 11, late: Some(1) },
+            });
+            pending.push(PendingListFlip {
+                id: id2,
+                origin: (2, 1),
+                flip: Flip { after: 0, heap, index: 8, handle: 0, key: 12, late: Some(1) },
+            });
+            PENDING_LIST_COUNT.store(pending.len(), std::sync::atomic::Ordering::Release);
+        }
+        let taken = take_pending_list_flip(id1).expect("id1 should be present");
+        assert_eq!(taken.index, 7);
+        assert!(take_pending_list_flip(id1).is_none(), "second take must be a no-op");
+        remove_pending_list_flip(id2);
+        assert!(take_pending_list_flip(id2).is_none(), "removed entry must be gone");
+    }
+
+    #[test]
+    fn deferred_flip_closure_keeps_pending_entry_alive_until_called_or_dropped() {
+        let heap = 0xcafe_babeusize;
+        let id1 = NEXT_PENDING_FLIP.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let id2 = NEXT_PENDING_FLIP.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        {
+            let mut pending = PENDING_LIST_FLIPS.lock().unwrap_or_else(|e| e.into_inner());
+            for (id, idx) in [(id1, 10), (id2, 11)] {
+                pending.push(PendingListFlip {
+                    id,
+                    origin: (3, 1),
+                    flip: Flip { after: 0, heap, index: idx, handle: 0, key: 20, late: Some(1) },
+                });
+            }
+            PENDING_LIST_COUNT.store(pending.len(), std::sync::atomic::Ordering::Release);
+        }
+        struct TestGuard(u64);
+        impl TestGuard {
+            fn id(&self) -> u64 {
+                self.0
+            }
+        }
+        impl Drop for TestGuard {
+            fn drop(&mut self) {
+                remove_pending_list_flip(self.0);
+            }
+        }
+        let make_cb = |id: u64| -> Box<dyn Fn() -> Option<u32> + Send + 'static> {
+            let guard = TestGuard(id);
+            Box::new(move || take_pending_list_flip(guard.id()).map(|f| f.index))
+        };
+        let cb1 = make_cb(id1);
+        let cb2 = make_cb(id2);
+        // Must still be present after make_cb returns (guard moved, not dropped).
+        assert_eq!(cb1(), Some(10));
+        assert_eq!(cb1(), None);
+        drop(cb2);
+        assert!(take_pending_list_flip(id2).is_none(), "dropping uncalled closure cleans up entry");
+    }
 }
