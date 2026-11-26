@@ -483,6 +483,24 @@ pub(crate) fn draw_targets(this: This, handles: &[u64], depth: u64) {
     }
 }
 
+/// As [`host_pipeline`], for a draw into render target and depth views of
+/// the formats `bound`: if a bound view has another format than the title's
+/// pipeline declares for its slot (`host::formats_differ`), the host
+/// pipeline of the same shaders and state made for the bound formats
+/// (`make::for_formats`). A draw whose views are as declared pays one
+/// comparison of the nine words.
+#[cfg(windows)]
+pub(crate) fn host_pipeline_for<'a>(this: This, bound: &host::TargetFormats) -> Option<&'a host::HostPipeline> {
+    if this.is_null() {
+        return None;
+    }
+    let p = &pipeline(this).host;
+    if p.formats != *bound && host::formats_differ(&p.formats, bound) {
+        return make::for_formats(p, bound);
+    }
+    make::ready(p)
+}
+
 /// Host pipelines queued and not made yet.
 #[cfg(windows)]
 pub(crate) fn making() -> u64 {
@@ -560,6 +578,7 @@ pub(crate) fn note_drop(this: This) {
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn note_why(why: String) {
     crate::capture::op(0, || format!("DROPPED {why}"));
+    crate::host::panel::log_event(format!("DROP {why}"));
     let mut drops = DROPS.lock().unwrap_or_else(|e| e.into_inner());
     *drops.get_or_insert_with(HashMap::new).entry(why).or_default() += 1;
 }
