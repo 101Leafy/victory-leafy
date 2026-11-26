@@ -6482,7 +6482,8 @@ impl Host {
         let mut text = String::new();
         let mut fault_va = None;
         // SAFETY: the outputs are the runtime's, valid while the device
-        // lives; nodes are walked as linked, histories have their counts.
+        // lives; nodes are walked as linked, histories read as far as they
+        // are mapped (`readable_history`).
         unsafe {
             if let Ok(fault) = dred.GetPageFaultAllocationOutput1()
                 && fault.PageFaultVA != 0
@@ -6543,12 +6544,8 @@ impl Host {
             while let Some(p) = plain.as_ref() {
                 let done = p.pLastBreadcrumbValue.as_ref().copied().unwrap_or(0);
                 if done < p.BreadcrumbCount && !p.pCommandHistory.is_null() {
-                    let history =
-                        std::slice::from_raw_parts(p.pCommandHistory, p.BreadcrumbCount as usize);
-                    text.push_str(&format!(
-                        "; a list stopped at command {done} of {} (op {})",
-                        p.BreadcrumbCount, history[done as usize].0
-                    ));
+                    let history = readable_history(p.pCommandHistory, p.BreadcrumbCount);
+                    text.push_str(&stopped_at(&history, p.BreadcrumbCount, done));
                     let list = p.pCommandList.as_ref().map(|l| l.as_raw());
                     let run = runs.iter().find(|r| Some(r.list.as_raw()) == list);
                     let named = [
@@ -6598,12 +6595,12 @@ impl Host {
                     let markers: Vec<(u32, String)> = Vec::new();
                     #[cfg(not(feature = "diagnostics"))]
                     let _ = fault_va;
-                    if done > 0 {
-                        text.push_str(&in_flight(history, &markers, done as usize));
+                    if done > 0 && (done as usize) < history.len() {
+                        text.push_str(&in_flight(&history, &markers, done as usize));
                     }
                     #[cfg(feature = "diagnostics")]
                     if let Some(indirects) = indirects {
-                        text.push_str(&indirects_around(history, done as usize, &indirects));
+                        text.push_str(&indirects_around(&history, done as usize, &indirects));
                     }
                     // (Without markers a list that stopped midway says what
                     // it may have been at only by what it binds.)
@@ -10496,6 +10493,35 @@ fn indirects_around(history: &[D3D12_AUTO_BREADCRUMB_OP], done: usize, all: &ind
     text
 }
 
+/// The first `count` commands of a breadcrumb node's history, up to the
+/// first page that cannot be read: the runtime's count can run past the
+/// history it committed (a report on an RTX 3070 Ti faulted reading
+/// command 15,360 of a long list).
+fn readable_history(history: *const D3D12_AUTO_BREADCRUMB_OP, count: u32) -> Vec<D3D12_AUTO_BREADCRUMB_OP> {
+    let mut ops = Vec::new();
+    let mut readable = true;
+    // Page by page: the kernel copies a range whole or fails it.
+    for_pieces(history as usize, 4 * count as usize, 4 << 10, |at, n| {
+        let mut piece = vec![D3D12_AUTO_BREADCRUMB_OP(0); n / 4];
+        readable = readable && read(at as *const u8, piece.as_mut_ptr().cast(), n);
+        if readable {
+            ops.extend(piece);
+        }
+    });
+    ops
+}
+
+/// Where a list stopped, from the part of its history that could be read
+/// and the runtime's count of its commands.
+fn stopped_at(history: &[D3D12_AUTO_BREADCRUMB_OP], count: u32, done: u32) -> String {
+    let op = history.get(done as usize).map_or_else(|| "unknown".to_owned(), |op| op.0.to_string());
+    let mut text = format!("; a list stopped at command {done} of {count} (op {op})");
+    if history.len() < count as usize {
+        text.push_str(&format!(", but only its first {} commands can be read", history.len()));
+    }
+    text
+}
+
 fn in_flight(history: &[D3D12_AUTO_BREADCRUMB_OP], markers: &[(u32, String)], done: usize) -> String {
     let barrier = |op: &D3D12_AUTO_BREADCRUMB_OP| *op == D3D12_AUTO_BREADCRUMB_OP_RESOURCEBARRIER;
     let from = history[..done].iter().rposition(barrier).map_or(0, |b| b + 1);
@@ -11510,3 +11536,57 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
     }
 }
 
+#[cfg(test)]
+mod breadcrumbs {
+    use super::{readable_history, stopped_at};
+    use windows::Win32::Graphics::Direct3D12::{
+        D3D12_AUTO_BREADCRUMB_OP, D3D12_AUTO_BREADCRUMB_OP_DISPATCH, D3D12_AUTO_BREADCRUMB_OP_SETMARKER,
+    };
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+    };
+
+    const PAGE: usize = 4 << 10;
+
+    /// The device-removed report of a list whose breadcrumb count runs a
+    /// page past its committed history (as the runtime's did on an RTX
+    /// 3070 Ti): the report takes the commands that are there and says the
+    /// rest cannot be read, instead of faulting.
+    #[test]
+    fn a_history_shorter_than_its_count_is_read_as_far_as_it_is_there() {
+        let op = |i: usize| -> D3D12_AUTO_BREADCRUMB_OP {
+            if i.is_multiple_of(2) { D3D12_AUTO_BREADCRUMB_OP_SETMARKER } else { D3D12_AUTO_BREADCRUMB_OP_DISPATCH }
+        };
+        let committed = PAGE / 4;
+        // SAFETY: a fresh reservation of two pages; the first is committed
+        // and ours to fill.
+        let base = unsafe {
+            let base =
+                VirtualAlloc(std::ptr::null(), 2 * PAGE, MEM_RESERVE, PAGE_NOACCESS).cast::<D3D12_AUTO_BREADCRUMB_OP>();
+            assert!(!base.is_null());
+            assert!(!VirtualAlloc(base.cast(), PAGE, MEM_COMMIT, PAGE_READWRITE).is_null());
+            for i in 0..committed {
+                base.add(i).write(op(i));
+            }
+            base
+        };
+        let count = 2 * committed as u32;
+        let history = readable_history(base, count);
+        assert_eq!(history.len(), committed, "the committed page");
+        assert!(history.iter().enumerate().all(|(i, o)| *o == op(i)), "its commands, in order");
+        assert_eq!(
+            stopped_at(&history, count, 7),
+            "; a list stopped at command 7 of 2048 (op 6), but only its first 1024 commands can be read"
+        );
+        assert_eq!(
+            stopped_at(&history, count, 1500),
+            "; a list stopped at command 1500 of 2048 (op unknown), but only its first 1024 commands can be read"
+        );
+        // A history that is all there reads whole, without the note.
+        let whole = readable_history(base, committed as u32);
+        assert_eq!(whole.len(), committed);
+        assert_eq!(stopped_at(&whole, committed as u32, 7), "; a list stopped at command 7 of 1024 (op 6)");
+        // SAFETY: the reservation made above.
+        assert_ne!(unsafe { VirtualFree(base.cast(), 0, MEM_RELEASE) }, 0);
+    }
+}
