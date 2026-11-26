@@ -183,11 +183,28 @@ pub(crate) enum C {
     /// Asks for memory outside buffers, answered by the windows: the
     /// thread's memory of asks does not hold these.
     LookupLoose,
+    /// List calls translated by threads of ours (`VICTORY_THIN`): the
+    /// nanoseconds of draws, dispatches and indirect commands (and how many),
+    /// of the calls that only set state, of barriers, of copies and clears,
+    /// and of the rest (resets, closes, memory writes and waits).
+    ThinDrawNs,
+    ThinDraws,
+    ThinSetNs,
+    ThinBarrierNs,
+    ThinCopyNs,
+    ThinOtherNs,
+    /// Texture bytes hashed though the guard saw no write: on the texture's
+    /// turn, and while it was due (new, verifying a change, or hot); and
+    /// the bytes of turns passed over as the texture was hashed on its turn
+    /// earlier in the frame.
+    TexHashedTurn,
+    TexHashedHot,
+    TexTurnSkipped,
 }
-const COUNTERS: usize = 96;
+const COUNTERS: usize = 112;
 
 /// The counters' names, in the order of [`C`], for the frame recorder's columns.
-pub(crate) const NAMES: [&str; 96] = [
+pub(crate) const NAMES: [&str; 105] = [
     "Submissions", "Copies", "CopyBytes", "Refreshes", "RefreshBytes", "Skipped", "SkippedBytes", "Runs",
     "RunUs", "Queries", "QueryUs", "MoveUs", "Unmapped", "Watches", "WatchUs", "Checked", "Unchanged",
     "Fallbacks", "GuardFaults", "TexWatched", "TexHashed", "TexChanged", "TexHot", "Frames", "RecordCalls",
@@ -199,11 +216,11 @@ pub(crate) const NAMES: [&str; 96] = [
     "Card8To32", "CardOver32", "CardUnder2Us", "Card2To8Us", "Card8To32Us", "CardOver32Us", "NothingBack",
     "NothingBackUs", "WaitsForGroups", "WaitsForBuffers", "IndirectBounded", "HeapLooked",
     "HeapLookedWritten", "HeapSameAgain", "HeapSelfMarks", "DynamicSlots", "DynamicSteps", "DynamicFull",
-    "FreshAgain",
-    "RefreshUpdates",
-    "RefreshEmpty", "RefreshEmptyUs", "RefreshAgain", "RefreshAgainBytes", "AskRefused", "AskRefusedUs",
-    "AskRefusedAgain", "AskSkipped", "AskAgain", "AskAgainBytes", "GuardAgain", "BackAgainBytes",
-    "RefreshGapBytes", "LookupQuick", "LookupTables", "LookupLoose",
+    "FreshAgain", "RefreshUpdates", "RefreshEmpty", "RefreshEmptyUs", "RefreshAgain", "RefreshAgainBytes",
+    "AskRefused", "AskRefusedUs", "AskRefusedAgain", "AskSkipped", "AskAgain", "AskAgainBytes", "GuardAgain",
+    "BackAgainBytes", "RefreshGapBytes", "LookupQuick", "LookupTables", "LookupLoose", "ThinDrawNs",
+    "ThinDraws", "ThinSetNs", "ThinBarrierNs", "ThinCopyNs", "ThinOtherNs", "TexHashedTurn", "TexHashedHot",
+    "TexTurnSkipped",
 ];
 /// One of some sets of counters, each in lines of the processor's memory of
 /// its own: a set for all threads had them wait for each other's lines at
@@ -514,7 +531,7 @@ mod command_tests {
     #[test]
     fn every_counter_is_named() {
         use super::{C, COUNTERS, NAMES};
-        assert_eq!(C::LookupLoose as usize + 1, NAMES.len());
+        assert_eq!(C::TexTurnSkipped as usize + 1, NAMES.len());
         assert_eq!(NAMES[C::Frames as usize], "Frames");
         assert!(NAMES.len() <= COUNTERS);
     }
