@@ -48,8 +48,10 @@ const MOST: usize = 8 << 20;
 
 /// Since the last frame-rate line: copies at their place, their bytes, those
 /// out of a host copy, texture copies out of one, and fills that took a
-/// copy's bytes ([`forwards`]).
-pub(super) static STATS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+/// copy's bytes ([`forwards`]); copies out of a host copy whose source a
+/// shader of the same submission was declared to write ahead of them, and
+/// those of them a fill took the bytes of ([`count_written_ahead`]).
+pub(super) static STATS: [std::sync::atomic::AtomicU64; 7] = [const { std::sync::atomic::AtomicU64::new(0) }; 7];
 
 /// What the CPU does at submission for a copy at its place in a list.
 pub(super) struct Placed {
@@ -229,6 +231,35 @@ impl Standing {
     fn fill(&self, fill: (usize, usize), src: usize, len: usize) -> Option<Forward> {
         let &(dst, _, copy) = self.0.iter().find(|s| len > 0 && s.0 <= src && src + len <= s.1)?;
         Some(Forward { fill, copy, at: src - dst })
+    }
+}
+
+/// Diagnostics: the copy on the card reads what a shader ahead of it in the
+/// submission put in its source, a fill that took its bytes at submission
+/// does not.
+pub(super) fn count_written_ahead(runs: &[&HostList], forwards: &[Forward]) {
+    if !on() {
+        return;
+    }
+    let mut ahead: Vec<(usize, usize)> = Vec::new();
+    let mut seen = std::collections::HashSet::<(usize, usize), std::hash::BuildHasherDefault<AddressHash>>::default();
+    for (n, list) in runs.iter().enumerate() {
+        for (i, step) in list.deferred().copies.iter().enumerate() {
+            match step {
+                &Step::GpuWrite(_, address, len) => {
+                    if seen.insert((address, len)) {
+                        ahead.push((address, address + len));
+                    }
+                }
+                Step::Placed(p) if p.from.is_none() && ahead.iter().any(|r| r.0 < p.src + p.len && p.src < r.1) => {
+                    STATS[5].fetch_add(1, Ordering::Relaxed);
+                    if forwards.iter().any(|f| f.copy == (n, i)) {
+                        STATS[6].fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                _ => {}
+            }
+        }
     }
 }
 

@@ -5221,13 +5221,15 @@ fn late_line(frames: f64) {
     if place::on() {
         let t: Vec<f64> = place::STATS.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
         tracing::info!(
-            "title buffer copies at their place in the lists, per frame (VICTORY_COPIES_IN_PLACE): {:.1} of {:.1} KB, {:.1} of them out              of what shaders wrote; {:.2} copies into textures out of what shaders wrote; {:.2} fills that took a copy's bytes              (VICTORY_FORWARD_PLACED={})",
+            "title buffer copies at their place in the lists, per frame (VICTORY_COPIES_IN_PLACE): {:.1} of {:.1} KB, {:.1} of them out              of what shaders wrote; {:.2} copies into textures out of what shaders wrote; {:.2} fills that took a copy's bytes              (VICTORY_FORWARD_PLACED={}); {:.2} copies out of what a shader of the same submission was              declared to write ahead of them, {:.2} of them with a fill that took their bytes",
             t[0],
             t[1] / 1024.0,
             t[2],
             t[3],
             t[4],
             u8::from(place::forward_on()),
+            t[5],
+            t[6],
         );
     }
     card_steps::log(frames);
@@ -7811,6 +7813,7 @@ impl Host {
         stage.next("submit: the lists' steps");
         let one_call = late && !parts.is_empty() && join_one_call();
         batch.forwards = place::forwards(&air, runs);
+        place::count_written_ahead(runs, &batch.forwards);
         for (n, list) in runs.iter().enumerate() {
             list.run_deferred(&mut batch, &air, n, |i| own.as_ref().is_some_and(|own| own.takes(list, i)));
             firsts.push(lists.len());
