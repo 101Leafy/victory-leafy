@@ -215,11 +215,11 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
 /// before stayed blended over the whole picture for minutes (run 195).
 /// A wait of seconds once (the pipeline library has it on the next run)
 /// against a picture wrong until the scene ends.
-/// On by default; `VICTORY_PIPELINE_COMPUTE_WAIT=0`: within the budget, as
-/// before.
+/// Off by default until a cold and a warm run show what it costs;
+/// `VICTORY_PIPELINE_COMPUTE_WAIT=1`: on.
 fn compute_waits() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_COMPUTE_WAIT").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_COMPUTE_WAIT").is_some_and(|v| v == "1"))
 }
 
 /// What a frame may spend making compute pipelines for its dispatches
