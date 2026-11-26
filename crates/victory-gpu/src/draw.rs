@@ -404,6 +404,10 @@ pub(crate) struct State {
     root_srv_slots: std::collections::HashMap<(usize, u64), RootSlot>,
     /// Root UAVs bound as one-view tables in this list, likewise.
     root_uav_slots: std::collections::HashMap<(usize, u64), RootSlot>,
+    /// Tables another list made this frame that this one uses as they are
+    /// ([`SharedTables`]): title heap, first dynamic slot; let go when the
+    /// dynamic slots are given back.
+    shared: Vec<(usize, u32)>,
     /// The list ran and its dynamic slots were given back.
     tables_gone: bool,
     /// This recording, for [`crate::descriptor::host::HostHeap::make_listed`]
@@ -415,6 +419,9 @@ impl Drop for State {
     fn drop(&mut self) {
         for &(heap, first, n) in &self.dynamic {
             crate::descriptor::release_dynamic(heap, first, n);
+        }
+        for &(heap, first) in &self.shared {
+            SharedTables::let_go(heap, first);
         }
     }
 }
@@ -428,7 +435,7 @@ impl State {
     /// shortcut: a list the title runs a second time without a reset then
     /// reads slots others may have taken (logged once).
     pub(crate) fn tables_done(&mut self) {
-        if self.tables_gone && self.dynamic.is_empty() {
+        if self.tables_gone && self.dynamic.is_empty() && self.shared.is_empty() {
             return;
         }
         if self.tables_gone {
@@ -437,6 +444,9 @@ impl State {
         }
         for (heap, first, n) in self.dynamic.drain(..) {
             crate::descriptor::release_dynamic(heap, first, n);
+        }
+        for (heap, first) in self.shared.drain(..) {
+            SharedTables::let_go(heap, first);
         }
         self.fresh_tables.clear();
         self.recording = 0;
@@ -3509,6 +3519,32 @@ impl State {
             };
             // Who reads of it, and as what, as far as [`readable`] goes by it.
             let reader = (used.as_ptr() as usize, used.len(), STORES.get(), TESTED_DEPTH.get().0);
+            // What the draw reads of a table made before brought up to date;
+            // whether that read the tested depth target.
+            let bring_up = |selected: &[u32]| {
+                let depth_before = TESTED_DEPTH.get();
+                TESTED_DEPTH.set((depth_before.0, false));
+                for u in entries().filter(|u| u.kind != ResourceType::Cbv) {
+                    let handle = table + u64::from(u.table_offset_dwords) * 4;
+                    if let Some(view) = crate::descriptor::view(handle) {
+                        readable(list, u.kind, &view);
+                    }
+                }
+                for &k in selected {
+                    if entries().any(|u| u.table_offset_dwords / 8 == k) {
+                        continue;
+                    }
+                    let handle = table + u64::from(k) * 32;
+                    if let Some(view) = crate::descriptor::view(handle)
+                        && let Some(kind) = view_kind(&view)
+                    {
+                        readable(list, kind, &view);
+                    }
+                }
+                let depth = TESTED_DEPTH.get().1;
+                TESTED_DEPTH.set((depth_before.0, depth_before.1 || depth));
+                depth
+            };
             if let Some(known) = self.fresh_tables.get_mut(&key) {
                 let first = known.first;
                 // This reader had it brought up to date, and nothing in the
@@ -3524,27 +3560,7 @@ impl State {
                     made.push((slot, first * 32));
                     continue;
                 }
-                let depth_before = TESTED_DEPTH.get();
-                TESTED_DEPTH.set((depth_before.0, false));
-                for u in entries().filter(|u| u.kind != ResourceType::Cbv) {
-                    let handle = table + u64::from(u.table_offset_dwords) * 4;
-                    if let Some(view) = crate::descriptor::view(handle) {
-                        readable(list, u.kind, &view);
-                    }
-                }
-                for k in selected {
-                    if entries().any(|u| u.table_offset_dwords / 8 == k) {
-                        continue;
-                    }
-                    let handle = table + u64::from(k) * 32;
-                    if let Some(view) = crate::descriptor::view(handle)
-                        && let Some(kind) = view_kind(&view)
-                    {
-                        readable(list, kind, &view);
-                    }
-                }
-                let depth = TESTED_DEPTH.get().1;
-                TESTED_DEPTH.set((depth_before.0, depth_before.1 || depth));
+                let depth = bring_up(&selected);
                 if once && let Some(known) = self.fresh_tables.get_mut(&key) {
                     // (The epoch as it is now: what this changed itself it
                     // need not do again.)
@@ -3560,20 +3576,22 @@ impl State {
                 made.push((slot, first * 32));
                 continue;
             }
+            let heap_key = (std::ptr::from_ref(heap) as usize, key);
             #[cfg(feature = "diagnostics")]
-            {
-                // Tables made from the same records by another list this frame.
-                type Seen = (u64, std::collections::HashSet<(usize, (u64, u32, u64))>);
-                static SEEN: std::sync::Mutex<Option<Seen>> = std::sync::Mutex::new(None);
-                let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-                let (frame, keys) = seen.get_or_insert_with(Default::default);
-                if *frame != crate::frame::current() {
-                    *frame = crate::frame::current();
-                    keys.clear();
+            FreshSeen::asked(heap_key, n);
+            if shared_tables() && let Some(first) = SharedTables::find(heap_key) {
+                // Another list made it this frame, with no constant views in
+                // it: its slots are used as they are.
+                #[cfg(feature = "diagnostics")]
+                {
+                    crate::copystat::add(crate::copystat::C::FreshShared, 1);
+                    crate::copystat::add(crate::copystat::C::FreshSharedSlots, u64::from(n));
                 }
-                if !keys.insert((std::ptr::from_ref(heap) as usize, key)) {
-                    crate::copystat::add(crate::copystat::C::FreshAgain, 1);
-                }
+                self.shared.push((heap_key.0, first));
+                self.fresh_tables.insert(key, FreshTable { first, epoch: 0, ready: Vec::new() });
+                bring_up(&selected);
+                made.push((slot, first * 32));
+                continue;
             }
             let Some(first) = dynamic_slots(host, n) else {
                 // No room: the draw must not run with the title's own
@@ -3581,9 +3599,12 @@ impl State {
                 made.push((slot, u32::MAX));
                 continue;
             };
+            #[cfg(feature = "diagnostics")]
+            let started = std::time::Instant::now();
             self.fresh_tables.insert(key, FreshTable { first, epoch: 0, ready: Vec::new() });
-            self.dynamic
-                .push((std::ptr::from_ref(heap) as usize, first, n));
+            // A constant view's bytes are this list's (copied at its
+            // submission), so a table holding one is not shared.
+            let mut constants = false;
             // The title's own slots of this table: what the draw reads of
             // them it brings up to date here, in the dynamic slots.
             let title_first = heap.index(table).filter(|first| first + n <= host.count());
@@ -3662,6 +3683,7 @@ impl State {
                         let slot = (std::ptr::from_ref(heap) as usize, index);
                         list.defer_constants(to, address as *const u8, size as usize, slot);
                         host.constant_at(index, &buffer, gpu, size);
+                        constants = true;
                     }
                     Some(view) => {
                         host.make_at(index, &view);
@@ -3691,6 +3713,21 @@ impl State {
                             once!(slot, "a table entry without a view");
                         }
                     }
+                }
+            }
+            if shared_tables() && !constants {
+                SharedTables::add(heap_key, first, n);
+                self.shared.push((heap_key.0, first));
+            } else {
+                self.dynamic.push((heap_key.0, first, n));
+            }
+            #[cfg(feature = "diagnostics")]
+            {
+                crate::copystat::add(crate::copystat::C::FreshMade, 1);
+                crate::copystat::add(crate::copystat::C::FreshMadeSlots, u64::from(n));
+                crate::copystat::add(crate::copystat::C::FreshNs, started.elapsed().as_nanos() as u64);
+                if constants {
+                    FreshSeen::constants(heap_key);
                 }
             }
             made.push((slot, first * 32));
@@ -4385,6 +4422,144 @@ fn ready_once() -> bool {
     crate::toggled!("VICTORY_READY_ONCE")
 }
 
+/// Whether a table made afresh with no constant views in it is used as it
+/// is by the frame's other lists that ask for the same one
+/// (`VICTORY_SHARED_TABLES=0`: each list makes its own).
+fn shared_tables() -> bool {
+    crate::toggled!("VICTORY_SHARED_TABLES")
+}
+
+type FreshKey = (usize, (u64, u32, u64));
+
+/// Tables made afresh this frame that other lists use as they are
+/// ([`shared_tables`]). A run of dynamic slots is given back once the last
+/// list using it has run.
+#[derive(Default)]
+struct SharedTables {
+    frame: u64,
+    /// (title heap, table, slot count, contents) → first dynamic slot, made
+    /// this frame.
+    made: std::collections::HashMap<FreshKey, u32, std::hash::BuildHasherDefault<crate::host::AddressHash>>,
+    /// (title heap, first dynamic slot) → slot count, lists using it, key.
+    held: std::collections::HashMap<(usize, u32), (u32, u32, (u64, u32, u64)), std::hash::BuildHasherDefault<crate::host::AddressHash>>,
+}
+
+static SHARED_TABLES: std::sync::Mutex<Option<SharedTables>> = std::sync::Mutex::new(None);
+
+impl SharedTables {
+    fn this_frame(&mut self, frame: u64) {
+        if self.frame != frame {
+            self.frame = frame;
+            self.made.clear();
+        }
+    }
+
+    /// The first slot of the table made this frame for `key`, now used by
+    /// one list more.
+    fn found(&mut self, frame: u64, key: FreshKey) -> Option<u32> {
+        self.this_frame(frame);
+        let first = *self.made.get(&key)?;
+        self.held.get_mut(&(key.0, first))?.1 += 1;
+        Some(first)
+    }
+
+    fn added(&mut self, frame: u64, key: FreshKey, first: u32, n: u32) {
+        self.this_frame(frame);
+        self.made.insert(key, first);
+        self.held.insert((key.0, first), (n, 1, key.1));
+    }
+
+    /// One list less uses the run at `first`: its slot count once none does.
+    fn dropped(&mut self, heap: usize, first: u32) -> Option<u32> {
+        let held = self.held.get_mut(&(heap, first))?;
+        held.1 -= 1;
+        if held.1 > 0 {
+            return None;
+        }
+        let (n, _, key) = self.held.remove(&(heap, first))?;
+        if self.made.get(&(heap, key)) == Some(&first) {
+            self.made.remove(&(heap, key));
+        }
+        Some(n)
+    }
+
+    fn find(key: FreshKey) -> Option<u32> {
+        let mut shared = SHARED_TABLES.lock().unwrap_or_else(|e| e.into_inner());
+        shared.get_or_insert_with(Default::default).found(crate::frame::current(), key)
+    }
+
+    fn add(key: FreshKey, first: u32, n: u32) {
+        let mut shared = SHARED_TABLES.lock().unwrap_or_else(|e| e.into_inner());
+        shared.get_or_insert_with(Default::default).added(crate::frame::current(), key, first, n);
+    }
+
+    fn let_go(heap: usize, first: u32) {
+        let n = SHARED_TABLES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_mut()
+            .and_then(|shared| shared.dropped(heap, first));
+        if let Some(n) = n {
+            crate::descriptor::release_dynamic(heap, first, n);
+        }
+    }
+}
+
+/// The fresh tables asked for this frame, for the counters (diagnostics
+/// builds): ones another list made from the same records at the same table
+/// (`FreshAgain`) or at another table (`FreshSame`), and which of them held
+/// constant views.
+#[cfg(feature = "diagnostics")]
+#[derive(Default)]
+struct FreshSeen {
+    frame: u64,
+    /// Whether the table held constant views.
+    at: std::collections::HashMap<FreshKey, bool>,
+    /// (title heap, slot count, contents) → the table first made from them.
+    records: std::collections::HashMap<(usize, u32, u64), u64>,
+}
+
+#[cfg(feature = "diagnostics")]
+static FRESH_SEEN: std::sync::Mutex<Option<FreshSeen>> = std::sync::Mutex::new(None);
+
+#[cfg(feature = "diagnostics")]
+impl FreshSeen {
+    fn asked(key: FreshKey, n: u32) {
+        use crate::copystat::{C, add};
+        let mut seen = FRESH_SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        let seen = seen.get_or_insert_with(Default::default);
+        if seen.frame != crate::frame::current() {
+            seen.frame = crate::frame::current();
+            seen.at.clear();
+            seen.records.clear();
+        }
+        if let Some(&constants) = seen.at.get(&key) {
+            add(C::FreshAgain, 1);
+            add(C::FreshAgainSlots, u64::from(n));
+            if constants {
+                add(C::FreshAgainCbvSlots, u64::from(n));
+            }
+            return;
+        }
+        seen.at.insert(key, false);
+        let (heap, (table, _, contents)) = key;
+        let first = *seen.records.entry((heap, n, contents)).or_insert(table);
+        if first != table {
+            add(C::FreshSame, 1);
+            add(C::FreshSameSlots, u64::from(n));
+        }
+    }
+
+    fn constants(key: FreshKey) {
+        let mut seen = FRESH_SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(seen) = seen.as_mut()
+            && seen.frame == crate::frame::current()
+        {
+            seen.at.insert(key, true);
+        }
+    }
+}
+
 /// A hash of records' words: 64 bits, two multiplications a record. (The
 /// standard library's took 3 % of the recording threads' time.)
 #[derive(Default)]
@@ -4693,7 +4868,7 @@ fn staging_budget_per_frame(vram_budget: Option<u64>) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{settle_due, staging_budget_per_frame};
+    use super::{SharedTables, settle_due, staging_budget_per_frame};
 
     #[test]
     fn staging_budget_scales_with_vram_budget() {
@@ -4721,6 +4896,37 @@ mod tests {
         assert!(settle_due(&settled, 1));
         assert!(!settle_due(&settled, 1));
         assert!(settle_due(&settled, 7));
+    }
+
+    #[test]
+    fn shared_tables_go_back_with_the_last_list() {
+        let mut shared = SharedTables::default();
+        let (a, b) = ((1, (0x1000, 4, 9)), (1, (0x2000, 4, 9)));
+        assert_eq!(shared.found(5, a), None);
+        shared.added(5, a, 100, 4);
+        // Same records at another table, or another heap: not the same table.
+        assert_eq!(shared.found(5, b), None);
+        assert_eq!(shared.found(5, (2, a.1)), None);
+        assert_eq!(shared.found(5, a), Some(100));
+        assert_eq!(shared.found(5, a), Some(100));
+        assert_eq!(shared.dropped(1, 100), None);
+        assert_eq!(shared.dropped(1, 100), None);
+        // The next frame makes its own; the last list still using the old
+        // run gives it back.
+        assert_eq!(shared.found(6, a), None);
+        assert_eq!(shared.dropped(1, 100), Some(4));
+        assert_eq!(shared.dropped(1, 100), None);
+        // Two lists that made the same table at once: each run goes back
+        // with its own list, and the one found later is the last made.
+        shared.added(6, a, 200, 4);
+        shared.added(6, a, 300, 4);
+        assert_eq!(shared.found(6, a), Some(300));
+        assert_eq!(shared.dropped(1, 200), Some(4));
+        assert_eq!(shared.found(6, a), Some(300));
+        assert_eq!(shared.dropped(1, 300), None);
+        assert_eq!(shared.dropped(1, 300), None);
+        assert_eq!(shared.dropped(1, 300), Some(4));
+        assert_eq!(shared.found(6, a), None);
     }
 }
 
