@@ -21,7 +21,6 @@
 #![allow(non_snake_case)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
-use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ffi::{CStr, c_char, c_void};
 use std::os::windows::fs::FileExt;
@@ -796,6 +795,7 @@ pub(crate) mod stream_log {
 
 /// A worker: runs the next read of the most deserving queue.
 fn work(scheduler: &'static Scheduler) {
+    let mut scratch = WorkerScratch::new();
     let mut lanes = scheduler.lock();
     loop {
         let Some(job) = lanes.start() else {
@@ -806,8 +806,9 @@ fn work(scheduler: &'static Scheduler) {
         let started = std::time::Instant::now();
         let traced = Traced::start(&job);
         let reading = victory_gpu::timeline::span("streaming: a request");
-        let result = execute(&job.request);
+        let result = execute(&job.request, &mut scratch);
         reading.end();
+        scratch.trim();
         walls_request(&job.request, &result, started);
         stream_log::request(&job, started, &result);
         if let Some(traced) = traced {
@@ -1395,8 +1396,38 @@ extern "system" fn close(this: QueueRef) {
     close_lane(unsafe { &*this }.state.id);
 }
 
+/// Maximum capacity retained per scratch buffer on an idle worker after a
+/// request finishes, preventing a single oversized read from pinning memory.
+const SCRATCH_RETAIN_CAP: usize = 8 * 1024 * 1024;
+
+/// Per-worker source and intermediate buffers. Each worker in [`work`] runs
+/// one request at a time, so the buffers are reused instead of allocated and
+/// zero-filled for every request.
+struct WorkerScratch {
+    source: Vec<u8>,
+    intermediate: Vec<u8>,
+}
+
+impl WorkerScratch {
+    fn new() -> Self {
+        Self {
+            source: Vec::new(),
+            intermediate: Vec::new(),
+        }
+    }
+
+    fn trim(&mut self) {
+        if self.source.capacity() > SCRATCH_RETAIN_CAP {
+            self.source = Vec::new();
+        }
+        if self.intermediate.capacity() > SCRATCH_RETAIN_CAP {
+            self.intermediate = Vec::new();
+        }
+    }
+}
+
 /// Reads, inflates and/or unpacks, and writes one request.
-fn execute(request: &Request) -> Result<(), HRESULT> {
+fn execute(request: &Request, scratch: &mut WorkerScratch) -> Result<(), HRESULT> {
     let options = request.options;
     let fail = |hr: HRESULT, why: &str| {
         tracing::warn!(
@@ -1430,21 +1461,28 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
             .map_err(|hr| fail(hr, "copying"));
     }
     let tables = if bc != 0 { Some(bcpack_tables()?) } else { None };
-    let source = read_source(request).map_err(|hr| fail(hr, "reading the source"))?;
+    let WorkerScratch {
+        source: source_buf,
+        intermediate,
+    } = scratch;
+    let source = read_source(request, source_buf).map_err(|hr| fail(hr, "reading the source"))?;
     // The console's order: zlib first, then BCPack.
     let source = if bc != 0 && options & ZLIB != 0 {
-        let mut packed = vec![0; request.intermediate_size as usize];
-        let n = inflate(&source, &mut packed).map_err(|hr| fail(hr, "zlib"))?;
-        packed.truncate(n);
-        Cow::Owned(packed)
+        let inter_size = request.intermediate_size as usize;
+        if intermediate.len() < inter_size {
+            intermediate.resize(inter_size, 0);
+        }
+        let n = inflate(source, &mut intermediate[..inter_size])
+            .map_err(|hr| fail(hr, "zlib"))?;
+        &intermediate[..n]
     } else {
         source
     };
     into_destination(request, size, |out| match tables {
-        Some(tables) => bcpack::decode(bc, &source, out, tables)
+        Some(tables) => bcpack::decode(bc, source, out, tables)
             .map(|()| out.len())
             .map_err(|e| fail(INVALID_DATA, &e.to_string())),
-        None => inflate(&source, out).map_err(|hr| fail(hr, "zlib")),
+        None => inflate(source, out).map_err(|hr| fail(hr, "zlib")),
     })?;
     tracing::trace!(
         options = format_args!("{options:#x}"),
@@ -1543,17 +1581,18 @@ fn load_bcpack_tables() -> Result<Tables, String> {
 }
 
 /// A compressed request's source: borrowed from memory, or read from the
-/// file.
-fn read_source(request: &Request) -> Result<Cow<'static, [u8]>, HRESULT> {
+/// file into the worker's reusable `scratch` buffer.
+fn read_source<'a>(request: &Request, scratch: &'a mut Vec<u8>) -> Result<&'a [u8], HRESULT> {
     let size = request.source_size as usize;
     if request.options & MEMORY_SOURCE != 0 {
         // SAFETY: the title's source holds `size` bytes until completion.
-        let bytes = unsafe { std::slice::from_raw_parts(request.source.cast(), size) };
-        return Ok(Cow::Borrowed(bytes));
+        return Ok(unsafe { std::slice::from_raw_parts(request.source.cast(), size) });
     }
-    let mut bytes = vec![0; size];
-    read_into(request, &mut bytes)?;
-    Ok(Cow::Owned(bytes))
+    if scratch.len() < size {
+        scratch.resize(size, 0);
+    }
+    read_into(request, &mut scratch[..size])?;
+    Ok(&scratch[..size])
 }
 
 /// Nanoseconds workers spent reading files, for the debug summary.
@@ -2641,5 +2680,23 @@ mod tests {
         assert_eq!(inflate(&bad_body, &mut out), Err(INVALID_DATA));
         assert_eq!(inflate(&packed, &mut out), Ok(plain.len()));
         assert_eq!(out, plain);
+    }
+
+    #[test]
+    fn worker_scratch_reuses_capacity_and_trims_outliers() {
+        let mut scratch = WorkerScratch::new();
+        scratch.source.resize(64 * 1024, 0);
+        scratch.intermediate.resize(128 * 1024, 0);
+        let src_ptr = scratch.source.as_ptr();
+        let inter_ptr = scratch.intermediate.as_ptr();
+        scratch.trim();
+        assert_eq!(scratch.source.as_ptr(), src_ptr);
+        assert_eq!(scratch.intermediate.as_ptr(), inter_ptr);
+
+        scratch.source.resize(SCRATCH_RETAIN_CAP + 4096, 0);
+        scratch.intermediate.resize(SCRATCH_RETAIN_CAP + 4096, 0);
+        scratch.trim();
+        assert_eq!(scratch.source.capacity(), 0);
+        assert_eq!(scratch.intermediate.capacity(), 0);
     }
 }
