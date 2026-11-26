@@ -761,6 +761,9 @@ struct LooseRegs {
     db_shader_control: u32,
     /// SPI_PS_INPUT_CNTL of each pixel input, in attribute order.
     cntl: Vec<u32>,
+    /// RSRC1 of a third stage that takes the vertex stage's place (0 when
+    /// there is none).
+    third_rsrc1: u32,
 }
 
 /// The register block of device method 0x1c8 in the layout most calls use:
@@ -768,18 +771,31 @@ struct LooseRegs {
 /// 22, the pixel input count at 23, DB_SHADER_CONTROL at 31, then the
 /// SPI_PS_INPUT_CNTL words from 93, padded to an even count, and two words
 /// more.
+///
+/// Call 15 of the title's pipelines (0x200 bytes) has no vertex stage: its
+/// RSRC1_VS is 0 and 21 words follow the pixel input count, starting with
+/// the third stage's RSRC1 and RSRC2 (words 24 and 25; 128, 128, and 2 at
+/// words 29, 30, and 34 look like a mesh stage's limits and topology). From
+/// there everything sits 21 words on: SPI_PS_INPUT_ADDR at 43, the count at
+/// 44, DB_SHADER_CONTROL at 52, the input words from 114.
 fn loose_regs(regs: &[u8]) -> Result<LooseRegs, ShaderError> {
     let word = |i: usize| u32_at(regs, 4 * i);
-    let n = word(23)? as usize;
-    if n > MAX_SEMANTICS as usize || regs.len() != 4 * (95 + n.next_multiple_of(2)) {
-        return Err(Malformed("loose registers of an unknown layout"));
-    }
+    let fits = |at: usize| -> Result<Option<usize>, ShaderError> {
+        let n = word(at)? as usize;
+        Ok((n <= MAX_SEMANTICS as usize && regs.len() == 4 * (at + 72 + n.next_multiple_of(2))).then_some(n))
+    };
+    let (n, shift) = match (fits(23)?, regs.len() > 4 * 44) {
+        (Some(n), _) => (n, 0),
+        (None, true) if word(14)? == 0 && let Some(n) = fits(44)? => (n, 21),
+        _ => return Err(Malformed("loose registers of an unknown layout")),
+    };
     Ok(LooseRegs {
         vs_rsrc1: word(14)?,
         ps_rsrc1: word(19)?,
-        input_addr: word(22)?,
-        db_shader_control: word(31)?,
-        cntl: (93..93 + n).map(word).collect::<Result<_, _>>()?,
+        input_addr: word(22 + shift)?,
+        db_shader_control: word(31 + shift)?,
+        cntl: (93 + shift..93 + shift + n).map(word).collect::<Result<_, _>>()?,
+        third_rsrc1: if shift == 0 { 0 } else { word(24)? },
     })
 }
 
@@ -1166,7 +1182,7 @@ pub struct LooseGraphics {
 ///
 /// Both programs run as wave32; no register here says otherwise. Refused
 /// for what that cannot carry: 16-bit or default-value pixel inputs, depth
-/// exports, and clip distances.
+/// exports, clip distances, and the third stage of call 15's layout.
 pub fn loose_graphics(
     regs: &[u8],
     layout: &[u8],
@@ -1175,6 +1191,9 @@ pub fn loose_graphics(
 ) -> Result<LooseGraphics, ShaderError> {
     let refuse = |what| ShaderError::Unsupported { offset: 0, what };
     let regs = loose_regs(regs)?;
+    if regs.third_rsrc1 != 0 {
+        return Err(refuse("a loose pipeline with a third stage in the vertex stage's place"));
+    }
     let inputs = loose_input_layout(layout)?;
     let vs_meta = loose_metadata(vs.1)?;
     let base = wave32_vgprs(regs.vs_rsrc1);
@@ -2207,6 +2226,49 @@ mod tests {
         let default = graphics_regs(0x20);
         assert!(loose_graphics(&default, &layout, (&vs, &vs_meta), Some((&mrt0, &ps_meta))).is_err());
         assert!(loose_graphics(&regs[..regs.len() - 4], &layout, (&vs, &vs_meta), None).is_err());
+    }
+
+    /// Call 15's 0x200 register block, as the title hands it over.
+    fn call15_regs() -> Vec<u8> {
+        let mut r = vec![0u32; 128];
+        r[17] = 0xffff_0000;
+        r[19] = 0x022c_c35f;
+        r[20] = 0x22;
+        r[21] = 0xffff;
+        r[24] = 0x022c_034d;
+        r[25] = 0x0009_0022;
+        r[26] = 0xfffe;
+        r[27] = 0x7f_ffff;
+        r[28] = 0x2004_0080;
+        r[29] = 0x80;
+        r[30] = 0x80;
+        r[34] = 2;
+        r[36] = 1;
+        r[40] = 0x78_8000;
+        r[42] = 0x8004;
+        r[43] = 0x8002;
+        r[44] = 11;
+        r[52] = 0xcc_0010;
+        for (i, c) in [1, 2, 3, 4, 5, 6, 7, 0x408, 0x409, 0x40a, 0].into_iter().enumerate() {
+            r[114 + i] = c;
+        }
+        r[125] = 7;
+        r[126] = 0x1000_0700;
+        words(&r)
+    }
+
+    #[test]
+    fn loose_regs_read_the_call15_layout() {
+        let r = loose_regs(&call15_regs()).unwrap();
+        assert_eq!((r.vs_rsrc1, r.ps_rsrc1, r.input_addr, r.db_shader_control, r.third_rsrc1), (0, 0x022c_c35f, 0x8002, 0xcc_0010, 0x022c_034d));
+        assert_eq!(r.cntl, [1, 2, 3, 4, 5, 6, 7, 0x408, 0x409, 0x40a, 0]);
+        let r = loose_regs(&graphics_regs(0)).unwrap();
+        assert_eq!((r.input_addr, r.cntl.len(), r.third_rsrc1), (2, 1, 0));
+
+        let vs = words(&[EXP_POS0[0], EXP_POS0[1], S_ENDPGM]);
+        let meta = graphics_meta(3, &[]);
+        let ps = words(&[EXP_MRT0[0], EXP_MRT0[1], S_ENDPGM]);
+        assert!(loose_graphics(&call15_regs(), &graphics_layout(), (&vs, &meta), Some((&ps, &meta))).is_err());
     }
 
     /// Call 1's vertex program: POSITION by a raw x3 load, COLOR by a typed

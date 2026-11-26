@@ -359,7 +359,9 @@ fn feature_levels(data: *mut c_void) -> HRESULT {
 ///   metadata for the pixel stage and then the vertex stage. A null pixel
 ///   stage is a depth-only pipeline. The vertex code fetches its own
 ///   vertices through buffer descriptors at the address in user data 0-1,
-///   which no metadata record names.
+///   which no metadata record names. Some descriptions (the 0x200 register
+///   block of call 15) leave the vertex stage null and fill a third pair
+///   instead, likely a mesh stage, so the log reads that one too.
 ///
 /// The metadata is the FSPX resource records behind a short header
 /// (`victory_shader::loose_metadata`). The first calls log every part and
@@ -399,10 +401,12 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
     };
     #[cfg(not(windows))]
     let read = |_: u64, _: u64| None::<Vec<u8>>;
-    let words: Vec<u64> = read(desc as u64, 128)
-        .map(|b| b.as_chunks::<8>().0.iter().map(|c| u64::from_le_bytes(*c)).collect())
-        .unwrap_or_default();
-    let pairs = if SLOT == 0x218 { 4 } else { 6 };
+    let mut bytes = read(desc as u64, 128).unwrap_or_default();
+    if SLOT == 0x1c8 && !bytes.is_empty() {
+        bytes.extend(read(desc as u64 + 128, 16).unwrap_or_default());
+    }
+    let words: Vec<u64> = bytes.as_chunks::<8>().0.iter().map(|c| u64::from_le_bytes(*c)).collect();
+    let pairs = if SLOT == 0x218 { 4 } else { 8 };
     let parts: Vec<Option<Vec<u8>>> = (0..pairs)
         .map(|i| words.get(1 + 2 * i..3 + 2 * i).and_then(|w| read(w[0], w[1])))
         .collect();
