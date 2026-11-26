@@ -278,11 +278,22 @@ pub(crate) enum C {
     /// The bytes of the read-back buffers made (`ReadBacksMade`), after
     /// rounding.
     ReadBacksMadeBytes,
+    /// Draws and dispatches by step (`draw.rs`): textures picked by index,
+    /// descriptor tables, title memory by address, user data and root
+    /// views, vertex and index buffers, target states, and the argument
+    /// refresh and clamp of indirect calls.
+    DrawEarlyNs,
+    DrawTablesNs,
+    DrawMemoryNs,
+    DrawRootsNs,
+    DrawBuffersNs,
+    DrawStatesNs,
+    IndirectArgsNs,
 }
 const COUNTERS: usize = 160;
 
 /// The counters' names, in the order of [`C`], for the frame recorder's columns.
-pub(crate) const NAMES: [&str; 150] = [
+pub(crate) const NAMES: [&str; 157] = [
     "Submissions", "Copies", "CopyBytes", "Refreshes", "RefreshBytes", "Skipped", "SkippedBytes", "Runs",
     "RunUs", "Queries", "QueryUs", "MoveUs", "Unmapped", "Watches", "WatchUs", "Checked", "Unchanged",
     "Fallbacks", "GuardFaults", "TexWatched", "TexHashed", "TexChanged", "TexHot", "Frames", "RecordCalls",
@@ -308,6 +319,8 @@ pub(crate) const NAMES: [&str; 150] = [
     "GuardPartFaults", "GuardPartWhole", "GuardPartAliased", "GuardPartBlocks", "GuardPartParts",
     "FreshMade", "FreshMadeSlots", "FreshAgainSlots", "FreshAgainCbvSlots", "FreshSame", "FreshSameSlots",
     "FreshNs", "FreshShared", "FreshSharedSlots", "ReadBacksMadeBytes",
+    "DrawEarlyNs", "DrawTablesNs", "DrawMemoryNs", "DrawRootsNs", "DrawBuffersNs", "DrawStatesNs",
+    "IndirectArgsNs",
 ];
 /// One of some sets of counters, each in lines of the processor's memory of
 /// its own: a set for all threads had them wait for each other's lines at
@@ -341,6 +354,11 @@ pub(crate) fn add(c: C, n: u64) {
 
 /// The counter, all sets together, as it is now (it goes back to 0 with
 /// [`log`]).
+/// The nanoseconds since `began`, added to `c`.
+pub(crate) fn lap(c: C, began: std::time::Instant) {
+    add(c, began.elapsed().as_nanos() as u64);
+}
+
 pub(crate) fn peek(c: C) -> u64 {
     let i = c as usize;
     COUNT.iter().map(|b| b.0[i].load(Relaxed)).sum()
