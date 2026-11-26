@@ -455,7 +455,7 @@ fn slow_limit() -> usize {
         if std::env::var_os("VICTORY_PIPELINE_SLOW").is_some_and(|v| v == "0") {
             usize::MAX
         } else {
-            (worker_count(None, std::thread::available_parallelism().map_or(2, |n| n.get())) / 4).max(1)
+            (workers_wanted() / 4).max(1)
         }
     })
 }
@@ -476,8 +476,7 @@ fn quiet_slow_limit() -> usize {
         if std::env::var_os("VICTORY_PIPELINE_SLOW_QUIET").is_some_and(|v| v == "0") {
             slow_limit()
         } else {
-            (worker_count(None, std::thread::available_parallelism().map_or(2, |n| n.get())) * 3 / 4)
-                .max(slow_limit())
+            (workers_wanted() * 3 / 4).max(slow_limit())
         }
     })
 }
@@ -494,6 +493,22 @@ fn quiet_slow_limit() -> usize {
 fn graphics_first() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_GRAPHICS_FIRST").is_none_or(|v| v != "0"))
+}
+
+/// Of the compute pipelines draws have asked for, the one the slow list says
+/// is made soonest (one not on it first; in the order asked among equals).
+/// In the 980073cbe run draws asked for 323: 107 of them took the driver
+/// 20 s or more each (2,989 s in all) and the other 216 616 s in all, but in
+/// the order asked they waited behind the long ones, half of them 160 s or
+/// more, their dispatches dropped all the while.
+/// `VICTORY_PIPELINE_QUICK_FIRST=0`: in the order asked, as before.
+fn quickest(list: &mut VecDeque<Arc<Pending>>) -> Option<Arc<Pending>> {
+    static ON: OnceLock<bool> = OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_QUICK_FIRST").is_none_or(|v| v != "0")) {
+        return list.pop_front();
+    }
+    let at = (0..list.len()).min_by_key(|&i| super::library::slow_ms(&list[i].key))?;
+    list.remove(at)
 }
 
 struct Queue {
@@ -584,7 +599,7 @@ impl Queue {
             p = self.requested.pop_front();
             from = TAKEN_REQUESTED;
             if p.is_none() && compute_free {
-                p = self.requested_compute.pop_front();
+                p = quickest(&mut self.requested_compute);
             }
             if p.is_none() {
                 p = unclaimed(&mut self.early);
@@ -667,6 +682,19 @@ fn worker_count(asked: Option<usize>, processors: usize) -> usize {
     }
 }
 
+/// [`worker_count`] here: the slow list's limits follow it too, so that
+/// `VICTORY_PIPELINE_WORKERS` changes them as well (they took 16 whatever it
+/// asked).
+fn workers_wanted() -> usize {
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| {
+        worker_count(
+            std::env::var("VICTORY_PIPELINE_WORKERS").ok().and_then(|v| v.trim().parse().ok()),
+            std::thread::available_parallelism().map_or(2, |n| n.get()),
+        )
+    })
+}
+
 /// Stack of each pipeline worker: room for the driver's shader compiler,
 /// which runs on it (reserved address space; committed only as used).
 const PIPELINE_STACK: usize = 64 << 20;
@@ -676,12 +704,7 @@ fn workers() -> bool {
     static RUNNING: OnceLock<bool> = OnceLock::new();
     *RUNNING.get_or_init(|| {
         let mut running = false;
-        let workers = worker_count(
-            std::env::var("VICTORY_PIPELINE_WORKERS")
-                .ok()
-                .and_then(|v| v.trim().parse().ok()),
-            std::thread::available_parallelism().map_or(2, |n| n.get()),
-        );
+        let workers = workers_wanted();
         tracing::info!(workers, "pipeline workers");
         if graphics_first() {
             // With one worker only, compute has to take it, else none is made.
