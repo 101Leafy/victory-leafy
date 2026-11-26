@@ -1187,8 +1187,8 @@ mod tests {
         let texture = std::sync::Arc::new(crate::resource::HostTexture::new(made.unwrap(), 0));
         let key = std::sync::Arc::as_ptr(&texture) as usize;
         list.states.lock().unwrap().insert(key, (start, leave, texture.clone()));
-        let first = list.prelude().expect("a move is recorded");
-        let second = list.prelude().expect("the second use records a move too");
+        let first = list.prelude(false).expect("a move is recorded");
+        let second = list.prelude(false).expect("the second use records a move too");
         assert_ne!(
             windows::core::Interface::as_raw(&first),
             windows::core::Interface::as_raw(&second),
@@ -1197,6 +1197,18 @@ mod tests {
         assert_eq!(texture.state.load(std::sync::atomic::Ordering::Relaxed), leave);
         let preludes = list.preludes.lock().unwrap();
         assert_eq!((preludes.free.len(), preludes.flight.len()), (0, 2));
+    }
+
+    /// The first list of a part sent in one call behind others
+    /// (`VICTORY_JOIN_ONE_CALL`) has a prelude with the barriers even with
+    /// nothing to move.
+    #[test]
+    fn a_joined_parts_first_list_gets_a_prelude() {
+        let Some(host) = super::host() else { return };
+        let list = host.new_list().unwrap();
+        list.close();
+        assert!(list.prelude(false).is_none(), "nothing to move: no prelude");
+        assert!(list.prelude(true).is_some(), "behind another part: a prelude with the barriers");
     }
 
     mod builder_memory {
@@ -3570,6 +3582,20 @@ fn stale_under_flights(runs: &[&HostList]) -> Vec<(std::sync::Arc<crate::shadow:
 /// bytes under an earlier part's declared writes would go missing).
 pub(crate) fn joins() -> (usize, usize) {
     if ahead_of_writes() { joins_asked() } else { (1, 1) }
+}
+
+/// Whether the parts [`joins`] gives the host go to the queue in one call,
+/// the first list of each part after the first behind a barrier that waits
+/// for everything before it ([`join_barriers`]) (`VICTORY_JOIN_ONE_CALL=1`;
+/// off by default, a call per part).
+///
+/// From Skyfrye's AnyXboxX#337 (`VICTORY_MERGE_SUBMISSIONS`), which holds the
+/// title's submissions back and sends them as one host submission with these
+/// barriers between them; here only the barriers and the one call, over the
+/// parts the line's thread joins already.
+fn join_one_call() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_JOIN_ONE_CALL"))
 }
 
 fn joins_asked() -> (usize, usize) {
@@ -6205,10 +6231,11 @@ impl Host {
             batch.refresh_ahead(runs, |list, i| own.as_ref().is_some_and(|own| own.takes(list, i)));
         }
         stage.next("submit: the lists' steps");
-        for list in runs {
+        let one_call = late && !parts.is_empty() && join_one_call();
+        for (n, list) in runs.iter().enumerate() {
             list.run_deferred(&mut batch, &air, |i| own.as_ref().is_some_and(|own| own.takes(list, i)));
             firsts.push(lists.len());
-            if let Some(prelude) = list.prelude() {
+            if let Some(prelude) = list.prelude(one_call && parts.contains(&n)) {
                 lists.push(Some(prelude));
             }
             lists.push(list.list.cast().ok());
@@ -6293,7 +6320,8 @@ impl Host {
                 lists.push(Some(behind));
                 firsts.iter_mut().for_each(|first| *first += 1);
             }
-            let cuts: Vec<usize> = parts.iter().filter_map(|&n| firsts.get(n).copied()).collect();
+            // With [`join_one_call`] the parts' barriers stand in for the cuts.
+            let cuts: Vec<usize> = if one_call { Vec::new() } else { parts.iter().filter_map(|&n| firsts.get(n).copied()).collect() };
             // SAFETY: closed lists; the fence is ours.
             let signalled = unsafe {
                 let mut from = 0;
@@ -7171,7 +7199,10 @@ impl HostList {
     /// states become those the list ends with. For depth textures with a
     /// colour twin it first copies the side the list uses as it finds it
     /// from the other, if a list submitted earlier left it behind.
-    fn prelude(&self) -> Option<ID3D12CommandList> {
+    /// With `join` the list is the first of a part sent in one call behind
+    /// others ([`join_one_call`]): the prelude is made in any case, and first
+    /// waits for everything before it ([`join_barriers`]).
+    fn prelude(&self, join: bool) -> Option<ID3D12CommandList> {
         const COPY_DEST: u32 = 0x400;
         const COPY_SOURCE: u32 = 0x800;
         let host_state = |state: u32| D3D12_RESOURCE_STATES(state as i32);
@@ -7232,7 +7263,7 @@ impl HostList {
             (real != *first)
                 .then(|| transition(&copy.texture, host_state(real), host_state(*first)))
         }));
-        if barriers.is_empty() && syncs.is_empty() {
+        if !join && barriers.is_empty() && syncs.is_empty() {
             return None;
         }
         // SAFETY: a plain query.
@@ -7246,6 +7277,9 @@ impl HostList {
         let recorded = unsafe {
             allocator.Reset().and_then(|()| {
                 list.Reset(&allocator, None)?;
+                if join {
+                    list.ResourceBarrier(&join_barriers());
+                }
                 if !to_copy.is_empty() {
                     list.ResourceBarrier(&to_copy);
                 }
@@ -10561,6 +10595,36 @@ pub(crate) fn transition(
             }),
         },
     }
+}
+
+/// What the first list of a part sent in one call behind others waits for
+/// ([`join_one_call`]): every shader write before it (an unordered-access
+/// barrier on no resource) and every use of memory before it (an aliasing
+/// barrier between no resources), as a call of its own made the card wait
+/// before. Lists of one `ExecuteCommandLists` may overlap on the card; lists
+/// of two calls do not. (Skyfrye's, AnyXboxX#337.)
+fn join_barriers() -> [D3D12_RESOURCE_BARRIER; 2] {
+    [
+        D3D12_RESOURCE_BARRIER {
+            Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+            Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                    pResource: std::mem::ManuallyDrop::new(None),
+                }),
+            },
+        },
+        D3D12_RESOURCE_BARRIER {
+            Type: D3D12_RESOURCE_BARRIER_TYPE_ALIASING,
+            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+            Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                Aliasing: std::mem::ManuallyDrop::new(D3D12_RESOURCE_ALIASING_BARRIER {
+                    pResourceBefore: std::mem::ManuallyDrop::new(None),
+                    pResourceAfter: std::mem::ManuallyDrop::new(None),
+                }),
+            },
+        },
+    ]
 }
 
 /// A window of the given client size, owned by its own message thread.
