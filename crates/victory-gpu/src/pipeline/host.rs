@@ -411,6 +411,40 @@ fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<HostPipeline>
     None
 }
 
+/// `VICTORY_COLOR_FINITE=targets`: a pixel stage drawing to 16-bit or
+/// 11/10-bit float targets gets a translation of its own whose float
+/// exports to those targets are held to +-65024, a NaN as 0
+/// (`emit::finite_targets`), as the console's colour block stores them.
+/// Only the export values change, so the root signature stays.
+fn finite_ps(ps: Option<&Shader>, targets: &D3D12_RT_FORMAT_ARRAY) -> Option<Arc<Vec<u8>>> {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var("VICTORY_COLOR_FINITE").is_ok_and(|v| v == "targets")) {
+        return None;
+    }
+    let ps = ps?;
+    let count = (targets.NumRenderTargets as usize).min(8);
+    let formats: Vec<u32> = targets.RTFormats[..count].iter().map(|f| f.0 as u32).collect();
+    let mask = victory_shader::emit::finite_targets(&formats);
+    if mask == 0 {
+        return None;
+    }
+    type Variants = std::collections::HashMap<(String, u8), Option<Arc<Vec<u8>>>>;
+    static MADE: std::sync::Mutex<Option<Variants>> = std::sync::Mutex::new(None);
+    let key = (ps.hash.clone(), mask);
+    if let Some(made) = MADE.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_default().get(&key) {
+        return made.clone();
+    }
+    let made = match crate::shader_cache::host_shader_finite(&ps.container, mask) {
+        Ok(t) => Some(Arc::new(t.dxil)),
+        Err(e) => {
+            tracing::warn!(error = %e, shader = %ps.hash, mask, "no finite translation; the plain one draws");
+            None
+        }
+    };
+    MADE.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_default().insert(key, made.clone());
+    made
+}
+
 impl HostPipeline {
     /// A host pipeline for vertex and pixel shaders with the graphics
     /// state `g`, or for one compute shader.
@@ -454,18 +488,7 @@ impl HostPipeline {
         }
         let host = host()?;
 
-        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS19::default();
-        // SAFETY: the feature query writes the structure of the given size.
-        // Older runtimes may not recognize OPTIONS19; that means no support.
-        let aniso_point_mip_supported = unsafe {
-            host.device.CheckFeatureSupport(
-                D3D12_FEATURE_D3D12_OPTIONS19,
-                (&raw mut options).cast(),
-                size_of_val(&options) as u32,
-            )
-        }
-        .is_ok()
-            && options.AnisoFilterWithPointMipSupported.as_bool();
+        let aniso_point_mip_supported = crate::sampler::aniso_point_mip(&host.device);
 
         // The root signature the translated shaders' bindings define.
         let mut params: Vec<D3D12_ROOT_PARAMETER1> = Vec::new();
@@ -664,6 +687,14 @@ impl HostPipeline {
             false
         };
         let state = g.describe();
+        let finite = finite_ps(stages.get(1).map(|(s, _)| &***s), &g.targets);
+        let code = |i: usize| match (i, &finite) {
+            (1, Some(ps)) => D3D12_SHADER_BYTECODE {
+                pShaderBytecode: ps.as_ptr().cast(),
+                BytecodeLength: ps.len(),
+            },
+            _ => code(i),
+        };
         if let Some(ms) = mesh {
             // A mesh program whose outputs pass D3D12's 32 KiB is linked with this pixel
             // program ([`linked`]): the pipeline gets the two made for each other, which bind
@@ -675,6 +706,7 @@ impl HostPipeline {
             };
             let (ms_code, ps_code) = match &pair {
                 Some(pair) => (bytecode(&pair.0.dxil), bytecode(&pair.1.dxil)),
+                // A linked pair keeps its pixel program as made, with no finite form.
                 None => (code(0), code(1)),
             };
             // "triangles": the stream names its topology since it did not
