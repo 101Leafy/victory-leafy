@@ -3263,6 +3263,17 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
         return None;
     }
     map.insert((address, *desc), out as usize);
+    tracing::debug!(
+        address = format_args!("{address:#x}"),
+        width = d.width,
+        height = d.height,
+        depth_or_array = d.depth_or_array_size,
+        mips = d.mip_levels,
+        format = d.format,
+        flags = format_args!("{:#x}", d.flags),
+        layout = format_args!("{:#x}", d.layout),
+        "placed texture from a view"
+    );
     crate::texture::placed_in_host_written(address, desc);
     resource(out)
         .host
