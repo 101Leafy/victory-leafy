@@ -175,11 +175,19 @@ pub(crate) enum C {
     /// ranges asked for, when a range was added apart from the one before:
     /// the range that covers both is refreshed, not the two.
     RefreshGapBytes,
+    /// Asks for a buffer's host copy answered from the asking thread's
+    /// memory of them (`VICTORY_QUICK_FIND`).
+    LookupQuick,
+    /// Asks answered from the buffers' table.
+    LookupTables,
+    /// Asks for memory outside buffers, answered by the windows: the
+    /// thread's memory of asks does not hold these.
+    LookupLoose,
 }
 const COUNTERS: usize = 96;
 
 /// The counters' names, in the order of [`C`], for the frame recorder's columns.
-pub(crate) const NAMES: [&str; 93] = [
+pub(crate) const NAMES: [&str; 96] = [
     "Submissions", "Copies", "CopyBytes", "Refreshes", "RefreshBytes", "Skipped", "SkippedBytes", "Runs",
     "RunUs", "Queries", "QueryUs", "MoveUs", "Unmapped", "Watches", "WatchUs", "Checked", "Unchanged",
     "Fallbacks", "GuardFaults", "TexWatched", "TexHashed", "TexChanged", "TexHot", "Frames", "RecordCalls",
@@ -195,7 +203,7 @@ pub(crate) const NAMES: [&str; 93] = [
     "RefreshUpdates",
     "RefreshEmpty", "RefreshEmptyUs", "RefreshAgain", "RefreshAgainBytes", "AskRefused", "AskRefusedUs",
     "AskRefusedAgain", "AskSkipped", "AskAgain", "AskAgainBytes", "GuardAgain", "BackAgainBytes",
-    "RefreshGapBytes",
+    "RefreshGapBytes", "LookupQuick", "LookupTables", "LookupLoose",
 ];
 /// One of some sets of counters, each in lines of the processor's memory of
 /// its own: a set for all threads had them wait for each other's lines at
@@ -506,7 +514,7 @@ mod command_tests {
     #[test]
     fn every_counter_is_named() {
         use super::{C, COUNTERS, NAMES};
-        assert_eq!(C::RefreshGapBytes as usize + 1, NAMES.len());
+        assert_eq!(C::LookupLoose as usize + 1, NAMES.len());
         assert_eq!(NAMES[C::Frames as usize], "Frames");
         assert!(NAMES.len() <= COUNTERS);
     }
