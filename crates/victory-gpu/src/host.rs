@@ -3210,7 +3210,9 @@ pub(crate) fn settle_for_fence() {
 /// lists give theirs back as they land. Counted with the settles for too
 /// much in the air, which it is.
 pub(crate) fn settle_for_tables() {
+    let began = std::time::Instant::now();
     settle_now(WHY_MOST);
+    crate::copystat::lap(crate::copystat::C::SettleTablesNs, began);
 }
 
 /// Resets the host lists of settled flights and keeps them for reuse, as
@@ -5173,9 +5175,13 @@ impl Host {
             self.settle(&mut submitted, WHY_READ);
         } else if most && relay_exact() {
             // Until there are fewer, not until there are none.
+            let began = std::time::Instant::now();
             relay_wait(WHY_MOST, |line| line.lists < late_most());
+            crate::copystat::lap(crate::copystat::C::SettleListsNs, began);
         } else if most {
+            let began = std::time::Instant::now();
             self.settle(&mut submitted, WHY_MOST);
+            crate::copystat::lap(crate::copystat::C::SettleListsNs, began);
         } else {
             LINE_MOVED.notify_one();
         }
@@ -5625,6 +5631,7 @@ impl Host {
             let settling = std::time::Instant::now();
             self.settle(&mut submitted, WHY_MOST);
             settled += settling.elapsed();
+            crate::copystat::lap(crate::copystat::C::SettleResultsNs, settling);
         }
         // What shaders may write through views they pick: last, so that no
         // refresh of this submission leaves it alone.
