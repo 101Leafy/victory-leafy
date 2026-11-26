@@ -371,7 +371,7 @@ fn feature_levels(data: *mut c_void) -> HRESULT {
 /// a 0x1c8 call whose parts make containers (`victory_shader::loose_graphics`)
 /// gets a graphics pipeline whose host pipelines are made at the first draw
 /// into each set of target formats.
-/// shortcut: neither is made by default: those calls fail as they always
+/// Neither is made by default: those calls fail as they always
 /// did, with `out` null. Answering `S_OK` without making the pipeline
 /// would hand the title whatever its stack held as an object.
 extern "system" fn unknown_pipeline<const SLOT: usize>(
