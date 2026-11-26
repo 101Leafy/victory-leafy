@@ -1023,6 +1023,13 @@ fn create() -> windows::core::Result<Host> {
 }
 
 impl Host {
+    /// Ticks per second of the queue's timestamps.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn timestamp_frequency(&self) -> u64 {
+        // SAFETY: a plain query.
+        unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1)
+    }
+
     /// The driver's version, as the system counts it (0: not known).
     pub(crate) fn driver(&self) -> i64 {
         let adapter = self.adapter.as_ref();
@@ -1243,6 +1250,9 @@ pub(crate) struct HostList {
     /// and at the end, and where they are read back.
     #[cfg(feature = "diagnostics")]
     stamps: OnceLock<Option<(ID3D12QueryHeap, ID3D12Resource)>>,
+    /// The batched clamps' passes on the card.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) clamp_stamps: crate::indirect::batch::Stamps,
 }
 
 /// A list's prelude: an allocator and a closed list.
@@ -4178,6 +4188,8 @@ impl Host {
                 notes,
                 #[cfg(feature = "diagnostics")]
                 stamps: OnceLock::new(),
+                #[cfg(feature = "diagnostics")]
+                clamp_stamps: Default::default(),
             })
         }
     }
@@ -6313,6 +6325,8 @@ impl HostList {
                 self.list.ResolveQueryData(heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, count + 1, back, 0);
             }
         }
+        #[cfg(feature = "diagnostics")]
+        self.clamp_stamps.resolve(&self.list);
         lap.to(6);
         // SAFETY: our list.
         if let Err(e) = unsafe { self.list.Close() } {
@@ -6367,6 +6381,8 @@ impl HostList {
         self.indirects.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        #[cfg(feature = "diagnostics")]
+        self.clamp_stamps.read();
         {
             let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
             (scratch.current, scratch.used) = (0, 0);
