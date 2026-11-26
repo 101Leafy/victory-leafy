@@ -404,7 +404,9 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
             victory_gpu::title_graphics_block(0, true);
         }
         if attributes & ALLOC_32BIT != 0 || watched {
-            VirtualFree(address, 0, MEM_RELEASE);
+            // As the title's own frees: the GPU side forgets what it noted
+            // of the range before the address can be handed out again.
+            title_virtual_free(address, 0, MEM_RELEASE);
             return;
         }
         let user = address.cast::<u8>();
