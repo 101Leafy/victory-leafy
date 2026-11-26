@@ -129,11 +129,36 @@ pub(crate) enum C {
     WaitsForGroups,
     WaitsForBuffers,
     IndirectBounded,
+    /// Refreshes of a copy that went as far as `Shadow::update`, those of
+    /// them that copied nothing, and their microseconds; refreshes of a copy
+    /// and range refreshed before in the same frame, and their bytes.
+    RefreshUpdates,
+    RefreshEmpty,
+    RefreshEmptyUs,
+    RefreshAgain,
+    RefreshAgainBytes,
+    /// Kernel askings about title memory it refused (not write-watched), and
+    /// their microseconds; of those, ranges refused before in the same frame;
+    /// askings not made because the range was refused before in the frame
+    /// (`VICTORY_REFUSED_ONCE`); askings that went through for a range asked
+    /// before in the same frame, and their bytes.
+    AskRefused,
+    AskRefusedUs,
+    AskRefusedAgain,
+    AskSkipped,
+    AskAgain,
+    AskAgainBytes,
+    /// Blocks made read-only that had been made read-only before in the same
+    /// frame (opened by a write in between).
+    GuardAgain,
+    /// Bytes of copies compared after a submission that were compared after
+    /// another submission of the same frame.
+    BackAgainBytes,
 }
-const COUNTERS: usize = 80;
+const COUNTERS: usize = 96;
 
 /// The counters' names, in the order of [`C`], for the frame recorder's columns.
-pub(crate) const NAMES: [&str; 71] = [
+pub(crate) const NAMES: [&str; 84] = [
     "Submissions", "Copies", "CopyBytes", "Refreshes", "RefreshBytes", "Skipped", "SkippedBytes", "Runs",
     "RunUs", "Queries", "QueryUs", "MoveUs", "Unmapped", "Watches", "WatchUs", "Checked", "Unchanged",
     "Fallbacks", "GuardFaults", "TexWatched", "TexHashed", "TexChanged", "TexHot", "Frames", "RecordCalls",
@@ -143,7 +168,9 @@ pub(crate) const NAMES: [&str; 71] = [
     "TexUploads", "TexSkipped", "Forced", "GpuWritesLeftOut", "GpuWritesLeftOutBytes", "WaitChecks",
     "WaitCheckNs", "HostLists", "HostListNs", "PartsTogether", "WholeUs", "CardUnder2", "Card2To8",
     "Card8To32", "CardOver32", "CardUnder2Us", "Card2To8Us", "Card8To32Us", "CardOver32Us", "NothingBack",
-    "NothingBackUs", "WaitsForGroups", "WaitsForBuffers", "IndirectBounded",
+    "NothingBackUs", "WaitsForGroups", "WaitsForBuffers", "IndirectBounded", "RefreshUpdates",
+    "RefreshEmpty", "RefreshEmptyUs", "RefreshAgain", "RefreshAgainBytes", "AskRefused", "AskRefusedUs",
+    "AskRefusedAgain", "AskSkipped", "AskAgain", "AskAgainBytes", "GuardAgain", "BackAgainBytes",
 ];
 /// One of some sets of counters, each in lines of the processor's memory of
 /// its own: a set for all threads had them wait for each other's lines at
@@ -454,7 +481,7 @@ mod command_tests {
     #[test]
     fn every_counter_is_named() {
         use super::{C, COUNTERS, NAMES};
-        assert_eq!(C::IndirectBounded as usize + 1, NAMES.len());
+        assert_eq!(C::BackAgainBytes as usize + 1, NAMES.len());
         assert_eq!(NAMES[C::Frames as usize], "Frames");
         assert!(NAMES.len() <= COUNTERS);
     }
@@ -1438,4 +1465,24 @@ pub(crate) fn log(frames: f64) {
             us as f64 / 1e3 / frames
         );
     }
+}
+
+/// What was worked on this frame, by kind (0 refreshes, 1 kernel askings, 2
+/// refused askings, 3 compares after submissions, 4 blocks made read-only):
+/// the frame and the keys.
+#[cfg(feature = "diagnostics")]
+static SEEN: Mutex<(u64, [Option<std::collections::HashSet<(usize, usize, usize)>>; 5])> =
+    Mutex::new((0, [None, None, None, None, None]));
+
+/// Whether work of `kind` on `key` was done before in this frame (and notes
+/// it done): for the counters of work done twice.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn again(kind: usize, key: (usize, usize, usize)) -> bool {
+    let frame = crate::frame::current();
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if seen.0 != frame {
+        seen.0 = frame;
+        seen.1.iter_mut().flatten().for_each(|keys| keys.clear());
+    }
+    !seen.1[kind].get_or_insert_with(Default::default).insert(key)
 }
