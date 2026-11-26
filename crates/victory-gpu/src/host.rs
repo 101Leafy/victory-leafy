@@ -8766,7 +8766,7 @@ impl Batch {
         #[cfg(feature = "diagnostics")]
         {
             use crate::copystat::{C, add, again};
-            crate::copystat::range(from, to - from, us, 0);
+            crate::copystat::range(from, to - from, copied, us, 0);
             add(C::RefreshUpdates, 1);
             if copied == 0 {
                 add(C::RefreshEmpty, 1);
