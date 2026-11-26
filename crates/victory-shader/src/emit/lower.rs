@@ -5049,8 +5049,24 @@ impl<'a> Lower<'a> {
                 if !self.console_lanes || self.mask_data != MaskData::Console {
                     return Err(err);
                 }
+                let mask = mask.ok_or(err)?;
+                // A join of compare results after a divergent branch: a lane
+                // that skipped it would bring the mask from before, where the
+                // console's register holds what the branch wrote (VOPC clears
+                // the lanes it skips). Only a join that takes one mask's bits
+                // on every way in is that mask's number.
+                if let Some(&(b, i)) = self.phi_at.get(&mask) {
+                    let st = self.x.st;
+                    let masks = self.x.p.blocks[b].phis[i]
+                        .args
+                        .iter()
+                        .any(|a| st.masks.contains_key(a) || st.highs.contains_key(a));
+                    if masks && self.same_bits(mask).is_none() {
+                        return Err(err);
+                    }
+                }
                 held(self)?;
-                let lo = self.i32_of(mask.ok_or(err)?).map_err(|_| err)?;
+                let lo = self.i32_of(mask).map_err(|_| err)?;
                 // wave64: the register after it holds lanes 32-63.
                 let hi = if self.x.native.wave64 {
                     let h = inst.read(Reg::S(code + 1)).ok_or(err)?;
