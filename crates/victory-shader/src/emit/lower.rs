@@ -49,6 +49,10 @@ mod lane_join;
 #[path = "interp_guard_tests.rs"]
 mod interp_guard_tests;
 
+#[cfg(test)]
+#[path = "wave_prefix_tests.rs"]
+mod wave_prefix_tests;
+
 type Why = &'static str;
 
 /// How an interpolation evaluates an input channel.
@@ -103,6 +107,11 @@ pub(crate) struct Lowered {
     /// The constant table's first byte and dwords, if the program has one.
     #[cfg(test)]
     pub code_table: Option<(u32, Vec<u32>)>,
+    /// Constant integer arguments to written `dx.op.wavePrefixOp.{f32,i32}` calls.
+    #[cfg(test)]
+    pub wave_prefix_f32_args: Vec<Vec<Option<i64>>>,
+    #[cfg(test)]
+    pub wave_prefix_i32_args: Vec<Vec<Option<i64>>>,
 }
 
 /// `DB_SHADER_CONTROL.DEPTH_BEFORE_SHADER` (AMD's register headers, as in
@@ -2433,7 +2442,8 @@ impl<'a> Lower<'a> {
         let sfx = if float { "f32" } else { "i32" };
         Ok(match (op, prefix) {
             (Op::AddU | Op::AddF, Some(inclusive)) => {
-                let (k0, k1) = (self.s.m.i8(0), self.s.m.i8(1));
+                // DXIL SignedOpKind: 0 = Signed (required for float ops), 1 = Unsigned.
+                let (k0, k1) = (self.s.m.i8(0), self.s.m.i8(u8::from(!float)));
                 let r = self.s.op(
                     c,
                     &format!("wavePrefixOp.{sfx}"),
@@ -2882,6 +2892,10 @@ impl<'a> Lower<'a> {
             select_false_ints: self.s.m.written_select_false_ints(),
             #[cfg(test)]
             code_table: self.code_table.map(|t| (t.1, self.code_words)),
+            #[cfg(test)]
+            wave_prefix_f32_args: self.s.m.written_call_int_args("dx.op.wavePrefixOp.f32"),
+            #[cfg(test)]
+            wave_prefix_i32_args: self.s.m.written_call_int_args("dx.op.wavePrefixOp.i32"),
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
