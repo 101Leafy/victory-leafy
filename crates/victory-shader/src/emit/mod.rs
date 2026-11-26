@@ -491,6 +491,28 @@ pub fn with_wave_wide<T>(on: bool, f: impl FnOnce() -> T) -> T {
 }
 
 
+thread_local! {
+    /// [`with_firstlane_own`]'s choice, for this thread's translations.
+    static FIRSTLANE_OWN_HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` (a translation) with a first-lane read where not every lane runs
+/// taken from the host wave's own first lane, as `VICTORY_FIRSTLANE_OWN=1`
+/// takes it for all: exact where the value is the same in every lane of the
+/// console wave, which holds for the programs it is asked for (the
+/// ray-tracing structure builder's scans, which read a sum of scalars).
+pub fn with_firstlane_own<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    let before = FIRSTLANE_OWN_HERE.replace(on);
+    let out = f();
+    FIRSTLANE_OWN_HERE.set(before);
+    out
+}
+
+/// Whether [`with_firstlane_own`] asked for it on this thread.
+pub(super) fn firstlane_own_here() -> bool {
+    FIRSTLANE_OWN_HERE.get()
+}
+
 /// Emits a program whose earlier stages already ran.
 pub fn emit(
     c: &Container,
