@@ -2727,6 +2727,7 @@ impl HostHeap {
         }
         self.put(index);
         self.clear_twin(index);
+        self.write_stride(index, 0);
         self.keep(index, None);
     }
 
@@ -6023,6 +6024,72 @@ mod tests {
         heap.release(last, 1);
         assert_eq!(heap.dynamic(2), None);
     }
+
+
+    #[test]
+    fn dynamic_slots_populate_and_clear_stride_table() {
+        use victory_shader::emit::{VIEW_INTEGER, VIEW_SIGNED};
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return; // no host GPU
+        };
+        let Some((_, _, data)) = heap.strides else {
+            panic!("view heap should allocate strides table");
+        };
+        let read_stride = |slot: u32| -> u32 {
+            // SAFETY: inside `SLOT_STRIDES_COUNT` mapping of `heap.strides`.
+            unsafe { *(data as *const u32).add(slot as usize) }
+        };
+        let memory = vec![0u64; 1 << 11];
+        let addr = (memory.as_ptr() as u64).next_multiple_of(4096);
+        let placed_typed = |uav: bool, dxgi_fmt: u32, elems: u32| {
+            let resource: [u32; 14] = [1, 0, 0, 0, 4096, 0, 1, 1 | 1 << 16, 0, 1, 0, 1, 0, 0];
+            let mut desc = [0u32; 16];
+            // [format, dim=1 (buffer), mapping/pad, ..., num_elements @6, stride @7, flags @8]
+            let words = if uav {
+                [dxgi_fmt, 1, 0, 0, elems, 0, 0, 0, 0, 0]
+            } else {
+                [dxgi_fmt, 1, 5768, 0, 0, 0, elems, 0, 0, 0]
+            };
+            desc[..10].copy_from_slice(&words);
+            (desc[10], desc[11]) = (addr as u32, (addr >> 32) as u32);
+            View::Placed(uav, resource, desc)
+        };
+
+        let s0 = heap.dynamic(4).unwrap();
+        // R16G16B16A16_UINT (12): 8 bytes + VIEW_INTEGER
+        let u16x4 = placed_typed(true, 12, 64);
+        heap.make_at(s0, &u16x4);
+        assert_eq!(read_stride(s0), 8 | VIEW_INTEGER);
+
+        // R16_SINT (59): 2 bytes + VIEW_INTEGER | VIEW_SIGNED
+        let s16 = placed_typed(false, 59, 64);
+        heap.make_at(s0 + 1, &s16);
+        assert_eq!(read_stride(s0 + 1), 2 | VIEW_INTEGER | VIEW_SIGNED);
+
+        // R16G16B16A16_FLOAT (10): 8 bytes, no integer bits
+        let f16x4 = placed_typed(true, 10, 64);
+        heap.make_at(s0 + 2, &f16x4);
+        assert_eq!(read_stride(s0 + 2), 8);
+
+        // Clearing / nulling / raw views overwrite stale bits cleanly.
+        heap.make_null(s0);
+        assert_eq!(read_stride(s0), 0);
+        heap.null_raw_at(s0 + 1);
+        assert_eq!(read_stride(s0 + 1), 0);
+        heap.null_raw_uav_at(s0 + 2);
+        assert_eq!(read_stride(s0 + 2), 0);
+
+        // `make_listed` (both cold creation and cached copy hit) must populate strides.
+        let mut slot_mem = [0u32; 8];
+        crate::descriptor::record(slot_mem.as_mut_ptr() as u64, u16x4);
+        let rec = [slot_mem[0], slot_mem[1], slot_mem[2]];
+        assert!(heap.make_listed(0x1234, rec, s0).is_some());
+        assert_eq!(read_stride(s0), 8 | VIEW_INTEGER);
+        heap.make_null(s0 + 3);
+        assert_eq!(read_stride(s0 + 3), 0);
+        assert!(heap.make_listed(0x1234, rec, s0 + 3).is_some());
+        assert_eq!(read_stride(s0 + 3), 8 | VIEW_INTEGER);
+    }
 }
 
 /// What is known of a record a list's tables hold, in that recording of the
@@ -6127,4 +6194,75 @@ pub(crate) fn note_listed(recording: u64, words: [u32; 3], listed: Listed) {
 /// for every table).
 pub(crate) fn list_views() -> bool {
     crate::toggled!("VICTORY_LIST_VIEWS")
+}
+
+#[cfg(test)]
+mod bake_flip_tests {
+    use super::*;
+
+    #[test]
+    fn pending_list_flips_promote_once_and_clean_up() {
+        let heap = 0xdead_beefusize;
+        let id1 = NEXT_PENDING_FLIP.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let id2 = NEXT_PENDING_FLIP.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        {
+            let mut pending = PENDING_LIST_FLIPS.lock().unwrap_or_else(|e| e.into_inner());
+            pending.push(PendingListFlip {
+                id: id1,
+                origin: (1, 1),
+                flip: Flip { after: 0, heap, index: 7, handle: 0, key: 11, late: Some(1) },
+            });
+            pending.push(PendingListFlip {
+                id: id2,
+                origin: (2, 1),
+                flip: Flip { after: 0, heap, index: 8, handle: 0, key: 12, late: Some(1) },
+            });
+            PENDING_LIST_COUNT.store(pending.len(), std::sync::atomic::Ordering::Release);
+        }
+        let taken = take_pending_list_flip(id1).expect("id1 should be present");
+        assert_eq!(taken.index, 7);
+        assert!(take_pending_list_flip(id1).is_none(), "second take must be a no-op");
+        remove_pending_list_flip(id2);
+        assert!(take_pending_list_flip(id2).is_none(), "removed entry must be gone");
+    }
+
+    #[test]
+    fn deferred_flip_closure_keeps_pending_entry_alive_until_called_or_dropped() {
+        let heap = 0xcafe_babeusize;
+        let id1 = NEXT_PENDING_FLIP.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let id2 = NEXT_PENDING_FLIP.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        {
+            let mut pending = PENDING_LIST_FLIPS.lock().unwrap_or_else(|e| e.into_inner());
+            for (id, idx) in [(id1, 10), (id2, 11)] {
+                pending.push(PendingListFlip {
+                    id,
+                    origin: (3, 1),
+                    flip: Flip { after: 0, heap, index: idx, handle: 0, key: 20, late: Some(1) },
+                });
+            }
+            PENDING_LIST_COUNT.store(pending.len(), std::sync::atomic::Ordering::Release);
+        }
+        struct TestGuard(u64);
+        impl TestGuard {
+            fn id(&self) -> u64 {
+                self.0
+            }
+        }
+        impl Drop for TestGuard {
+            fn drop(&mut self) {
+                remove_pending_list_flip(self.0);
+            }
+        }
+        let make_cb = |id: u64| -> Box<dyn Fn() -> Option<u32> + Send + 'static> {
+            let guard = TestGuard(id);
+            Box::new(move || take_pending_list_flip(guard.id()).map(|f| f.index))
+        };
+        let cb1 = make_cb(id1);
+        let cb2 = make_cb(id2);
+        // Must still be present after make_cb returns (guard moved, not dropped).
+        assert_eq!(cb1(), Some(10));
+        assert_eq!(cb1(), None);
+        drop(cb2);
+        assert!(take_pending_list_flip(id2).is_none(), "dropping uncalled closure cleans up entry");
+    }
 }
