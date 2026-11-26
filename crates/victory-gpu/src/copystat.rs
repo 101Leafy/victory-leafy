@@ -322,11 +322,17 @@ pub(crate) enum C {
     IndirectFindNs,
     IndirectPrepareNs,
     IndirectDriverNs,
+    /// Settles for lists in the air, by cause: dynamic descriptor slots run
+    /// out (`settle_for_tables`), the card compare result area full
+    /// (`card_results_low`), and too many lists out (`late_most`).
+    SettleTablesNs,
+    SettleResultsNs,
+    SettleListsNs,
 }
 const COUNTERS: usize = 192;
 
 /// The counters' names, in the order of [`C`], for the frame recorder's columns.
-pub(crate) const NAMES: [&str; 173] = [
+pub(crate) const NAMES: [&str; 176] = [
     "Submissions", "Copies", "CopyBytes", "Refreshes", "RefreshBytes", "Skipped", "SkippedBytes", "Runs",
     "RunUs", "Queries", "QueryUs", "MoveUs", "Unmapped", "Watches", "WatchUs", "Checked", "Unchanged",
     "Fallbacks", "GuardFaults", "TexWatched", "TexHashed", "TexChanged", "TexHot", "Frames", "RecordCalls",
@@ -356,7 +362,7 @@ pub(crate) const NAMES: [&str; 173] = [
     "HeapDueTwice", "HeapAgainShows", "HeapAgainLater", "HeapAgainTabled", "HeapAgainNothing",
     "DrawEarlyNs", "DrawTablesNs", "DrawMemoryNs", "DrawRootsNs", "DrawBuffersNs", "DrawStatesNs",
     "IndirectArgsNs", "DrawBindNs", "DrawDriverNs", "DrawAfterNs", "IndirectFindNs", "IndirectPrepareNs",
-    "IndirectDriverNs",
+    "IndirectDriverNs", "SettleTablesNs", "SettleResultsNs", "SettleListsNs",
 ];
 /// One of some sets of counters, each in lines of the processor's memory of
 /// its own: a set for all threads had them wait for each other's lines at
