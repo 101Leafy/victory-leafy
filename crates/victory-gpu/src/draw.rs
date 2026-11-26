@@ -746,7 +746,8 @@ fn set(roots: &mut Vec<Root>, slot: u32, root: Root) {
 type Picked = crate::heap_pass::Picked<std::sync::Arc<crate::shadow::Shadow>>;
 
 struct Ranges {
-    heaps: std::collections::HashMap<usize, Picked>,
+    /// By [`crate::descriptor::host::HostHeap::serial`].
+    heaps: std::collections::HashMap<u64, Picked>,
     /// A round ahead made this frame's sweep (`Picked::plan`).
     swept: bool,
 }
@@ -840,7 +841,7 @@ fn heap_looks(
     }
     let ranges = ranges
         .heaps
-        .entry(std::ptr::from_ref(host) as usize)
+        .entry(host.serial)
         .or_insert_with(|| Picked::new(crate::heap_pass::full_pass()));
     let changed = host.buffer_changes();
     #[cfg(feature = "diagnostics")]
@@ -1030,7 +1031,7 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
     #[cfg(feature = "diagnostics")]
     let looked = std::time::Instant::now();
     // Per host copy, the span its picked views cover.
-    let ranges = &ranges.heaps[&(std::ptr::from_ref(host) as usize)];
+    let ranges = &ranges.heaps[&host.serial];
     let views = ranges.views() as u32;
     let spans = ranges.spans();
     drop(kept);
@@ -2136,9 +2137,10 @@ impl State {
             .find(|h| !h.samplers())?;
         let host = heap.host()?;
         let gpu = host.strides_gpu()?;
-        // One key per list, as textures have: no title resource is there.
-        const ONCE: usize = usize::MAX - 0x5e;
-        if !list.first_use(ONCE) {
+        // One key per list and table (bit 0: no title address), so that a
+        // list that runs such shaders with two heaps keeps both tables
+        // (codec_d 18bdf7932).
+        if !list.first_use(gpu as usize | 1) {
             return Some(gpu);
         }
         // The list may outlive the title's heap object, which owns the table.
@@ -2150,9 +2152,9 @@ impl State {
         // frame (2026-11-24, run 11).
         // shortcut: what the title writes into such buffers between lists
         // of one frame is seen a frame late.
-        static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
+        // Per heap: a second heap of the frame had no pass (codec_d 18bdf7932).
         let frame = crate::frame::current();
-        if FRAME.swap(frame, Ordering::Relaxed) == frame {
+        if host.buffer_frame.swap(frame, Ordering::Relaxed) == frame {
             return Some(gpu);
         }
         let started = std::time::Instant::now();
@@ -2160,9 +2162,13 @@ impl State {
         if crate::host::aside::on() {
             let at = std::ptr::from_ref(heap) as usize;
             list.refreshes_coming(move || {
-                crate::descriptor::with_heap(at, |heap| heap.host().map(|host| heap_buffer_pass(heap, host, frame)))
-                    .flatten()
-                    .unwrap_or_default()
+                // Not a heap made at the same address since: its table is
+                // another than the one the list keeps (codec_d 18bdf7932).
+                crate::descriptor::with_heap(at, |heap| {
+                    heap.host().filter(|h| h.strides_gpu() == Some(gpu)).map(|host| heap_buffer_pass(heap, host, frame))
+                })
+                .flatten()
+                .unwrap_or_default()
             });
         } else {
             for (shadow, from, to) in heap_buffer_pass(heap, host, frame) {
