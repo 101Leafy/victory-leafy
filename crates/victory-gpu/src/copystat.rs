@@ -1446,6 +1446,12 @@ pub(crate) fn log(frames: f64) {
     tracing::info!(
         "guarded blocks opened, since the start: {runs} runs with one call each, {in_runs} blocks in them; {one_by_one} blocks one call each"
     );
+    let [loose, to_lock, taken] =
+        [0, 1, 2].map(|n| crate::watch::LOOSE_OPENS[n].load(std::sync::atomic::Ordering::Relaxed));
+    tracing::info!(
+        "write faults that opened their block with no lock (VICTORY_LOOSE_FAULTS=0 for none), since the start: {loose}; \
+         {to_lock} went on to the lock; {taken} taken into the notes after"
+    );
     tracing::info!(
         "waits for the write trackers' locks per frame, all threads (number, time): {}",
         crate::watch::lock_waits(frames as f64)
