@@ -8653,10 +8653,18 @@ impl Host {
         /// Buffers up to this size are kept: up to 16 MiB rounded up to a
         /// power of two from 64 KiB, larger ones to a multiple of 8 MiB.
         const LARGEST: u64 = 256 << 20;
-        const KEPT: usize = 48;
         const KEPT_BYTES: u64 = 1 << 30;
         static POOL: Mutex<Vec<(u64, ID3D12Resource)>> = Mutex::new(Vec::new());
         static ON: OnceLock<bool> = OnceLock::new();
+        // How many are kept; with `VICTORY_READ_BACK_KEEP=<n>` more (play-g:
+        // with 48, each frame made about 11 while lists in the air held the
+        // kept ones, slower as the run went on), and the pool's lock is not
+        // held while one is made.
+        static KEEP: OnceLock<Option<usize>> = OnceLock::new();
+        let keep = *KEEP.get_or_init(|| {
+            std::env::var("VICTORY_READ_BACK_KEEP").ok().and_then(|v| v.parse().ok()).filter(|&n: &usize| n > 0).map(|n| n.min(4096))
+        });
+        let kept = keep.unwrap_or(48);
         // SAFETY: a live buffer of the pool's; the count before the
         // reference taken here tells whether anyone else holds it, and only
         // the pool hands it out, under its lock.
@@ -8672,7 +8680,11 @@ impl Host {
             0..=0x100_0000 => size.max(64 << 10).next_power_of_two(),
             _ => size.next_multiple_of(8 << 20),
         };
-        let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+        #[cfg(feature = "diagnostics")]
+        let started = std::time::Instant::now();
+        let pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::ReadBackPoolNs, started.elapsed().as_nanos() as u64);
         if pooled
             && let Some((_, buffer)) = pool.iter().find(|(kept, buffer)| *kept == size && idle(buffer))
         {
@@ -8685,6 +8697,14 @@ impl Host {
             crate::copystat::add(crate::copystat::C::ReadBacksMade, 1);
             crate::copystat::add(crate::copystat::C::ReadBacksMadeBytes, size);
         }
+        let mut pool = if keep.is_some() {
+            drop(pool);
+            None
+        } else {
+            Some(pool)
+        };
+        #[cfg(feature = "diagnostics")]
+        let making = std::time::Instant::now();
         let heap = D3D12_HEAP_PROPERTIES {
             Type: D3D12_HEAP_TYPE_READBACK,
             ..Default::default()
@@ -8714,11 +8734,14 @@ impl Host {
                 &mut buffer,
             )
         };
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::ReadBacksMadeNs, making.elapsed().as_nanos() as u64);
         match made {
             Ok(()) => {
                 if pooled && let Some(buffer) = &buffer {
+                    let mut pool = pool.take().unwrap_or_else(|| POOL.lock().unwrap_or_else(|e| e.into_inner()));
                     let full = |pool: &Vec<(u64, ID3D12Resource)>| {
-                        pool.len() >= KEPT || pool.iter().map(|(kept, _)| kept).sum::<u64>() + size > KEPT_BYTES
+                        pool.len() >= kept || pool.iter().map(|(kept, _)| kept).sum::<u64>() + size > KEPT_BYTES
                     };
                     while full(&pool) {
                         let Some(i) = pool.iter().position(|(_, b)| idle(b)) else {
