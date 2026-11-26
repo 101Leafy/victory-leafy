@@ -203,6 +203,19 @@ fn sync_early() -> Option<std::time::Duration> {
 #[cfg(windows)]
 static SYNC_ROUNDS: (std::sync::Mutex<(u64, u64)>, std::sync::Condvar) = (std::sync::Mutex::new((0, 0)), std::sync::Condvar::new());
 
+/// Rounds of the thread ended, asked for or early.
+#[cfg(windows)]
+static SYNC_ENDED: (std::sync::Mutex<u64>, std::sync::Condvar) = (std::sync::Mutex::new(0), std::sync::Condvar::new());
+
+/// Waits until a round of the heap sync thread ends after `seen` of them
+/// had, or for `most`; the rounds ended by then.
+#[cfg(windows)]
+pub(crate) fn sync_round_after(seen: u64, most: std::time::Duration) -> u64 {
+    let ended = SYNC_ENDED.0.lock().unwrap_or_else(|e| e.into_inner());
+    let (ended, _) = SYNC_ENDED.1.wait_timeout_while(ended, most, |n| *n <= seen).unwrap_or_else(|e| e.into_inner());
+    *ended
+}
+
 /// [`sync_heaps`], begun; done when it is dropped (with [`sync_aside`]), or
 /// when this returns.
 #[cfg(windows)]
@@ -254,6 +267,8 @@ pub(crate) fn begin_sync_heaps() -> SyncedHeaps {
                 let _round =
                     crate::timeline::span(if asked { "the heaps' records, for a submission" } else { "the heaps' records, early" });
                 let _ = std::panic::catch_unwind(sync_heaps);
+                *SYNC_ENDED.0.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+                SYNC_ENDED.1.notify_all();
             }
         });
         THREAD.store(made.is_ok(), std::sync::atomic::Ordering::Release);

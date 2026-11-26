@@ -105,7 +105,7 @@ struct Last {
     asked: u64,
     /// The frame a partly mapped texture was last read in.
     partial: Option<u64>,
-    /// Until this frame a guarded texture is hashed at every check from its
+    /// Until this frame a guarded texture is hashed once a frame from its
     /// first check on, for the ones written behind the guard from the start
     /// (the six-star screen of the first seconds, which the hash never
     /// caught changing). 0: not checked under the guard yet.
@@ -121,8 +121,8 @@ struct Last {
     /// every third frame, so "again" cannot mean "the next frame".
     changed_at: u64,
     verify: bool,
-    /// The frame the texture was last hashed on its turn: a turn is a
-    /// sample, and the frame's later checks pass it over.
+    /// The frame the texture was last hashed on its turn or in its first
+    /// frames: either is a sample, and the frame's later checks pass it over.
     turned: u64,
 }
 
@@ -135,6 +135,10 @@ fn count_hashed(size: usize, why: u8) {
         match why {
             1 => add(C::TexHashedTurn, size as u64),
             2 => add(C::TexHashedHot, size as u64),
+            3 => {
+                add(C::TexHashedHot, size as u64);
+                add(C::TexHashedFirst, size as u64);
+            }
             _ => {}
         }
     }
@@ -142,7 +146,8 @@ fn count_hashed(size: usize, why: u8) {
 }
 
 /// How many frames a texture that keeps changing stays hashed at every
-/// check after its last change, and a guarded texture from its first check.
+/// check after its last change, and a guarded texture once a frame from its
+/// first check.
 const HOT_FRAMES: u64 = 64;
 /// How long after a change the next check still counts as "again".
 const VERIFY_FRAMES: u64 = 24;
@@ -188,8 +193,9 @@ impl Last {
 /// late and in turns: the boot logo video and the loading animation
 /// flickered between old and new pictures (fx-flicker run 1441). 0: on its
 /// turns only (every eighth frame), as before; 1: hashed at every check
-/// for its first frames ([`HOT_FRAMES`]), after a change the guard did not
-/// see, and while it keeps changing ([`Last::hash_due`]); 2 (default): as
+/// after a change the guard did not see and while it keeps changing
+/// ([`Last::hash_due`]), and once a frame for its first frames
+/// ([`HOT_FRAMES`], [`first_once`]); 2 (default): as
 /// 1, a check in the frame right after a change does not end the
 /// verifying, and while the next check may hash the texture every list
 /// that samples it records the copy into its host texture.
@@ -199,6 +205,34 @@ fn hot_level() -> u8 {
         Some(v) if v == "0" => 0,
         Some(v) if v == "1" => 1,
         _ => 2,
+    })
+}
+
+/// Whether a texture in its first frames, not changing, is hashed once a
+/// frame rather than at every check (`VICTORY_TEXTURE_FIRST_ONCE=0`, as
+/// before). Every texture streamed in has these frames, and each list that
+/// samples one checked it: 100-158 MB a frame hashed while due against
+/// 18-48 MB changed in the first gameplay seconds of run play-b, up to
+/// 50 ms of texture time a frame. A change made after the frame's hash is
+/// found by the next frame's.
+fn first_once() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_FIRST_ONCE").is_none_or(|v| v != "0"))
+}
+
+/// Every how many frames a guarded texture that was never found changing
+/// again is hashed on its turn (`VICTORY_TEXTURE_TURN`). One that was keeps
+/// every eighth frame. 8 as before when bit 1 of `VICTORY_PAGE_WRITES` is
+/// off; 64 when it is on, since DirectStorage's writes then open the
+/// texture's blocks and the guard sees them: in runs play-d to play-f
+/// (`all`) the turns hashed 4.5-6 MB a frame in the open world and found
+/// no change there, one in each run in the menus. A texture is hashed once
+/// a frame in its first frames anyway ([`HOT_FRAMES`]).
+fn turn_every() -> u64 {
+    static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *EVERY.get_or_init(|| {
+        let set = std::env::var("VICTORY_TEXTURE_TURN").ok().and_then(|v| v.parse().ok());
+        set.unwrap_or(if crate::watch::page_writes() & 1 != 0 { 64 } else { 8 }).max(1)
     })
 }
 
@@ -296,7 +330,7 @@ fn staged_under(at: usize, end: usize) -> Vec<Arc<Staging>> {
 /// Such a texture keeps its staging buffer and is checked at every
 /// submission that samples it ([`Staging::refresh`]). That check skips the
 /// read while the guards saw no write to the texture's blocks, unless it is
-/// the texture's turn (one frame in eight) or the texture changed lately. A
+/// the texture's turn ([`turn_every`]) or the texture changed lately. A
 /// write into the physical pages through the runtime's own view does not
 /// fault at the guard: the check sees it only if bit 1 of
 /// `VICTORY_PAGE_WRITES` opened the blocks, or at the texture's turn. The
@@ -1287,20 +1321,47 @@ pub(crate) fn zeros(list: &HostList, host: &crate::host::Host, texture: &ID3D12R
     let layers = if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D { 1 } else { u32::from(d.DepthOrArraySize) };
     let count = u32::from(d.MipLevels) * layers;
     let mut footprints = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); count as usize];
+    let mut rows = vec![0u32; count as usize];
     let mut bytes = 0u64;
     // SAFETY: outputs for `count` subresources.
     unsafe {
-        host.device
-            .GetCopyableFootprints(&d, 0, count, 0, Some(footprints.as_mut_ptr()), None, None, Some(&mut bytes));
+        host.device.GetCopyableFootprints(
+            &d,
+            0,
+            count,
+            0,
+            Some(footprints.as_mut_ptr()),
+            Some(rows.as_mut_ptr()),
+            None,
+            Some(&mut bytes),
+        );
     }
     if bytes == 0 || bytes == u64::MAX {
         return;
     }
-    let Some((buffer, data)) = list.upload(host, bytes) else {
-        return;
+    let most = footprints
+        .iter()
+        .zip(&rows)
+        .map(|(f, &rows)| u64::from(f.Footprint.RowPitch) * u64::from(rows) * u64::from(f.Footprint.Depth))
+        .max()
+        .unwrap_or(0);
+    let buffer = match shared_zeros(host, most) {
+        Some(buffer) => {
+            // Each subresource reads the same zeros from the start.
+            for footprint in &mut footprints {
+                footprint.Offset = 0;
+            }
+            buffer
+        }
+        None => {
+            let Some((buffer, data)) = list.upload(host, bytes) else {
+                return;
+            };
+            // SAFETY: a mapped buffer of `bytes` bytes, just made.
+            unsafe { std::ptr::write_bytes(data, 0, bytes as usize) };
+            buffer
+        }
     };
-    // SAFETY: a mapped buffer of `bytes` bytes, just made.
-    unsafe { std::ptr::write_bytes(data, 0, bytes as usize) };
     for (i, footprint) in footprints.iter().enumerate() {
         let to = D3D12_TEXTURE_COPY_LOCATION {
             // SAFETY: a borrowed pointer the location never releases.
@@ -1309,7 +1370,8 @@ pub(crate) fn zeros(list: &HostList, host: &crate::host::Host, texture: &ID3D12R
             Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: i as u32 },
         };
         let from = D3D12_TEXTURE_COPY_LOCATION {
-            // SAFETY: as above; the list holds the buffer until it is reset.
+            // SAFETY: as above; the list holds an upload buffer until it is
+            // reset, and the shared zeros are never let go.
             pResource: unsafe { std::mem::transmute_copy(&buffer) },
             Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
             Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: *footprint },
@@ -1317,6 +1379,66 @@ pub(crate) fn zeros(list: &HostList, host: &crate::host::Host, texture: &ID3D12R
         // SAFETY: an open list; both locations name live resources.
         unsafe { list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
     }
+}
+
+/// A buffer of at least `size` bytes of zeros in card memory, which every
+/// [`zeros`] copy reads and nothing writes; `None` past 256 MB or with
+/// `VICTORY_SHARED_ZEROS=0`. Before it each texture's zeros were an upload
+/// buffer of the whole texture (a level, for [`card_writes`]), made, waited
+/// resident and cleared while the list was recorded, and sent over the bus
+/// again. The buffer grows by powers of two; one outgrown stays, as a list
+/// recorded with it may not have run.
+fn shared_zeros(host: &crate::host::Host, size: u64) -> Option<ID3D12Resource> {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_SHARED_ZEROS").is_none_or(|v| v != "0")) || size > 256 << 20 {
+        return None;
+    }
+    static ZEROS: Mutex<(Option<(ID3D12Resource, u64)>, Vec<ID3D12Resource>)> = Mutex::new((None, Vec::new()));
+    let mut zeros = ZEROS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((buffer, len)) = &zeros.0
+        && *len >= size
+    {
+        return Some(buffer.clone());
+    }
+    let len = size.next_power_of_two().max(4 << 20);
+    let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
+    let desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+        Width: len,
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+        ..Default::default()
+    };
+    let mut buffer: Option<ID3D12Resource> = None;
+    // SAFETY: plain creation; memory made without CREATE_NOT_ZEROED holds zeros.
+    let made = unsafe {
+        host.device
+            .CreateCommittedResource(
+                &heap,
+                crate::host::not_resident(),
+                &desc,
+                D3D12_RESOURCE_STATE_COMMON,
+                None,
+                &mut buffer,
+            )
+            .and_then(|()| crate::host::resident(&host.device, buffer.as_ref().ok_or_else(windows::core::Error::empty)?))
+    };
+    let buffer = match made {
+        Ok(()) => buffer?,
+        Err(e) => {
+            tracing::warn!(error = %e, len, "no buffer of zeros");
+            return None;
+        }
+    };
+    crate::host::name(&buffer, || format!("zeros {len:#x}"));
+    if let Some((outgrown, _)) = zeros.0.take() {
+        zeros.1.push(outgrown);
+    }
+    zeros.0 = Some((buffer.clone(), len));
+    Some(buffer)
 }
 
 /// Levels on demand (`crate::tiles`): the card itself is about to write
@@ -1362,14 +1484,18 @@ pub(crate) fn card_writes(list: &HostList, resource: This, texture: &ID3D12Resou
                 host.device
                     .GetCopyableFootprints(&d, level, 1, 0, Some(&mut footprint), None, None, Some(&mut bytes));
             }
-            let Some((buffer, data)) = list.upload(host, bytes) else {
+            let made = shared_zeros(host, bytes).or_else(|| {
+                let (buffer, data) = list.upload(host, bytes)?;
+                // SAFETY: a mapped buffer of `bytes` bytes, just made.
+                unsafe { std::ptr::write_bytes(data, 0, bytes as usize) };
+                Some(buffer)
+            });
+            let Some(buffer) = made else {
                 // (With the levels that share its tiles, if it is one of
                 // the small ones.)
                 unzeroed |= tiled.with_level(level);
                 continue;
             };
-            // SAFETY: a mapped buffer of `bytes` bytes, just made.
-            unsafe { std::ptr::write_bytes(data, 0, bytes as usize) };
             let to = D3D12_TEXTURE_COPY_LOCATION {
                 // SAFETY: a borrowed pointer the location never releases.
                 pResource: unsafe { std::mem::transmute_copy(texture) },
@@ -1377,7 +1503,7 @@ pub(crate) fn card_writes(list: &HostList, resource: This, texture: &ID3D12Resou
                 Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: level },
             };
             let from = D3D12_TEXTURE_COPY_LOCATION {
-                // SAFETY: as above; the list holds the buffer until it is reset.
+                // SAFETY: as above; as in [`zeros`].
                 pResource: unsafe { std::mem::transmute_copy(&buffer) },
                 Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
                 Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: footprint },
@@ -1577,42 +1703,51 @@ impl Staging {
         // is noted, a mapping is announced by the runtime. While neither
         // happened the texture is as it was. What the guard cannot see (a
         // write to the same pages through another view) is still found by
-        // the hash, which is taken every eighth frame only, by the
+        // the hash, which is taken on turns only ([`turn_every`]), by the
         // texture's address, so the textures take turns.
         // `VICTORY_TEXTURE_GUARD=0` hashes at every check, as before.
         static GUARD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         // The guard saw no write: a change the hash finds came another way.
         let mut blind = false;
         // Why an unwritten texture is hashed: 0 written or unguarded, 1 its
-        // turn, 2 due.
+        // turn, 2 due, 3 in its first frames only.
         let mut why = 0;
         if !alone
             && *GUARD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD").is_none_or(|v| v != "0"))
             && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, true))
         {
-            const HASH_EVERY: u64 = 8;
             let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
             last.asked = now;
             let frame = crate::frame::current();
-            let turn = frame
-                .wrapping_add((start >> 16) as u64)
-                .is_multiple_of(HASH_EVERY);
+            let every = if last.hot_until == 0 { turn_every() } else { 8 };
+            let turn = frame.wrapping_add((start >> 16) as u64).is_multiple_of(every);
             // A texture starts hot: one written that way from its first
             // frames on changes before the hash has ever caught it.
             if last.started == 0 {
                 last.started = frame + HOT_FRAMES;
             }
-            let due = hot_level() >= 1 && (frame < last.started || last.hash_due(frame));
+            let first = frame < last.started && !last.hash_due(frame);
+            let mut due = hot_level() >= 1 && (frame < last.started || last.hash_due(frame));
+            let passed = due && first && last.turned == frame && first_once();
+            if passed {
+                due = false;
+            }
             if unwritten && !due && (!turn || last.turned == frame) {
                 #[cfg(feature = "diagnostics")]
-                if turn {
+                if passed {
+                    crate::copystat::add(crate::copystat::C::TexFirstSkipped, size as u64);
+                } else if turn {
                     crate::copystat::add(crate::copystat::C::TexTurnSkipped, size as u64);
                 }
                 return 0;
             }
             if unwritten {
-                why = if due { 2 } else { 1 };
-                if !due {
+                why = match (due, first) {
+                    (false, _) => 1,
+                    (true, false) => 2,
+                    (true, true) => 3,
+                };
+                if !due || first {
                     last.turned = frame;
                 }
             }

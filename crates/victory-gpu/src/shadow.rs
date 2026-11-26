@@ -172,7 +172,15 @@ pub(crate) fn cards() -> bool {
 /// - Unknown (`None`, e.g. WARP) or `<= 12 GiB` (8–12 GB cards, whose WDDM
 ///   budget is below 12 GiB): `(16, 512)` MiB, matching the 12 GB baseline.
 /// - `> 12 GiB` and `< 20 GiB` (16 GB cards, whose WDDM budget is typically
-///   ~13.5–15.2 GiB): `(4, 2048)` MiB.
+///   ~13.5–15.2 GiB): `(1, 2048)` MiB. It was `(4, 2048)`: on the RTX 5080
+///   (budget 15,209 MB) the play run of 2026-11-26 made 57 copies in the
+///   card's memory (925 MB of 2,048, none turned down for room), while the
+///   CPU snapshotted 93-96 MB a frame and compared 105-132 MB, 82-100 MB of
+///   it in copies of 1 to 4 MiB. Run play-b (50ca4bf41) named the top ones:
+///   two copies of 2 MiB compared 4.8 times a frame, 10.1 MB each, with
+///   0.03 MB and nothing written back, and two of 3.75 MiB twice a frame.
+///   On the card those are a compute pass and a fetch of the pieces that
+///   changed. `VICTORY_CARD_BUFFERS_MIN_MB=4` is the old line.
 /// - `>= 20 GiB` (24–32+ GB cards): `(1, (budget_mb / 4).min(8192))` MiB,
 ///   capping at 25% of local budget (at most 8 GiB) so "before" twins (up to 2x)
 ///   still leave headroom for textures and render targets.
@@ -186,7 +194,7 @@ fn default_card_limits_mb(local_vram_budget: Option<u64>) -> (u64, u64) {
     if budget_mb <= TWELVE_GIB_MB {
         (16, 512)
     } else if budget_mb < TWENTY_GIB_MB {
-        (4, 2048)
+        (1, 2048)
     } else {
         (1, (budget_mb / 4).min(8192))
     }
@@ -212,7 +220,7 @@ fn resolve_card_limits(
 /// shaders write takes its size twice), both in bytes:
 /// `VICTORY_CARD_BUFFERS_MIN_MB` and `VICTORY_CARD_BUFFERS_MB`.
 /// Defaults scale with the adapter's local VRAM budget (16 MiB / 512 MiB on
-/// `<= 12 GiB` budgets, 4 MiB / 2048 MiB on 16 GB cards, 1 MiB / up to 8192 MiB
+/// `<= 12 GiB` budgets, 1 MiB / 2048 MiB on 16 GB cards, 1 MiB / up to 8192 MiB
 /// on `>= 20 GiB` budgets), and explicit env vars always override.
 fn card_limits() -> (u64, u64) {
     static LIMITS: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
@@ -2843,6 +2851,9 @@ pub(crate) fn let_go_idle() {
 /// buffers kept for reuse and the bytes they reserve.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn memory() -> [u64; 6] {
+    if census_due() {
+        same_bytes();
+    }
     let (windows, window_bytes) = {
         let loose = LOOSE.write().unwrap_or_else(|e| e.into_inner());
         // Each copy once: a window may stand under several keys.
@@ -2866,6 +2877,117 @@ pub(crate) fn memory() -> [u64; 6] {
         kept,
         kept_bytes,
     ]
+}
+
+/// Whether [`same_bytes`] is to run now: once, at the first memory line
+/// `VICTORY_DUP_CENSUS` seconds or more after the first (off without it).
+#[cfg(feature = "diagnostics")]
+fn census_due() -> bool {
+    static AFTER: std::sync::OnceLock<Option<(std::time::Instant, u64)>> = std::sync::OnceLock::new();
+    static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let Some((first, after)) = *AFTER.get_or_init(|| {
+        let after = std::env::var("VICTORY_DUP_CENSUS").ok()?.parse().ok()?;
+        Some((std::time::Instant::now(), after))
+    }) else {
+        return false;
+    };
+    first.elapsed().as_secs() >= after && !DONE.swap(true, Ordering::Relaxed)
+}
+
+/// Logs how much of the host copies of title memory holds the same bytes
+/// as another copy: whole copies, and 64 KiB pieces (from each copy's
+/// first byte) the same as a piece seen before or all zeros; the title
+/// memory under more than one copy; and the bytes the host buffers take
+/// beyond the title's (each is its own committed resource: 64 KiB lines,
+/// and no buffer goes on the 4 KiB line, on any card). Windows in card
+/// memory the CPU maps are not read (reads there are slow), copies placed
+/// on title memory are no copies. A one-off: it reads every copy, about
+/// 4 GB, on the thread of the memory line, and bytes changing meanwhile
+/// only blur it.
+#[cfg(feature = "diagnostics")]
+fn same_bytes() {
+    let started = std::time::Instant::now();
+    let mut copies: Vec<Arc<Shadow>> = Vec::new();
+    {
+        let mut seen = std::collections::HashSet::new();
+        let mut take = |s: &Arc<Shadow>| {
+            if seen.insert(Arc::as_ptr(s) as usize) {
+                copies.push(s.clone());
+            }
+        };
+        BUFFERS.read().unwrap_or_else(|e| e.into_inner()).values().filter_map(|e| e.shadow.as_ref()).for_each(&mut take);
+        LOOSE.read().unwrap_or_else(|e| e.into_inner()).values().for_each(&mut take);
+        EXACT.lock().unwrap_or_else(|e| e.into_inner()).1.values().for_each(|(s, _)| take(s));
+    }
+    copies.retain(|s| s.place.is_none());
+    let mapped = copies.iter().filter(|s| s.mapped).count();
+    copies.retain(|s| !s.mapped && !s.data.is_null());
+
+    // Bytes: looked at, whole copies alike, pieces alike (windows,
+    // buffers, card copies), pieces of zeros; then the host buffers'
+    // width, of copies under 64 KiB their bytes, width and 4 KiB lines.
+    let mut b = [0u64; 10];
+    let mut alike_copies = 0u64;
+    let mut small = 0u64;
+    let mut wholes = std::collections::HashSet::new();
+    let mut pieces = std::collections::HashSet::new();
+    let mut zeros: std::collections::HashMap<usize, blake3::Hash> = std::collections::HashMap::new();
+    let mut spans = Vec::with_capacity(copies.len());
+    for s in &copies {
+        let len = s.len as usize;
+        // SAFETY: the copy is alive (held here) and its mapping `len` bytes.
+        let bytes = unsafe { std::slice::from_raw_parts(s.data.cast_const(), len) };
+        let mut whole = blake3::Hasher::new();
+        for piece in bytes.chunks(PIECE) {
+            let hash = blake3::hash(piece);
+            whole.update(hash.as_bytes());
+            let zero = *zeros.entry(piece.len()).or_insert_with(|| blake3::hash(&vec![0u8; piece.len()]));
+            let n = piece.len() as u64;
+            if hash == zero {
+                b[4] += n;
+            } else if !pieces.insert((piece.len(), hash)) {
+                b[if s.card.is_some() { 3 } else if s.window { 1 } else { 2 }] += n;
+            }
+        }
+        if !wholes.insert((len, whole.finalize())) {
+            alike_copies += 1;
+            b[5] += s.len;
+        }
+        b[0] += s.len;
+        b[6] += s.width();
+        if s.len < PIECE as u64 {
+            small += 1;
+            b[7] += s.len;
+            b[8] += s.width();
+            b[9] += s.len.next_multiple_of(KERNEL_PAGE as u64);
+        }
+        spans.push((s.start, s.start + s.len));
+    }
+    spans.sort_unstable();
+    let mut under = 0u64;
+    let mut reach = 0u64;
+    for (start, end) in spans {
+        under += end.saturating_sub(start.max(reach));
+        reach = reach.max(end);
+    }
+    let mb = |v: u64| v >> 20;
+    tracing::info!(
+        "memory, the same bytes in host copies of title memory (VICTORY_DUP_CENSUS, once, {} ms): {} copies {} MB read,          {mapped} windows in card memory the CPU maps not read; {alike_copies} copies the same as another whole, {} MB;          of 64 KiB pieces, the same as another: {} MB in windows, {} MB in buffers, {} MB in copies in the card's memory,          and {} MB all zeros; title memory under more than one copy: {} MB; host buffers {} MB for {} MB of title memory,          of them {small} under 64 KiB {} MB for {} KB (on 4 KiB lines {} KB)",
+        started.elapsed().as_millis(),
+        copies.len(),
+        mb(b[0]),
+        mb(b[5]),
+        mb(b[1]),
+        mb(b[2]),
+        mb(b[3]),
+        mb(b[4]),
+        mb(b[0] - under),
+        mb(b[6]),
+        mb(b[0]),
+        mb(b[8]),
+        b[7] >> 10,
+        b[9] >> 10,
+    );
 }
 
 // SAFETY: D3D12 resources are free-threaded; `data` is a persistent mapping
@@ -5446,10 +5568,10 @@ mod window_tests {
         assert_eq!(default_card_limits_mb(Some(12 * GIB)), (16, 512));
 
         // 16 GB tier (> 12 GiB, < 20 GiB), including WDDM budgets around 13.5–15 GiB.
-        assert_eq!(default_card_limits_mb(Some(13 * GIB)), (4, 2048));
-        assert_eq!(default_card_limits_mb(Some(14 * GIB)), (4, 2048));
-        assert_eq!(default_card_limits_mb(Some(15 * GIB)), (4, 2048));
-        assert_eq!(default_card_limits_mb(Some(16 * GIB)), (4, 2048));
+        assert_eq!(default_card_limits_mb(Some(13 * GIB)), (1, 2048));
+        assert_eq!(default_card_limits_mb(Some(14 * GIB)), (1, 2048));
+        assert_eq!(default_card_limits_mb(Some(15 * GIB)), (1, 2048));
+        assert_eq!(default_card_limits_mb(Some(16 * GIB)), (1, 2048));
 
         // 24–32+ GB tier (>= 20 GiB): 1 MiB min, 25% of budget capped at 8192 MiB.
         assert_eq!(default_card_limits_mb(Some(20 * GIB)), (1, 5120));
