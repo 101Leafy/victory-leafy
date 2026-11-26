@@ -100,25 +100,32 @@ pub(crate) fn kept() -> [u64; 7] {
     ]
 }
 
-/// The shared container for `bytes`.
+/// The shared container for `bytes`. A new one is built outside the lock
+/// (the copy and the compute role scan), so other creations do not wait on
+/// it; of two built at once, the first in keeps its place.
 fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
     let full = blake3::hash(bytes);
+    let key = *full.as_bytes();
+    if let Some(known) = SHADERS.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|s| s.get(&key)) {
+        return known.clone();
+    }
+    let built = Arc::new(Shader {
+        stage,
+        hash: full.to_hex()[..16].to_owned(),
+        container: bytes.to_vec(),
+        #[cfg(windows)]
+        ambient: (stage == "compute").then(|| crate::ambient::role(bytes)).flatten(),
+        #[cfg(windows)]
+        translated: OnceLock::new(),
+    });
     let mut shaders = SHADERS.lock().unwrap_or_else(|e| e.into_inner());
     shaders
         .get_or_insert_with(HashMap::new)
-        .entry(*full.as_bytes())
+        .entry(key)
         .or_insert_with(|| {
             KEPT[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             KEPT[1].fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
-            Arc::new(Shader {
-                stage,
-                hash: full.to_hex()[..16].to_owned(),
-                container: bytes.to_vec(),
-                #[cfg(windows)]
-                ambient: (stage == "compute").then(|| crate::ambient::role(bytes)).flatten(),
-                #[cfg(windows)]
-                translated: OnceLock::new(),
-            })
+            built
         })
         .clone()
 }
@@ -256,49 +263,9 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
     })
 }
 
-/// The compute pipelines of the console's ray-tracing structure builder
-/// (`XboxBvhBuilder.dll`; its programs are the ones with a spilled
-/// user-data table) run **all or none**. Its stages feed each other
-/// through memory: a stage that runs on what a dropped stage never wrote
-/// computes its store offsets from garbage. The structures lie in plain
-/// title memory, between the title's own objects, and a root view has no
-/// size, so those stores land on the neighbours (run 98, with 14 of 35
-/// stages translated: the title died within a second of the first builder
-/// submission, on pointers that had become bounding-box bit patterns).
-///
-/// So a builder dispatch runs only while every builder pipeline the title
-/// has created has a host pipeline; the first builder dispatch makes them
-/// all on the spot instead of over the next frames (a stage "still being
-/// made" would be a dropped stage). While one cannot be made the builder
-/// is off; it is looked at again when the title creates another. A stage
-/// that could not be bound stops the stages after it for the rest of that
-/// frame and the next ([`builder_rests`]); it turned the builder off for the
-/// rest of the run at first.
-///
-/// shortcut: and only with `VICTORY_BVH_BUILDER=1`, until a run has shown
-/// the whole builder and the host side of title memory by address
-/// (`memory.rs`) working on a card; nothing reads the structures before
-/// the programs that walk them translate.
-#[cfg(windows)]
-struct Builder {
-    pipelines: Vec<Arc<make::Pending>>,
-    /// Every one of `pipelines` has a host pipeline.
-    whole: bool,
-    /// One could not be made, of so many (0: none).
-    off: usize,
-    /// No stage runs before this frame.
-    rests: u64,
-}
-
-#[cfg(windows)]
-static BUILDER: Mutex<Builder> = Mutex::new(Builder {
-    pipelines: Vec::new(),
-    whole: false,
-    off: 0,
-    rests: 0,
-});
-
-/// Whether `shaders` are a pipeline of the structure builder.
+/// Whether `shaders` are a pipeline of the ray-tracing structure builder,
+/// guessed by its programs (a spilled user-data table) while its image is
+/// not known ([`builder`]).
 #[cfg(windows)]
 fn of_builder(shaders: &[Arc<Shader>]) -> bool {
     use victory_shader::{Container, FourCC};
@@ -345,47 +312,56 @@ pub(crate) fn is_builder(this: This) -> bool {
 /// this frame and the next (what it fed is not there).
 #[cfg(windows)]
 pub(crate) fn builder_rests(why: &'static str) {
-    let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
-    b.rests = crate::frame::current() + 2;
-    static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-    if SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 20 {
-        tracing::warn!(why, "the ray-tracing structure builder rests for this frame and the next: its stages run all or none");
-    }
+    builder::rests(why);
 }
 
 /// At a dispatch of a builder pipeline: whether the builder runs (see
-/// [`Builder`]).
+/// [`builder`]).
 #[cfg(windows)]
 pub(crate) fn builder_runs() -> bool {
-    static ALLOWED: OnceLock<bool> = OnceLock::new();
-    if !*ALLOWED.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1")) {
+    builder::runs()
+}
+
+/// Why a dispatch of the title's pipeline `this` is held back, if it is: a
+/// stage of the structure builder in a frame where the builder does not
+/// run, or a program that walks its structures before it has run whole
+/// ([`builder`]).
+#[cfg(windows)]
+pub(crate) fn held_back(this: This) -> Option<&'static str> {
+    if this.is_null() {
+        return None;
+    }
+    let p = pipeline(this);
+    if p.builder {
+        return (!builder::runs()).then_some("a stage of the ray-tracing structure builder, which is off");
+    }
+    (p.walks_bvh && !builder::built()).then_some("walks the ray-tracing structures before the builder has run whole")
+}
+
+/// A title DLL was mapped (the structure builder's pipelines are known by
+/// its image from then on).
+#[cfg(windows)]
+pub fn note_title_dll(file: &str, base: usize, size: usize) {
+    builder::note_title_dll(file, base, size);
+}
+
+/// Whether a shader container's programs walk the ray-tracing structures.
+#[cfg(windows)]
+fn walks_bvh(container: &[u8]) -> bool {
+    use victory_shader::{Container, FourCC};
+    let Ok(c) = Container::parse(container) else {
         return false;
-    }
-    let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
-    if b.off == b.pipelines.len() || crate::frame::current() < b.rests {
-        return false;
-    }
-    if b.whole {
-        return true;
-    }
-    let missing: Vec<String> = b.pipelines.iter().filter(|p| !make::now(p)).map(|p| make::hashes(p)).collect();
-    if !missing.is_empty() {
-        b.off = b.pipelines.len();
-        tracing::warn!(
-            missing = missing.len(),
-            of = b.pipelines.len(),
-            which = ?missing,
-            "the ray-tracing structure builder stays off: not all of its programs have a host pipeline, and its stages run all or none"
-        );
-        return false;
-    }
-    b.off = 0;
-    tracing::info!(
-        pipelines = b.pipelines.len(),
-        "the ray-tracing structure builder runs: all of its programs have host pipelines"
-    );
-    b.whole = true;
-    true
+    };
+    c.part(FourCC::DXIL)
+        .and_then(|part| victory_shader::native_programs(part.data).ok())
+        .is_some_and(|programs| programs.iter().any(|p| code_walks_bvh(&p.code)))
+}
+
+/// Whether console code has an `image_bvh*_intersect_ray`.
+#[cfg(windows)]
+fn code_walks_bvh(code: &[u8]) -> bool {
+    victory_shader::gfx10::decode(code)
+        .is_ok_and(|code| code.iter().any(|i| i.name().is_some_and(|n| n.starts_with("image_bvh"))))
 }
 
 /// Whether a console program can store to buffer memory: it has a buffer,
@@ -446,9 +422,12 @@ struct Pipeline {
     /// (by a worker: the title may release the pipeline meanwhile).
     #[cfg(windows)]
     host: Arc<make::Pending>,
-    /// One of the ray-tracing structure builder's ([`Builder`]).
+    /// One of the ray-tracing structure builder's ([`builder`]).
     #[cfg(windows)]
     builder: bool,
+    /// Walks the builder's structures (waits until it has run whole).
+    #[cfg(windows)]
+    walks_bvh: bool,
 }
 const _: () = assert!(offset_of!(Pipeline, packet) == 0x10);
 
@@ -590,6 +569,7 @@ fn copy(stage: &'static str, code: &Bytecode) -> Option<Arc<Shader>> {
 fn hand_out(
     shaders: Vec<Arc<Shader>>,
     #[cfg(windows)] graphics: Option<Box<host::GraphicsState>>,
+    #[cfg(windows)] code: &[*const u8],
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
@@ -601,14 +581,20 @@ fn hand_out(
     #[cfg(windows)]
     make::early(&host);
     #[cfg(windows)]
-    let builder = of_builder(&shaders);
+    let compute = matches!(&shaders[..], [s] if s.stage == "compute");
+    #[cfg(windows)]
+    let builder = compute
+        && if builder::mapped() {
+            builder::created_by_builder(code)
+        } else {
+            of_builder(&shaders)
+        };
     #[cfg(windows)]
     if builder {
-        // Another stage: the group is looked at again at its next dispatch.
-        let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
-        b.pipelines.push(host.clone());
-        b.whole = false;
+        builder::note(&host);
     }
+    #[cfg(windows)]
+    let walks_bvh = !builder && builder::allowed() && shaders.iter().any(|s| walks_bvh(&s.container));
     let pipeline = Box::new(Pipeline {
         object: Object::new(&FUNCTIONS),
         packet: [0; 8],
@@ -616,6 +602,8 @@ fn hand_out(
         host,
         #[cfg(windows)]
         builder,
+        #[cfg(windows)]
+        walks_bvh,
         shaders,
         bound: std::sync::atomic::AtomicBool::new(false),
     });
@@ -639,6 +627,8 @@ pub(crate) extern "system" fn create_graphics(
         shaders,
         #[cfg(windows)]
         None,
+        #[cfg(windows)]
+        &[],
         iid,
         out,
     )
@@ -659,6 +649,8 @@ pub(crate) extern "system" fn create_compute(
         copy("compute", &desc.stage).into_iter().collect(),
         #[cfg(windows)]
         None,
+        #[cfg(windows)]
+        &[desc.stage.code],
         iid,
         out,
     )
@@ -761,6 +753,8 @@ pub(crate) extern "system" fn create_stream(
         shaders,
         #[cfg(windows)]
         Some(Box::new(graphics)),
+        #[cfg(windows)]
+        &[],
         iid,
         out,
     )
@@ -783,6 +777,8 @@ static FUNCTIONS: Table<24> = {
     Table(f)
 };
 
+#[cfg(windows)]
+mod builder;
 #[cfg(windows)]
 pub(crate) mod host;
 #[cfg(windows)]
@@ -842,6 +838,91 @@ mod tests {
             .iter()
             .map(|s| (s.stage, s.container.clone()))
             .collect()
+    }
+
+    /// The same bytes give the same container, kept and counted once.
+    #[test]
+    fn same_bytes_share_one_container() {
+        let bytes: Vec<u8> = (0..4096u32).map(|i| (i * 31 + 7) as u8).collect();
+        let first = shader("pixel", &bytes);
+        let kept = KEPT[0].load(std::sync::atomic::Ordering::Relaxed);
+        let again = shader("pixel", &bytes);
+        assert!(Arc::ptr_eq(&first, &again));
+        assert_eq!(first.hash, blake3::hash(&bytes).to_hex()[..16]);
+        assert!(KEPT[0].load(std::sync::atomic::Ordering::Relaxed) >= kept);
+    }
+
+    /// A compute pipeline the structure builder creates (its bytecode in
+    /// the builder's image) is known as the builder's, and its dispatches
+    /// are held back while its host pipeline is not made: here never, as
+    /// its bytes are no shader container. Pipelines of other code are not
+    /// held back.
+    #[cfg(windows)]
+    #[test]
+    fn builder_dispatches_wait_for_every_builder_pipeline() {
+        let _one = builder::test_lock();
+        let code = [0xB0u8; 64];
+        let create = |code: &[u8]| {
+            let desc = ComputeHead {
+                root: std::ptr::null(),
+                stage: Bytecode {
+                    code: code.as_ptr(),
+                    size: code.len(),
+                },
+            };
+            let mut p: This = std::ptr::null();
+            assert_eq!(
+                create_compute(std::ptr::null(), &desc, &PIPELINE_IIDS[0], &mut p),
+                S_OK
+            );
+            p
+        };
+        builder::note_title_dll("xboxbvhbuilder.DLL", code.as_ptr() as usize, code.len());
+        let p = create(&code);
+        let other_code = [0xC0u8; 64];
+        let other = create(&other_code);
+        builder::clear_image_for_tests();
+        assert!(pipeline(p).builder, "its bytecode is in the builder's image");
+        assert!(!pipeline(other).builder);
+        // Its host pipeline is started at once and refused.
+        let refused = (0..500).any(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            make::state(&pipeline(p).host).is_some()
+        });
+        assert!(refused, "the builder's pipeline was started");
+        assert_eq!(make::state(&pipeline(p).host), Some(false));
+        assert!(held_back(p).is_some(), "one builder pipeline missing: the builder waits");
+        assert_eq!(held_back(other), None);
+        for q in [p, other] {
+            slot::<extern "system" fn(This) -> u32>(q, 0x10)(q);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn programs_that_intersect_rays_walk_the_structures() {
+        let code = |words: &[u32]| words.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>();
+        const S_ENDPGM: u32 = 0xBF81_0000;
+        // Result v[20:23], descriptor s[12:15] (as in victory-shader's BVH tests).
+        let rest = 20 << 8 | 3 << 16;
+        let narrow = code(&[0xF198_9F01, rest | 2, S_ENDPGM]);
+        // NSA: pointer v2, v13, then the ray from v3 to v12.
+        let wide = code(&[0xF19C_9F07, rest | 2, 0x0504_030D, 0x0908_0706, 0x000C_0B0A, S_ENDPGM]);
+        assert!(code_walks_bvh(&narrow), "image_bvh_intersect_ray");
+        assert!(code_walks_bvh(&wide), "image_bvh64_intersect_ray");
+        assert!(!code_walks_bvh(&code(&[S_ENDPGM])));
+    }
+
+    /// What walks the structures waits until the builder has run whole: in a
+    /// title with the builder, not before; in a title without it, at once.
+    #[cfg(windows)]
+    #[test]
+    fn walks_wait_for_the_builder_to_run_whole() {
+        let _one = builder::test_lock();
+        builder::note_title_dll("XboxBvhBuilder.dll", 0x1000, 0x1000);
+        assert!(!builder::built(), "a title with the builder: not built yet");
+        builder::clear_image_for_tests();
+        assert!(builder::built(), "a title without the builder: walks run");
     }
 
     #[test]
