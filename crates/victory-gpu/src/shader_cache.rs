@@ -277,13 +277,23 @@ pub fn precompile(container: &[u8]) -> Result<bool, String> {
 /// The translation of a console shader container, from the cache when
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
+    host_shader_finite(container, 0)
+}
+
+/// [`host_shader`] with the float colour exports to the targets in `mask`
+/// held finite (`emit::with_finite_targets`), cached apart from the plain
+/// translation; a mask of 0 is the plain one.
+pub(crate) fn host_shader_finite(container: &[u8], mask: u8) -> Result<HostShader, String> {
     let hash = blake3::hash(container).to_hex();
     let (wide, own) = (wave_wide(&hash), firstlane_own(&hash));
     let translate = move |c: &[u8]| {
-        victory_shader::emit::with_wave_wide(wide, || {
-            victory_shader::emit::with_firstlane_own(own, || victory_shader::emit::translate(c))
-        })
-        .map_err(|e| e.to_string())
+        let plain = || {
+            victory_shader::emit::with_wave_wide(wide, || {
+                victory_shader::emit::with_firstlane_own(own, || victory_shader::emit::translate(c))
+            })
+        };
+        if mask == 0 { plain() } else { victory_shader::emit::with_finite_targets(mask, plain) }
+            .map_err(|e| e.to_string())
     };
     match CACHE.get() {
         // The forms a list allows are part of what the entry was made from. A
@@ -297,6 +307,13 @@ pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
                 }
                 if own {
                     build[1] ^= 0x4f;
+                }
+                if mask != 0 {
+                    let mut key = blake3::Hasher::new();
+                    key.update(&build);
+                    key.update(b"finite targets");
+                    key.update(&[mask]);
+                    build = *key.finalize().as_bytes();
                 }
                 build
             };
