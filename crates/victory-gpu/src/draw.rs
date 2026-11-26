@@ -3999,7 +3999,16 @@ impl State {
             let Some(Root::Table(table)) = self.roots_ref(true).get(usize::from(slot)) else {
                 return None;
             };
-            let resource = match (kind, crate::descriptor::view(table + u64::from(offset) * 4)?) {
+            // A view of a texture the title placed in its memory is a placed
+            // record; its host texture is the one placed_texture names (run
+            // final-3: the miss program's depth and most of its textures).
+            let view = crate::descriptor::view(table + u64::from(offset) * 4)?;
+            let placed = crate::descriptor::host::placed_texture(&view);
+            let view = match &placed {
+                Some(p) => p.view.clone(),
+                None => view,
+            };
+            let resource = match (kind, view) {
                 (ResourceType::Srv, View::Shader(r, _)) | (ResourceType::Uav, View::Unordered(r, ..)) => r,
                 _ => return None,
             };
@@ -4023,10 +4032,14 @@ impl State {
         // with its normal to the camera (flat floors). Seen in the capture
         // haze2: after the _ReflectiveCaustics variant 34fb51b8a0312e82 the
         // place (0,464) named #6481's stencil plane.
+        // (The description's words are D3D12_SHADER_RESOURCE_VIEW_DESC's: its
+        // union starts at word 4, so a 2D view's plane is word 6; word 5 is
+        // its levels, which run final-3 mistook for the plane.)
         fn stencil_view(view: Option<View>) -> bool {
+            let view = view.map(|v| crate::descriptor::host::placed_texture(&v).map_or(v, |p| p.view.clone()));
             match view {
                 Some(View::Shader(_, Some(d))) => {
-                    matches!(crate::resource::pc_format(d[0]), 22 | 47) || (d[1] == 4 && d[5] == 1)
+                    matches!(crate::resource::pc_format(d[0]), 22 | 47) || (d[1] == 4 && d[6] == 1)
                 }
                 _ => false,
             }
