@@ -1743,7 +1743,11 @@ impl Staging {
             // Read through the copy, which stands unmapped pages: memory of
             // big pools is too slow to ask page by page.
             let read = with_read(size, |read| {
-                if since != 0 && !self.on_demand && let Some(bytes) = self.detile_written(read, &written, since) {
+                if since != 0
+                    && !self.on_demand
+                    && crate::toggled!("VICTORY_TEXTURE_ROWS")
+                    && let Some(bytes) = self.detile_written(read, &written, since)
+                {
                     return bytes;
                 }
                 crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
@@ -1974,6 +1978,8 @@ impl Staging {
     /// written into mip 0 of a 4K texture re-read and detiled all 16 MiB of
     /// it). Returns the bytes read, or `None` if the layout cannot say which
     /// rows or a part was not detiled (then it is detiled whole).
+    /// `VICTORY_TEXTURE_ROWS=0`: every written texture is detiled whole, as
+    /// before.
     fn detile_written(&self, read: &mut [u8], written: &[(usize, u64)], since: u64) -> Option<usize> {
         let (start, size) = (self.memory as usize, self.read);
         let page = crate::watch::PAGE;
