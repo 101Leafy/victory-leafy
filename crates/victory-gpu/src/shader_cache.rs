@@ -140,6 +140,29 @@ pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
     }
 }
 
+/// [`host_shader`] with the float colour exports to the targets in `mask`
+/// held finite (`emit::with_finite_targets`), cached apart from the plain
+/// translation.
+pub(crate) fn host_shader_finite(container: &[u8], mask: u8) -> Result<HostShader, String> {
+    if mask == 0 {
+        return host_shader(container);
+    }
+    let translate = move |c: &[u8]| {
+        victory_shader::emit::with_finite_targets(mask, || victory_shader::emit::translate(c))
+            .map_err(|e| e.to_string())
+    };
+    match CACHE.get() {
+        Some(cache) => {
+            let mut key = blake3::Hasher::new();
+            key.update(&build());
+            key.update(b"finite targets");
+            key.update(&[mask]);
+            cached(cache, key.finalize().as_bytes(), container, translate)
+        }
+        None => translate(container),
+    }
+}
+
 /// The cache entry's converter: the build and the container in, the
 /// encoded translation out. `ran` tells a miss from a hit.
 struct Translate<F> {
