@@ -3741,9 +3741,9 @@ impl State {
                     bring_up(&selected);
                     if let Some(title) = heap.index(table).filter(|first| first + n <= host.count()) {
                         for k in 0..n {
-                            let read = entries.iter().any(|u| u.table_offset_dwords / 8 == k)
+                            let read = entries().any(|u| u.table_offset_dwords / 8 == k)
                                 || selected.binary_search(&k).is_ok();
-                            if n <= 64 || entries.iter().any(|u| u.table_offset_dwords / 8 == k) {
+                            if n <= 64 || entries().any(|u| u.table_offset_dwords / 8 == k) {
                                 host.slot_tabled(title + k);
                             }
                             let at = table + u64::from(k) * 32;
