@@ -52,6 +52,59 @@ pub(crate) struct IndexView {
     format: u32,
 }
 
+/// Why a draw that reached [`State::bind`] or [`State::prepare_for`] is
+/// dropped.
+#[derive(Clone, Copy)]
+enum Refused {
+    /// A descriptor table found no free slots.
+    NoSlots,
+    /// A shader reads title memory by address and the list has no view heap
+    /// for its views.
+    NoHeap,
+    /// The same with a view heap: the host could not hold the memory.
+    NotHeld,
+    /// Its index buffer is in no title buffer the host has a copy of.
+    NoIndex,
+    /// A draw with a mesh pipeline, or the other way round, or a compute one.
+    Kind,
+    /// A root view bound as a one-view table found no slot or no view heap.
+    RootTable,
+}
+
+impl Refused {
+    fn text(self) -> &'static str {
+        match self {
+            Refused::NoSlots => "prepare failed: descriptor table found no free slots",
+            Refused::NoHeap => "prepare failed: reads by address without a view heap",
+            Refused::NotHeld => "prepare failed: memory read by address not held",
+            Refused::NoIndex => "prepare failed: index buffer with no host copy",
+            Refused::Kind => "prepare failed: pipeline kind mismatch",
+            Refused::RootTable => "prepare failed: root view table without a slot or view heap",
+        }
+    }
+}
+
+/// Notes why the draw is dropped ([`REFUSED`], and its counter): false.
+fn refuse(why: Refused) -> bool {
+    REFUSED.set(Some(why));
+    #[cfg(feature = "diagnostics")]
+    {
+        use crate::copystat::{C, add};
+        add(
+            match why {
+                Refused::NoSlots => C::RefusedNoSlots,
+                Refused::NoHeap => C::RefusedNoHeap,
+                Refused::NotHeld => C::RefusedNotHeld,
+                Refused::NoIndex => C::RefusedNoIndex,
+                Refused::Kind => C::RefusedKind,
+                Refused::RootTable => C::RefusedRootTable,
+            },
+            1,
+        );
+    }
+    false
+}
+
 /// Host states of a depth target, and of a texture shaders read.
 const DEPTH_WRITE: u32 = 0x10;
 const DEPTH_READ: u32 = 0x20;
@@ -66,6 +119,10 @@ thread_local! {
     /// While a stage's tables are walked (`State::tables`): whether that
     /// stage's shader can store to buffers (`Translated::stores`).
     static STORES: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    /// Why the last [`State::bind`] or [`State::prepare_for`] refused its
+    /// draw, for the indirect drop reasons (None: it did not, or for a
+    /// reason checked before).
+    static REFUSED: std::cell::Cell<Option<Refused>> = const { std::cell::Cell::new(None) };
     /// While `State::early_textures` runs the texture pass: the
     /// milliseconds and the bytes that run may take, in place of the
     /// pass's own per frame.
@@ -502,8 +559,13 @@ pub(crate) static HEAP_TEXTURES_WAITING: AtomicU64 = AtomicU64::new(0);
 pub(crate) static HEAP_TEXTURES_FULL: AtomicU64 = AtomicU64::new(0);
 
 /// Frames after a whole upload of a texture picked by index at which its
-/// memory is looked at again, each counted from the look before.
-const RECHECK_FRAMES: [u64; 5] = [4, 12, 40, 120, 400];
+/// memory is looked at again, each counted from the look before. The last
+/// two: of the changes found in a six-minute run (22,000), more turned up
+/// at the fifth look (400 frames on) than at the fourth, so the memory
+/// keeps changing past it, and a texture changed then kept what the last
+/// look saw for the rest of the run. At 2-3 frames a second 3,600 frames
+/// are about twenty minutes; a look reads 48 KiB.
+const RECHECK_FRAMES: [u64; 7] = [4, 12, 40, 120, 400, 1200, 3600];
 
 /// Looks at uploaded textures picked by index that found the memory as it
 /// was, and that found it changed (uploaded again), since the start.
@@ -525,6 +587,35 @@ pub(crate) static HEAP_TEXTURES_REUPLOADED_FULL: AtomicU64 = AtomicU64::new(0);
 fn full_card_pass() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_FULL_CARD_PASS").is_none_or(|v| v != "0"))
+}
+
+/// Dynamic descriptor slots asked for and not found at first, since the
+/// start: found after the flights in the air were settled (their lists'
+/// slots come back as they land); refused all the same (the draw is
+/// dropped).
+pub(crate) static DYNAMIC_SHORT: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+
+/// `n` dynamic slots of `host` ([`HostHeap::dynamic`]); with none free,
+/// the flights in the air are settled first and the slots asked for again
+/// (`VICTORY_TABLE_SETTLE=0`: not). A frame of some 18,700 draws in the
+/// world ran the ring out while the frames sent ahead still held theirs,
+/// and its draws went without their tables. The slots the title's lists
+/// hold before they are submitted cannot be had this way.
+///
+/// [`HostHeap::dynamic`]: crate::descriptor::host::HostHeap::dynamic
+fn dynamic_slots(host: &crate::descriptor::host::HostHeap, n: u32) -> Option<u32> {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if let Some(first) = host.dynamic(n) {
+        return Some(first);
+    }
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_TABLE_SETTLE").is_none_or(|v| v != "0")) {
+        DYNAMIC_SHORT[1].fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+    crate::host::settle_for_tables();
+    let found = host.dynamic(n);
+    DYNAMIC_SHORT[usize::from(found.is_none())].fetch_add(1, Ordering::Relaxed);
+    found
 }
 
 /// Whether a texture that has its host copy is still brought up to date
@@ -1382,7 +1473,7 @@ impl State {
         };
         if p.compute || p.mesh != mesh {
             once!(mesh, "a draw or mesh dispatch with another kind of pipeline");
-            return false;
+            return refuse(Refused::Kind);
         }
         if p.rects && self.topology != RECTANGLES {
             // Its geometry stage would turn each triangle into a rectangle.
@@ -1422,7 +1513,7 @@ impl State {
         if indexed {
             let v = self.index;
             let Some(shadow) = crate::shadow::find_any(v.address, u64::from(v.size)) else {
-                return false;
+                return refuse(Refused::NoIndex);
             };
             shadow.refresh(list, v.address, u64::from(v.size));
             let view = D3D12_INDEX_BUFFER_VIEW {
@@ -1538,7 +1629,7 @@ impl State {
             STORES.set(true);
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
-                return false;
+                return refuse(Refused::NoSlots);
             }
             if stage.shader.ambient.is_some() {
                 self.ambient_tables.clear();
@@ -1558,8 +1649,13 @@ impl State {
                     crate::memory::Use::Reads
                 };
                 let Some(ready) = self.memory_ready(list, &t, compute, use_) else {
-                    once!("a shader that reads title memory by address without a view heap to hold its views: the draw is dropped");
-                    return false;
+                    let heap = self.heaps[0] != 0 && crate::descriptor::heap(self.heaps[0] as This).host().is_some();
+                    if !heap {
+                        once!("a shader that reads title memory by address without a view heap to hold its views: the draw is dropped");
+                        return refuse(Refused::NoHeap);
+                    }
+                    once!("a shader that reads title memory by address whose memory the host could not hold: the draw is dropped");
+                    return refuse(Refused::NotHeld);
                 };
                 Some(ready)
             } else {
@@ -1644,7 +1740,7 @@ impl State {
                         once!(slot, "a shader reads a root view the title did not set");
                         // A table left unset is undefined: a null view.
                         if tabled && !self.root_srv_table(list, None, param, compute, false) {
-                            return false;
+                            return refuse(Refused::RootTable);
                         }
                         continue;
                     };
@@ -1656,7 +1752,7 @@ impl State {
                         });
                     if tabled {
                         if !self.root_srv_table(list, Some(address), param, compute, biased) {
-                            return false;
+                            return refuse(Refused::RootTable);
                         }
                         continue;
                     }
@@ -1796,7 +1892,7 @@ impl State {
             Some((index, shadow)) => (*index, address.zip(shadow.clone())),
             None => {
                 let shadow = address.and_then(|a| find(a).map(|s| (a, s)));
-                let Some(index) = host.dynamic(1) else {
+                let Some(index) = dynamic_slots(host, 1) else {
                     return false;
                 };
                 self.dynamic.push((key.0, index, 1));
@@ -1867,7 +1963,7 @@ impl State {
             Some((index, shadow)) => (*index, address.zip(shadow.clone())),
             None => {
                 let shadow = address.and_then(|a| crate::shadow::find(a, 1).map(|s| (a, s)));
-                let Some(index) = host.dynamic(1) else {
+                let Some(index) = dynamic_slots(host, 1) else {
                     return false;
                 };
                 self.dynamic.push((key.0, index, 1));
@@ -2648,6 +2744,7 @@ impl State {
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32, flags: u32) {
         // It may write the arguments a window holds clamped.
         self.window = None;
+        self.watch_dispatch([x, y, z]);
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -3145,6 +3242,115 @@ impl State {
         }
     }
 
+    /// `VICTORY_WATCH_SHADER=<hash>` (a compute shader, as the log names
+    /// it): at its dispatches, what it is given (root views, constants,
+    /// tables), and what the title memory its root views and its constant
+    /// pairs that look like addresses name holds by its next dispatch, as
+    /// floats and as words. The first eight dispatches and then each
+    /// power of two. For the boat that sinks once the first mission's
+    /// cutscene ends: `ShallowWaterSim:CS_ResolveHeightLookUps`
+    /// (92b4790eb4c29f6d) answers the title's water height questions; this
+    /// says whether its answers reach title memory.
+    fn watch_dispatch(&self, groups: [u32; 3]) {
+        static HASH: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+        let Some(hash) = HASH.get_or_init(|| std::env::var("VICTORY_WATCH_SHADER").ok().map(|v| v.trim().to_lowercase())) else {
+            return;
+        };
+        if !crate::pipeline::has_shader(self.pipeline as This, hash) {
+            return;
+        }
+        // The previous dispatch's addresses: read now, a frame or so after.
+        static PREVIOUS: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
+        static SEEN: AtomicU64 = AtomicU64::new(0);
+        let n = SEEN.fetch_add(1, Ordering::Relaxed);
+        let mut previous = PREVIOUS.lock().unwrap_or_else(|e| e.into_inner());
+        let mut addresses = Vec::new();
+        let mut given = Vec::new();
+        for (slot, root) in self.compute.iter().enumerate() {
+            match root {
+                Root::None => {}
+                Root::Table(at) => {
+                    given.push(format!("{slot}: table {at:#x}"));
+                    // Its first entries: what each views, and what that
+                    // memory holds as this dispatch is recorded (for an
+                    // output, what the dispatches before wrote).
+                    for k in 0..8u64 {
+                        let Some(view) = crate::descriptor::view(at + k * 32) else {
+                            continue;
+                        };
+                        let (what, memory) = match &view {
+                            View::Constant(address, size) => (format!("constant buffer {size} bytes"), Some(*address)),
+                            View::Shader(r, desc) | View::Unordered(r, _, desc) => {
+                                let kind = if matches!(view, View::Unordered(..)) { "unordered" } else { "shader" };
+                                match crate::resource::buffer_bytes(*r as This) {
+                                    Some((data, width)) => {
+                                        // A buffer view's first element and stride
+                                        // (raw and typed views: 4-byte elements).
+                                        let offset = desc.map_or(0, |d| {
+                                            (u64::from(d[2]) | u64::from(d[3]) << 32) * u64::from(d[5].max(4))
+                                        });
+                                        (
+                                            format!("{kind} buffer view of {width} bytes, desc {desc:x?}"),
+                                            Some(data as u64 + offset),
+                                        )
+                                    }
+                                    None => (format!("{kind} texture view, desc {desc:x?}"), None),
+                                }
+                            }
+                            View::Placed(unordered, _, desc) => (
+                                format!("placed {} view, desc {desc:x?}", if *unordered { "unordered" } else { "shader" }),
+                                Some(u64::from(desc[10]) | u64::from(desc[11]) << 32),
+                            ),
+                            View::Sampler(_) | View::ConsoleSampler(_) => ("sampler".to_owned(), None),
+                        };
+                        let held = memory.and_then(|address| {
+                            let mut bytes = [0u8; 64];
+                            crate::host::read_into(address as *const u8, &mut bytes).then(|| {
+                                let words: Vec<u32> = bytes.as_chunks::<4>().0.iter().map(|w| u32::from_le_bytes(*w)).collect();
+                                let floats: Vec<f32> = words.iter().map(|&w| f32::from_bits(w)).collect();
+                                format!("at {address:#x} floats {floats:?} words {words:x?}")
+                            })
+                        });
+                        given.push(format!("  table {slot} entry {k}: {what}; {}", held.unwrap_or_else(|| "memory not read".to_owned())));
+                    }
+                }
+                Root::View(at) => {
+                    given.push(format!("{slot}: view {at:#x}"));
+                    addresses.push(*at);
+                }
+                Root::Constants(words) => {
+                    given.push(format!("{slot}: constants {:x?}", &words[..words.len().min(16)]));
+                    // A pair whose high word is small and whose value is
+                    // past the first 64 KiB: a 40-bit title address.
+                    for pair in words.chunks_exact(2) {
+                        let at = u64::from(pair[0]) | u64::from(pair[1]) << 32;
+                        if pair[1] < 0x100 && at >= 0x10000 && at % 4 == 0 {
+                            addresses.push(at);
+                        }
+                    }
+                }
+            }
+        }
+        if n < 8 || n.is_power_of_two() {
+            for &at in previous.iter() {
+                let mut bytes = [0u8; 64];
+                if !crate::host::read_into(at as *const u8, &mut bytes) {
+                    tracing::info!(dispatch = n, address = format_args!("{at:#x}"), "watched shader: the previous dispatch's address is not readable");
+                    continue;
+                }
+                let words: Vec<u32> = bytes.as_chunks::<4>().0.iter().map(|w| u32::from_le_bytes(*w)).collect();
+                let floats: Vec<f32> = words.iter().map(|&w| f32::from_bits(w)).collect();
+                tracing::info!(
+                    dispatch = n,
+                    address = format_args!("{at:#x}"),
+                    "watched shader: what the previous dispatch's address holds now: floats {floats:?} words {words:x?}"
+                );
+            }
+            tracing::info!(dispatch = n, ?groups, hash = %hash, "watched shader dispatched with {}", given.join("; "));
+        }
+        *previous = addresses;
+    }
+
     fn roots_ref(&self, compute: bool) -> &Vec<Root> {
         if compute {
             &self.compute
@@ -3354,7 +3560,7 @@ impl State {
                     crate::copystat::add(crate::copystat::C::FreshAgain, 1);
                 }
             }
-            let Some(first) = host.dynamic(n) else {
+            let Some(first) = dynamic_slots(host, n) else {
                 // No room: the draw must not run with the title's own
                 // offsets (slots never made for it); `bind` drops it.
                 made.push((slot, u32::MAX));
@@ -3937,6 +4143,7 @@ impl State {
                 (bounded, 0)
             }
         };
+        REFUSED.set(None);
         let ran = match kind {
             DRAW | INDEXED => self.prepare(list, kind == INDEXED),
             MESH => self.prepare_for(list, false, true),
@@ -3944,7 +4151,7 @@ impl State {
             _ => false,
         };
         if !ran {
-            why("prepare failed");
+            why(REFUSED.get().map_or("prepare failed", Refused::text));
             return false;
         }
         #[cfg(feature = "diagnostics")]
