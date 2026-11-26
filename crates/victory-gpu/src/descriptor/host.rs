@@ -112,6 +112,12 @@ impl Made {
 }
 
 pub(crate) struct HostHeap {
+    /// Its number, never another heap's in the run: what is kept for it
+    /// elsewhere is not found by a heap made later at its address (codec_d
+    /// 18bdf7932).
+    pub(crate) serial: u64,
+    /// The frame of its last heap pass ([`crate::draw`]'s `heap_buffers`).
+    pub(crate) buffer_frame: std::sync::atomic::AtomicU64,
     pub(crate) heap: ID3D12DescriptorHeap,
     cpu: usize,
     step: u32,
@@ -1659,7 +1665,10 @@ impl HostHeap {
                 Some((buffer, gpu, data as usize))
             })
             .flatten();
+        static SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let h = HostHeap {
+            serial: SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            buffer_frame: std::sync::atomic::AtomicU64::new(u64::MAX),
             heap,
             cpu,
             step,
