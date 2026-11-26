@@ -837,12 +837,12 @@ mod tests {
     /// A shader that writes through views it picks: its buffer is found when
     /// it comes to it in turn, and what it writes from then on is landed.
     #[test]
-    #[ignore = "wants VICTORY_RELAY=2 VICTORY_RELAY_COPY=1 VICTORY_PICKED_WRITES=1 VICTORY_PICKED_MB=1 and a process of its own"]
+    #[ignore = "wants VICTORY_RELAY=2 VICTORY_RELAY_COPY=1 VICTORY_PICKED_WRITES=2 VICTORY_PICKED_MB=1 and a process of its own"]
     fn writes_through_picked_views_come_back() {
         let Some(host) = host() else {
             return;
         };
-        assert!(crate::picked::on(), "set VICTORY_PICKED_WRITES=1");
+        assert!(crate::picked::on(), "set VICTORY_PICKED_WRITES=2");
         let (title, start, shadow) = title(0x6666, true);
         crate::picked::shown(vec![(shadow.clone(), start as u64, (start + LEN) as u64)], true);
         let at = (37 << 16) + 512;
@@ -943,7 +943,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "wants VICTORY_RELAY=2 VICTORY_RELAY_COPY=1 and a process of its own"]
+    #[ignore = "wants VICTORY_RELAY=2 VICTORY_RELAY_COPY=1 VICTORY_CARD_BUFFERS_MIN_KB=1 and a process of its own"]
     fn each_submission_reads_its_own_copy_on_the_card() {
         each_reads_its_own(LEN, 0x7777, true);
     }
@@ -1104,7 +1104,7 @@ mod tests {
 
     /// Two buffers with two sides.
     #[test]
-    #[ignore = "wants VICTORY_RELAY=2 VICTORY_RELAY_COPY=1 and a process of its own"]
+    #[ignore = "wants VICTORY_RELAY=2 VICTORY_RELAY_COPY=1 VICTORY_CARD_BUFFERS_MIN_KB=1 and a process of its own"]
     fn copies_stand_where_the_list_has_them_on_the_card() {
         in_order(0x9100, [LEN, LEN, LEN]);
     }
@@ -1112,7 +1112,7 @@ mod tests {
     /// One in the card's memory, one in the PC's (one side without
     /// `VICTORY_CARD_ALL`).
     #[test]
-    #[ignore = "wants VICTORY_RELAY=2 VICTORY_RELAY_COPY=1 and a process of its own"]
+    #[ignore = "wants VICTORY_RELAY=2 VICTORY_RELAY_COPY=1 VICTORY_CARD_BUFFERS_MIN_KB=1 and a process of its own"]
     fn copies_stand_where_the_list_has_them_mixed() {
         in_order(0x9200, [LEN, 256 << 10, 256 << 10]);
     }
