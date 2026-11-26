@@ -1220,6 +1220,8 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
     let refreshed = std::time::Instant::now();
     crate::watch::look_at_holes();
     #[cfg(feature = "diagnostics")]
+    crate::copystat::lap(crate::copystat::C::HolesNs, refreshed);
+    #[cfg(feature = "diagnostics")]
     for (sum, time) in HEAP_SPLIT.iter().zip([looked - started, refreshed - looked]) {
         sum.fetch_add(time.as_nanos() as u64, Ordering::Relaxed);
     }
