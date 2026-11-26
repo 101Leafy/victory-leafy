@@ -2012,6 +2012,8 @@ impl Staging {
             return Some(bytes);
         }
         self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+        #[cfg(feature = "diagnostics")]
+        let touched = bands.iter().map(|(rows, _)| rows.clone()).collect::<Vec<_>>();
         for (i, (band, _)) in bands.into_iter().enumerate() {
             if band.is_empty() {
                 continue;
@@ -2033,7 +2035,70 @@ impl Staging {
         }
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexRowsDetiled, bytes as u64);
+        #[cfg(feature = "diagnostics")]
+        self.check_rows(&touched);
         Some(bytes)
+    }
+
+    /// With `VICTORY_TEXTURE_ROWS_CHECK=1`: after a detile of written rows,
+    /// detiles the whole texture again into a scratch copy and logs each
+    /// part whose staging rows differ, inside the rows just detiled (the
+    /// title wrote between the two reads, or the rows were detiled wrong)
+    /// or outside them (a write the watch did not see). The first 16 such
+    /// textures are saved to the capture folder as `rows-<memory>.tiled`
+    /// and `rows-<memory>-<part>.staging` / `.whole`.
+    #[cfg(feature = "diagnostics")]
+    fn check_rows(&self, touched: &[std::ops::Range<u32>]) {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        static SAVED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if !*ON.get_or_init(|| crate::switch::on("VICTORY_TEXTURE_ROWS_CHECK")) {
+            return;
+        }
+        let mut tiled = vec![0; self.read];
+        crate::host::copy_mapped(tiled.as_mut_ptr(), self.memory, self.read, false);
+        let mut differed = false;
+        for (i, (footprint, &rows)) in self.footprints.iter().zip(&self.rows).enumerate() {
+            let (mip, slice) = self.part(i);
+            let f = footprint.Footprint;
+            let pitch = f.RowPitch as usize;
+            let len = (pitch * rows as usize * f.Depth as usize)
+                .min(self.bytes.saturating_sub(footprint.Offset) as usize);
+            // SAFETY: the part's piece of the mapped staging buffer.
+            let staged = unsafe { std::slice::from_raw_parts(self.data.add(footprint.Offset as usize), len) };
+            let mut whole = staged.to_vec();
+            if self.layout.detile(&tiled, mip, slice, &mut whole, pitch, pitch * rows as usize).is_err() {
+                continue;
+            }
+            let Some(first) = staged.iter().zip(&whole).position(|(a, b)| a != b) else {
+                continue;
+            };
+            let bytes = staged.iter().zip(&whole).filter(|(a, b)| a != b).count();
+            let row = first % (pitch * rows as usize).max(1) / pitch.max(1);
+            tracing::warn!(
+                memory = ?self.memory,
+                desc = ?self.layout.desc,
+                mip,
+                slice,
+                row,
+                detiled = ?touched[i],
+                bytes,
+                "texture rows check: staging differs from a whole detile"
+            );
+            if SAVED.load(std::sync::atomic::Ordering::Relaxed) < 16
+                && let Some(dir) = crate::capture::folder()
+            {
+                let name = format!("rows-{:x}-{i}", self.memory as usize);
+                let _ = std::fs::write(dir.join(format!("{name}.staging")), staged);
+                let _ = std::fs::write(dir.join(format!("{name}.whole")), &whole);
+                differed = true;
+            }
+        }
+        if differed
+            && SAVED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 16
+            && let Some(dir) = crate::capture::folder()
+        {
+            let _ = std::fs::write(dir.join(format!("rows-{:x}.tiled", self.memory as usize)), &tiled);
+        }
     }
 
     /// Detiles `tiled` (the texture's memory) into the staging buffer.
