@@ -752,10 +752,17 @@ pub(crate) static DYNAMIC_SHORT: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64:
 /// frame waited 150 to 350 ms a frame for the card (2.3 fps).
 ///
 /// [`HostHeap::dynamic`]: crate::descriptor::host::HostHeap::dynamic
-fn dynamic_slots(host: &crate::descriptor::host::HostHeap, n: u32) -> Option<u32> {
+fn dynamic_slots(heap: usize, host: &crate::descriptor::host::HostHeap, n: u32) -> Option<u32> {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     static SETTLED: AtomicU64 = AtomicU64::new(u64::MAX);
     if let Some(first) = host.dynamic(n) {
+        return Some(first);
+    }
+    // Shared tables parked for the frame's later lists go back before
+    // anything waits for the card.
+    if SharedTables::unpark(heap, host)
+        && let Some(first) = host.dynamic(n)
+    {
         return Some(first);
     }
     let mode = *MODE.get_or_init(|| match std::env::var("VICTORY_TABLE_SETTLE").as_deref().map(str::trim) {
@@ -1211,7 +1218,16 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
     }
     #[cfg(feature = "diagnostics")]
     let refreshed = std::time::Instant::now();
-    crate::watch::look_at_holes();
+    let [wait, hold] = crate::watch::look_at_holes();
+    #[cfg(feature = "diagnostics")]
+    {
+        use crate::copystat::{C, add, lap};
+        lap(C::HolesNs, refreshed);
+        add(C::HolesWaitNs, wait);
+        add(C::HolesHoldNs, hold);
+    }
+    #[cfg(not(feature = "diagnostics"))]
+    let _ = (wait, hold);
     #[cfg(feature = "diagnostics")]
     for (sum, time) in HEAP_SPLIT.iter().zip([looked - started, refreshed - looked]) {
         sum.fetch_add(time.as_nanos() as u64, Ordering::Relaxed);
@@ -2131,7 +2147,7 @@ impl State {
             Some((index, shadow)) => (*index, address.zip(shadow.clone())),
             None => {
                 let shadow = address.and_then(|a| find(a).map(|s| (a, s)));
-                let Some(index) = dynamic_slots(host, 1) else {
+                let Some(index) = dynamic_slots(key.0, host, 1) else {
                     return false;
                 };
                 self.dynamic.push((key.0, index, 1));
@@ -2202,7 +2218,7 @@ impl State {
             Some((index, shadow)) => (*index, address.zip(shadow.clone())),
             None => {
                 let shadow = address.and_then(|a| crate::shadow::find(a, 1).map(|s| (a, s)));
-                let Some(index) = dynamic_slots(host, 1) else {
+                let Some(index) = dynamic_slots(key.0, host, 1) else {
                     return false;
                 };
                 self.dynamic.push((key.0, index, 1));
@@ -3382,12 +3398,15 @@ impl State {
             crate::pipeline::note_drop(self.pipeline as This);
             return;
         }
-        // The ray-tracing structure builder's stages run all or none.
-        if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
+        // The ray-tracing structure builder's stages run all or none, and
+        // what walks its structures waits until it has run whole
+        // (`pipeline::builder`, upstream #2118 and #2311).
+        if let Some(why) = crate::pipeline::held_back(self.pipeline as This) {
+            once!(why, "a dispatch held back");
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             {
-                crate::pipeline::note_why("a stage of the ray-tracing structure builder, which is off".to_owned());
+                crate::pipeline::note_why(why.to_owned());
                 self.list_dropped_roots([x, y, z]);
             }
             return;
@@ -4170,23 +4189,72 @@ impl State {
             let heap_key = (std::ptr::from_ref(heap) as usize, key);
             #[cfg(feature = "diagnostics")]
             FreshSeen::asked(heap_key, n);
-            if shared_tables() && let Some(first) = SharedTables::find(heap_key) {
+            if shared_tables() && let Some((first, revived)) = SharedTables::find(heap_key) {
                 // Another list made it this frame, with no constant views in
                 // it: its slots are used as they are.
                 #[cfg(feature = "diagnostics")]
                 {
                     crate::copystat::add(crate::copystat::C::FreshShared, 1);
                     crate::copystat::add(crate::copystat::C::FreshSharedSlots, u64::from(n));
+                    if revived {
+                        crate::copystat::add(crate::copystat::C::FreshRevived, 1);
+                        crate::copystat::add(crate::copystat::C::FreshRevivedSlots, u64::from(n));
+                    }
                 }
+                #[cfg(not(feature = "diagnostics"))]
+                let _ = revived;
                 self.shared.push((heap_key.0, first));
                 self.fresh_tables.insert(key, FreshTable { first, epoch: 0, ready: Vec::new() });
                 bring_up(&selected);
                 made.push((slot, first * 32));
                 continue;
             }
-            let Some(first) = dynamic_slots(host, n) else {
-                // No room: the draw must not run with the title's own
-                // offsets (slots never made for it); `bind` drops it.
+            let Some(first) = dynamic_slots(heap_key.0, host, n) else {
+                // No room, but another list made a table of the same
+                // records this frame at another table: the draw reads that
+                // run, and this table's title slots are marked a table's as
+                // a made one's are.
+                if shared_tables()
+                    && same_tables()
+                    && let Some((first, revived)) = SharedTables::find_same(heap_key.0, n, key.2)
+                {
+                    #[cfg(feature = "diagnostics")]
+                    {
+                        crate::copystat::add(crate::copystat::C::FreshSameUsed, 1);
+                        crate::copystat::add(crate::copystat::C::FreshSameUsedSlots, u64::from(n));
+                        if revived {
+                            crate::copystat::add(crate::copystat::C::FreshRevived, 1);
+                            crate::copystat::add(crate::copystat::C::FreshRevivedSlots, u64::from(n));
+                        }
+                    }
+                    #[cfg(not(feature = "diagnostics"))]
+                    let _ = revived;
+                    self.shared.push((heap_key.0, first));
+                    self.fresh_tables.insert(key, FreshTable { first, epoch: 0, ready: Vec::new() });
+                    bring_up(&selected);
+                    if let Some(title) = heap.index(table).filter(|first| first + n <= host.count()) {
+                        for k in 0..n {
+                            let read = entries().any(|u| u.table_offset_dwords / 8 == k)
+                                || selected.binary_search(&k).is_ok();
+                            if n <= 64 || entries().any(|u| u.table_offset_dwords / 8 == k) {
+                                host.slot_tabled(title + k);
+                            }
+                            let at = table + u64::from(k) * 32;
+                            if let Some(view) = crate::descriptor::view(at)
+                                && crate::descriptor::host::is_texture_view(&view)
+                            {
+                                host.texture_slot_tabled(title + k, read);
+                                if read {
+                                    host.mirror_after(list, title + k, at);
+                                }
+                            }
+                        }
+                    }
+                    made.push((slot, first * 32));
+                    continue;
+                }
+                // The draw must not run with the title's own offsets
+                // (slots never made for it); `bind` drops it.
                 made.push((slot, u32::MAX));
                 continue;
             };
@@ -4632,7 +4700,10 @@ impl State {
             crate::pipeline::note_drop(self.pipeline as This);
             return false;
         }
-        if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
+        if let Some(held) = crate::pipeline::held_back(self.pipeline as This) {
+            once!(why = held, "an indirect call held back");
+            #[cfg(feature = "diagnostics")]
+            crate::pipeline::note_why(format!("indirect kind {kind}: {held}"));
             return false;
         }
         const DRAW: u32 = 0;
@@ -5039,19 +5110,49 @@ fn shared_tables() -> bool {
     crate::toggled!("VICTORY_SHARED_TABLES")
 }
 
+/// Whether a shared table whose last list has run is kept for the frame's
+/// later lists (parked) instead of going back at once
+/// (`VICTORY_PARK_TABLES=0`: it goes back). In play-g lists asked again
+/// for 516 million slots' worth of tables another list had made that frame
+/// with no constant views, of 656 million made, and found none of them
+/// shared: the first list had run and given them back before the next one
+/// asked.
+fn park_tables() -> bool {
+    crate::toggled!("VICTORY_PARK_TABLES")
+}
+
+/// Whether a table that finds no dynamic slots reads a run another list
+/// made this frame from the same records at another table, rather than
+/// its draw being dropped (`VICTORY_SAME_TABLES=0`: dropped). In the
+/// binocular flash, frame 13386 asked for 451,641 slots against a ring of
+/// 606,784, 340,417 of them for tables remade, and refused 4,531 tables.
+fn same_tables() -> bool {
+    crate::toggled!("VICTORY_SAME_TABLES")
+}
+
 type FreshKey = (usize, (u64, u32, u64));
 
 /// Tables made afresh this frame that other lists use as they are
-/// ([`shared_tables`]). A run of dynamic slots is given back once the last
-/// list using it has run.
+/// ([`shared_tables`]). A run of dynamic slots is kept once the last list
+/// using it has run ([`park_tables`]), until the next frame or until a
+/// table finds no room; without parking it goes back then.
 #[derive(Default)]
 struct SharedTables {
     frame: u64,
     /// (title heap, table, slot count, contents) → first dynamic slot, made
     /// this frame.
     made: std::collections::HashMap<FreshKey, u32, std::hash::BuildHasherDefault<crate::host::AddressHash>>,
-    /// (title heap, first dynamic slot) → slot count, lists using it, key.
+    /// (title heap, first dynamic slot) → slot count, lists using it (0:
+    /// parked), key.
     held: std::collections::HashMap<(usize, u32), (u32, u32, (u64, u32, u64)), std::hash::BuildHasherDefault<crate::host::AddressHash>>,
+    /// (title heap, slot count, contents) → the run of `made` last made
+    /// from them, at whichever table ([`same_tables`]).
+    same: std::collections::HashMap<(usize, u32, u64), u32, std::hash::BuildHasherDefault<crate::host::AddressHash>>,
+    /// Runs parked.
+    parked: u32,
+    /// Parked runs of past frames, to go back once the lock is let go:
+    /// (title heap, first dynamic slot, slot count).
+    gone: Vec<(usize, u32, u32)>,
 }
 
 static SHARED_TABLES: std::sync::Mutex<Option<SharedTables>> = std::sync::Mutex::new(None);
@@ -5061,46 +5162,147 @@ impl SharedTables {
         if self.frame != frame {
             self.frame = frame;
             self.made.clear();
+            self.same.clear();
+            self.unparked(None);
         }
     }
 
+    /// Moves the parked runs of `heap` (of all heaps for `None`) to
+    /// `gone`; whether there were any.
+    fn unparked(&mut self, heap: Option<usize>) -> bool {
+        if self.parked == 0 {
+            return false;
+        }
+        let before = self.gone.len();
+        let (made, same, gone) = (&mut self.made, &mut self.same, &mut self.gone);
+        self.held.retain(|&(at, first), &mut (n, users, key)| {
+            if users > 0 || heap.is_some_and(|h| h != at) {
+                return true;
+            }
+            if made.get(&(at, key)) == Some(&first) {
+                made.remove(&(at, key));
+            }
+            if same.get(&(at, key.1, key.2)) == Some(&first) {
+                same.remove(&(at, key.1, key.2));
+            }
+            gone.push((at, first, n));
+            false
+        });
+        let taken = self.gone.len() - before;
+        self.parked -= taken as u32;
+        taken > 0
+    }
+
     /// The first slot of the table made this frame for `key`, now used by
-    /// one list more.
-    fn found(&mut self, frame: u64, key: FreshKey) -> Option<u32> {
+    /// one list more; whether it was parked.
+    fn found(&mut self, frame: u64, key: FreshKey) -> Option<(u32, bool)> {
         self.this_frame(frame);
         let first = *self.made.get(&key)?;
-        self.held.get_mut(&(key.0, first))?.1 += 1;
-        Some(first)
+        self.used(key.0, first)
+    }
+
+    /// The first slot of a run made this frame from the records `contents`
+    /// of `n` slots in title heap `heap`, at any table, now used by one
+    /// list more; whether it was parked.
+    fn found_same(&mut self, frame: u64, heap: usize, n: u32, contents: u64) -> Option<(u32, bool)> {
+        self.this_frame(frame);
+        let first = *self.same.get(&(heap, n, contents))?;
+        self.used(heap, first)
+    }
+
+    fn used(&mut self, heap: usize, first: u32) -> Option<(u32, bool)> {
+        let users = &mut self.held.get_mut(&(heap, first))?.1;
+        let revived = *users == 0;
+        *users += 1;
+        if revived {
+            self.parked -= 1;
+        }
+        Some((first, revived))
     }
 
     fn added(&mut self, frame: u64, key: FreshKey, first: u32, n: u32) {
         self.this_frame(frame);
         self.made.insert(key, first);
+        self.same.insert((key.0, key.1.1, key.1.2), first);
         self.held.insert((key.0, first), (n, 1, key.1));
     }
 
-    /// One list less uses the run at `first`: its slot count once none does.
-    fn dropped(&mut self, heap: usize, first: u32) -> Option<u32> {
+    /// One list less uses the run at `first`: its slot count once none does
+    /// and it is not parked.
+    fn dropped(&mut self, heap: usize, first: u32, park: bool) -> Option<u32> {
         let held = self.held.get_mut(&(heap, first))?;
         held.1 -= 1;
         if held.1 > 0 {
+            return None;
+        }
+        // Still the run a list asking for this table would find.
+        if park && self.made.get(&(heap, held.2)) == Some(&first) {
+            self.parked += 1;
             return None;
         }
         let (n, _, key) = self.held.remove(&(heap, first))?;
         if self.made.get(&(heap, key)) == Some(&first) {
             self.made.remove(&(heap, key));
         }
+        if self.same.get(&(heap, key.1, key.2)) == Some(&first) {
+            self.same.remove(&(heap, key.1, key.2));
+        }
         Some(n)
     }
 
-    fn find(key: FreshKey) -> Option<u32> {
-        let mut shared = SHARED_TABLES.lock().unwrap_or_else(|e| e.into_inner());
-        shared.get_or_insert_with(Default::default).found(crate::frame::current(), key)
+    fn find(key: FreshKey) -> Option<(u32, bool)> {
+        let mut guard = SHARED_TABLES.lock().unwrap_or_else(|e| e.into_inner());
+        let shared = guard.get_or_insert_with(Default::default);
+        let found = shared.found(crate::frame::current(), key);
+        let gone = std::mem::take(&mut shared.gone);
+        drop(guard);
+        Self::give_back(gone);
+        found
+    }
+
+    fn find_same(heap: usize, n: u32, contents: u64) -> Option<(u32, bool)> {
+        let mut guard = SHARED_TABLES.lock().unwrap_or_else(|e| e.into_inner());
+        let shared = guard.get_or_insert_with(Default::default);
+        let found = shared.found_same(crate::frame::current(), heap, n, contents);
+        let gone = std::mem::take(&mut shared.gone);
+        drop(guard);
+        Self::give_back(gone);
+        found
     }
 
     fn add(key: FreshKey, first: u32, n: u32) {
-        let mut shared = SHARED_TABLES.lock().unwrap_or_else(|e| e.into_inner());
-        shared.get_or_insert_with(Default::default).added(crate::frame::current(), key, first, n);
+        let mut guard = SHARED_TABLES.lock().unwrap_or_else(|e| e.into_inner());
+        let shared = guard.get_or_insert_with(Default::default);
+        shared.added(crate::frame::current(), key, first, n);
+        let gone = std::mem::take(&mut shared.gone);
+        drop(guard);
+        Self::give_back(gone);
+    }
+
+    /// Runs parked in past frames go back.
+    fn give_back(gone: Vec<(usize, u32, u32)>) {
+        for (heap, first, n) in gone {
+            crate::descriptor::release_dynamic(heap, first, n);
+        }
+    }
+
+    /// The runs parked in the title heap at `heap` go back to `host`, its
+    /// host heap; whether there were any.
+    fn unpark(heap: usize, host: &crate::descriptor::host::HostHeap) -> bool {
+        let mut guard = SHARED_TABLES.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(shared) = guard.as_mut() else {
+            return false;
+        };
+        let before = shared.gone.len();
+        if !shared.unparked(Some(heap)) {
+            return false;
+        }
+        let ours = shared.gone.split_off(before);
+        drop(guard);
+        for (_, first, n) in ours {
+            host.release(first, n);
+        }
+        true
     }
 
     fn let_go(heap: usize, first: u32) {
@@ -5108,7 +5310,7 @@ impl SharedTables {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .as_mut()
-            .and_then(|shared| shared.dropped(heap, first));
+            .and_then(|shared| shared.dropped(heap, first, park_tables()));
         if let Some(n) = n {
             crate::descriptor::release_dynamic(heap, first, n);
         }
@@ -5512,31 +5714,104 @@ mod tests {
     fn shared_tables_go_back_with_the_last_list() {
         let mut shared = SharedTables::default();
         let (a, b) = ((1, (0x1000, 4, 9)), (1, (0x2000, 4, 9)));
-        assert_eq!(shared.found(5, a), None);
+        let found = |shared: &mut SharedTables, frame, key| shared.found(frame, key).map(|f| f.0);
+        assert_eq!(found(&mut shared, 5, a), None);
         shared.added(5, a, 100, 4);
         // Same records at another table, or another heap: not the same table.
-        assert_eq!(shared.found(5, b), None);
-        assert_eq!(shared.found(5, (2, a.1)), None);
-        assert_eq!(shared.found(5, a), Some(100));
-        assert_eq!(shared.found(5, a), Some(100));
-        assert_eq!(shared.dropped(1, 100), None);
-        assert_eq!(shared.dropped(1, 100), None);
+        assert_eq!(found(&mut shared, 5, b), None);
+        assert_eq!(found(&mut shared, 5, (2, a.1)), None);
+        assert_eq!(found(&mut shared, 5, a), Some(100));
+        assert_eq!(found(&mut shared, 5, a), Some(100));
+        assert_eq!(shared.dropped(1, 100, false), None);
+        assert_eq!(shared.dropped(1, 100, false), None);
         // The next frame makes its own; the last list still using the old
         // run gives it back.
-        assert_eq!(shared.found(6, a), None);
-        assert_eq!(shared.dropped(1, 100), Some(4));
-        assert_eq!(shared.dropped(1, 100), None);
+        assert_eq!(found(&mut shared, 6, a), None);
+        assert_eq!(shared.dropped(1, 100, false), Some(4));
+        assert_eq!(shared.dropped(1, 100, false), None);
         // Two lists that made the same table at once: each run goes back
         // with its own list, and the one found later is the last made.
         shared.added(6, a, 200, 4);
         shared.added(6, a, 300, 4);
-        assert_eq!(shared.found(6, a), Some(300));
-        assert_eq!(shared.dropped(1, 200), Some(4));
-        assert_eq!(shared.found(6, a), Some(300));
-        assert_eq!(shared.dropped(1, 300), None);
-        assert_eq!(shared.dropped(1, 300), None);
-        assert_eq!(shared.dropped(1, 300), Some(4));
+        assert_eq!(found(&mut shared, 6, a), Some(300));
+        assert_eq!(shared.dropped(1, 200, false), Some(4));
+        assert_eq!(found(&mut shared, 6, a), Some(300));
+        assert_eq!(shared.dropped(1, 300, false), None);
+        assert_eq!(shared.dropped(1, 300, false), None);
+        assert_eq!(shared.dropped(1, 300, false), Some(4));
+        assert_eq!(found(&mut shared, 6, a), None);
+        assert!(shared.gone.is_empty());
+    }
+
+    #[test]
+    fn same_records_at_another_table_are_found_until_their_run_goes() {
+        let mut shared = SharedTables::default();
+        let (a, b) = ((1, (0x1000, 4, 9)), (1, (0x2000, 4, 9)));
+        assert_eq!(shared.found_same(5, 1, 4, 9), None);
+        shared.added(5, a, 100, 4);
+        // Another table of the same records, not another heap, count or
+        // contents.
+        assert_eq!(shared.found(5, b), None);
+        assert_eq!(shared.found_same(5, 1, 4, 9), Some((100, false)));
+        assert_eq!(shared.found_same(5, 2, 4, 9), None);
+        assert_eq!(shared.found_same(5, 1, 8, 9), None);
+        assert_eq!(shared.found_same(5, 1, 4, 7), None);
+        // Parked, it is revived; once it goes back, it is not found.
+        assert_eq!(shared.dropped(1, 100, true), None);
+        assert_eq!(shared.dropped(1, 100, true), None);
+        assert_eq!(shared.parked, 1);
+        assert_eq!(shared.found_same(5, 1, 4, 9), Some((100, true)));
+        assert_eq!(shared.parked, 0);
+        assert_eq!(shared.dropped(1, 100, false), Some(4));
+        assert_eq!(shared.found_same(5, 1, 4, 9), None);
+        // The last made of the same records is the one found; a parked
+        // run unparked for room is not.
+        shared.added(5, a, 200, 4);
+        shared.added(5, b, 300, 4);
+        assert_eq!(shared.found_same(5, 1, 4, 9), Some((300, false)));
+        assert_eq!(shared.dropped(1, 300, true), None);
+        assert_eq!(shared.dropped(1, 300, true), None);
+        assert!(shared.unparked(Some(1)));
+        assert_eq!(shared.found_same(5, 1, 4, 9), None);
+        // Nor one of a frame gone by.
+        assert_eq!(shared.found_same(6, 1, 4, 9), None);
+        assert_eq!(shared.dropped(1, 200, true), Some(4));
+    }
+
+    #[test]
+    fn parked_tables_wait_for_the_next_list_or_frame() {
+        let mut shared = SharedTables::default();
+        let (a, b) = ((1, (0x1000, 4, 9)), (1, (0x2000, 8, 9)));
+        shared.added(5, a, 100, 4);
+        shared.added(5, b, 200, 8);
+        // The list that made them has run: they stay for a later list.
+        assert_eq!(shared.dropped(1, 100, true), None);
+        assert_eq!(shared.dropped(1, 200, true), None);
+        assert_eq!(shared.parked, 2);
+        assert_eq!(shared.found(5, a), Some((100, true)));
+        assert_eq!(shared.found(5, a), Some((100, false)));
+        assert_eq!(shared.parked, 1);
+        assert_eq!(shared.dropped(1, 100, true), None);
+        assert_eq!(shared.dropped(1, 100, true), None);
+        // No room in another heap leaves them; in theirs they go.
+        assert!(!shared.unparked(Some(2)));
+        assert!(shared.unparked(Some(1)));
+        assert_eq!(shared.parked, 0);
+        shared.gone.sort_unstable();
+        assert_eq!(std::mem::take(&mut shared.gone), [(1, 100, 4), (1, 200, 8)]);
+        assert_eq!(shared.found(5, a), None);
+        // A run parked at the end of a frame goes back with the next.
+        shared.added(5, a, 300, 4);
+        assert_eq!(shared.dropped(1, 300, true), None);
         assert_eq!(shared.found(6, a), None);
+        assert_eq!(shared.gone, [(1, 300, 4)]);
+        assert_eq!(shared.parked, 0);
+        // Of a frame gone by, nothing is parked.
+        shared.gone.clear();
+        shared.added(6, a, 400, 4);
+        assert_eq!(shared.found(7, b), None);
+        assert_eq!(shared.dropped(1, 400, true), Some(4));
+        assert_eq!(shared.parked, 0);
     }
 }
 
