@@ -67,6 +67,9 @@ unsafe impl Send for Held {}
 
 /// The queues that hold something: `(queue_addr, weak_held)` so `release_held`
 /// upgrades the `Arc` safely without dereferencing a concurrently freed `Queue`.
+/// Each entry holds a reference to its queue ([`register_waiting`]): a title
+/// that lets go of a queue while it waits does not lose what it holds. A
+/// present runs what is held ([`forces`]), so it lasts a frame at most.
 #[cfg(windows)]
 static WAITING: Mutex<Vec<(usize, Weak<Mutex<Vec<Held>>>)>> = Mutex::new(Vec::new());
 
@@ -76,7 +79,9 @@ fn register_waiting(this: This) {
     let weak = Arc::downgrade(&queue(this).held);
     let mut waiting = lock(&WAITING);
     if !waiting.iter().any(|(q, w)| *q == id && w.ptr_eq(&weak)) {
+        // (One left from a queue that was freed holds no reference.)
         waiting.retain(|(q, _)| *q != id);
+        object::add_ref(this);
         waiting.push((id, weak));
     }
 }
@@ -437,8 +442,18 @@ pub(crate) fn release_held(all: bool) {
                 }
                 moved = true;
             }
-            if held.is_empty() {
-                lock(&WAITING).retain(|(_, w)| !w.ptr_eq(&weak));
+            let off = held.is_empty() && {
+                let mut waiting = lock(&WAITING);
+                let before = waiting.len();
+                waiting.retain(|(_, w)| !w.ptr_eq(&weak));
+                waiting.len() < before
+            };
+            drop(held);
+            drop(held_arc);
+            // The list's reference, let go of with nothing locked: it may be
+            // the last one.
+            if off {
+                release(q as This);
             }
         }
         if !moved {
@@ -570,6 +585,14 @@ extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT
     )
 }
 extern "system" fn release(this: This) -> u32 {
+    // Not while it is on the waiting list, which holds a reference.
+    #[cfg(windows)]
+    if !this.is_null() && object::refs(this) == 1 && !lock(&queue(this).held).is_empty() {
+        static ONCE: AtomicBool = AtomicBool::new(false);
+        if !ONCE.swap(true, Ordering::Relaxed) {
+            tracing::warn!(kind = queue(this).kind, "a queue is let go of while it holds work: the work is dropped");
+        }
+    }
     #[cfg(windows)]
     let weak = (!this.is_null()).then(|| Arc::downgrade(&queue(this).held));
     let left = object::release_boxed::<Queue>(this);
@@ -1252,6 +1275,31 @@ mod tests {
     }
 
     /// The title's compute queue: `{COMPUTE, 0, pipe 1, queue 0}`.
+    #[cfg(windows)]
+    #[test]
+    fn a_queue_let_go_of_while_it_waits_lives_until_the_wait_is_met() {
+        let null = std::ptr::null();
+        let desc = QueueDesc {
+            kind: 0,
+            priority: 0,
+            flags: 0,
+            nodes: 0,
+        };
+        let mut q = null;
+        assert_eq!(create(null, &desc, &QUEUE_IIDS[0], &mut q), S_OK);
+        let mut fence = null;
+        let fence_iid = &crate::fence::FENCE_IIDS[0];
+        assert_eq!(crate::fence::create(null, 0, 0, fence_iid, &mut fence), S_OK);
+        assert_eq!(wait(q, fence, 5), S_OK);
+        assert!(lock(&WAITING).iter().any(|(at, _)| *at == q as usize));
+        assert_eq!(release(q), 1, "the waiting list's reference");
+        assert!(!lock(&queue(q).held).is_empty());
+        crate::fence::set(fence, 5);
+        release_held(false);
+        assert!(!lock(&WAITING).iter().any(|(at, _)| *at == q as usize));
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(fence, 0x10)(fence), 0);
+    }
+
     #[test]
     fn console_queues_are_created_as_on_pc() {
         let null = std::ptr::null();
@@ -1325,8 +1373,11 @@ mod tests {
             .map(|(_, w)| w.clone())
             .expect("waiting queue must be registered");
 
-        // Dropping the queue must drop its strong Arc<Mutex<Vec<Held>>> and remove it.
-        assert_eq!(slot::<extern "system" fn(This) -> u32>(q, 0x10)(q), 0);
+        // The waiting list keeps the queue until what it holds has run; then
+        // its strong Arc<Mutex<Vec<Held>>> is dropped and the entry removed.
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(q, 0x10)(q), 1);
+        assert!(weak.upgrade().is_some());
+        release_held(true);
         assert!(weak.upgrade().is_none());
         assert!(!lock(&WAITING).iter().any(|(_, w)| w.ptr_eq(&weak)));
 
@@ -1362,6 +1413,7 @@ mod tests {
             let wait_fn =
                 slot::<extern "system" fn(This, This, u64) -> HRESULT>(q, signal_slot(q) + 8);
             assert_eq!(wait_fn(q, fence, 100), S_OK);
+            let weak = Arc::downgrade(&queue(q).held);
 
             let barrier = Arc::new(Barrier::new(2));
             let b2 = barrier.clone();
@@ -1370,8 +1422,10 @@ mod tests {
                 release_held(true);
             });
             barrier.wait();
-            assert_eq!(slot::<extern "system" fn(This) -> u32>(q, 0x10)(q), 0);
+            // 1 if the waiting list still has it, 0 if it ran first.
+            assert!(slot::<extern "system" fn(This) -> u32>(q, 0x10)(q) <= 1);
             releaser.join().unwrap();
+            assert!(weak.upgrade().is_none());
         }
         assert_eq!(slot::<extern "system" fn(This) -> u32>(fence, 0x10)(fence), 0);
     }
