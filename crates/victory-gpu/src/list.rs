@@ -889,6 +889,44 @@ fn wait_needed(this: This) -> bool {
     needed
 }
 
+/// `VICTORY_WAIT_SHARE=1`: a full wait of the title is left out when the
+/// call recorded before it on the same host list was a full wait too, with
+/// only bindings since (pipeline, tables, views, constants, fixed function
+/// state): no shader ran that a second wait could order. Only in lists whose
+/// calls are written down ([`thin`]), where every call between the two is
+/// seen ([`thin::binds_only`]).
+fn wait_share() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_WAIT_SHARE").as_deref() == Ok("1"))
+}
+
+thread_local! {
+    /// While a written-down list is made ([`thin`]) with `wait_share`: the
+    /// host list whose last recorded call was a full wait, 0 if the last
+    /// was other work. `None` otherwise.
+    static QUIET: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// Whether a full wait on `list` can be left out (`wait_share`). If not,
+/// the one about to be recorded is noted.
+#[cfg(windows)]
+fn wait_shared(list: &crate::host::HostList) -> bool {
+    use windows::core::Interface;
+    let at = list.list.as_raw() as usize;
+    match QUIET.get() {
+        Some(q) if q == at => {
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::WaitsLeftOut, 1);
+            true
+        }
+        Some(_) => {
+            QUIET.set(Some(at));
+            false
+        }
+        None => false,
+    }
+}
+
 /// Returns the console's barrier "actions" (none).
 extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> u32 {
     #[cfg(windows)]
@@ -908,7 +946,7 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
         // a barrier on one waits for every shader write before it.
         if barriers.iter().any(|b| {
             b.kind != 1 && !b.first.is_null() && crate::resource::buffer_bytes(b.first).is_some()
-        }) && wait_needed(this)
+        }) && wait_needed(this) && (!host.is_empty() || !wait_shared(list))
         {
             host.push(UAV_BARRIER);
             #[cfg(feature = "diagnostics")]
@@ -1890,7 +1928,7 @@ extern "system" fn sync(this: This, flags: u32, control: u32, address: u64, size
                 }
                 crate::copystat::add(crate::copystat::C::WaitsForGroups, 1);
             }
-            if wait_needed(this) {
+            if wait_needed(this) && !wait_shared(list) {
                 // SAFETY: the same layout; no resource named.
                 let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
                 // SAFETY: an open list.
@@ -2658,7 +2696,7 @@ pub(crate) fn barrier_groups_waiting(this: This, count: u32, need: u8) {
         use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
         with_state(this, |_, state| state.synced());
         // A wait left out is not one the quiet waits count as made.
-        if need < group_waits_left() && wait_needed(this) {
+        if need < group_waits_left() && wait_needed(this) && !wait_shared(list) {
             // SAFETY: the same layout; no resource named.
             let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
             // SAFETY: an open list.

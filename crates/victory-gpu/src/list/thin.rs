@@ -752,11 +752,57 @@ extern "system" fn copy_texture_region_x(
     copy_texture_region(this, dst, x, y, z, src, source_box);
 }
 
+/// Calls that only bind or set state: the card runs nothing for them, so a
+/// full wait after them waits for no more than one before them
+/// ([`super::wait_share`]).
+fn binds_only(op: u64) -> bool {
+    [
+        Plain::TOPOLOGY as u64,
+        Plain::STENCIL_REF as u64,
+        Plain::DEPTH_BOUNDS as u64,
+        Plain::COMPUTE_TABLE as u64,
+        Plain::GRAPHICS_TABLE as u64,
+        Plain::COMPUTE_CONSTANT as u64,
+        Plain::GRAPHICS_CONSTANT as u64,
+        Plain::COMPUTE_VIEW as u64,
+        Plain::GRAPHICS_VIEW as u64,
+        Plain::SET_PIPELINE as u64,
+        VIEWPORTS,
+        SCISSORS,
+        BLEND_FACTOR,
+        HEAPS,
+        COMPUTE_CONSTANTS,
+        GRAPHICS_CONSTANTS,
+        INDEX_BUFFER,
+        VERTEX_BUFFERS,
+    ]
+    .contains(&op)
+}
+
+/// The calls that may record a full wait, and nothing else on the card.
+fn waits(op: u64) -> bool {
+    op == BARRIER || op == BARRIER_GROUPS || op == Plain::SYNC as u64
+}
+
+/// Ends [`super::QUIET`] when a stream is done, also if it unwinds.
+struct Quiet;
+
+impl Drop for Quiet {
+    fn drop(&mut self) {
+        super::QUIET.set(None);
+    }
+}
+
 /// Makes the calls of a stream on `list`: how many, and whether the last one
 /// closed it. Once `left` says so only what must not be lost is done.
 fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool) {
     let (mut i, mut calls, mut closed) = (0, 0, false);
     let mut skip = left();
+    let share = super::wait_share();
+    let _quiet = share.then(|| {
+        super::QUIET.set(Some(0));
+        Quiet
+    });
     while i < stream.len() {
         let (op, len) = (stream[i] & 0xffff, (stream[i] >> 16) as usize);
         let w = &stream[i + 1..i + 1 + len];
@@ -775,6 +821,9 @@ fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool)
         }
         if skip && op != CLOSE && op != RESET {
             continue;
+        }
+        if share && !binds_only(op) && !waits(op) {
+            super::QUIET.set(Some(0));
         }
         #[cfg(feature = "diagnostics")]
         let began = std::time::Instant::now();
@@ -981,6 +1030,46 @@ mod tests {
         // SAFETY: as above.
         assert_eq!(unsafe { *at::<[u32; 3]>(&w[1..], 2, 3) }, [7, 8, 9]);
         assert!(at::<u32>(&w[1..], 2, 0).is_null());
+    }
+
+    /// Of the calls a stream holds, only those that leave the card idle
+    /// count as bindings, and waits are told apart from them.
+    #[test]
+    fn bindings_record_no_work() {
+        let work = [
+            Plain::DRAW as u64,
+            Plain::DRAW_INDEXED as u64,
+            Plain::DISPATCH as u64,
+            Plain::DISPATCH_X as u64,
+            Plain::DISPATCH_MESH as u64,
+            Plain::DISPATCH_MESH_X as u64,
+            Plain::COPY_BUFFER as u64,
+            Plain::COPY_RESOURCE as u64,
+            Plain::COPY_RESOURCE_X as u64,
+            Plain::COPY_MEMORY as u64,
+            Plain::RESOLVE as u64,
+            Plain::RESOLVE_QUERIES as u64,
+            Plain::EXECUTE_INDIRECT as u64,
+            Plain::WRITE32 as u64,
+            Plain::WRITE64 as u64,
+            Plain::WAIT_VALUE as u64,
+            Plain::WAIT_VALUE64 as u64,
+            RESET,
+            CLOSE,
+            UPLOAD,
+            TARGETS,
+            CLEAR_RTV,
+            CLEAR_DSV,
+            COPY_TEXTURE,
+        ];
+        for op in work {
+            assert!(!binds_only(op) && !waits(op), "op {op}");
+        }
+        for op in [BARRIER, BARRIER_GROUPS, Plain::SYNC as u64] {
+            assert!(waits(op) && !binds_only(op), "op {op}");
+        }
+        let named = (0..=COPY_TEXTURE).filter(|&op| binds_only(op) || waits(op) || work.contains(&op)).count();
+        assert_eq!(named as u64, COPY_TEXTURE + 1, "a call is in no list");
     }
 
     /// A view's record is the one at the call, also if its slot is written
