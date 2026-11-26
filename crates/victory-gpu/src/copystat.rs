@@ -129,11 +129,87 @@ pub(crate) enum C {
     WaitsForGroups,
     WaitsForBuffers,
     IndirectBounded,
+    /// Slots the heap's buffer-view pass looked at, the ones of them in the
+    /// written set, those of these whose copy and range came out as they
+    /// were, and the marks its own looks would have put back in the
+    /// written set (left out: the pass just found what they would ask).
+    HeapLooked,
+    HeapLookedWritten,
+    HeapSameAgain,
+    HeapSelfMarks,
+    /// Dynamic slots asked for (`DynamicAsked` counts tables), the slots the
+    /// search for a free run stepped over, and refusals made without a
+    /// search (too few free, or a run as long known not to fit).
+    DynamicSlots,
+    DynamicSteps,
+    DynamicFull,
+    /// Tables made afresh in a list that another list of the same frame
+    /// had made already from the same records.
+    FreshAgain,
+    /// Refreshes of a copy that went as far as `Shadow::update`, those of
+    /// them that copied nothing, and their microseconds; refreshes of a copy
+    /// and range refreshed before in the same frame, and their bytes.
+    RefreshUpdates,
+    RefreshEmpty,
+    RefreshEmptyUs,
+    RefreshAgain,
+    RefreshAgainBytes,
+    /// Kernel askings about title memory it refused (not write-watched), and
+    /// their microseconds; of those, ranges refused before in the same frame;
+    /// askings not made because the range was refused before in the frame
+    /// (`VICTORY_REFUSED_ONCE`); askings that went through for a range asked
+    /// before in the same frame, and their bytes.
+    AskRefused,
+    AskRefusedUs,
+    AskRefusedAgain,
+    AskSkipped,
+    AskAgain,
+    AskAgainBytes,
+    /// Blocks made read-only that had been made read-only before in the same
+    /// frame (opened by a write in between).
+    GuardAgain,
+    /// Bytes of copies compared after a submission that were compared after
+    /// another submission of the same frame.
+    BackAgainBytes,
+    /// Bytes a submission's pending refresh of a copy took in between the
+    /// ranges asked for, when a range was added apart from the one before:
+    /// the range that covers both is refreshed, not the two.
+    RefreshGapBytes,
+    /// Asks for a buffer's host copy answered from the asking thread's
+    /// memory of them (`VICTORY_QUICK_FIND`).
+    LookupQuick,
+    /// Asks answered from the buffers' table.
+    LookupTables,
+    /// Asks for memory outside buffers, answered by the windows: the
+    /// thread's memory of asks does not hold these.
+    LookupLoose,
+    /// List calls translated by threads of ours (`VICTORY_THIN`): the
+    /// nanoseconds of draws, dispatches and indirect commands (and how many),
+    /// of the calls that only set state, of barriers, of copies and clears,
+    /// and of the rest (resets, closes, memory writes and waits).
+    ThinDrawNs,
+    ThinDraws,
+    ThinSetNs,
+    ThinBarrierNs,
+    ThinCopyNs,
+    ThinOtherNs,
+    /// Texture bytes hashed though the guard saw no write: on the texture's
+    /// turn, and while it was due (new, verifying a change, or hot); and
+    /// the bytes of turns passed over as the texture was hashed on its turn
+    /// earlier in the frame.
+    TexHashedTurn,
+    TexHashedHot,
+    TexTurnSkipped,
+    /// Of TexHashedHot, the bytes hashed only for being in the texture's
+    /// first frames; and those frames' checks passed over as the texture
+    /// was hashed earlier in the frame (`texture::first_once`).
+    TexHashedFirst,
+    TexFirstSkipped,
 }
-const COUNTERS: usize = 80;
+const COUNTERS: usize = 112;
 
 /// The counters' names, in the order of [`C`], for the frame recorder's columns.
-pub(crate) const NAMES: [&str; 71] = [
+pub(crate) const NAMES: [&str; 107] = [
     "Submissions", "Copies", "CopyBytes", "Refreshes", "RefreshBytes", "Skipped", "SkippedBytes", "Runs",
     "RunUs", "Queries", "QueryUs", "MoveUs", "Unmapped", "Watches", "WatchUs", "Checked", "Unchanged",
     "Fallbacks", "GuardFaults", "TexWatched", "TexHashed", "TexChanged", "TexHot", "Frames", "RecordCalls",
@@ -143,7 +219,13 @@ pub(crate) const NAMES: [&str; 71] = [
     "TexUploads", "TexSkipped", "Forced", "GpuWritesLeftOut", "GpuWritesLeftOutBytes", "WaitChecks",
     "WaitCheckNs", "HostLists", "HostListNs", "PartsTogether", "WholeUs", "CardUnder2", "Card2To8",
     "Card8To32", "CardOver32", "CardUnder2Us", "Card2To8Us", "Card8To32Us", "CardOver32Us", "NothingBack",
-    "NothingBackUs", "WaitsForGroups", "WaitsForBuffers", "IndirectBounded",
+    "NothingBackUs", "WaitsForGroups", "WaitsForBuffers", "IndirectBounded", "HeapLooked",
+    "HeapLookedWritten", "HeapSameAgain", "HeapSelfMarks", "DynamicSlots", "DynamicSteps", "DynamicFull",
+    "FreshAgain", "RefreshUpdates", "RefreshEmpty", "RefreshEmptyUs", "RefreshAgain", "RefreshAgainBytes",
+    "AskRefused", "AskRefusedUs", "AskRefusedAgain", "AskSkipped", "AskAgain", "AskAgainBytes", "GuardAgain",
+    "BackAgainBytes", "RefreshGapBytes", "LookupQuick", "LookupTables", "LookupLoose", "ThinDrawNs",
+    "ThinDraws", "ThinSetNs", "ThinBarrierNs", "ThinCopyNs", "ThinOtherNs", "TexHashedTurn", "TexHashedHot",
+    "TexTurnSkipped", "TexHashedFirst", "TexFirstSkipped",
 ];
 /// One of some sets of counters, each in lines of the processor's memory of
 /// its own: a set for all threads had them wait for each other's lines at
@@ -454,7 +536,7 @@ mod command_tests {
     #[test]
     fn every_counter_is_named() {
         use super::{C, COUNTERS, NAMES};
-        assert_eq!(C::IndirectBounded as usize + 1, NAMES.len());
+        assert_eq!(C::TexFirstSkipped as usize + 1, NAMES.len());
         assert_eq!(NAMES[C::Frames as usize], "Frames");
         assert!(NAMES.len() <= COUNTERS);
     }
@@ -1438,4 +1520,24 @@ pub(crate) fn log(frames: f64) {
             us as f64 / 1e3 / frames
         );
     }
+}
+
+/// What was worked on this frame, by kind (0 refreshes, 1 kernel askings, 2
+/// refused askings, 3 compares after submissions, 4 blocks made read-only):
+/// the frame and the keys.
+#[cfg(feature = "diagnostics")]
+static SEEN: Mutex<(u64, [Option<std::collections::HashSet<(usize, usize, usize)>>; 5])> =
+    Mutex::new((0, [None, None, None, None, None]));
+
+/// Whether work of `kind` on `key` was done before in this frame (and notes
+/// it done): for the counters of work done twice.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn again(kind: usize, key: (usize, usize, usize)) -> bool {
+    let frame = crate::frame::current();
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if seen.0 != frame {
+        seen.0 = frame;
+        seen.1.iter_mut().flatten().for_each(|keys| keys.clear());
+    }
+    !seen.1[kind].get_or_insert_with(Default::default).insert(key)
 }
