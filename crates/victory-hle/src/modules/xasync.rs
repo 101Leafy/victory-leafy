@@ -881,10 +881,10 @@ pub fn pending_with(
                     if let Ok(bytes) = result {
                         lock(&state).1 = bytes;
                     }
-                    let block = block as *mut AsyncBlock;
-                    let current = call(block);
-                    if mine.is_some_and(|mine| current.is_some_and(|c| Arc::ptr_eq(&c, &mine))) {
-                        XAsyncComplete(block, hr, len);
+                    // Completes the call it was started for, never by block;
+                    // a call already over (canceled) is left alone.
+                    if let Some(mine) = mine {
+                        complete_call(&mine, block as *mut AsyncBlock, hr, len);
                     }
                 });
             }
