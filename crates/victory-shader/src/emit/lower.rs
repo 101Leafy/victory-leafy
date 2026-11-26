@@ -5227,8 +5227,9 @@ impl<'a> Lower<'a> {
 
     /// Whether instruction `i` of block `b` may join a run lowered in every
     /// lane ([`Self::guarded_runs`]): plain VALU work that reads no other
-    /// lane (no DPP, lane reads or writes, lane counts), no EXEC, no lane
-    /// mask but a `v_cndmask` selector, and writes VGPRs only.
+    /// lane (no DPP, lane reads or writes, lane counts), no EXEC operand
+    /// (vccz and execz too), no lane mask but a `v_cndmask` selector, and
+    /// writes VGPRs only.
     fn runs_alone(&self, b: usize, i: usize) -> bool {
         let inst = &self.x.p.blocks[b].insts[i];
         let Fields::Valu(v) = &inst.fields else {
@@ -5243,6 +5244,11 @@ impl<'a> Lower<'a> {
             || name.contains("lane")
             || self.x.res.waterfall.compares.contains(&(b, i))
             || !inst.writes.iter().all(|w| matches!(w.0, Reg::V(_)))
+            || v.src.iter().any(|o| match *o {
+                Operand::Scalar { code, dwords } => code < EXEC + 2 && u16::from(code) + u16::from(dwords) > u16::from(EXEC),
+                Operand::Const(c) => c == 251 || c == 252,
+                _ => false,
+            })
         {
             return false;
         }
@@ -5256,7 +5262,8 @@ impl<'a> Lower<'a> {
             }
         };
         inst.reads.iter().all(|&(r, x)| match r {
-            Reg::S(c) if c == EXEC || c == EXEC + 1 => false,
+            // (every vector instruction reads EXEC for the lanes it keeps)
+            Reg::S(c) if c == EXEC || c == EXEC + 1 => true,
             Reg::S(c) if self.x.st.masks.contains_key(&x) || self.x.st.highs.contains_key(&x) => {
                 selector.is_some_and(|s| c == s || c == s + 1)
             }
@@ -5321,8 +5328,11 @@ impl<'a> Lower<'a> {
                 {
                     continue;
                 }
+                // A float select only where the old value is a float too: one
+                // born an integer may be a denormal or NaN pattern, which a
+                // float select on the host need not keep bit for bit.
                 match self.floats.get(&w).copied() {
-                    Some(f) if super::guard_float() => {
+                    Some(f) if super::guard_float() && old.is_none_or(|o| self.floats.contains_key(&o)) => {
                         let o = match old.map(|o| self.float_of(o)) {
                             Some(Ok(o)) => o,
                             _ => self.s.m.f32(0),
@@ -5480,6 +5490,7 @@ impl<'a> Lower<'a> {
             && super::guard_float()
             && Self::sdwa_dst(inst).is_none()
             && let Some(new) = inst.write(Reg::V(reg))
+            && inst.read(Reg::V(reg)).is_none_or(|o| self.floats.contains_key(&o))
         {
             let old = match inst.read(Reg::V(reg)).map(|o| self.float_of(o)) {
                 Some(Ok(o)) => o,
