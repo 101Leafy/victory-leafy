@@ -144,14 +144,14 @@ pub use shader::{
 /// A change behind a switch that is off by default needs no raise, but the
 /// switch joins the key in the commit that reads it: in the list of
 /// `VICTORY_*` names in `shader_cache`'s `build`, or as a bit of
-/// [`host_settings`] (taken: 0-3 of the last for [`rdna`], 31 for
+/// [`host_settings`] (taken: 0-3 of the last for [`rdna`], 30 for helper lane waves, 31 for
 /// `VICTORY_COLOR_FINITE`). A dependency update needs none: the `Cargo.lock`
 /// entries this crate is built from are in the key.
 ///
 /// The first run after a source change without a raise translates its first
 /// 64 cached shaders again and compares the entries byte for byte; if one
 /// differs, that build keys on the whole source instead, as before.
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 
 static HELPER_LANE_WAVES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
