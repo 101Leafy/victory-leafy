@@ -34,8 +34,9 @@
 //!   size (+0x7e92f0 → the upscaler's +0x50 method): the title's own
 //!   (+0x7e9440) multiplies by a scale at +0x90 of it, set to 2/3 at
 //!   +0x28f1e78 (so 2560x1440 for 4K, 1280x720 for 1080p).
-//!   `VICTORY_RENDER_SCALE` replaces that constant (as pull request #53
-//!   did); 1.0 renders at the output size, with no upscaling.
+//!   That constant is set to 1.0, so the title renders at the output size
+//!   and nothing is upscaled. `VICTORY_RENDER_SCALE` (pull request #53) is
+//!   still read, and only 1.0 is taken.
 
 use crate::frame_rate::Patched;
 
@@ -59,13 +60,16 @@ pub fn parse_output(spec: &str) -> Option<(u32, u32)> {
     MODES.contains(&size).then_some(size)
 }
 
-/// `VICTORY_RENDER_SCALE=<s>`, 0.5 to 1.0 (0.5: half the output's width and
-/// height). `None` if unset or out of range (said why).
+/// The title's render scale: the output size, so nothing is upscaled.
+pub const NATIVE_SCALE: f32 = 1.0;
+
+/// `VICTORY_RENDER_SCALE=<s>`: only 1.0 is taken; under it the title would
+/// render smaller and upscale.
 pub fn asked_render_scale() -> Option<f32> {
     let spec = std::env::var("VICTORY_RENDER_SCALE").ok()?;
-    let scale = parse_render_scale(&spec);
+    let scale = parse_render_scale(&spec).filter(|&s| s == NATIVE_SCALE);
     if scale.is_none() {
-        eprintln!("VIctory: VICTORY_RENDER_SCALE={spec}: expected 0.5 to 1.0");
+        eprintln!("VIctory: VICTORY_RENDER_SCALE={spec}: only 1.0 is left; the title renders at the output size anyway");
     }
     scale
 }
@@ -239,8 +243,8 @@ pub unsafe fn write(base: usize, size: usize, site: &Site, code: &[u8]) -> Patch
     Patched::Done
 }
 
-/// Applies what the switches ask for and the picker's 6; a line each in the
-/// log and on standard output.
+/// Applies what the switches ask for, the scale of 1.0 and the picker's 6;
+/// a line each in the log and on standard output.
 ///
 /// # Safety
 /// The image of `size` bytes at `base` stays mapped and no thread runs its
@@ -252,9 +256,8 @@ pub unsafe fn apply_asked(base: usize, size: usize) {
         asked.push((&OUTPUT, output_code(w, h), format!("{w}x{h}")));
         asked.push((&POOL_LEFT, vec![0xeb, 0x01], "skipped".into()));
     }
-    if let Some(s) = asked_render_scale() {
-        asked.push((&OWN_SCALE, own_scale_code(s), format!("{s}")));
-    }
+    asked_render_scale();
+    asked.push((&OWN_SCALE, own_scale_code(NATIVE_SCALE), format!("{NATIVE_SCALE}")));
     asked_upscaler();
     asked.push((&PICKER, picker_code(OWN_UPSCALER), format!("returns {OWN_UPSCALER}")));
     for (site, code, value) in asked {
