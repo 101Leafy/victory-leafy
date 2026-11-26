@@ -291,7 +291,8 @@ pub(crate) fn sections(p: &Program, block: usize) -> HashMap<usize, Section> {
                 && insts[j].read(Reg::S(saved_code(inst))) == Some(saved)
         });
         let Some(end) = end else {
-            break;
+            i += 1;
+            continue;
         };
         let (vec, uni) = simulate(&insts[i + 1..end], wave, saved);
         let mut reads = HashMap::new();
@@ -1334,5 +1335,23 @@ mod tests {
             bad_ident[0] = red(None, v0, m0, 1, 1);
             assert_eq!(per_lane(&bad_ident, all), None);
         }
+    }
+
+    #[test]
+    fn unmatched_saveexec_does_not_skip_later_wave_sections_in_block() {
+        // An unmatched `s_or_saveexec_b64 s[2:3], -1` earlier in the block (its
+        // EXEC restore in a later block) must not end the scan for the
+        // whole-wave sections after it.
+        let mut w = vec![0xBE82_25C1]; // s_or_saveexec_b64 s[2:3], -1
+        w.extend(WAVE_OR_V7_TO_S7);
+        let p = build(&w, true);
+        let insts = &p.blocks[0].insts;
+        let saved = insts[1].write(Reg::S(4)).unwrap();
+        let v7 = p.inputs.iter().find_map(|&(r, v)| (r == Reg::V(7)).then_some(v)).unwrap();
+        let total = insts[insts.len() - 3].write(Reg::S(7)).unwrap();
+        let secs = sections(&p, 0);
+        assert!(!secs.contains_key(&0), "unmatched saveexec should not form a section");
+        let sec = secs.get(&1).expect("later matched section in the same block must still be discovered");
+        assert_eq!(sec.shapes.get(&total).copied(), Some(Shape::Active(Op::Or, v7, saved, 0)));
     }
 }
