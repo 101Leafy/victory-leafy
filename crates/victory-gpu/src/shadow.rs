@@ -5865,7 +5865,7 @@ pub(crate) fn exact_line(frames: f64) {
 mod window_tests {
     use super::{
         WINDOW, cover, default_card_limits_mb, grid, holder, longest_tail, resolve_card_limits,
-        tail_of, window_of,
+        tail_of, trim, window_of,
     };
 
     #[test]
