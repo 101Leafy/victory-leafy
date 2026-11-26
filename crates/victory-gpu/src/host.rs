@@ -2808,7 +2808,8 @@ impl Readbacks {
 /// lists put a few constants or a rectangle's corners there, and every
 /// list that did took 4 MiB of the PC's memory for it.
 const SCRATCH_FIRST: u64 = 256 << 10;
-/// The most bytes of chunks kept while no list holds them.
+/// The most bytes of chunks kept while no list holds them, unless
+/// `VICTORY_SCRATCH_SPARE_MB` says otherwise ([`spare_most`]).
 const SPARE_MOST: u64 = 128 << 20;
 /// The same with [`keep_freed`].
 const SPARE_KEPT: u64 = 1 << 30;
@@ -2860,28 +2861,64 @@ impl<T> Spare<T> {
 /// Scratch chunks no list holds.
 static SPARE: Mutex<Spare<Chunk>> = Mutex::new(Spare::new());
 
-/// A scratch chunk of `size` bytes: one kept ([`SPARE`]) or a new one.
-fn take_chunk(host: &Host, size: u64) -> Option<Chunk> {
-    if scratch_pool()
-        && let Some(chunk) = SPARE.lock().unwrap_or_else(|e| e.into_inner()).take(size)
-    {
-        ALIVE[3].fetch_sub(1, Ordering::Relaxed);
-        ALIVE[4].fetch_sub(size, Ordering::Relaxed);
-        ALIVE[5].fetch_add(1, Ordering::Relaxed);
-        return Some(chunk);
+/// A scratch chunk of `size` bytes or more: one kept ([`SPARE`]) or a new
+/// one; and its size.
+///
+/// A small first chunk ([`SCRATCH_FIRST`]) asked for while none of them is
+/// kept is a kept 4 MiB one. Without that, on an RTX 5080 (Jason's balcony,
+/// Series S) the spares sat at their bound the whole time, all of them
+/// 4 MiB ones, while some 35 small first chunks a frame were made new and
+/// as many came back past the bound and were freed (about 1 ms each, a
+/// committed upload buffer).
+fn take_chunk(host: &Host, size: u64) -> Option<(Chunk, u64)> {
+    if scratch_pool() {
+        let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+        let kept = spare.take(size).map(|c| (c, size)).or_else(|| {
+            let any = size == SCRATCH_FIRST && scratch_any_size();
+            any.then(|| spare.take(SCRATCH_CHUNK).map(|c| (c, SCRATCH_CHUNK))).flatten()
+        });
+        if let Some((chunk, size)) = kept {
+            ALIVE[3].fetch_sub(1, Ordering::Relaxed);
+            ALIVE[4].fetch_sub(size, Ordering::Relaxed);
+            ALIVE[5].fetch_add(1, Ordering::Relaxed);
+            return Some((chunk, size));
+        }
     }
     let (buffer, data) = host.upload_buffer(size)?;
     name(&buffer, || "list scratch".into());
     ALIVE[1].fetch_add(1, Ordering::Relaxed);
     ALIVE[2].fetch_add(size, Ordering::Relaxed);
-    Some(Chunk {
+    let chunk = Chunk {
         buffer,
         data: data as usize,
+    };
+    Some((chunk, size))
+}
+
+/// Whether a list's small first chunk may be a kept 4 MiB one
+/// (`VICTORY_SCRATCH_ANY_SIZE`, on; `=0`: only one of its own size).
+fn scratch_any_size() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SCRATCH_ANY_SIZE").is_none_or(|v| v != "0"))
+}
+
+/// The most bytes of scratch chunks kept while no list holds them:
+/// [`SPARE_MOST`], or `VICTORY_SCRATCH_SPARE_MB`.
+///
+/// On the balcony the lists hold some 140 MB of chunks at once, and with
+/// 128 MB the spares stood at the bound the whole run: what came back past
+/// it was freed and what was asked for next made new, some 12 chunks of
+/// 4 MiB a frame, about 2 ms each to free.
+fn spare_most() -> u64 {
+    static MOST: OnceLock<u64> = OnceLock::new();
+    *MOST.get_or_init(|| {
+        let mb = std::env::var("VICTORY_SCRATCH_SPARE_MB").ok();
+        mb.and_then(|v| v.trim().parse::<u64>().ok()).map_or(SPARE_MOST, |mb| mb << 20)
     })
 }
 
 /// A list is done with `chunks` (it was reset after its submissions ran,
-/// or dropped): kept for the next list, or freed past [`SPARE_MOST`] and
+/// or dropped): kept for the next list, or freed past [`spare_most`] and
 /// without the pool.
 fn give_chunks(chunks: Vec<(Chunk, u64)>) {
     if chunks.is_empty() {
@@ -2892,7 +2929,7 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
         let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
         for (chunk, size) in chunks {
             let back = if scratch_pool() {
-                spare.give(chunk, size, if keep_freed() { SPARE_KEPT } else { SPARE_MOST })
+                spare.give(chunk, size, if keep_freed() { SPARE_KEPT } else { spare_most() })
             } else {
                 Some(chunk)
             };
@@ -9678,7 +9715,7 @@ impl HostList {
             } else {
                 SCRATCH_CHUNK
             };
-            let chunk = take_chunk(host, size)?;
+            let (chunk, size) = take_chunk(host, size)?;
             s.chunks.push((chunk, size));
             s.used = 0;
         }
