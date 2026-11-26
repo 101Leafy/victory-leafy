@@ -295,3 +295,122 @@ pub(super) fn record(
         l.ResourceBarrier(&[after]);
     }
 }
+
+/// The passes of one list that are timed; later ones are not.
+#[cfg(feature = "diagnostics")]
+const TIMED: u32 = 64;
+
+/// GPU timestamps before and after each pass of a list, read once it ran:
+/// what the passes cost the card, for the frame counters (`ClampPassNs`).
+/// `VICTORY_CLAMP_STAMPS=0`: not timed.
+#[cfg(feature = "diagnostics")]
+#[derive(Default)]
+pub(crate) struct Stamps {
+    /// The query heap, its read-back buffer and where that is mapped.
+    made: std::sync::OnceLock<Option<(ID3D12QueryHeap, ID3D12Resource, usize)>>,
+    /// The passes recorded since the list was reset.
+    passes: std::sync::atomic::AtomicU32,
+}
+
+#[cfg(feature = "diagnostics")]
+impl Stamps {
+    fn made(&self) -> Option<&(ID3D12QueryHeap, ID3D12Resource, usize)> {
+        if !crate::toggled!("VICTORY_CLAMP_STAMPS") {
+            return None;
+        }
+        self.made
+            .get_or_init(|| {
+                let device = &crate::host::host()?.device;
+                let mut heap: Option<ID3D12QueryHeap> = None;
+                let mut back: Option<ID3D12Resource> = None;
+                let readback = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() };
+                let desc = D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                    Width: u64::from(TIMED) * 16,
+                    Height: 1,
+                    DepthOrArraySize: 1,
+                    MipLevels: 1,
+                    SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                    Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                    ..Default::default()
+                };
+                let mut data = std::ptr::null_mut();
+                // SAFETY: plain object creation; a read-back buffer stays
+                // mapped while it lives.
+                unsafe {
+                    device
+                        .CreateQueryHeap(
+                            &D3D12_QUERY_HEAP_DESC { Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP, Count: TIMED * 2, NodeMask: 0 },
+                            &mut heap,
+                        )
+                        .ok()?;
+                    device
+                        .CreateCommittedResource(&readback, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut back)
+                        .ok()?;
+                    let back = back?;
+                    back.Map(0, None, Some(&mut data)).ok()?;
+                    std::ptr::write_bytes(data.cast::<u8>(), 0, TIMED as usize * 16);
+                    Some((heap?, back, data as usize))
+                }
+            })
+            .as_ref()
+    }
+
+    /// Before a pass: its number, `None` if it is not timed.
+    pub(crate) fn before(&self, l: &ID3D12GraphicsCommandList) -> Option<u32> {
+        let (heap, _, _) = self.made()?;
+        let i = self.passes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if i >= TIMED {
+            return None;
+        }
+        // SAFETY: an open list and our heap.
+        unsafe { l.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, 2 * i) };
+        Some(i)
+    }
+
+    /// After pass `i`.
+    pub(crate) fn after(&self, l: &ID3D12GraphicsCommandList, i: Option<u32>) {
+        let (Some(i), Some((heap, _, _))) = (i, self.made.get().and_then(Option::as_ref)) else {
+            return;
+        };
+        // SAFETY: an open list and our heap.
+        unsafe { l.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, 2 * i + 1) };
+    }
+
+    /// At the list's close: the stamps to the read-back buffer.
+    pub(crate) fn resolve(&self, l: &ID3D12GraphicsCommandList) {
+        let n = self.passes.load(std::sync::atomic::Ordering::Relaxed).min(TIMED);
+        let Some((heap, back, _)) = self.made.get().and_then(Option::as_ref).filter(|_| n > 0) else {
+            return;
+        };
+        // SAFETY: an open list, our heap and buffer; every stamp resolved
+        // was written in this list.
+        unsafe { l.ResolveQueryData(heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, 2 * n, back, 0) };
+    }
+
+    /// Once the list ran, before it is reset: the passes' time to the
+    /// counters. A list closed and never run resolved nothing, and reads
+    /// the zeros left by the last read.
+    pub(crate) fn read(&self) {
+        let n = self.passes.swap(0, std::sync::atomic::Ordering::Relaxed).min(TIMED) as usize;
+        let Some((_, _, at)) = self.made.get().and_then(Option::as_ref).filter(|_| n > 0) else {
+            return;
+        };
+        static FREQUENCY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        let frequency = *FREQUENCY.get_or_init(|| crate::host::host().map_or(1, |h| h.timestamp_frequency()).max(1));
+        // SAFETY: the mapped read-back buffer, which the finished list
+        // resolved into and nothing writes now.
+        let stamps = unsafe { std::slice::from_raw_parts_mut(*at as *mut u64, 2 * n) };
+        let (mut ticks, mut passes) = (0u64, 0u64);
+        for pair in stamps.chunks_exact(2) {
+            if pair[0] != 0 && pair[1] >= pair[0] {
+                ticks += pair[1] - pair[0];
+                passes += 1;
+            }
+        }
+        stamps.fill(0);
+        let ns = (u128::from(ticks) * 1_000_000_000 / u128::from(frequency)) as u64;
+        crate::copystat::add(crate::copystat::C::ClampPassNs, ns);
+        crate::copystat::add(crate::copystat::C::ClampPasses, passes);
+    }
+}
