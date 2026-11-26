@@ -2245,6 +2245,7 @@ fn read_only_blocks(from: usize, to: usize) -> Vec<Took> {
 /// A block [`open`] opened in between (notes gone, `PROTECTED` cleared) is
 /// made writable again; a run that failed (`!done`, nothing changed) is
 /// guarded block by block as before. Then the other views of its pages.
+#[cfg(test)]
 fn protected_later(g: &mut Guards, from: usize, to: usize, done: bool) {
     protected_later_as(g, from, to, if done { Fared::Whole } else { Fared::Not }, None);
 }
