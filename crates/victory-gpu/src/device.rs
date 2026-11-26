@@ -356,7 +356,10 @@ fn feature_levels(data: *mut c_void) -> HRESULT {
 /// - 0x218 (compute): the FSPX register packet, a second part, the code,
 ///   the metadata;
 /// - 0x1c8 (graphics): a register block, the input layout, then code and
-///   metadata for each of two stages.
+///   metadata for the pixel stage and then the vertex stage. A null pixel
+///   stage is a depth-only pipeline. The vertex code fetches its own
+///   vertices through buffer descriptors at the address in user data 0-1,
+///   which no metadata record names.
 ///
 /// The metadata is the FSPX resource records behind a short header
 /// (`victory_shader::loose_metadata`). The first calls log every part and
