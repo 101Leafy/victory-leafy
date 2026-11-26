@@ -86,6 +86,21 @@ impl Taken {
         });
         (found, steps)
     }
+
+    /// The longest run of free slots (runs do not wrap past the end), and
+    /// the words looked at.
+    pub(crate) fn longest(&self) -> (usize, u64) {
+        let mut steps = 0;
+        let mut most = 0;
+        let mut at = 0;
+        while at < self.len {
+            let free = self.next(at, self.len, false, &mut steps);
+            let taken = self.next(free, self.len, true, &mut steps);
+            most = most.max(taken - free);
+            at = taken;
+        }
+        (most, steps)
+    }
 }
 
 #[cfg(test)]
@@ -138,8 +153,23 @@ mod tests {
                 let cursor = random(len);
                 let n = 1 + random(len.min(140));
                 assert_eq!(bits.find(cursor, n).0, slow(&plain, cursor, n), "len {len} cursor {cursor} n {n}");
+                let most = plain.split(|t| *t).map(<[bool]>::len).max().unwrap_or(0);
+                assert_eq!(bits.longest().0, most, "len {len}");
+                // No run longer than the longest is found from any cursor.
+                assert_eq!(bits.find(cursor, most + 1).0, None);
             }
         }
+    }
+
+    #[test]
+    fn longest_of_full_and_empty() {
+        let mut bits = Taken::new(200);
+        assert_eq!(bits.longest().0, 200);
+        bits.fill(0, 200, true);
+        assert_eq!(bits.longest().0, 0);
+        bits.fill(70, 75, false);
+        bits.fill(190, 200, false);
+        assert_eq!(bits.longest().0, 10);
     }
 
     #[test]
