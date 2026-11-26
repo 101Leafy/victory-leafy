@@ -48,6 +48,10 @@ pub(crate) struct Shadow {
     /// a range holds in part cannot say so in `copied`. Locked inside
     /// `copied`'s lock.
     ranged: Mutex<[(usize, usize, u64); 2]>,
+    /// Per page [`Shadow::merge_under_writes`] put the title's bytes in for
+    /// part of it, not noted in `copied`: the part and the asking after
+    /// which it was. Locked inside `copied`'s lock.
+    merged: Mutex<std::collections::HashMap<usize, (usize, usize, u64)>>,
     /// Whether the memory is write-watched: unknown, yes, no.
     watched: AtomicU8,
     /// Ranges shaders of a submission not yet copied back may be writing:
@@ -1995,8 +1999,10 @@ fn back_piece(
 }
 
 /// Since the last frame-rate line, of [`Shadow::merge_under_writes`]: pages
-/// compared, changed runs put in, and their bytes.
-static MERGED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+/// compared, changed runs put in, their bytes, and pages not compared
+/// because a merge or a range taken whole put in their part after the
+/// title's last write ([`past_floor`]).
+static MERGED: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
 /// Why [`Shadow::merge_under_writes`] last left the caller to wait.
 static STALE_WHY: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -2018,8 +2024,8 @@ pub(crate) fn stale_why() -> &'static str {
 }
 
 /// [`MERGED`], taken.
-pub(crate) fn merged_stats() -> [u64; 3] {
-    [0, 1, 2].map(|i| MERGED[i].swap(0, Ordering::Relaxed))
+pub(crate) fn merged_stats() -> [u64; 4] {
+    [0, 1, 2, 3].map(|i| MERGED[i].swap(0, Ordering::Relaxed))
 }
 
 /// The runs of bytes where `now` differs from `was` (of one length), as
@@ -2655,11 +2661,39 @@ fn stale_pages_in(base: usize, copied: &[u64], a: usize, e: usize, written: &[(u
         .filter(|&page| match copied.get(page - base) {
             None => false,
             Some(0) => true,
-            Some(&at) => written
-                .binary_search_by_key(&page, |&(p, _)| p)
-                .is_ok_and(|i| written[i].1 > at),
+            Some(&at) => written_after(written, page, at),
         })
         .collect()
+}
+
+/// Of `pages` ([`stale_pages_in`] of `[a, e)`), those the title wrote after
+/// `floor` (page, part of it in the range) says the copy got that part:
+/// 0 for none known.
+///
+/// A page the copy never took whole, or holds in part of a range, was
+/// compared again at every submission with no write between, 95-120 pages
+/// a frame in the open world. With no write since the floor, title memory
+/// there is what was put in, and whatever the compare finds is the
+/// shaders' bytes, which stay.
+fn past_floor(
+    pages: Vec<usize>,
+    a: usize,
+    e: usize,
+    written: &[(usize, u64)],
+    floor: impl Fn(usize, usize, usize) -> u64,
+) -> Vec<usize> {
+    pages
+        .into_iter()
+        .filter(|&page| {
+            let at = floor(page, (page * PAGE).max(a), ((page + 1) * PAGE).min(e));
+            at == 0 || written_after(written, page, at)
+        })
+        .collect()
+}
+
+/// Whether `written` (by page in order) has `page` written after asking `at`.
+fn written_after(written: &[(usize, u64)], page: usize, at: u64) -> bool {
+    written.binary_search_by_key(&page, |&(p, _)| p).is_ok_and(|i| written[i].1 > at)
 }
 
 /// `runs` (from, to, whether the copy held it before), cut in those of pages
@@ -2781,6 +2815,22 @@ mod stale_tests {
         // Part of a page counts as the page; pages outside the copy do not.
         assert_eq!(stale_pages_in(base, &copied, at(0x101) + 8, at(0x101) + 16, &[]), [0x101]);
         assert!(stale_pages_in(base, &copied, at(0x104), at(0x106), &[(0x104, 9)]).is_empty());
+    }
+
+    #[test]
+    fn pages_put_in_after_the_last_write_are_not_compared_again() {
+        let at = |page: usize| page * PAGE;
+        // 0x101 was put in at 5 and written at 4, 0x102 put in at 5 and
+        // written at 6, 0x103 put in at 5 and never written; 0x104 has no
+        // floor.
+        let written = [(0x101, 4), (0x102, 6), (0x104, 2)];
+        let floor = |page: usize, _: usize, _: usize| if page == 0x104 { 0 } else { 5 };
+        let pages = vec![0x101, 0x102, 0x103, 0x104];
+        assert_eq!(past_floor(pages, at(0x101), at(0x105), &written, floor), [0x102, 0x104]);
+        // A floor for part of the page does not cover a wider part.
+        let part = |_: usize, lo: usize, hi: usize| if lo >= at(0x101) + 8 && hi <= at(0x102) { 5 } else { 0 };
+        assert_eq!(past_floor(vec![0x101], at(0x101) + 8, at(0x101) + 16, &written, part), [] as [usize; 0]);
+        assert_eq!(past_floor(vec![0x101], at(0x101), at(0x101) + 16, &written, part), [0x101]);
     }
 }
 
@@ -3152,6 +3202,7 @@ impl Shadow {
             len,
             copied: Mutex::new(vec![0; pages as usize]),
             ranged: Mutex::default(),
+            merged: Mutex::default(),
             watched: AtomicU8::new(0),
             pending: Mutex::default(),
             flights: Mutex::default(),
@@ -3650,9 +3701,28 @@ impl Shadow {
         let base = start / PAGE;
         let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
         busy.into_iter().any(|(a, e)| match crate::watch::asked(a, e) {
-            Some((_, written)) => !stale_pages_in(base, &copied, a, e, &written).is_empty(),
+            Some((_, written)) => !self.stale_in(base, &copied, a, e, &written).is_empty(),
             None => true,
         })
+    }
+
+    /// [`stale_pages_in`] of `[a, e)`, less those a merge or a range taken
+    /// whole put in after the title last wrote them ([`past_floor`]). The
+    /// caller holds `copied`'s lock.
+    fn stale_in(&self, base: usize, copied: &[u64], a: usize, e: usize, written: &[(usize, u64)]) -> Vec<usize> {
+        let stale = stale_pages_in(base, copied, a, e, written);
+        if stale.is_empty() {
+            return stale;
+        }
+        let n = stale.len();
+        let merged = self.merged.lock().unwrap_or_else(|e| e.into_inner());
+        let left = past_floor(stale, a, e, written, |page, lo, hi| {
+            let put = merged.get(&page).filter(|m| m.0 <= lo && hi <= m.1).map_or(0, |m| m.2);
+            put.max(self.ranged(lo, hi))
+        });
+        drop(merged);
+        MERGED[3].fetch_add((n - left.len()) as u64, Ordering::Relaxed);
+        left
     }
 
     /// Where [`Shadow::stale_under_writes`] says yes: puts the bytes the
@@ -3711,7 +3781,7 @@ impl Shadow {
             };
             let stale: Vec<usize> = {
                 let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-                stale_pages_in(base, &copied, a, e, &written)
+                self.stale_in(base, &copied, a, e, &written)
             };
             if stale.is_empty() {
                 continue;
@@ -3766,6 +3836,7 @@ impl Shadow {
             }
             *runs_left = left.into_inner().max(0) as usize;
             let mut taken = Vec::new();
+            let mut parts = Vec::new();
             for (i, runs) in done.into_iter().enumerate() {
                 let Some(runs) = runs.into_inner().unwrap_or_else(|e| e.into_inner()) else {
                     continue;
@@ -3779,16 +3850,31 @@ impl Shadow {
                 // only whole pages, and the page is looked at again.
                 if lo < hi && (stale[i] * PAGE).max(start) >= a && ((stale[i] + 1) * PAGE).min(end) <= e {
                     taken.push(stale[i]);
+                } else if lo < hi {
+                    parts.push((stale[i], lo, hi));
                 }
             }
             drop(before);
             drop(merging);
             {
                 let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+                let mut merged = self.merged.lock().unwrap_or_else(|e| e.into_inner());
                 for page in taken {
                     if let Some(at) = copied.get_mut(page - base) {
                         *at = now;
                     }
+                    merged.remove(&page);
+                }
+                // A part put in before that the title has not written
+                // since is current too, and joins this one where they meet.
+                for (page, lo, hi) in parts {
+                    let (lo, hi) = match merged.get(&page) {
+                        Some(&(l, h, put)) if l <= hi && lo <= h && !written_after(&written, page, put) => {
+                            (l.min(lo), h.max(hi))
+                        }
+                        _ => (lo, hi),
+                    };
+                    merged.insert(page, (lo, hi, now));
                 }
             }
             if over.into_inner() {
