@@ -228,11 +228,30 @@ extern "system" fn create_queue(
 
 /// The title asks for 32 MiB and stops if this fails.
 extern "system" fn set_staging_buffer_size(_: Factory, size: u32) -> HRESULT {
-    tracing::info!(size, "dstorage: staging buffer size");
+    let floor = staging_floor();
+    tracing::info!(size, floor, "dstorage: staging buffer size");
     if let Some(scheduler) = scheduler() {
-        scheduler.lock().staging = u64::from(size);
+        scheduler.lock().staging = u64::from(size).max(floor);
     }
     S_OK
+}
+
+/// The least staging the title is given (`VICTORY_DSTORAGE_FLOOR=1`; off by
+/// default): 256 MiB, or `VICTORY_DSTORAGE_STAGING_MB`, so that chunks of
+/// several MB on every worker are not held back by the 32 MiB the title
+/// asks for. After codec_d's 256 MiB DirectStorage floor.
+fn staging_floor() -> u64 {
+    static FLOOR: OnceLock<u64> = OnceLock::new();
+    *FLOOR.get_or_init(|| {
+        if !std::env::var("VICTORY_DSTORAGE_FLOOR").is_ok_and(|v| v.trim() == "1") {
+            return 0;
+        }
+        let mb = std::env::var("VICTORY_DSTORAGE_STAGING_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(256);
+        mb << 20
+    })
 }
 
 fn text(name: *const c_char) -> String {
