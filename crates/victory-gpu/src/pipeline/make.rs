@@ -262,6 +262,19 @@ pub(crate) fn now(p: &Arc<Pending>) -> bool {
     p.made.get().is_some_and(|made| made.is_some())
 }
 
+/// Starts making `p` now, without waiting for it.
+pub(crate) fn begin(p: &Arc<Pending>) {
+    if !p.shaders.is_empty() {
+        start(p, REQUESTED);
+    }
+}
+
+/// Whether `p`'s host pipeline is made (`Some(true)`), refused or not
+/// translated (`Some(false)`), or not yet (`None`); never waits.
+pub(crate) fn state(p: &Pending) -> Option<bool> {
+    p.made.get().map(Option::is_some)
+}
+
 /// At the title's creation of a pipeline: starts it at once if an earlier
 /// run drew with it (during loading, so the world's first frames find it).
 pub(crate) fn early(p: &Arc<Pending>) {
