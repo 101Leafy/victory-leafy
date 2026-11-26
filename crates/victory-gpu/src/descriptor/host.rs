@@ -1656,7 +1656,11 @@ impl HostHeap {
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::DynamicAsked, 1);
+        {
+            use crate::copystat::{C, add};
+            add(C::DynamicAsked, 1);
+            add(C::DynamicSlots, u64::from(n));
+        }
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
         let (next, taken) = &mut *guard;
         let enough = self.free.load(std::sync::atomic::Ordering::Relaxed) >= n
@@ -1671,18 +1675,24 @@ impl HostHeap {
         let mut run = 0;
         let mut found = None;
         let mut last = usize::MAX;
+        let mut steps = 0u64;
         for at in starts.take(if enough { usize::MAX } else { 0 }) {
             // A run cannot wrap past the end.
             if at != last.wrapping_add(1) {
                 run = 0;
             }
             last = at;
+            steps += 1;
             run = if taken[at] { 0 } else { run + 1 };
             if run == n {
                 found = Some(at + 1 - n);
                 break;
             }
         }
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::DynamicSteps, steps);
+        #[cfg(not(feature = "diagnostics"))]
+        let _ = steps;
         let Some(first) = found else {
             if enough {
                 self.too_long.fetch_min(n as u32, std::sync::atomic::Ordering::Relaxed);
@@ -1693,6 +1703,7 @@ impl HostHeap {
             {
                 use crate::copystat::{C, add};
                 add(C::DynamicRefused, 1);
+                add(C::DynamicFull, u64::from(!enough));
                 add(C::DynamicNs, started.elapsed().as_nanos() as u64);
             }
             return None;
@@ -2419,6 +2430,18 @@ impl HostHeap {
         self.buffers.all(|slot| slot % parts == part)
     }
 
+    /// [`HostHeap::mirror`] for a draw, asked by the heap's buffer-view
+    /// pass: what it finds does not put the slot back in the written set,
+    /// which would have the next pass look at it again for nothing (a title
+    /// write leaves a buffer slot for later, and the pass's own look makes
+    /// it).
+    pub(crate) fn mirror_for_pass(&self, index: u32, handle: u64) -> Option<View> {
+        FOR_PASS.set(true);
+        let view = self.mirror(index, handle, true);
+        FOR_PASS.set(false);
+        view
+    }
+
     /// The title slots whose buffer view was written, or went, since the
     /// last call.
     pub(crate) fn buffer_changes(&self) -> Vec<u32> {
@@ -2518,7 +2541,12 @@ impl HostHeap {
             self.buffers.remove(index)
         };
         if was {
-            self.changed.put(index);
+            if FOR_PASS.get() {
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::HeapSelfMarks, 1);
+            } else {
+                self.changed.put(index);
+            }
         }
         stale
     }
@@ -5536,6 +5564,11 @@ impl ListViews {
 
 thread_local! {
     static LIST_VIEWS: std::cell::RefCell<Option<ListViews>> = const { std::cell::RefCell::new(None) };
+}
+
+thread_local! {
+    /// Whether this thread is in [`HostHeap::mirror_for_pass`].
+    static FOR_PASS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// The view the record `words` names, as this thread made it for `recording`.
