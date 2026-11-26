@@ -23,11 +23,20 @@
 //! (upstream #2118). Before its image is known they are guessed by their
 //! programs (`of_builder`: a spilled user-data table).
 //!
+//! The programs that walk the structures (`image_bvh*_intersect_ray`) wait
+//! for the builder too (upstream #2311): until it has run whole once, the
+//! structures are whatever lay in that memory, and a walk of them (the
+//! title bounds it at 65,535 steps per wave) can outlast the host's GPU
+//! timeout. On a host where the builder cannot run (its 64-lane programs
+//! refused on 32-lane waves) they never run then.
+//!
 //! shortcut: all of it only with `VICTORY_BVH_BUILDER=1`, until a run has
 //! shown the whole builder and the host side of title memory by address
-//! (`memory.rs`) working on a card. Without it the builder never runs.
+//! (`memory.rs`) working on a card. Without it the builder never runs and
+//! the walks are not held: they read zeros where the host has no copy and
+//! find nothing, and `crate::ambient` stands in for the light they trace.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use super::make::{self, Pending};
@@ -117,6 +126,9 @@ pub(crate) fn rests(why: &'static str) {
 /// The frame [`runs`] last decided for, and its decision.
 static DECIDED: Mutex<(u64, bool)> = Mutex::new((u64::MAX, false));
 
+/// The builder has run whole in some frame: its structures exist.
+static BUILT: AtomicBool = AtomicBool::new(false);
+
 /// Whether the builder's dispatches run in the current frame: decided once
 /// per frame, so that a frame never runs part of the builder.
 pub(crate) fn runs() -> bool {
@@ -158,6 +170,9 @@ pub(crate) fn runs() -> bool {
         );
     }
     *decided = (frame, open);
+    if open && !BUILT.swap(true, Ordering::Relaxed) {
+        tracing::info!(frame, "the ray-tracing structure builder ran whole: programs that walk its structures run from here on");
+    }
     open
 }
 
@@ -167,6 +182,13 @@ fn all_made(states: &[Option<bool>]) -> bool {
     states.iter().all(|s| *s == Some(true))
 }
 
+/// Whether programs that walk the structures may run: the builder has run
+/// whole once, the title has no builder (its structures come from
+/// elsewhere), or the builder may not run (see the shortcut above).
+pub(crate) fn built() -> bool {
+    BUILT.load(Ordering::Relaxed) || image().is_none() || !allowed()
+}
+
 /// Tests that set the builder's image, one at a time; each starts with
 /// no decision made.
 #[cfg(test)]
@@ -174,6 +196,7 @@ pub(crate) fn test_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: Mutex<()> = Mutex::new(());
     let guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
     *DECIDED.lock().unwrap_or_else(|e| e.into_inner()) = (u64::MAX, false);
+    BUILT.store(false, Ordering::Relaxed);
     guard
 }
 
