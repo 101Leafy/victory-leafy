@@ -1925,6 +1925,11 @@ fn view_guard() -> bool {
 #[cfg(feature = "diagnostics")]
 pub(crate) static ALIASES: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
+/// Diagnostics: runs of guarded blocks opened with one call ([`open_run`]),
+/// the blocks in them, and blocks opened one at a time; since the start.
+#[cfg(feature = "diagnostics")]
+pub(crate) static OPENS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
 /// Of the blocks `[from, to)`, which are read-only by our hand where they
 /// can be: every other view of their pages is made read-only too. Where one
 /// cannot be (the kernel writes through it now, or the runtime is changing
@@ -2121,9 +2126,10 @@ fn open(g: &mut Guards, start: usize, end: usize) -> usize {
     here
 }
 
-/// Gives write access back to `blocks`, guarded ones.
+/// Gives write access back to `blocks`, guarded ones: one `VirtualProtect`
+/// a run of blocks next to each other where it can ([`open_run`]), else one
+/// a block.
 fn unguard(g: &mut Guards, blocks: &[usize]) {
-    use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE, VirtualProtect};
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
     // All of them before the first can be written: a write through one is a
@@ -2134,24 +2140,83 @@ fn unguard(g: &mut Guards, blocks: &[usize]) {
         g.parted.remove(&block);
         PUBLISHED.clear(block);
     }
-    for &block in blocks {
-        let mut old = 0;
-        // SAFETY: a block we made read-only.
-        unsafe {
-            if VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) != 0
-                && !matches!(old, PAGE_READONLY | PAGE_READWRITE)
-            {
-                // Not what we left there: the address is other memory's
-                // (code's, say), which keeps its protection.
-                VirtualProtect((block * BLOCK) as *const _, BLOCK, old, &mut old);
-            }
+    let mut sorted = blocks.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    for run in sorted.chunk_by(|a, b| a + 1 == *b) {
+        if run.len() == 1 || !open_run(run[0], run[run.len() - 1] + 1) {
+            run.iter().for_each(|&block| open_block(block));
         }
-        PROTECTED.clear(block);
+        run.iter().for_each(|&block| PROTECTED.clear(block));
     }
     #[cfg(feature = "diagnostics")]
     if !blocks.is_empty() {
         tally(8, started.elapsed().as_nanos() as u64);
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// `VirtualProtect` calls the test thread made to open guarded blocks.
+    static TEST_OPEN_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Gives write access back to the guarded blocks `[first, last)` with one
+/// `VirtualProtect`, when they are one region of one allocation, committed
+/// and read-only (as we left them); whether it did.
+///
+/// A title write over a range and a range mapped again open long runs, and
+/// one call a block was most of the guard lock's time (upstream issue #400:
+/// about 3,800 calls and 600 ms a frame). Over separate allocations (views,
+/// placeholders) one call fails, and over other memory among ours it would
+/// make that writable: those are left to [`open_block`].
+fn open_run(first: usize, last: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_READONLY, PAGE_READWRITE, VirtualProtect, VirtualQuery,
+    };
+    // SAFETY: plain data filled in by the query.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out pointer of the right size.
+    let n = unsafe { VirtualQuery((first * BLOCK) as *const _, &mut info, size_of_val(&info)) };
+    if n == 0
+        || info.State != MEM_COMMIT
+        || info.Protect != PAGE_READONLY
+        || (info.BaseAddress as usize).saturating_add(info.RegionSize) < last * BLOCK
+    {
+        return false;
+    }
+    let mut old = 0;
+    // SAFETY: blocks we made read-only, all of one region.
+    let done =
+        unsafe { VirtualProtect((first * BLOCK) as *const _, (last - first) * BLOCK, PAGE_READWRITE, &mut old) } != 0;
+    #[cfg(test)]
+    TEST_OPEN_CALLS.with(|c| c.set(c.get() + 1));
+    #[cfg(feature = "diagnostics")]
+    if done {
+        OPENS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        OPENS[1].fetch_add((last - first) as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+    done
+}
+
+/// Gives write access back to guarded block `block`.
+fn open_block(block: usize) {
+    use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE, VirtualProtect};
+    let mut old = 0;
+    // SAFETY: a block we made read-only.
+    unsafe {
+        if VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) != 0
+            && !matches!(old, PAGE_READONLY | PAGE_READWRITE)
+        {
+            // Not what we left there: the address is other memory's
+            // (code's, say), which keeps its protection.
+            VirtualProtect((block * BLOCK) as *const _, BLOCK, old, &mut old);
+        }
+    }
+    #[cfg(test)]
+    TEST_OPEN_CALLS.with(|c| c.set(c.get() + 1));
+    #[cfg(feature = "diagnostics")]
+    OPENS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// How many 4 KiB parts of a block of the descriptor heaps ([`FINE`]) write
@@ -3786,6 +3851,84 @@ mod tests {
         writing(one, 8);
         assert!(writable(one));
         drop_views(section, &[one, two], BLOCK);
+    }
+
+    /// A write over a run of guarded blocks of one view opens them with one
+    /// `VirtualProtect` call, not one a block.
+    #[test]
+    fn a_write_over_a_guarded_run_opens_it_in_one_call() {
+        use windows_sys::Win32::System::Memory::{CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, UnmapViewOfFile};
+        const BLOCKS: usize = 8;
+        // SAFETY: a pagefile section, mapped read-write.
+        let view = unsafe {
+            let section = CreateFileMappingW(
+                -1isize as _,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                (BLOCKS * BLOCK) as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, BLOCKS * BLOCK).Value as usize
+        };
+        assert_ne!(view, 0);
+        assert!(guard(view, view + BLOCKS * BLOCK).is_some());
+        assert!((0..BLOCKS).all(|b| !writable(view + b * BLOCK)), "guarded");
+        TEST_OPEN_CALLS.with(|c| c.set(0));
+        writing(view, BLOCKS * BLOCK);
+        assert_eq!(TEST_OPEN_CALLS.with(|c| c.get()), 1, "one call for the run");
+        assert!((0..BLOCKS).all(|b| writable(view + b * BLOCK)), "every block writable again");
+        title_memory_unmapping(view, BLOCKS * BLOCK);
+        // SAFETY: our view.
+        unsafe {
+            UnmapViewOfFile(windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS { Value: view as *mut _ })
+        };
+    }
+
+    /// Blocks next to each other but of separate allocations (one call over
+    /// them fails) are opened one at a time, all of them.
+    #[test]
+    fn a_guarded_run_over_separate_allocations_opens_block_by_block() {
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, MEM_PRESERVE_PLACEHOLDER, MEM_REPLACE_PLACEHOLDER, MapViewOfFile3, UnmapViewOfFile2,
+        };
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        let p = placeholder(2);
+        // SAFETY: a section of one block in place of each placeholder.
+        let views = [0, 1].map(|i| unsafe {
+            let section =
+                CreateFileMappingW(-1isize as _, std::ptr::null(), PAGE_READWRITE, 0, BLOCK as u32, std::ptr::null());
+            assert!(!section.is_null());
+            MapViewOfFile3(
+                section,
+                GetCurrentProcess(),
+                (p + i * BLOCK) as *const _,
+                0,
+                BLOCK,
+                MEM_REPLACE_PLACEHOLDER,
+                PAGE_READWRITE,
+                std::ptr::null_mut(),
+                0,
+            )
+        });
+        assert!(views.iter().enumerate().all(|(i, v)| v.Value as usize == p + i * BLOCK));
+        assert!(guard(p, p + 2 * BLOCK).is_some());
+        assert!(!writable(p) && !writable(p + BLOCK), "guarded");
+        TEST_OPEN_CALLS.with(|c| c.set(0));
+        writing(p, 2 * BLOCK);
+        assert_eq!(TEST_OPEN_CALLS.with(|c| c.get()), 2, "one call a block");
+        assert!(writable(p) && writable(p + BLOCK), "both writable again");
+        title_memory_unmapping(p, 2 * BLOCK);
+        // SAFETY: our views and the placeholders left by them.
+        unsafe {
+            for view in views {
+                UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER);
+            }
+            for i in 0..2 {
+                VirtualFree((p + i * BLOCK) as *mut _, 0, MEM_RELEASE);
+            }
+        }
     }
 
     /// A block the title has just written is not made read-only, and is told
