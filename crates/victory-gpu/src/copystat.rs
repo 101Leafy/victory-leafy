@@ -358,11 +358,15 @@ pub(crate) enum C {
     /// the ones the pool had none idle for.
     ReadBackPoolNs,
     ReadBacksMadeNs,
+    /// Of `FreshShared`: tables found parked, made by a list that had run
+    /// already, and their slots.
+    FreshRevived,
+    FreshRevivedSlots,
 }
 const COUNTERS: usize = 256;
 
 /// The counters' names, in the order of [`C`], for the frame recorder's columns.
-pub(crate) const NAMES: [&str; 193] = [
+pub(crate) const NAMES: [&str; 195] = [
     "Submissions", "Copies", "CopyBytes", "Refreshes", "RefreshBytes", "Skipped", "SkippedBytes", "Runs",
     "RunUs", "Queries", "QueryUs", "MoveUs", "Unmapped", "Watches", "WatchUs", "Checked", "Unchanged",
     "Fallbacks", "GuardFaults", "TexWatched", "TexHashed", "TexChanged", "TexHot", "Frames", "RecordCalls",
@@ -399,6 +403,7 @@ pub(crate) const NAMES: [&str; 193] = [
     "SettleTablesNs", "SettleResultsNs", "SettleListsNs",
     "SubmitLockDoneNs", "SubmitLockSettleNs",
     "ReadBackPoolNs", "ReadBacksMadeNs",
+    "FreshRevived", "FreshRevivedSlots",
 ];
 /// One of some sets of counters, each in lines of the processor's memory of
 /// its own: a set for all threads had them wait for each other's lines at
@@ -714,7 +719,7 @@ mod command_tests {
     #[test]
     fn every_counter_is_named() {
         use super::{C, COUNTERS, NAMES};
-        assert_eq!(C::HeapTexUploadNs as usize + 1, NAMES.len());
+        assert_eq!(C::FreshRevivedSlots as usize + 1, NAMES.len());
         assert_eq!(NAMES[C::Frames as usize], "Frames");
         assert!(NAMES.len() <= COUNTERS);
     }
