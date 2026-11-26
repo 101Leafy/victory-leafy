@@ -2116,7 +2116,9 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
         );
         return None;
     };
-    if layout.desc.swizzle.xor() {
+    // Render-target XOR layouts of one 2D slice and mip have addresses
+    // (`Layout::addressable`); the other XOR modes do not.
+    if !layout.addressable() {
         once!(?desc, "texture contents in an XOR mode not uploaded");
         return None;
     }
