@@ -764,6 +764,12 @@ struct LooseRegs {
     /// RSRC1 of a third stage that takes the vertex stage's place (0 when
     /// there is none).
     third_rsrc1: u32,
+    /// What looks like CB_TARGET_MASK (word 51): 0 in passes that draw no
+    /// colour, all ones elsewhere.
+    target_mask: u32,
+    /// CB_BLEND0..7_CONTROL (words 52 to 59): blending off is 0x80000000,
+    /// alpha blending 0xe5040504.
+    blend: [u32; 8],
 }
 
 /// The register block of device method 0x1c8 in the layout most calls use:
@@ -796,6 +802,8 @@ fn loose_regs(regs: &[u8]) -> Result<LooseRegs, ShaderError> {
         db_shader_control: word(31 + shift)?,
         cntl: (93 + shift..93 + shift + n).map(word).collect::<Result<_, _>>()?,
         third_rsrc1: if shift == 0 { 0 } else { word(24)? },
+        target_mask: word(51 + shift)?,
+        blend: std::array::from_fn(|i| u32_at(regs, 4 * (52 + shift + i)).unwrap_or(0)),
     })
 }
 
@@ -1161,6 +1169,12 @@ pub struct LooseGraphics {
     pub vs: Vec<u8>,
     pub ps: Option<Vec<u8>>,
     pub inputs: Vec<InputElement>,
+    /// The register block's CB_TARGET_MASK and CB_BLEND0..7_CONTROL, for
+    /// the host's blend state; nothing else in it varies with the
+    /// pipeline's state (depth, rasterizer, and target formats are not
+    /// there).
+    pub target_mask: u32,
+    pub blend: [u32; 8],
 }
 
 /// Containers for a graphics pipeline handed over as loose parts (device
@@ -1300,7 +1314,7 @@ pub fn loose_graphics(
             ]))
         }
     };
-    Ok(LooseGraphics { vs, ps, inputs })
+    Ok(LooseGraphics { vs, ps, inputs, target_mask: regs.target_mask, blend: regs.blend })
 }
 
 fn u16_at(data: &[u8], at: usize) -> Result<u16, ShaderError> {
@@ -2249,6 +2263,8 @@ mod tests {
         r[43] = 0x8002;
         r[44] = 11;
         r[52] = 0xcc_0010;
+        r[72] = u32::MAX;
+        r[73..81].fill(0xe504_0504);
         for (i, c) in [1, 2, 3, 4, 5, 6, 7, 0x408, 0x409, 0x40a, 0].into_iter().enumerate() {
             r[114 + i] = c;
         }
@@ -2262,6 +2278,7 @@ mod tests {
         let r = loose_regs(&call15_regs()).unwrap();
         assert_eq!((r.vs_rsrc1, r.ps_rsrc1, r.input_addr, r.db_shader_control, r.third_rsrc1), (0, 0x022c_c35f, 0x8002, 0xcc_0010, 0x022c_034d));
         assert_eq!(r.cntl, [1, 2, 3, 4, 5, 6, 7, 0x408, 0x409, 0x40a, 0]);
+        assert_eq!((r.target_mask, r.blend), (u32::MAX, [0xe504_0504; 8]));
         let r = loose_regs(&graphics_regs(0)).unwrap();
         assert_eq!((r.input_addr, r.cntl.len(), r.third_rsrc1), (2, 1, 0));
 
