@@ -837,11 +837,34 @@ pub fn start_host() {
     let spawned = std::thread::Builder::new().name("host device".into()).spawn(|| {
         let started = std::time::Instant::now();
         let made = host().is_some();
-        tracing::info!(made, ms = started.elapsed().as_millis() as u64, "host device made ahead of the title");
+        // This thread's own processor time against the wall clock: near the
+        // wall time means the driver was working, far under it waiting.
+        let (user, kernel) = thread_times();
+        tracing::info!(
+            made,
+            ms = started.elapsed().as_millis() as u64,
+            user_ms = user,
+            kernel_ms = kernel,
+            "host device made ahead of the title"
+        );
     });
     if let Err(e) = spawned {
         tracing::warn!(error = %e, "host device thread not started; made on first use");
     }
+}
+
+/// This thread's user and kernel time so far, in milliseconds.
+fn thread_times() -> (u64, u64) {
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::Threading::{GetCurrentThread, GetThreadTimes};
+    let zero = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+    let (mut created, mut exited, mut kernel, mut user) = (zero, zero, zero, zero);
+    // SAFETY: our own thread's pseudo handle and four out pointers.
+    if unsafe { GetThreadTimes(GetCurrentThread(), &mut created, &mut exited, &mut kernel, &mut user) } == 0 {
+        return (0, 0);
+    }
+    let ms = |t: FILETIME| ((u64::from(t.dwHighDateTime) << 32) | u64::from(t.dwLowDateTime)) / 10_000;
+    (ms(user), ms(kernel))
 }
 
 fn create() -> windows::core::Result<Host> {
