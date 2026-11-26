@@ -314,14 +314,18 @@ pub(crate) fn builder_runs() -> bool {
 
 /// Why a dispatch of the title's pipeline `this` is held back, if it is: a
 /// stage of the structure builder in a frame where the builder does not
-/// run ([`builder`]).
+/// run, or a program that walks its structures before it has run whole
+/// ([`builder`]).
 #[cfg(windows)]
 pub(crate) fn held_back(this: This) -> Option<&'static str> {
     if this.is_null() {
         return None;
     }
     let p = pipeline(this);
-    (p.builder && !builder::runs()).then_some("a stage of the ray-tracing structure builder, which is off")
+    if p.builder {
+        return (!builder::runs()).then_some("a stage of the ray-tracing structure builder, which is off");
+    }
+    (p.walks_bvh && !builder::built()).then_some("walks the ray-tracing structures before the builder has run whole")
 }
 
 /// A title DLL was mapped (the structure builder's pipelines are known by
@@ -329,6 +333,25 @@ pub(crate) fn held_back(this: This) -> Option<&'static str> {
 #[cfg(windows)]
 pub fn note_title_dll(file: &str, base: usize, size: usize) {
     builder::note_title_dll(file, base, size);
+}
+
+/// Whether a shader container's programs walk the ray-tracing structures.
+#[cfg(windows)]
+fn walks_bvh(container: &[u8]) -> bool {
+    use victory_shader::{Container, FourCC};
+    let Ok(c) = Container::parse(container) else {
+        return false;
+    };
+    c.part(FourCC::DXIL)
+        .and_then(|part| victory_shader::native_programs(part.data).ok())
+        .is_some_and(|programs| programs.iter().any(|p| code_walks_bvh(&p.code)))
+}
+
+/// Whether console code has an `image_bvh*_intersect_ray`.
+#[cfg(windows)]
+fn code_walks_bvh(code: &[u8]) -> bool {
+    victory_shader::gfx10::decode(code)
+        .is_ok_and(|code| code.iter().any(|i| i.name().is_some_and(|n| n.starts_with("image_bvh"))))
 }
 
 /// Whether a console program can store to buffer memory: it has a buffer,
@@ -392,6 +415,9 @@ struct Pipeline {
     /// One of the ray-tracing structure builder's ([`builder`]).
     #[cfg(windows)]
     builder: bool,
+    /// Walks the builder's structures (waits until it has run whole).
+    #[cfg(windows)]
+    walks_bvh: bool,
 }
 const _: () = assert!(offset_of!(Pipeline, packet) == 0x10);
 
@@ -557,6 +583,8 @@ fn hand_out(
     if builder {
         builder::note(&host);
     }
+    #[cfg(windows)]
+    let walks_bvh = !builder && builder::allowed() && shaders.iter().any(|s| walks_bvh(&s.container));
     let pipeline = Box::new(Pipeline {
         object: Object::new(&FUNCTIONS),
         packet: [0; 8],
@@ -564,6 +592,8 @@ fn hand_out(
         host,
         #[cfg(windows)]
         builder,
+        #[cfg(windows)]
+        walks_bvh,
         shaders,
         bound: std::sync::atomic::AtomicBool::new(false),
     });
@@ -844,6 +874,33 @@ mod tests {
         for q in [p, other] {
             slot::<extern "system" fn(This) -> u32>(q, 0x10)(q);
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn programs_that_intersect_rays_walk_the_structures() {
+        let code = |words: &[u32]| words.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>();
+        const S_ENDPGM: u32 = 0xBF81_0000;
+        // Result v[20:23], descriptor s[12:15] (as in victory-shader's BVH tests).
+        let rest = 20 << 8 | 3 << 16;
+        let narrow = code(&[0xF198_9F01, rest | 2, S_ENDPGM]);
+        // NSA: pointer v2, v13, then the ray from v3 to v12.
+        let wide = code(&[0xF19C_9F07, rest | 2, 0x0504_030D, 0x0908_0706, 0x000C_0B0A, S_ENDPGM]);
+        assert!(code_walks_bvh(&narrow), "image_bvh_intersect_ray");
+        assert!(code_walks_bvh(&wide), "image_bvh64_intersect_ray");
+        assert!(!code_walks_bvh(&code(&[S_ENDPGM])));
+    }
+
+    /// What walks the structures waits until the builder has run whole: in a
+    /// title with the builder, not before; in a title without it, at once.
+    #[cfg(windows)]
+    #[test]
+    fn walks_wait_for_the_builder_to_run_whole() {
+        let _one = builder::test_lock();
+        builder::note_title_dll("XboxBvhBuilder.dll", 0x1000, 0x1000);
+        assert!(!builder::built(), "a title with the builder: not built yet");
+        builder::clear_image_for_tests();
+        assert!(builder::built(), "a title without the builder: walks run");
     }
 
     #[test]
