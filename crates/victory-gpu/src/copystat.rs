@@ -129,11 +129,21 @@ pub(crate) enum C {
     WaitsForGroups,
     WaitsForBuffers,
     IndirectBounded,
+    /// List calls translated by threads of ours (`VICTORY_THIN`): the
+    /// nanoseconds of draws, dispatches and indirect commands (and how many),
+    /// of the calls that only set state, of barriers, of copies and clears,
+    /// and of the rest (resets, closes, memory writes and waits).
+    ThinDrawNs,
+    ThinDraws,
+    ThinSetNs,
+    ThinBarrierNs,
+    ThinCopyNs,
+    ThinOtherNs,
 }
 const COUNTERS: usize = 80;
 
 /// The counters' names, in the order of [`C`], for the frame recorder's columns.
-pub(crate) const NAMES: [&str; 71] = [
+pub(crate) const NAMES: [&str; 77] = [
     "Submissions", "Copies", "CopyBytes", "Refreshes", "RefreshBytes", "Skipped", "SkippedBytes", "Runs",
     "RunUs", "Queries", "QueryUs", "MoveUs", "Unmapped", "Watches", "WatchUs", "Checked", "Unchanged",
     "Fallbacks", "GuardFaults", "TexWatched", "TexHashed", "TexChanged", "TexHot", "Frames", "RecordCalls",
@@ -143,7 +153,8 @@ pub(crate) const NAMES: [&str; 71] = [
     "TexUploads", "TexSkipped", "Forced", "GpuWritesLeftOut", "GpuWritesLeftOutBytes", "WaitChecks",
     "WaitCheckNs", "HostLists", "HostListNs", "PartsTogether", "WholeUs", "CardUnder2", "Card2To8",
     "Card8To32", "CardOver32", "CardUnder2Us", "Card2To8Us", "Card8To32Us", "CardOver32Us", "NothingBack",
-    "NothingBackUs", "WaitsForGroups", "WaitsForBuffers", "IndirectBounded",
+    "NothingBackUs", "WaitsForGroups", "WaitsForBuffers", "IndirectBounded", "ThinDrawNs", "ThinDraws",
+    "ThinSetNs", "ThinBarrierNs", "ThinCopyNs", "ThinOtherNs",
 ];
 /// One of some sets of counters, each in lines of the processor's memory of
 /// its own: a set for all threads had them wait for each other's lines at
@@ -454,7 +465,7 @@ mod command_tests {
     #[test]
     fn every_counter_is_named() {
         use super::{C, COUNTERS, NAMES};
-        assert_eq!(C::IndirectBounded as usize + 1, NAMES.len());
+        assert_eq!(C::ThinOtherNs as usize + 1, NAMES.len());
         assert_eq!(NAMES[C::Frames as usize], "Frames");
         assert!(NAMES.len() <= COUNTERS);
     }
