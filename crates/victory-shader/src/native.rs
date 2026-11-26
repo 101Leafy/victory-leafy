@@ -495,8 +495,9 @@ pub fn native_programs(part: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
 ///         register, u32 view dimension (1 buffer, 4 2D, 0 root view),
 ///         u8 descriptor dwords, u8 user-data dword, u8 root slot, u8 0,
 ///         u32 -1, u32 0
-///   0x42  a view declaration: u32 0, u8 1, u8 class (0 SRV, 1 UAV),
-///         u8 resource kind (DXIL's), u8 0, u32 register
+///   0x42  a view declaration: u32 0, u8 1 (2: picked from a descriptor
+///         heap, [`heap_params`]), u8 class (0 SRV, 1 UAV, 3 sampler
+///         heap), u8 resource kind (DXIL's), u8 0, u32 register
 ///   0x43  the shader hash (16 B); the last record
 /// ```
 pub fn fspx_program(part: &[u8]) -> Result<NativeProgram, ShaderError> {
@@ -529,7 +530,9 @@ pub fn fspx_program(part: &[u8]) -> Result<NativeProgram, ShaderError> {
     let granules = (u32_at(packet, PACKET_RSRC1)? & 0x3F) + 1;
     let vgprs = (granules * if wave64 { 4 } else { 8 }).min(256) as u16;
     let threads = |i: usize| u16_at(packet, PACKET_THREADS + 2 * i).map(u32::from);
-    let (layout, used) = records(meta, FSPX_RECORDS)?;
+    let (mut layout, used) = records(meta, FSPX_RECORDS)?;
+    let users = (u32_at(packet, PACKET_RSRC2)? >> 1 & 0x1F) as u8;
+    heap_params(meta, FSPX_RECORDS, code, users, &mut layout);
     Ok(NativeProgram {
         stage: HwStage::Cs,
         wave64,
@@ -595,6 +598,111 @@ fn records(meta: &[u8], from: usize) -> Result<(Vec<RootParam>, Vec<UsedResource
         used.push(u);
     }
     Ok((layout, used))
+}
+
+/// The descriptor heaps a compute program indexes (SM 6.6's
+/// `ResourceDescriptorHeap` and `SamplerDescriptorHeap`), put ahead of the
+/// root parameters in `layout`. The metadata says a program uses a heap (a
+/// 0x42 record with byte 8 at 2, class 3 for the sampler heap) but not the
+/// user SGPR that holds its address, and the 0x41 records list only the
+/// parameters the program reads, so the position can't be counted from
+/// them: the loose 0x218 programs then failed as "an address with two
+/// computed terms" (the heap address and the index), about 750 of them.
+/// The code tells instead: it makes a 32-bit address of an entry SGPR
+/// (`s_mov_b32 sN, sU` and `s_mov_b32 sN+1, 0`, or the high half cleared
+/// next to it) and loads descriptors from it. In GTA's programs the sampler
+/// heap is always the last user SGPR and the view heap the one below it, or
+/// the last when there is no sampler heap; a view heap the code makes no
+/// address of is left out. A root constant record claims 4 dwords whatever
+/// the program reads, so a heap may sit inside one; being first, the heap
+/// wins that SGPR ([`crate::resource`] takes the first parameter that covers
+/// a register).
+fn heap_params(meta: &[u8], from: usize, code: &[u8], users: u8, layout: &mut Vec<RootParam>) {
+    use crate::gfx10::{Fields, Operand};
+    let (mut views, mut samplers) = (false, false);
+    for e in meta.get(from..).unwrap_or(&[]).as_chunks::<FSPX_RECORD>().0 {
+        match e[0] {
+            0x43 => break,
+            0x42 if e[8] == 2 && e[9] == 3 => samplers = true,
+            0x42 if e[8] == 2 => views = true,
+            _ => {}
+        }
+    }
+    if !(views || samplers) || users == 0 {
+        return;
+    }
+    #[derive(Clone, Copy, PartialEq)]
+    enum Held {
+        Entry(u8),
+        Zero,
+    }
+    // Compute programs: user data dword i is s<i>.
+    let address = |u: u8| {
+        !layout.iter().any(|p| {
+            matches!(p.root, RootType::Table | RootType::Descriptor)
+                && u32::from(u) >= p.user_data.into()
+                && u32::from(u) < u32::from(p.user_data) + p.sgprs
+        })
+    };
+    let mut held = [None; 106];
+    for (r, h) in held.iter_mut().enumerate().take(users.into()) {
+        *h = Some(Held::Entry(r as u8));
+    }
+    // Code that doesn't decode fails later with its own error.
+    let Ok(code) = crate::gfx10::decode(code) else { return };
+    let mut bases = std::collections::BTreeSet::new();
+    for i in code {
+        let f = i.fields(false);
+        if let Fields::Smem { base: Operand::Scalar { code: b, .. }, .. } = f {
+            let at = |r: u8| held.get(usize::from(r)).copied().flatten();
+            if let (Some(Held::Entry(u)), Some(Held::Zero)) = (at(b), at(b + 1))
+                && address(u)
+            {
+                bases.insert(u);
+            }
+        }
+        let copy = match &f {
+            Fields::Sop { dst: Some(Operand::Scalar { code: d, .. }), src, .. } if i.name() == Some("s_mov_b32") => {
+                Some((*d, match src[..] {
+                    [Operand::Scalar { code, .. }] => held.get(usize::from(code)).copied().flatten(),
+                    [Operand::Const(128)] => Some(Held::Zero),
+                    _ => None,
+                }))
+            }
+            _ => None,
+        };
+        for (c, n) in scalar_operands(&f).1 {
+            for r in c..c.saturating_add(n) {
+                if let Some(h) = held.get_mut(usize::from(r)) {
+                    *h = None;
+                }
+            }
+        }
+        if let Some((d, h)) = copy
+            && let Some(slot) = held.get_mut(usize::from(d))
+        {
+            *slot = h;
+        }
+    }
+    let last = users - 1;
+    let mut heaps = Vec::new();
+    if views && let Some(&u) = bases.iter().rev().find(|&&u| !(samplers && u == last)) {
+        heaps.push((RootType::ResourceHeap, u, u8::MAX));
+    }
+    if samplers && address(last) {
+        heaps.push((RootType::SamplerHeap, last, u8::MAX - 1));
+    }
+    layout.splice(
+        0..0,
+        heaps.into_iter().map(|(root, user_data, slot)| RootParam {
+            root,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data,
+            slot,
+        }),
+    );
 }
 
 /// Program metadata handed over on its own, outside a container (device
@@ -2061,6 +2169,76 @@ mod tests {
         assert_eq!((m.version, m.code_dwords, m.used[0].kind), (2, 0x66, ResourceType::Cbv));
         v2.push(0);
         assert!(loose_metadata(&v2).is_err());
+    }
+
+    /// A loose compute program of `users` user SGPRs: an SRV table in s4,
+    /// root constants claiming s6-s9, and descriptor heap declarations
+    /// (class 3 the sampler heap).
+    fn heap_program(users: u32, classes: &[u8], code: &[u32]) -> NativeProgram {
+        let mut m = vec![0u8; FSPX_RECORDS];
+        m[0..4].copy_from_slice(&0x403u32.to_le_bytes());
+        m[0x14..0x18].copy_from_slice(&[0x40, 4, 2, 0]);
+        m.extend(record(0x41, 0, 3, 0, 0, 1, 4, 1));
+        m.extend(record(0x41, 2, 0, 0, 500, 4, 6, 2));
+        for &c in classes {
+            m.extend(record(0x42, 0, 0, 2 | u32::from(c) << 8, 0, 0, 0, 0));
+        }
+        m.extend(record(0x43, 0, 0, 0, 0, 0, 0, 0));
+        let size = (m.len() - 0x14) as u32;
+        m[4..8].copy_from_slice(&size.to_le_bytes());
+        let c = loose_compute(&packet([64, 1, 1], users << 1), &words(code), &m).unwrap();
+        let c = crate::Container::parse(&c).unwrap();
+        native_programs(c.part(crate::FourCC::ACCC).unwrap().data).unwrap().remove(0)
+    }
+
+    fn heaps(p: &NativeProgram) -> Vec<(RootType, u8)> {
+        p.layout
+            .iter()
+            .filter(|r| matches!(r.root, RootType::ResourceHeap | RootType::SamplerHeap))
+            .map(|r| (r.root, r.user_data))
+            .collect()
+    }
+
+    /// The view heap in s8, inside the constants' claim: the code clears
+    /// s9 and loads a descriptor at a root constant times 32.
+    #[test]
+    fn a_view_heap_is_found_in_the_code() {
+        let code = [
+            0xBE89_0380, // s_mov_b32 s9, 0
+            0x8F06_8506, // s_lshl_b32 s6, s6, 5
+            0xF408_0304,
+            0x0C00_0000, // s_load_dwordx4 s[12:15], s[8:9], s6
+            0xBF81_0000,
+        ];
+        let p = heap_program(9, &[0], &code);
+        assert_eq!(heaps(&p), [(RootType::ResourceHeap, 8)]);
+        assert_eq!(p.layout[0].root, RootType::ResourceHeap);
+        let ir = crate::ir::build(&p.code, false, 256).unwrap();
+        let lanes = crate::structure::structure(&ir).ok();
+        let r = crate::resource::track(&ir, &p.layout, HwStage::Cs, lanes.as_ref()).unwrap();
+        assert_eq!(r.scalar[0].1.param, 0);
+        // No heap the code makes an address of: none declared.
+        let p = heap_program(9, &[0], &code[1..]);
+        assert!(heaps(&p).is_empty());
+    }
+
+    /// Both heaps: the sampler heap in the last user SGPR, the view heap
+    /// copied to a pair below it.
+    #[test]
+    fn both_heaps_take_the_last_user_sgprs() {
+        let code = [
+            0xBE8C_0308, // s_mov_b32 s12, s8
+            0xBE8D_0380, // s_mov_b32 s13, 0
+            0xF408_0406,
+            0xFA00_0000, // s_load_dwordx4 s[16:19], s[12:13], 0x0
+            0xBF81_0000,
+        ];
+        let p = heap_program(10, &[0, 3], &code);
+        assert_eq!(heaps(&p), [(RootType::ResourceHeap, 8), (RootType::SamplerHeap, 9)]);
+        // The table is no heap, though the code makes the same address of it.
+        let mut table = code;
+        table[0] = 0xBE8C_0304; // s_mov_b32 s12, s4
+        assert_eq!(heaps(&heap_program(10, &[0, 3], &table)), [(RootType::SamplerHeap, 9)]);
     }
 
     /// A pixel stage's 4 root constants at b500, user data 9, as in the
