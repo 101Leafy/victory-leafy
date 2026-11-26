@@ -412,6 +412,8 @@ struct Lower<'a> {
     traces: bool,
     /// The block a loop stopped by [`LOOP_LIMIT`] leaves the program from.
     abort: Option<usize>,
+    /// The loops closed by a plain jump that test the limit at their own exits instead.
+    limit: LimitExits,
     /// The paired form ([`with_paired_lanes`]): what the lowering keeps per lane for the other
     /// console lane of this thread, and whether the lane being lowered is the upper one (its
     /// console lane the host lane plus 32).
@@ -515,6 +517,107 @@ fn all_lane_blocks(st: &Structured) -> Option<Vec<bool>> {
     }
     Some(all)
 }
+
+/// The loops closed by a plain jump (a lane's view of a loop entered past its first
+/// instruction, say) whose own exits test the iteration limit.
+///
+/// Testing it in the latch gives the loop a second way out, to the end of the program
+/// (`abort_block`), so no block after the loop is one every lane of it passes. With that, a
+/// wave operation after the loop (a ballot, a first lane, the mask two host waves exchange)
+/// did not cover the wave's lanes on NVIDIA. Measured on a GeForce card
+/// with a title's program that appends each thread's tile to one of two lists after
+/// such a loop, numbered per wave: of 14,260 threads 442 took a slot another had and 53 took
+/// none; with the limit tested at the loop's exits every one has its own.
+///
+/// A lane taken out at the limit this way goes on with the code after the loop, as one in a
+/// loop closed by a branch does.
+///
+/// Only programs whose code asks the wave (`console_lanes`) are shaped this way; in the others
+/// lanes do not see each other, and one stopped at the limit leaves the program as before.
+#[derive(Default)]
+struct LimitExits {
+    /// By block ending in a branch out of such a loop: the loops' headers.
+    tests: HashMap<usize, Vec<usize>>,
+    /// By header: the loop's blocks.
+    bodies: HashMap<usize, HashSet<usize>>,
+    /// The latches whose jump stays a plain one: a lane passes a testing branch on every way
+    /// from the header to them.
+    plain: HashSet<usize>,
+}
+
+fn limit_exits(p: &Program, st: &Structured) -> LimitExits {
+    let order = crate::ir::reverse_postorder(&p.blocks);
+    let mut place = vec![usize::MAX; p.blocks.len()];
+    for (n, &b) in order.iter().enumerate() {
+        place[b] = n;
+    }
+    let mut preds = vec![Vec::new(); p.blocks.len()];
+    for &b in &order {
+        let to = match st.exits[b] {
+            LaneExit::Jump(t) => [Some(t), None],
+            LaneExit::Branch { taken, not_taken, .. } => [Some(taken), Some(not_taken)],
+            LaneExit::End | LaneExit::Indirect => [None, None],
+        };
+        for t in to.into_iter().flatten().filter(|&t| place[t] != usize::MAX) {
+            preds[t].push(b);
+        }
+    }
+    let jumps = |b: usize| matches!(st.exits[b], LaneExit::Jump(_));
+    let mut found = LimitExits::default();
+    for &h in &order {
+        let latches: Vec<usize> = preds[h].iter().copied().filter(|&q| place[h] <= place[q]).collect();
+        if !latches.iter().any(|&q| jumps(q)) {
+            continue;
+        }
+        // the loop: its header and what reaches a latch without passing the header
+        let mut body = HashSet::from([h]);
+        let mut stack = latches.clone();
+        while let Some(b) = stack.pop() {
+            if body.insert(b) {
+                stack.extend(preds[b].iter().copied());
+            }
+        }
+        // (entered at a second place: the header's count is not known in all of it)
+        if h != order[0] && body.contains(&order[0]) {
+            continue;
+        }
+        let exiting: HashSet<usize> = body
+            .iter()
+            .copied()
+            .filter(|&b| {
+                matches!(st.exits[b], LaneExit::Branch { taken, not_taken, .. }
+                    if body.contains(&taken) != body.contains(&not_taken))
+            })
+            .collect();
+        let mut any = false;
+        for &latch in latches.iter().filter(|&&q| jumps(q)) {
+            // back from the latch to the header through no exiting block?
+            let (mut seen, mut stack, mut free) = (HashSet::new(), vec![latch], false);
+            while let Some(b) = stack.pop() {
+                if exiting.contains(&b) || !seen.insert(b) {
+                    continue;
+                }
+                if b == h {
+                    free = true;
+                    break;
+                }
+                stack.extend(preds[b].iter().copied().filter(|q| body.contains(q)));
+            }
+            if !free {
+                found.plain.insert(latch);
+                any = true;
+            }
+        }
+        if any {
+            for &b in &exiting {
+                found.tests.entry(b).or_default().push(h);
+            }
+            found.bodies.insert(h, body);
+        }
+    }
+    found
+}
+
 
 /// Every per-lane branch (by its block) with its region: the blocks reachable from it that do
 /// not post-dominate it, which only some lanes run. Not the branches the wave takes together
@@ -1400,8 +1503,8 @@ impl<'a> Lower<'a> {
         // The title's barriers a thread of the group may never reach, which
         // leaves the others waiting on the host: those in blocks some lanes
         // do not run, and all of them in a program with a loop closed by a
-        // plain jump (a lane still in it at the iteration limit leaves the
-        // program there, `abort_block`).
+        // plain jump that a lane still in it at the iteration limit leaves
+        // the program from (`abort_block`).
         let fence_only: HashSet<usize> = if insts().any(|i| i.name() == "s_barrier") {
             let order = crate::ir::reverse_postorder(&p.blocks);
             let mut place = vec![usize::MAX; p.blocks.len()];
@@ -1412,12 +1515,17 @@ impl<'a> Lower<'a> {
                 let at = |b: usize| place.get(b).copied().unwrap_or(usize::MAX);
                 at(from) != usize::MAX && at(to) <= at(from)
             };
+            let stays = if s.threads.is_some() && console_lanes {
+                limit_exits(p, x.st).plain
+            } else {
+                HashSet::new()
+            };
             let cut_short = x
                 .st
                 .exits
                 .iter()
                 .enumerate()
-                .any(|(b, e)| matches!(*e, LaneExit::Jump(t) if back(b, t)));
+                .any(|(b, e)| matches!(*e, LaneExit::Jump(t) if back(b, t)) && !stays.contains(&b));
             let all = all_lane_blocks(x.st);
             (0..p.blocks.len())
                 .filter(|&b| p.blocks[b].insts.iter().any(|i| i.name() == "s_barrier"))
@@ -1593,6 +1701,7 @@ impl<'a> Lower<'a> {
             counters: HashMap::new(),
             traces: p.blocks.iter().any(|b| b.insts.iter().any(|i| i.name().starts_with("image_bvh"))),
             abort: None,
+            limit: LimitExits::default(),
             twin: paired.then(Box::default),
             upper: false,
             lds_last: None,
@@ -2333,6 +2442,11 @@ impl<'a> Lower<'a> {
                 let phi = self.s.m.phi(blk, self.s.t.i32);
                 self.counters.insert(b, (phi, Vec::new()));
             }
+        }
+        // (compute programs whose code asks the wave only: a pixel stopped at the limit is
+        // discarded, and a lane of any other program leaves it, in `abort_block`)
+        if self.s.threads.is_some() && self.s.mesh.is_none() && self.console_lanes {
+            self.limit = limit_exits(p, self.x.st);
         }
         self.cur = self.s.entry;
         // Title memory written by address has no rasterizer-ordered form.
@@ -12096,9 +12210,14 @@ impl<'a> Lower<'a> {
             .map_or(self.x.p.blocks[b].offset, |i| i.machine.offset);
         let term = match self.x.st.exits[b] {
             LaneExit::Jump(t) if self.counters.contains_key(&t) && self.rpo[t] <= self.rpo[b] => {
-                let ok = self.count_iteration(t, pred::IULT);
-                let abort = self.abort_block();
-                Term::CondBr(ok, self.block[t].expect("reachable"), abort)
+                if self.limit.plain.contains(&b) {
+                    self.next_iteration(t);
+                    Term::Br(self.block[t].expect("reachable"))
+                } else {
+                    let ok = self.count_iteration(t, pred::IULT);
+                    let abort = self.abort_block();
+                    Term::CondBr(ok, self.block[t].expect("reachable"), abort)
+                }
             }
             LaneExit::Jump(t) => {
                 self.enter_loop(b, t, self.cur);
@@ -12143,7 +12262,7 @@ impl<'a> Lower<'a> {
                     |l: &Self, to: usize| l.counters.contains_key(&to) && l.rpo[to] <= l.rpo[b];
                 // (No `xor` of a compare: a loop exit testing one hung the
                 // AMD driver.)
-                let cond = if back(self, taken) {
+                let mut cond = if back(self, taken) {
                     let ok = self.count_iteration(taken, pred::IULT);
                     self.s.m.bin(self.cur, Bin::And, cond, ok)
                 } else if back(self, not_taken) {
@@ -12152,6 +12271,21 @@ impl<'a> Lower<'a> {
                 } else {
                     cond
                 };
+                // The way out of a loop closed by a plain jump is taken at the limit too
+                // (`LimitExits`).
+                for h in self.limit.tests.get(&b).cloned().unwrap_or_default() {
+                    let Some(&(count, _)) = self.counters.get(&h) else { continue };
+                    let last = self.s.m.i32(self.iteration_limit() - 1);
+                    cond = if self.limit.bodies[&h].contains(&taken) {
+                        let under = self.s.m.cmp(self.cur, pred::IULT, count, last);
+                        self.s.m.tag(under, Tag::Counter);
+                        self.s.m.bin(self.cur, Bin::And, cond, under)
+                    } else {
+                        let over = self.s.m.cmp(self.cur, pred::IUGE, count, last);
+                        self.s.m.tag(over, Tag::Counter);
+                        self.s.m.bin(self.cur, Bin::Or, cond, over)
+                    };
+                }
                 // Critical edges get a block of their own, so loops have
                 // dedicated exits and preheaders as DXC emits them.
                 let (t, f) = (self.edge(b, taken), self.edge(b, not_taken));
@@ -12197,12 +12331,31 @@ impl<'a> Lower<'a> {
     /// critical-edge block): the count goes up; the result compares it with
     /// [`LOOP_LIMIT`] by `p` (below: go on; at or above: stop).
     fn count_iteration(&mut self, to: usize, p: u8) -> V {
+        let next = self.next_iteration(to);
+        let limit = self.s.m.i32(self.iteration_limit());
+        let over = self.s.m.cmp(self.cur, p, next, limit);
+        self.s.m.tag(over, Tag::Counter);
+        over
+    }
+
+    /// A back edge to header `to`: the count goes up. Returns the new count.
+    fn next_iteration(&mut self, to: usize) -> V {
         let c = self.cur;
         let (phi, _) = self.counters[&to];
         let one = self.s.m.i32(1);
         let next = self.s.m.bin(c, Bin::Add, phi, one);
         self.s.m.tag(phi, Tag::Counter);
         self.s.m.tag(next, Tag::Counter);
+        self.counters
+            .get_mut(&to)
+            .expect("header")
+            .1
+            .push((next, c));
+        next
+    }
+
+    /// The iterations a lane makes of a loop it entered before it is taken out of it.
+    fn iteration_limit(&self) -> u32 {
         // Per stage unless the switch names one: a loop that never meets its
         // exit (a count read from a buffer the host has not got yet, say)
         // runs to the limit in every lane. A million iterations a pixel
@@ -12214,22 +12367,13 @@ impl<'a> Lower<'a> {
         // 14-25 frames in, in a minimap or shadow mesh draw; with every
         // loop cut at 64 it ran 90 frames. Raise them again once shaders
         // stop reading data that is not there yet.)
-        let limit = match super::loop_limit() {
+        match super::loop_limit() {
             LOOP_LIMIT if self.s.pixel => 1 << 7,
             LOOP_LIMIT if self.s.mesh.is_some() || self.s.threads.is_none() => 1 << 8,
             LOOP_LIMIT if self.traces => TRACE_LOOP_LIMIT,
             LOOP_LIMIT => 1 << 12,
             named => named,
-        };
-        let limit = self.s.m.i32(limit);
-        self.counters
-            .get_mut(&to)
-            .expect("header")
-            .1
-            .push((next, c));
-        let over = self.s.m.cmp(c, p, next, limit);
-        self.s.m.tag(over, Tag::Counter);
-        over
+        }
     }
 
     /// The block a lane stopped by [`LOOP_LIMIT`] leaves through.
