@@ -19,8 +19,6 @@
 mod ambient;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
-#[cfg(windows)]
-mod compose;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
@@ -62,8 +60,6 @@ pub mod query;
 pub mod queue;
 #[cfg(all(windows, feature = "diagnostics"))]
 pub mod replay;
-#[cfg(windows)]
-mod residency;
 pub mod resource;
 pub mod root;
 #[cfg(windows)]
