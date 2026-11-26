@@ -6047,7 +6047,11 @@ mod tests {
     #[test]
     fn a_wide_table_takes_only_slots_that_follow_on() {
         let pools = Pools::new(64);
-        pools.shards[0].lock().unwrap().take_at(7, 1);
+        // (Slot 7 alone taken: take_at wants the start of a run.)
+        let mut first = pools.shards[0].lock().unwrap();
+        first.take_at(0, 8);
+        first.give(0, 7);
+        drop(first);
         assert_eq!(pools.take(16), Some(8));
         assert_eq!(pools.free(), 64 - 1 - 16);
         assert_eq!(pools.give(8, 16), 16);
