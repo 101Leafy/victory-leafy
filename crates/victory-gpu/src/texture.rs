@@ -543,7 +543,9 @@ static THROUGH: Mutex<Option<HashMap<usize, Arc<Through>>>> = Mutex::new(None);
 /// and again whenever the list used `source` in another way since (wrote
 /// it, or read it itself). Leaves `placed` in the copy destination state,
 /// as [`upload`] does. False if the copy cannot be made: the caller fills
-/// the texture from title memory, as before.
+/// the texture from title memory, as before. The caller holds `source`
+/// (`crate::resource::held_alias_of`); both host copies are held here until
+/// the copy is recorded.
 pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
     const TARGET_OR_UNORDERED: u32 = 0x4 | 0x8;
     const COPY_DEST: u32 = 0x400;
@@ -551,11 +553,12 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
     // (All of its levels: the copy is level by level.)
     crate::resource::want_level(placed, 0);
     let (Some(to), Some(from)) = (
-        crate::resource::host_resource(placed),
-        crate::resource::host_resource(source),
+        crate::resource::host_copy(placed),
+        crate::resource::host_copy(source),
     ) else {
         return false;
     };
+    let (to, from) = (&to.texture, &from.texture);
     let Some(host) = host() else { return false };
     let through = {
         let mut map = THROUGH.lock().unwrap_or_else(|e| e.into_inner());
