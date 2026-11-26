@@ -396,10 +396,14 @@ fn firstlane_own(hash: &str) -> bool {
 }
 
 /// The cache entry's converter: the build and the container in, the
-/// encoded translation out. `ran` tells a miss from a hit.
+/// encoded translation out. `ran` tells a miss from a hit; `made` keeps a
+/// miss's translation, so the entry just written is not read back (the
+/// first read of a new file costs about as much as a small translation
+/// where a virus scanner looks at it: 0.5-3 ms).
 struct Translate<F> {
     translate: F,
     ran: AtomicBool,
+    made: Mutex<Option<HostShader>>,
 }
 
 impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Translate<F> {
@@ -413,7 +417,9 @@ impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Tra
     fn convert(&self, input: &[u8]) -> anyhow::Result<Vec<u8>> {
         self.ran.store(true, Ordering::Relaxed);
         let shader = (self.translate)(&input[32..]).map_err(anyhow::Error::msg)?;
-        Ok(encode(&shader))
+        let bytes = encode(&shader);
+        *self.made.lock().unwrap_or_else(|e| e.into_inner()) = Some(shader);
+        Ok(bytes)
     }
 }
 
@@ -427,11 +433,25 @@ fn cached(
     let converter = Translate {
         translate,
         ran: AtomicBool::new(false),
+        made: Mutex::new(None),
     };
+    let made = || converter.made.lock().unwrap_or_else(|e| e.into_inner()).take();
     for _ in 0..2 {
-        let path = cache
-            .get_or_convert(&converter, &input)
-            .map_err(|e| format!("{e:#}"))?;
+        let path = match cache.get_or_convert(&converter, &input) {
+            Ok(path) => path,
+            // A translation whose entry could not be written is handed back
+            // as it was made.
+            Err(e) => {
+                let shader = made().ok_or_else(|| format!("{e:#}"))?;
+                MISSES.fetch_add(1, Ordering::Relaxed);
+                return Ok(shader);
+            }
+        };
+        if let Some(shader) = made() {
+            MISSES.fetch_add(1, Ordering::Relaxed);
+            tracing::debug!(entry = %entry_name(&path), "shader translated and cached");
+            return Ok(shader);
+        }
         if let Some(shader) = std::fs::read(&path).ok().and_then(|b| decode(&b)) {
             let (counter, what) = if converter.ran.load(Ordering::Relaxed) {
                 (&MISSES, "translated and cached")
@@ -446,7 +466,7 @@ fn cached(
         let _ = std::fs::remove_file(&path);
     }
     MISSES.fetch_add(1, Ordering::Relaxed);
-    (converter.translate)(container)
+    made().map_or_else(|| (converter.translate)(container), Ok)
 }
 
 /// The entry for `container` under `build`, read and not translated: its
@@ -456,6 +476,7 @@ fn lookup(cache: &Cache, build: &[u8; 32], container: &[u8]) -> Option<(HostShad
     let absent = Translate {
         translate: |_: &[u8]| Err::<HostShader, _>(String::new()),
         ran: AtomicBool::new(false),
+        made: Mutex::new(None),
     };
     let path = cache.get_or_convert(&absent, &input).ok()?;
     let bytes = std::fs::read(&path).ok()?;
@@ -710,6 +731,24 @@ mod tests {
         // Failures are not stored.
         let fail = |_: &[u8]| Err::<HostShader, _>("unsupported".to_owned());
         assert!(cached(&cache, &build, b"other", fail).is_err());
+    }
+
+    /// A translation whose entry cannot be written (the cache folder is
+    /// a file now) is handed back as it was made, not made again.
+    #[test]
+    fn a_translation_is_made_once_when_its_entry_cannot_be_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("cache");
+        let cache = Cache::open(&root).unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::write(&root, b"not a folder").unwrap();
+        let runs = AtomicU64::new(0);
+        let translate = |_: &[u8]| {
+            runs.fetch_add(1, Ordering::Relaxed);
+            Ok(shader())
+        };
+        assert_eq!(cached(&cache, &[7; 32], b"a container", translate), Ok(shader()));
+        assert_eq!(runs.load(Ordering::Relaxed), 1);
     }
 
     fn walk(dir: &std::path::Path) -> Vec<PathBuf> {
