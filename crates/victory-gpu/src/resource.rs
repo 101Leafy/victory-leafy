@@ -1793,10 +1793,11 @@ pub(crate) fn host_copy_made(this: This) -> bool {
     r.desc.dimension != BUFFER && r.host.made.lock().unwrap_or_else(|e| e.into_inner()).is_some()
 }
 
-/// (Neptune) Whether the host refused to make a copy of title texture `this`.
+/// (Neptune) Whether the host refused to make a copy of title texture `this`
+/// and is not asked again yet.
 #[cfg(windows)]
 pub(crate) fn host_refused(this: This) -> bool {
-    !this.is_null() && resource(this).host.refused.load(std::sync::atomic::Ordering::Relaxed)
+    !this.is_null() && refused(resource(this))
 }
 
 /// (Neptune) Keeps title resource `this` alive until [`let_go_kept`]: a
