@@ -126,6 +126,9 @@ struct Card {
     sent: Mutex<SentRuns>,
     /// Whether something was put into `dirty` since it was last taken.
     touched: std::sync::atomic::AtomicBool,
+    /// When something was last put into `dirty` ([`crate::host::coarse_ms`]),
+    /// 0 for never since it was made.
+    changed_at: AtomicU64,
     /// The buffers' bytes (the title buffer's, rounded up to 64 KiB).
     size: u64,
 }
@@ -738,6 +741,47 @@ pub(crate) fn send_copied(dst: usize, len: usize) {
             shadow.copy(a, b);
         }
     }
+}
+
+/// For the memory line: the CPU sides of the copies in the card's memory,
+/// each as big as its card side, by what keeps them of use. Copies and
+/// bytes, three times: shaders were declared to write it (what they wrote
+/// is merged against it); only changed dwords go up (it is what they are
+/// found against); the rest, where it only passes title memory on to the
+/// card. Then of the rest, copies and bytes with nothing sent up for 10 s
+/// and for 60 s.
+///
+/// The play-f census held about 1,022 MB of these beside the same in the
+/// card's memory. Where they only pass bytes on and sit unchanged, a
+/// short-lived buffer per change would do.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn card_sides_census() -> [u64; 10] {
+    let now = crate::host::coarse_ms();
+    let mut out = [0u64; 10];
+    for shadow in CARDED.lock().unwrap_or_else(|e| e.into_inner()).iter().filter_map(std::sync::Weak::upgrade) {
+        let Some(card) = &shadow.card else {
+            continue;
+        };
+        let kind = if shadow.written.load(Ordering::Relaxed) {
+            0
+        } else if shadow.changes_only.load(Ordering::Relaxed) {
+            1
+        } else {
+            2
+        };
+        out[kind * 2] += 1;
+        out[kind * 2 + 1] += card.size;
+        if kind == 2 {
+            let idle = now.saturating_sub(card.changed_at.load(Ordering::Relaxed));
+            for (i, ms) in [(6, 10_000), (8, 60_000)] {
+                if idle >= ms {
+                    out[i] += 1;
+                    out[i + 1] += card.size;
+                }
+            }
+        }
+    }
+    out
 }
 
 /// The copies in the card's memory (diagnostics: `crate::host::upcheck`).
@@ -4252,6 +4296,7 @@ impl Shadow {
         }
         // (Under the lock: what takes the list sees it or finds it set.)
         card.touched.store(true, Ordering::Release);
+        card.changed_at.store(crate::host::coarse_ms(), Ordering::Relaxed);
     }
 
     /// Whether shaders were ever declared to write it.
@@ -4548,6 +4593,7 @@ impl Shadow {
                 dirty: Mutex::default(),
                 sent: Mutex::default(),
                 touched: Default::default(),
+                changed_at: Default::default(),
                 size: len.next_multiple_of(PIECE as u64),
             });
         }
@@ -4704,6 +4750,7 @@ mod land_tests {
             dirty: Mutex::default(),
             sent: Mutex::default(),
                 touched: Default::default(),
+                changed_at: Default::default(),
             size: len as u64,
         });
         Some(shadow)
@@ -5125,6 +5172,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                     dirty: Mutex::default(),
                     sent: Mutex::default(),
                 touched: Default::default(),
+                changed_at: Default::default(),
                     size,
                 };
                 (on_card, Some(card))
@@ -5353,6 +5401,7 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
         dirty: Mutex::default(),
         sent: Mutex::default(),
         touched: Default::default(),
+        changed_at: Default::default(),
         size: len,
     });
     let shadow = Arc::new(shadow);
@@ -5442,6 +5491,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
                 dirty: Mutex::default(),
                 sent: Mutex::default(),
                 touched: Default::default(),
+                changed_at: Default::default(),
                 size: len,
             };
             (on_card, Some(card))
