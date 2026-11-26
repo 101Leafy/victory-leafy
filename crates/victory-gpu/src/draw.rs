@@ -1574,6 +1574,7 @@ impl State {
             return false;
         }
         let l = &list.list;
+        #[cfg(feature = "diagnostics")]
         let began = std::time::Instant::now();
         // Vertex buffers the input layout reads.
         let mut views = [D3D12_VERTEX_BUFFER_VIEW::default(); 32];
@@ -1616,7 +1617,9 @@ impl State {
             // SAFETY: an open list; the view names a live host buffer.
             unsafe { l.IASetIndexBuffer(Some(&view)) };
         }
+        #[cfg(feature = "diagnostics")]
         crate::copystat::lap(crate::copystat::C::DrawBuffersNs, began);
+        #[cfg(feature = "diagnostics")]
         let began = std::time::Instant::now();
         const RENDER_TARGET: u32 = 0x4;
         for &t in &self.targets {
@@ -1642,6 +1645,7 @@ impl State {
             };
             crate::list::ensure_state(list, self.depth as This, state);
         }
+        #[cfg(feature = "diagnostics")]
         crate::copystat::lap(crate::copystat::C::DrawStatesNs, began);
         true
     }
@@ -1655,12 +1659,14 @@ impl State {
     /// could not be given a view.
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
         let l = &list.list;
+        #[cfg(feature = "diagnostics")]
         let began = std::time::Instant::now();
         // Textures picked by index, before anything asks for them.
         self.early_textures(list, p, compute);
         if crate::host::walls_trace() {
             self.walls_census(p, compute);
         }
+        #[cfg(feature = "diagnostics")]
         crate::copystat::lap(crate::copystat::C::DrawEarlyNs, began);
         // A list without a view heap: one of the title's for the views the
         // host itself puts into heap slots.
@@ -1722,8 +1728,10 @@ impl State {
             if t.stores && crate::picked::on() && crate::picked::picks(&stage.shader, &t.picks) {
                 crate::picked::runs_in(list);
             }
+            #[cfg(feature = "diagnostics")]
             let began = std::time::Instant::now();
             let made = self.tables(list, &t.used, &t.host.root_indexed_views, compute);
+            #[cfg(feature = "diagnostics")]
             crate::copystat::lap(crate::copystat::C::DrawTablesNs, began);
             STORES.set(true);
             if made.iter().any(|m| m.1 == u32::MAX) {
@@ -1738,6 +1746,7 @@ impl State {
             // copied back into title memory afterwards.
             let writes = (t.stores || !write_skip())
                 && !crate::pipeline::builder_quarantined(self.pipeline as This);
+            #[cfg(feature = "diagnostics")]
             let began = std::time::Instant::now();
             // Title memory by address: what the shader finds it by.
             let memory = if t.host.root_srvs.contains(&victory_shader::emit::SLOT_MEMORY) {
@@ -1761,7 +1770,9 @@ impl State {
             } else {
                 None
             };
+            #[cfg(feature = "diagnostics")]
             crate::copystat::lap(crate::copystat::C::DrawMemoryNs, began);
+            #[cfg(feature = "diagnostics")]
             let began = std::time::Instant::now();
             if let Some((param, dwords)) = stage.user_data {
                 // (A root signature holds 64 dwords.)
@@ -1908,11 +1919,13 @@ impl State {
                     return false;
                 }
             }
+            #[cfg(feature = "diagnostics")]
             crate::copystat::lap(crate::copystat::C::DrawRootsNs, began);
         }
         // Depth textures it writes through unordered access: their colour
         // twins hold what they lack from here on.
         list.twins_written();
+        #[cfg(feature = "diagnostics")]
         crate::copystat::lap(crate::copystat::C::DrawBindNs, began);
         true
     }
@@ -3005,6 +3018,7 @@ impl State {
             }
         }
         let base = compute_word(p, victory_shader::emit::USER_GROUP_BASE_X);
+        #[cfg(feature = "diagnostics")]
         let began = std::time::Instant::now();
         if x <= crate::indirect::PIECE {
             // SAFETY: an open list with everything set.
@@ -3027,9 +3041,12 @@ impl State {
                 unsafe { list.list.SetComputeRoot32BitConstant(param, 0, word) };
             }
         }
+        #[cfg(feature = "diagnostics")]
         crate::copystat::lap(crate::copystat::C::DrawDriverNs, began);
+        #[cfg(feature = "diagnostics")]
         let began = std::time::Instant::now();
         self.buffers_written();
+        #[cfg(feature = "diagnostics")]
         crate::copystat::lap(crate::copystat::C::DrawAfterNs, began);
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
         if let Some(role) = p.stages.first().and_then(|s| s.shader.ambient)
@@ -4067,15 +4084,19 @@ impl State {
             };
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("draw {count}x{instances}"), false));
+            #[cfg(feature = "diagnostics")]
             let began = std::time::Instant::now();
             // SAFETY: an open list with everything set.
             unsafe {
                 list.list
                     .DrawInstanced(count, instances, from, first_instance)
             };
+            #[cfg(feature = "diagnostics")]
             crate::copystat::lap(crate::copystat::C::DrawDriverNs, began);
+            #[cfg(feature = "diagnostics")]
             let began = std::time::Instant::now();
             self.drew(crate::pipeline::host_pipeline(self.pipeline as This));
+            #[cfg(feature = "diagnostics")]
             crate::copystat::lap(crate::copystat::C::DrawAfterNs, began);
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
@@ -4176,15 +4197,19 @@ impl State {
         if ran {
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("indexed {indices}x{instances}"), false));
+            #[cfg(feature = "diagnostics")]
             let began = std::time::Instant::now();
             // SAFETY: an open list with everything set.
             unsafe {
                 list.list
                     .DrawIndexedInstanced(indices, instances, first, base, first_instance)
             };
+            #[cfg(feature = "diagnostics")]
             crate::copystat::lap(crate::copystat::C::DrawDriverNs, began);
+            #[cfg(feature = "diagnostics")]
             let began = std::time::Instant::now();
             self.drew(crate::pipeline::host_pipeline(self.pipeline as This));
+            #[cfg(feature = "diagnostics")]
             crate::copystat::lap(crate::copystat::C::DrawAfterNs, began);
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
@@ -4295,6 +4320,7 @@ impl State {
         let why = |what: &str| crate::pipeline::note_why(format!("indirect kind {kind}: {what}"));
         #[cfg(not(feature = "diagnostics"))]
         let why = |_: &str| {};
+        #[cfg(feature = "diagnostics")]
         let entered = std::time::Instant::now();
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             #[cfg(feature = "diagnostics")]
@@ -4366,7 +4392,9 @@ impl State {
             why("mesh draws are switched off (VICTORY_MESH_TEST=skip)");
             return false;
         }
+        #[cfg(feature = "diagnostics")]
         crate::copystat::lap(crate::copystat::C::IndirectFindNs, entered);
+        #[cfg(feature = "diagnostics")]
         let began = std::time::Instant::now();
         // One record without a count: clamped in a batch (`batches`).
         let batch = if batches() > 0 && max == 1 && count.is_none() && split.is_none() {
@@ -4460,8 +4488,10 @@ impl State {
                 (bounded, 0)
             }
         };
+        #[cfg(feature = "diagnostics")]
         crate::copystat::lap(crate::copystat::C::IndirectArgsNs, began);
         REFUSED.set(None);
+        #[cfg(feature = "diagnostics")]
         let began = std::time::Instant::now();
         let ran = match kind {
             DRAW | INDEXED => self.prepare(list, kind == INDEXED),
@@ -4469,6 +4499,7 @@ impl State {
             DISPATCH => self.bind(list, p, true),
             _ => false,
         };
+        #[cfg(feature = "diagnostics")]
         crate::copystat::lap(crate::copystat::C::IndirectPrepareNs, began);
         if !ran {
             why(REFUSED.get().map_or("prepare failed", Refused::text));
@@ -4483,6 +4514,7 @@ impl State {
         if kind == MESH {
             self.mesh_scissor(list, true);
         }
+        #[cfg(feature = "diagnostics")]
         let began = std::time::Instant::now();
         // SAFETY: an open list with everything set; the scratch buffer and
         // host copies are kept alive by the list, and the signature is cached.
@@ -4507,6 +4539,7 @@ impl State {
                 ),
             }
         };
+        #[cfg(feature = "diagnostics")]
         crate::copystat::lap(crate::copystat::C::IndirectDriverNs, began);
         if split.is_some() {
             // Root arguments a command signature sets are undefined after it.
@@ -4516,12 +4549,14 @@ impl State {
         if kind == MESH {
             self.mesh_scissor(list, false);
         }
+        #[cfg(feature = "diagnostics")]
         let began = std::time::Instant::now();
         if kind == DISPATCH {
             self.buffers_written();
         } else {
             self.drew(Some(p));
         }
+        #[cfg(feature = "diagnostics")]
         crate::copystat::lap(crate::copystat::C::DrawAfterNs, began);
         // The scratch buffer stays readable as arguments: the next draw of
         // the window reads it with no barrier, and the next clamp moves it

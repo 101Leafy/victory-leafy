@@ -12,12 +12,12 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, mpsc};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, mpsc};
 
 use victory_pipeline::{Cache, Converter};
 use victory_shader::emit::{HostShader, StaticSampler, UserData};
 use victory_shader::resource::RootIndexedView;
-use victory_shader::{HwStage, RootType};
+use victory_shader::{HwStage, RootType, ShaderError};
 
 /// The form of an entry. This file is not part of the translator's
 /// fingerprint (`build.rs`), so a change to `encode` or `decode` that old
@@ -100,12 +100,7 @@ fn build(translator: &str) -> [u8; 32] {
             "VICTORY_WAVE_PAIRS",
             "VICTORY_LAUNCHED_EXEC",
         ] {
-            bytes.extend_from_slice(name.as_bytes());
-            bytes.push(b'=');
-            if let Some(value) = std::env::var_os(name) {
-                bytes.extend_from_slice(value.as_encoded_bytes());
-            }
-            bytes.push(0);
+            append_switch(&mut bytes, name, std::env::var_os(name).as_deref());
         }
         // And which clean-up passes ran over the translated code.
         bytes.extend_from_slice(&victory_shader::emit::shader_opt().to_le_bytes());
@@ -272,10 +267,65 @@ impl Check {
 /// can do decides the form of some programs.
 pub fn precompile(container: &[u8]) -> Result<bool, String> {
     let _ = crate::host::host();
-    let misses = MISSES.load(Ordering::Relaxed);
-    host_shader(container)?;
-    // (Counts other threads' misses too: the caller only adds them up.)
-    Ok(MISSES.load(Ordering::Relaxed) == misses)
+    // Told by this call, not by `MISSES` around it: with more than one
+    // worker another thread's miss would count here.
+    let (_, translated) = host_shader_by(container, 0)?;
+    Ok(!translated)
+}
+
+/// Translations the pipeline workers run at once: the host's processors
+/// less the title's (an Xbox Series title has 7 cores, 14 threads), at
+/// least one. In play-i 744 shaders that did not translate took 2,761,450
+/// ms of worker time, and from 200 s on the title got too little of the
+/// processor. The title's own threads never wait here: a draw that asks
+/// for a shader first translates it at once.
+/// `VICTORY_TRANSLATE_JOBS=n`: n at once.
+const TITLE_THREADS: usize = 14;
+
+struct Turns {
+    limit: usize,
+    busy: Mutex<usize>,
+    free: Condvar,
+}
+
+struct Turn<'a>(&'a Turns);
+
+impl Turns {
+    fn new(limit: usize) -> Self {
+        Self { limit: limit.max(1), busy: Mutex::new(0), free: Condvar::new() }
+    }
+
+    fn take(&self) -> Turn<'_> {
+        let mut busy = self.busy.lock().unwrap_or_else(|e| e.into_inner());
+        while *busy >= self.limit {
+            busy = self.free.wait(busy).unwrap_or_else(|e| e.into_inner());
+        }
+        *busy += 1;
+        Turn(self)
+    }
+}
+
+impl Drop for Turn<'_> {
+    fn drop(&mut self) {
+        *self.0.busy.lock().unwrap_or_else(|e| e.into_inner()) -= 1;
+        self.0.free.notify_one();
+    }
+}
+
+/// A turn to translate when this is a pipeline worker (`pipeline::make`).
+fn worker_turn() -> Option<Turn<'static>> {
+    static TURNS: OnceLock<Turns> = OnceLock::new();
+    if !std::thread::current().name().is_some_and(|n| n.starts_with("victory-pipelines-")) {
+        return None;
+    }
+    let turns = TURNS.get_or_init(|| {
+        let asked = std::env::var("VICTORY_TRANSLATE_JOBS").ok().and_then(|v| v.trim().parse().ok());
+        let processors = std::thread::available_parallelism().map_or(2, |n| n.get());
+        let limit = asked.unwrap_or(processors.saturating_sub(TITLE_THREADS));
+        tracing::info!(limit = limit.max(1), "translations at once on the pipeline workers");
+        Turns::new(limit)
+    });
+    Some(turns.take())
 }
 
 /// The translation of a console shader container, from the cache when
@@ -284,20 +334,38 @@ pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
     host_shader_finite(container, 0)
 }
 
+/// One switch in the key: `NAME=value`, `NAME=` when unset, and `NAME`
+/// alone when set and empty, so a switch read only for whether it is set
+/// (`VICTORY_STRICT_JOINS`) set to nothing does not share the unset key.
+fn append_switch(bytes: &mut Vec<u8>, name: &str, value: Option<&std::ffi::OsStr>) {
+    bytes.extend_from_slice(name.as_bytes());
+    if value.is_none_or(|v| !v.is_empty()) {
+        bytes.push(b'=');
+        bytes.extend_from_slice(value.unwrap_or_default().as_encoded_bytes());
+    }
+    bytes.push(0);
+}
+
 /// [`host_shader`] with the float colour exports to the targets in `mask`
 /// held finite (`emit::with_finite_targets`), cached apart from the plain
 /// translation; a mask of 0 is the plain one.
 pub(crate) fn host_shader_finite(container: &[u8], mask: u8) -> Result<HostShader, String> {
+    host_shader_by(container, mask).map(|(shader, _)| shader)
+}
+
+/// [`host_shader_finite`], and whether this call translated it (rather than
+/// read it from the cache).
+fn host_shader_by(container: &[u8], mask: u8) -> Result<(HostShader, bool), String> {
     let hash = blake3::hash(container).to_hex();
     let (wide, own) = (wave_wide(&hash), firstlane_own(&hash));
     let translate = move |c: &[u8]| {
+        let _turn = worker_turn();
         let plain = || {
             victory_shader::emit::with_wave_wide(wide, || {
                 victory_shader::emit::with_firstlane_own(own, || victory_shader::emit::translate(c))
             })
         };
         if mask == 0 { plain() } else { victory_shader::emit::with_finite_targets(mask, plain) }
-            .map_err(|e| e.to_string())
     };
     match CACHE.get() {
         // The forms a list allows are part of what the entry was made from. A
@@ -323,7 +391,7 @@ pub(crate) fn host_shader_finite(container: &[u8], mask: u8) -> Result<HostShade
             };
             keyed(cache, check(), salted, &hash[..16], container, translate)
         }
-        None => translate(container),
+        None => translate(container).map(|shader| (shader, true)).map_err(|e| e.to_string()),
     }
 }
 
@@ -335,17 +403,17 @@ fn keyed(
     build: impl Fn(&str) -> [u8; 32],
     shader: &str,
     container: &[u8],
-    translate: impl Fn(&[u8]) -> Result<HostShader, String> + Send + Sync + 'static,
-) -> Result<HostShader, String> {
+    translate: impl Fn(&[u8]) -> Result<HostShader, ShaderError> + Send + Sync + 'static,
+) -> Result<(HostShader, bool), String> {
     if check.state() == PENDING {
         if let Some((found, entry)) = lookup(cache, &build(&check.kept), container) {
             let container = container.to_vec();
             check.offer(shader, move || translate(&container).is_ok_and(|s| encode(&s) == entry));
-            return Ok(found);
+            return Ok((found, false));
         }
-        return cached(cache, &build(&check.source), container, translate);
+        return cached_by(cache, &build(&check.source), container, translate);
     }
-    cached(cache, &build(check.key()), container, translate)
+    cached_by(cache, &build(check.key()), container, translate)
 }
 
 /// Console wave64 compute programs (by the 16-digit hash the log names
@@ -396,16 +464,21 @@ fn firstlane_own(hash: &str) -> bool {
 
 /// The cache entry's converter: the build and the container in, the
 /// encoded translation out. `ran` tells a miss from a hit; `made` keeps a
-/// miss's translation, so the entry just written is not read back (the
-/// first read of a new file costs about as much as a small translation
-/// where a virus scanner looks at it: 0.5-3 ms).
+/// miss's translation or refusal, so the entry just written is not read
+/// back (the first read of a new file costs about as much as a small
+/// translation where a virus scanner looks at it: 0.5-3 ms).
+///
+/// Code the translator does not handle (`ShaderError::Unsupported`) is
+/// refused the same way every time under one build, so the refusal is an
+/// entry too and the next run does not try again. Other errors are not
+/// kept.
 struct Translate<F> {
     translate: F,
     ran: AtomicBool,
-    made: Mutex<Option<HostShader>>,
+    made: Mutex<Option<Result<HostShader, String>>>,
 }
 
-impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Translate<F> {
+impl<F: Fn(&[u8]) -> Result<HostShader, ShaderError> + Send + Sync> Converter for Translate<F> {
     fn id(&self) -> &'static str {
         "shader.dxil"
     }
@@ -415,9 +488,15 @@ impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Tra
     }
     fn convert(&self, input: &[u8]) -> anyhow::Result<Vec<u8>> {
         self.ran.store(true, Ordering::Relaxed);
-        let shader = (self.translate)(&input[32..]).map_err(anyhow::Error::msg)?;
-        let bytes = encode(&shader);
-        *self.made.lock().unwrap_or_else(|e| e.into_inner()) = Some(shader);
+        let (bytes, made) = match (self.translate)(&input[32..]) {
+            Ok(shader) => (encode(&shader), Ok(shader)),
+            Err(e @ ShaderError::Unsupported { .. }) => {
+                let reason = e.to_string();
+                (refusal(&reason), Err(reason))
+            }
+            Err(e) => return Err(e.into()),
+        };
+        *self.made.lock().unwrap_or_else(|e| e.into_inner()) = Some(made);
         Ok(bytes)
     }
 }
@@ -426,8 +505,19 @@ fn cached(
     cache: &Cache,
     build: &[u8; 32],
     container: &[u8],
-    translate: impl Fn(&[u8]) -> Result<HostShader, String> + Send + Sync,
+    translate: impl Fn(&[u8]) -> Result<HostShader, ShaderError> + Send + Sync,
 ) -> Result<HostShader, String> {
+    cached_by(cache, build, container, translate).map(|(shader, _)| shader)
+}
+
+/// [`cached`], and whether this call translated it (rather than read it
+/// from the cache).
+fn cached_by(
+    cache: &Cache,
+    build: &[u8; 32],
+    container: &[u8],
+    translate: impl Fn(&[u8]) -> Result<HostShader, ShaderError> + Send + Sync,
+) -> Result<(HostShader, bool), String> {
     let input = [&build[..], container].concat();
     let converter = Translate {
         translate,
@@ -441,31 +531,34 @@ fn cached(
             // A translation whose entry could not be written is handed back
             // as it was made.
             Err(e) => {
-                let shader = made().ok_or_else(|| format!("{e:#}"))?;
+                let made = made().ok_or_else(|| format!("{e:#}"))?;
                 MISSES.fetch_add(1, Ordering::Relaxed);
-                return Ok(shader);
+                return made.map(|shader| (shader, true));
             }
         };
-        if let Some(shader) = made() {
+        if let Some(made) = made() {
             MISSES.fetch_add(1, Ordering::Relaxed);
             tracing::debug!(entry = %entry_name(&path), "shader translated and cached");
-            return Ok(shader);
+            return made.map(|shader| (shader, true));
         }
-        if let Some(shader) = std::fs::read(&path).ok().and_then(|b| decode(&b)) {
-            let (counter, what) = if converter.ran.load(Ordering::Relaxed) {
+        if let Some(entry) = std::fs::read(&path).ok().and_then(|b| decode_entry(&b)) {
+            let ran = converter.ran.load(Ordering::Relaxed);
+            let (counter, what) = if ran {
                 (&MISSES, "translated and cached")
             } else {
                 (&HITS, "from the cache")
             };
             counter.fetch_add(1, Ordering::Relaxed);
             tracing::debug!(entry = %entry_name(&path), "shader {what}");
-            return Ok(shader);
+            return entry.map(|shader| (shader, ran));
         }
         tracing::debug!(entry = %entry_name(&path), "unreadable shader cache entry; translating again");
         let _ = std::fs::remove_file(&path);
     }
     MISSES.fetch_add(1, Ordering::Relaxed);
-    made().map_or_else(|| (converter.translate)(container), Ok)
+    made()
+        .unwrap_or_else(|| (converter.translate)(container).map_err(|e| e.to_string()))
+        .map(|shader| (shader, true))
 }
 
 /// The entry for `container` under `build`, read and not translated: its
@@ -473,15 +566,19 @@ fn cached(
 fn lookup(cache: &Cache, build: &[u8; 32], container: &[u8]) -> Option<(HostShader, Vec<u8>)> {
     let input = [&build[..], container].concat();
     let absent = Translate {
-        translate: |_: &[u8]| Err::<HostShader, _>(String::new()),
+        translate: |_: &[u8]| Err::<HostShader, _>(ShaderError::NotDxbc),
         ran: AtomicBool::new(false),
         made: Mutex::new(None),
     };
     let path = cache.get_or_convert(&absent, &input).ok()?;
     let bytes = std::fs::read(&path).ok()?;
-    let Some(shader) = decode(&bytes) else {
-        let _ = std::fs::remove_file(&path);
-        return None;
+    let shader = match decode_entry(&bytes) {
+        Some(Ok(shader)) => shader,
+        Some(Err(_)) => return None,
+        None => {
+            let _ = std::fs::remove_file(&path);
+            return None;
+        }
     };
     HITS.fetch_add(1, Ordering::Relaxed);
     Some((shader, bytes))
@@ -494,6 +591,35 @@ fn entry_name(path: &std::path::Path) -> String {
 }
 
 const MAGIC: &[u8; 4] = b"VSH1";
+const REFUSED: &[u8; 4] = b"VSR1";
+
+/// The translator's source and what it is built from (`build.rs`), in each
+/// refusal. A refusal can come from a translator bug, and a fix to it may
+/// leave every translation the same: then [`Check`] finds the output
+/// unchanged and goes on keying by `emit::VERSION`, so the key alone would
+/// keep serving the refusal.
+const MADE_BY: &str = env!("VICTORY_TRANSLATOR");
+
+/// A refusal's entry: [`REFUSED`], [`MADE_BY`], the reason's length (u32)
+/// and the reason. Builds from before refusals were kept do not read it and
+/// translate again.
+fn refusal(reason: &str) -> Vec<u8> {
+    [REFUSED.as_slice(), MADE_BY.as_bytes(), &(reason.len() as u32).to_le_bytes(), reason.as_bytes()].concat()
+}
+
+/// An entry read back: a translation, a refusal's reason, or `None` when it
+/// is damaged or a refusal by another translator source, which is
+/// translated again.
+fn decode_entry(bytes: &[u8]) -> Option<Result<HostShader, String>> {
+    let Some(rest) = bytes.strip_prefix(REFUSED) else {
+        return decode(bytes).map(Ok);
+    };
+    let (len, reason) = rest.strip_prefix(MADE_BY.as_bytes())?.split_first_chunk::<4>()?;
+    if reason.is_empty() || reason.len() != u32::from_le_bytes(*len) as usize {
+        return None;
+    }
+    String::from_utf8(reason.to_vec()).ok().map(Err)
+}
 const STAGES: [HwStage; 8] = [
     HwStage::Ls,
     HwStage::Hs,
@@ -727,9 +853,65 @@ mod tests {
         assert_eq!(cached(&cache, &build, container, translate), Ok(shader()));
         assert_eq!(runs.load(Ordering::Relaxed), 3);
 
-        // Failures are not stored.
-        let fail = |_: &[u8]| Err::<HostShader, _>("unsupported".to_owned());
+        // Failures other than a refusal are not stored.
+        let fail = |_: &[u8]| Err::<HostShader, _>(ShaderError::Malformed("test input"));
         assert!(cached(&cache, &build, b"other", fail).is_err());
+    }
+
+    /// A refusal under the same build is read back on the next run, not
+    /// translated again; another build or another container tries again.
+    #[test]
+    fn refusals_come_back_from_the_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let runs = AtomicU64::new(0);
+        let refuse = |_: &[u8]| {
+            runs.fetch_add(1, Ordering::Relaxed);
+            Err::<HostShader, _>(ShaderError::Unsupported { offset: 4, what: "test opcode" })
+        };
+        let want = Err("GFX10 code at 0x4: test opcode is not supported".to_owned());
+        assert_eq!(cached(&Cache::open(dir.path()).unwrap(), &[7; 32], b"a container", refuse), want);
+        let cache = Cache::open(dir.path()).unwrap();
+        assert_eq!(cached(&cache, &[7; 32], b"a container", refuse), want);
+        assert_eq!(runs.load(Ordering::Relaxed), 1);
+        assert_eq!(cached(&cache, &[8; 32], b"a container", refuse), want);
+        assert_eq!(cached(&cache, &[7; 32], b"another container", refuse), want);
+        assert_eq!(runs.load(Ordering::Relaxed), 3);
+
+        // Not a translation to offer, and kept.
+        assert!(lookup(&cache, &[7; 32], b"a container").is_none());
+        assert_eq!(cached(&cache, &[7; 32], b"a container", refuse), want);
+        assert_eq!(runs.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn other_failures_are_tried_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(dir.path()).unwrap();
+        let runs = AtomicU64::new(0);
+        let flaky = |_: &[u8]| {
+            if runs.fetch_add(1, Ordering::Relaxed) == 0 {
+                Err(ShaderError::Malformed("test input"))
+            } else {
+                Ok(shader())
+            }
+        };
+        assert!(cached(&cache, &[7; 32], b"a container", flaky).is_err());
+        assert_eq!(cached(&cache, &[7; 32], b"a container", flaky), Ok(shader()));
+        assert_eq!(runs.load(Ordering::Relaxed), 2);
+    }
+
+    /// Set and empty is a key of its own; unset and set keep the bytes
+    /// entries were made under before.
+    #[test]
+    fn an_empty_switch_is_not_an_unset_one() {
+        let key = |value: Option<&str>| {
+            let mut bytes = Vec::new();
+            append_switch(&mut bytes, "VICTORY_STRICT_JOINS", value.map(std::ffi::OsStr::new));
+            bytes
+        };
+        assert_eq!(key(None), b"VICTORY_STRICT_JOINS=\0");
+        assert_eq!(key(Some("1")), b"VICTORY_STRICT_JOINS=1\0");
+        assert_eq!(key(Some("")), b"VICTORY_STRICT_JOINS\0");
     }
 
     /// A translation whose entry cannot be written (the cache folder is
@@ -748,6 +930,51 @@ mod tests {
         };
         assert_eq!(cached(&cache, &[7; 32], b"a container", translate), Ok(shader()));
         assert_eq!(runs.load(Ordering::Relaxed), 1);
+    }
+
+    /// No more than the limit translate at once, and every one gets a turn.
+    #[test]
+    fn turns_hold_the_limit() {
+        let turns = &Turns::new(3);
+        let (now, most) = (&AtomicU32::new(0), &AtomicU32::new(0));
+        std::thread::scope(|s| {
+            for _ in 0..12 {
+                s.spawn(move || {
+                    for _ in 0..20 {
+                        let _turn = turns.take();
+                        most.fetch_max(now.fetch_add(1, Ordering::SeqCst) + 1, Ordering::SeqCst);
+                        std::thread::yield_now();
+                        now.fetch_sub(1, Ordering::SeqCst);
+                    }
+                });
+            }
+        });
+        assert!((1..=3).contains(&most.load(Ordering::SeqCst)));
+        assert_eq!(*turns.busy.lock().unwrap(), 0);
+        assert_eq!(Turns::new(0).limit, 1);
+    }
+
+    /// Whether a call translated is its own, not read off `MISSES`: the
+    /// warm-up (`precompile`) runs several workers at once.
+    #[test]
+    fn each_call_tells_its_own_hit_from_its_miss() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = &Cache::open(dir.path()).unwrap();
+        let build = [11u8; 32];
+        let translate = |_: &[u8]| Ok(shader());
+        let hit = b"a container already in the cache".as_slice();
+        assert_eq!(cached_by(cache, &build, hit, translate), Ok((shader(), true)));
+        let misses: Vec<Vec<u8>> = (0..64).map(|i| format!("miss {i}").into_bytes()).collect();
+        std::thread::scope(|s| {
+            for c in &misses {
+                s.spawn(move || {
+                    assert_eq!(cached_by(cache, &build, c, translate), Ok((shader(), true)));
+                });
+            }
+            for _ in 0..64 {
+                assert_eq!(cached_by(cache, &build, hit, translate), Ok((shader(), false)));
+            }
+        });
     }
 
     fn walk(dir: &std::path::Path) -> Vec<PathBuf> {
@@ -797,7 +1024,7 @@ mod tests {
         let first = open("a");
         assert_eq!(first.state(), SAME);
         for c in &containers {
-            assert_eq!(keyed(&cache, &first, key, "0123456789abcdef", c, same), Ok(shader()));
+            assert_eq!(keyed(&cache, &first, key, "0123456789abcdef", c, same).map(|(s, _)| s), Ok(shader()));
         }
         assert_eq!(RUNS.load(Ordering::Relaxed), u64::from(CHECKED) + 4);
 
@@ -807,7 +1034,7 @@ mod tests {
         assert_eq!(second.state(), PENDING);
         RUNS.store(0, Ordering::Relaxed);
         for c in &containers {
-            assert_eq!(keyed(&cache, &second, key, "0123456789abcdef", c, same), Ok(shader()));
+            assert_eq!(keyed(&cache, &second, key, "0123456789abcdef", c, same).map(|(s, _)| s), Ok(shader()));
         }
         assert_eq!(settled(&second), SAME);
         assert_eq!(RUNS.load(Ordering::Relaxed), u64::from(CHECKED), "only the samples ran");
@@ -815,7 +1042,7 @@ mod tests {
 
         // A miss while the check runs is kept under the source, not the number.
         let third = open("c");
-        assert_eq!(keyed(&cache, &third, key, "0123456789abcdef", b"new", same), Ok(shader()));
+        assert_eq!(keyed(&cache, &third, key, "0123456789abcdef", b"new", same).map(|(s, _)| s), Ok(shader()));
         assert!(lookup(&cache, &key("v1 deps"), b"new").is_none());
         assert!(lookup(&cache, &key("c"), b"new").is_some());
 
@@ -823,12 +1050,12 @@ mod tests {
         // from then on it translates under its source.
         let fourth = open("d");
         RUNS.store(0, Ordering::Relaxed);
-        assert_eq!(keyed(&cache, &fourth, key, "0123456789abcdef", &containers[0], changed), Ok(shader()));
+        assert_eq!(keyed(&cache, &fourth, key, "0123456789abcdef", &containers[0], changed).map(|(s, _)| s), Ok(shader()));
         assert_eq!(settled(&fourth), DIFFERS);
         assert_eq!(fourth.key(), "d");
         let mut want = shader();
         want.dxil.push(0);
-        assert_eq!(keyed(&cache, &fourth, key, "0123456789abcdef", &containers[0], changed), Ok(want));
+        assert_eq!(keyed(&cache, &fourth, key, "0123456789abcdef", &containers[0], changed).map(|(s, _)| s), Ok(want));
         assert_eq!(RUNS.load(Ordering::Relaxed), 2);
         assert_eq!(open("d").state(), DIFFERS, "and so does its next run");
 
@@ -887,5 +1114,34 @@ mod tests {
         assert_eq!(decode(&bytes[..bytes.len() - 1]), None);
         assert_eq!(decode(&[bytes.as_slice(), &[0]].concat()), None);
         assert_eq!(decode(b"VSH0"), None);
+        assert_eq!(decode_entry(&bytes), Some(Ok(shader())));
+        assert_eq!(decode_entry(&refusal("why")), Some(Err("why".to_owned())));
+        let refused = |rest: &[u8]| [REFUSED.as_slice(), MADE_BY.as_bytes(), rest].concat();
+        assert_eq!(decode_entry(&refused(b"\x03\0\0\0why")), Some(Err("why".to_owned())));
+        assert_eq!(decode_entry(&refused(b"\x04\0\0\0cut")), None);
+        assert_eq!(decode_entry(&refused(b"\x01\0\0\0\xff")), None);
+        assert_eq!(decode_entry(&refused(b"\0\0\0\0")), None);
+        assert_eq!(decode_entry(b"VSR1\x03\0\0\0why"), None);
+    }
+
+    /// A refusal by another translator source is translated again, even
+    /// where the key is the same (a fix that changed no translation).
+    #[test]
+    fn a_refusal_by_another_translator_is_tried_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(dir.path()).unwrap();
+        let refuse = |_: &[u8]| Err::<HostShader, _>(ShaderError::Unsupported { offset: 4, what: "test opcode" });
+        assert!(cached(&cache, &[7; 32], b"a container", refuse).is_err());
+        // Entries sit in folders; the root holds the cache's own marker.
+        let entries: Vec<_> = walk(dir.path()).into_iter().filter(|e| e.parent() != Some(dir.path())).collect();
+        assert_eq!(entries.len(), 1);
+        for e in entries {
+            let mut bytes = std::fs::read(&e).unwrap();
+            assert!(bytes.starts_with(REFUSED));
+            bytes[REFUSED.len()] ^= 1;
+            assert_eq!(decode_entry(&bytes), None);
+            std::fs::write(e, bytes).unwrap();
+        }
+        assert_eq!(cached(&cache, &[7; 32], b"a container", |_: &[u8]| Ok(shader())), Ok(shader()));
     }
 }
