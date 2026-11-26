@@ -966,6 +966,12 @@ pub(crate) fn slow(key: &str) -> bool {
     slow_ones().as_ref().is_some_and(|s| s.contains_key(key))
 }
 
+/// How long making the title pipeline with `key` took if that was
+/// [`SLOW_MS`] or more, else 0.
+pub(crate) fn slow_ms(key: &str) -> u64 {
+    slow_ones().as_ref().and_then(|s| s.get(key).copied()).unwrap_or(0)
+}
+
 /// The title pipeline with `key` took `ms` to make.
 pub(crate) fn note_time(key: &str, ms: u64) {
     if ms < SLOW_MS {
