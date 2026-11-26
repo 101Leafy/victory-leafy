@@ -67,6 +67,36 @@ pub(super) fn folder() -> Option<PathBuf> {
     DIR.get().cloned()
 }
 
+/// The folder of the library's file itself: `VICTORY_LIBRARY_DIR`, so that
+/// runs with different cache folders share one library and pay for each
+/// driver compile once (each folder made the same 1,300 slow pipelines
+/// again, about 14 minutes). The early and slow lists stay per folder.
+/// Two runs that both save keep the last one's library: the host cannot
+/// list or merge another library's pipelines.
+fn library_dir() -> Option<PathBuf> {
+    static SHARED: OnceLock<Option<PathBuf>> = OnceLock::new();
+    let shared = SHARED.get_or_init(|| std::env::var_os("VICTORY_LIBRARY_DIR").filter(|v| !v.is_empty()).map(PathBuf::from));
+    shared.clone().or_else(folder)
+}
+
+/// The lock a run holds on [`LOCK_FILE`] in `dir` while it writes the
+/// library's file there, so that two runs sharing it do not write one
+/// temporary file at once. Tried for `wait`; `None` if another run still
+/// holds it.
+fn writer(dir: &std::path::Path, wait: std::time::Duration) -> Option<std::fs::File> {
+    let file = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(dir.join(LOCK_FILE)).ok()?;
+    let began = std::time::Instant::now();
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Some(file),
+            Err(std::fs::TryLockError::WouldBlock) if began.elapsed() < wait => {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(_) => return None,
+        }
+    }
+}
+
 /// Host pipelines created, loaded from the library, and title pipelines
 /// started at creation, since the start.
 pub(crate) static MADE: AtomicU64 = AtomicU64::new(0);
@@ -207,11 +237,14 @@ enum Blob {
 
 impl Blob {
     /// The library file in `dir`: a library a save left beside it
-    /// ([`NEXT_FILE`]) takes its place first.
+    /// ([`NEXT_FILE`]) takes its place first, unless another run is saving.
     fn of(dir: &std::path::Path) -> Blob {
         let path = dir.join(LIBRARY_FILE);
         let next = dir.join(NEXT_FILE);
-        if next.exists() && std::fs::rename(&next, &path).is_err() {
+        if next.exists()
+            && let Some(_lock) = writer(dir, std::time::Duration::ZERO)
+            && std::fs::rename(&next, &path).is_err()
+        {
             tracing::warn!("the host pipeline library saved last could not take the old one's place");
         }
         if mapped()
@@ -438,6 +471,8 @@ const LIBRARY_FILE: &str = "host-pipelines.bin";
 /// had it mapped (a system that refuses to replace a mapped file): the next
 /// start renames it over the library first ([`Blob::of`]).
 const NEXT_FILE: &str = "host-pipelines.next";
+/// Held locked by the run writing the library ([`writer`]).
+const LOCK_FILE: &str = "host-pipelines.lock";
 const EARLY_FILE: &str = "early-pipelines.txt";
 /// Title pipelines listed for an early start, at most.
 const EARLY_MAX: usize = 100_000;
@@ -447,7 +482,7 @@ fn library() -> Option<&'static Library> {
     LIBRARY
         .get_or_init(|| {
             let device = crate::host::host()?.device.cast::<ID3D12Device1>().ok()?;
-            let blob = DIR.get().map_or(Blob::None, |d| Blob::of(d));
+            let blob = library_dir().map_or(Blob::None, |d| Blob::of(&d));
             let library = open(&device, blob);
             if library.is_none() {
                 tracing::warn!("no host pipeline library: pipelines are not kept");
@@ -582,16 +617,19 @@ pub(crate) fn save(now: bool) {
         }
         *last = Some(std::time::Instant::now());
     }
-    if let Err(e) = std::fs::create_dir_all(dir) {
+    let shared = library_dir().unwrap_or_else(|| dir.clone());
+    if let Err(e) = std::fs::create_dir_all(dir).and_then(|()| std::fs::create_dir_all(&shared)) {
         tracing::warn!(error = %e, "host pipeline library not saved");
         return;
     }
-    let tmp = dir.join(LIBRARY_FILE).with_extension("tmp");
+    let tmp = shared.join(LIBRARY_FILE).with_extension("tmp");
     // The bytes of the library written to `tmp`; 0 when no pipeline was
     // added: the library on disk is then what it was, and only the early
     // list is written (a title pipeline first drawn with wrote all 1,352 MB
-    // of the library again: run 60's second save).
-    let bytes = {
+    // of the library again: run 60's second save). Also 0 while another run
+    // writes the shared library: the pipelines stay counted as added, for
+    // the next save. A save at the end waits for that run; others do not.
+    let (bytes, _lock) = {
         let _all = one_call();
         // No store between asking the size and writing; loads go on.
         let _alone = library.saving.write().unwrap_or_else(|e| e.into_inner());
@@ -599,8 +637,13 @@ pub(crate) fn save(now: bool) {
         if !USED_CHANGED.swap(false, Ordering::Relaxed) && added == 0 {
             return;
         }
-        if added == 0 {
-            0
+        let wait = std::time::Duration::from_secs(if now { 30 } else { 0 });
+        let lock = if added == 0 { None } else { writer(&shared, wait) };
+        if added > 0 && lock.is_none() {
+            tracing::warn!("host pipeline library not saved this time: another run is saving it");
+        }
+        if lock.is_none() {
+            (0, None)
         } else {
             // SAFETY: a plain query.
             let size = unsafe { library.library.GetSerializedSize() };
@@ -612,16 +655,16 @@ pub(crate) fn save(now: bool) {
             }
             library.added.store(0, Ordering::Relaxed);
             SAVED.store(size as u64, Ordering::Relaxed);
-            size
+            (size, lock)
         }
     };
     // Through `used`: a process that asked for none yet (`victory shaders`)
     // must not write the earlier runs' list over with nothing.
     let used: Vec<String> = used().iter().flatten().cloned().collect();
-    let library_written = if bytes > 0 { replace_library(dir, &tmp) } else { Ok(()) };
+    let library_written = if bytes > 0 { replace_library(&shared, &tmp) } else { Ok(()) };
     if bytes > 0 && library_written.is_ok() {
         // In place unless the system refused and the new one waits beside it.
-        let in_place = !dir.join(NEXT_FILE).exists();
+        let in_place = !shared.join(NEXT_FILE).exists();
         if in_place && VIEW[0].load(Ordering::Relaxed) != 0 {
             REPLACED[1].store(crate::host::now_ms(), Ordering::Relaxed);
             REPLACED[0].fetch_add(1, Ordering::Relaxed);
