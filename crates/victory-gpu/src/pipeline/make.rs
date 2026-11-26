@@ -46,6 +46,9 @@ pub(crate) struct Pending {
     used: AtomicBool,
     /// A pass over the screen ([`GraphicsState::screen_pass`]).
     screen: bool,
+    /// Whether a draw already waited [`GIVE_UP`] for it in vain: later
+    /// draws do not wait for it (see [`wait`]).
+    given_up: AtomicBool,
 }
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
@@ -73,6 +76,7 @@ impl Pending {
             made: OnceLock::new(),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
+            given_up: AtomicBool::new(false),
         }
     }
 
@@ -209,9 +213,28 @@ fn shared_budget() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_WAIT_SHARED").is_none_or(|v| v != "0"))
 }
 
-/// Waits for `p` while frame `frame` has budget left.
+/// How long one wait for a pipeline may last in vain before later draws
+/// stop waiting for it. A pipeline the driver takes seconds for otherwise
+/// costs every frame the whole budget: in play-g's drive into the world
+/// the frames waited 470-500 ms each for three minutes while pipelines
+/// took 6-16 s each. Given up, it is still made in the background and its
+/// draws are dropped until then, as they are once the budget is spent.
+/// Passes over the screen keep waiting. `VICTORY_PIPELINE_GIVE_UP=0` waits
+/// as before.
+const GIVE_UP: Duration = Duration::from_millis(100);
+
+fn give_up() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_GIVE_UP").is_none_or(|v| v != "0"))
+}
+
+/// Waits for `p` while frame `frame` has budget left, unless an earlier
+/// wait for it gave up.
 fn wait(p: &Pending, frame: u64) {
     let screen = p.screen && screens_first();
+    if !screen && p.given_up.load(Ordering::Relaxed) {
+        return;
+    }
     let budget = if screen { screen_budget() } else { wait_budget() };
     if budget.is_zero() {
         return;
@@ -247,6 +270,13 @@ fn wait(p: &Pending, frame: u64) {
     }
     drop(held);
     let waited = started.elapsed().min(left);
+    if !screen && p.made.get().is_none() && waited >= GIVE_UP && give_up() && !p.given_up.swap(true, Ordering::Relaxed) {
+        tracing::info!(
+            ms = waited.as_millis() as u64,
+            key = %p.key,
+            "a pipeline waited for in vain: later draws do not wait for it (VICTORY_PIPELINE_GIVE_UP=0: they do)"
+        );
+    }
     if screen && waited > Duration::from_millis(500) {
         tracing::info!(
             ms = waited.as_millis() as u64,
@@ -527,6 +557,23 @@ mod tests {
         assert_eq!(worker_count(None, 64), 16);
         assert_eq!(worker_count(Some(0), 24), 1);
         assert_eq!(worker_count(Some(20), 24), 20);
+    }
+
+    /// A pipeline one wait gave up on is not waited for again: nothing makes
+    /// it here, so the first draw waits the frame's budget for it, and a
+    /// draw of a later frame not at all.
+    #[test]
+    fn a_pipeline_waited_for_in_vain_is_not_waited_for_again() {
+        let p = Pending::new(Vec::new(), None);
+        // Frames of its own, so the first has its whole budget.
+        let frame = u64::MAX - 7;
+        let started = Instant::now();
+        wait(&p, frame);
+        assert!(started.elapsed() >= GIVE_UP, "{:?}", started.elapsed());
+        assert!(p.given_up.load(Ordering::Relaxed));
+        let again = Instant::now();
+        wait(&p, frame - 1);
+        assert!(again.elapsed() < GIVE_UP / 10, "{:?}", again.elapsed());
     }
 
     /// A first use queues the pipeline and, within the budget, gets the
