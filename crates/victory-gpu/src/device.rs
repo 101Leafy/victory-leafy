@@ -350,53 +350,116 @@ fn feature_levels(data: *mut c_void) -> HRESULT {
 /// (title+0x2477578 and title+0x24800d5) as `(this, description, interface
 /// id, out)`, asks for `ID3D12PipelineState`, and on success keeps the
 /// object `out` names and draws with it; on failure it goes without that
-/// pipeline, silently. What the descriptions hold is not known: the calls
-/// fail as they always did, with `out` null, and the first ones log the
-/// description's words and what its first word points at, so that the two
-/// methods can be written.
-/// shortcut: not implemented. Answering `S_OK` here without making the
-/// pipeline would hand the title whatever its stack held as an object.
+/// pipeline, silently. Both build a pipeline from loose parts instead of a
+/// shader container. The description starts with the root signature, then
+/// (pointer, size) pairs:
+/// - 0x218 (compute): the FSPX register packet, a second part, the code,
+///   the metadata;
+/// - 0x1c8 (graphics): a register block, the input layout, then code and
+///   metadata for each of two stages.
+///
+/// The metadata is the FSPX resource records behind a short header
+/// (`victory_shader::loose_metadata`). The first calls log every part and
+/// what parsing made of it. With `VICTORY_LOOSE_PIPELINES=1`, a 0x218 call
+/// whose parts make an FSPX program (`victory_shader::loose_compute`) gets
+/// a compute pipeline from that container.
+/// shortcut: graphics pipelines are not made (the register block and input
+/// layout are not decoded), nor compute ones by default: those calls fail
+/// as they always did, with `out` null. Answering `S_OK` without making
+/// the pipeline would hand the title whatever its stack held as an object.
 extern "system" fn unknown_pipeline<const SLOT: usize>(
-    _: This,
+    this: This,
     desc: *const u8,
-    _iid: *const Iid,
+    iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
     use std::sync::atomic::{AtomicU32, Ordering};
     static CALLS: [AtomicU32; 2] = [const { AtomicU32::new(0) }; 2];
+    static MAKE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let calls = CALLS[usize::from(SLOT == 0x218)].fetch_add(1, Ordering::Relaxed) + 1;
     if !out.is_null() {
         // SAFETY: the title's out pointer (a local of its own).
         unsafe { *out = std::ptr::null() };
     }
-    if calls <= 4 || calls.is_power_of_two() {
-        // Sixteen 64-bit words at `at`, read through the kernel: neither
-        // pointer is known to be mapped.
-        #[cfg(windows)]
-        let words = |at: usize| -> Option<Vec<u64>> {
-            let mut bytes = [0u8; 128];
-            (at != 0 && crate::host::read_into(at as *const u8, &mut bytes)).then(|| {
-                bytes
-                    .as_chunks::<8>().0.iter()
-                    .map(|c| c.iter().rev().fold(0u64, |v, &b| v << 8 | u64::from(b)))
-                    .collect()
+    let make = SLOT == 0x218
+        && *MAKE.get_or_init(|| std::env::var("VICTORY_LOOSE_PIPELINES").as_deref() == Ok("1"));
+    let log = calls <= 4 || calls.is_power_of_two();
+    if !make && !log {
+        return E_NOTIMPL;
+    }
+    // Title memory at `at`, read through the kernel: neither the
+    // description nor its parts are known to be mapped.
+    #[cfg(windows)]
+    let read = |at: u64, size: u64| -> Option<Vec<u8>> {
+        let mut bytes = vec![0u8; usize::try_from(size).ok().filter(|&n| n <= 1 << 20)?];
+        (at != 0 && crate::host::read_into(at as *const u8, &mut bytes)).then_some(bytes)
+    };
+    #[cfg(not(windows))]
+    let read = |_: u64, _: u64| None::<Vec<u8>>;
+    let words: Vec<u64> = read(desc as u64, 128)
+        .map(|b| b.as_chunks::<8>().0.iter().map(|c| u64::from_le_bytes(*c)).collect())
+        .unwrap_or_default();
+    let pairs = if SLOT == 0x218 { 4 } else { 6 };
+    let parts: Vec<Option<Vec<u8>>> = (0..pairs)
+        .map(|i| words.get(1 + 2 * i..3 + 2 * i).and_then(|w| read(w[0], w[1])))
+        .collect();
+    let part = |i: usize| parts.get(i).and_then(|p| p.as_deref());
+    let built = (SLOT == 0x218).then(|| match (part(0), part(2), part(3)) {
+        (Some(packet), Some(code), Some(meta)) => {
+            victory_shader::loose_compute(packet, code, meta).map_err(|e| e.to_string())
+        }
+        _ => Err("a part is not readable".to_owned()),
+    });
+    if log {
+        let hex = |p: Option<&[u8]>| {
+            p.map(|b| {
+                let shown: String = b.iter().take(0x400).map(|v| format!("{v:02x}")).collect();
+                format!("{:#x} bytes: {shown}", b.len())
             })
         };
-        #[cfg(not(windows))]
-        let words = |_: usize| None::<Vec<u64>>;
-        let description = words(desc as usize);
-        let first = description
-            .as_ref()
-            .and_then(|w| words(w[0] as usize));
+        let metadata: Vec<String> = (3..pairs)
+            .step_by(2)
+            .map(|i| {
+                part(i).map_or("not readable".to_owned(), |m| {
+                    match victory_shader::loose_metadata(m) {
+                        Ok(m) => format!(
+                            "v{} code dwords {:#x}, {} root parameters, {} resources",
+                            m.version, m.code_dwords, m.layout.len(), m.used.len()
+                        ),
+                        Err(e) => e.to_string(),
+                    }
+                })
+            })
+            .collect();
         tracing::warn!(
             slot = format_args!("{:#x}", SLOT),
             calls,
-            description = format_args!("{description:x?}"),
-            first_points_at = format_args!("{first:x?}"),
-            "a pipeline creation method that is not implemented: the title goes without this pipeline"
+            description = format_args!("{words:x?}"),
+            parts = format_args!("{:?}", parts.iter().map(|p| hex(p.as_deref())).collect::<Vec<_>>()),
+            metadata = format_args!("{metadata:?}"),
+            program = format_args!("{:?}", built.as_ref().map(|b| b.as_ref().map(Vec::len))),
+            make,
+            "a pipeline made from loose parts"
         );
     }
-    E_NOTIMPL
+    match built {
+        Some(Ok(container)) if make => {
+            /// `pipeline::ComputeHead`'s layout.
+            #[repr(C)]
+            struct Head {
+                root: This,
+                code: *const u8,
+                size: usize,
+            }
+            let head = Head {
+                root: words.first().map_or(std::ptr::null(), |&w| w as This),
+                code: container.as_ptr(),
+                size: container.len(),
+            };
+            pipeline::create_compute(this, (&raw const head).cast(), iid, out)
+        }
+        _ => E_NOTIMPL,
+    }
 }
 
 /// The host device's state: the console's device is removed when the host's is
