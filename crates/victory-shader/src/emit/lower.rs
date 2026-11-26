@@ -2614,7 +2614,7 @@ impl<'a> Lower<'a> {
             let original = self.s.entry;
             let width = self.s.threads.expect("compute thread count")[0];
             let limit = self.host_word(RootType::Other(super::shader::USER_DISPATCH_THREADS_X), 0, width);
-            let Val::I32(group) = self.compute_id("groupId.i32", 94, 0) else {
+            let Val::I32(group) = self.group_id(0) else {
                 unreachable!()
             };
             let Val::I32(thread) = self.thread_id(0) else {
@@ -2929,7 +2929,7 @@ impl<'a> Lower<'a> {
             // host's value can be.
             Input::FrontFace => (13, 0),
             Input::ThreadIdInGroup(c) => return self.thread_id(c),
-            Input::GroupId(c) => return self.compute_id("groupId.i32", 94, c),
+            Input::GroupId(c) => return self.group_id(c),
             Input::GroupInfo => return Val::Missing("the thread-group info SGPR"),
             Input::MeshGroup => {
                 let Val::I32(g) = self.compute_id("groupId.i32", 94, 0) else {
@@ -3001,6 +3001,21 @@ impl<'a> Lower<'a> {
             self.s
                 .op(entry, name, Attr::ReadNone, self.s.t.i32, opcode, &[c]),
         )
+    }
+
+    /// A component of the group id. In a compute program X counts from the
+    /// first group of the piece of a dispatch the host split
+    /// ([`super::shader::USER_GROUP_BASE_X`]).
+    fn group_id(&mut self, c: u8) -> Val {
+        let id = self.compute_id("groupId.i32", 94, c);
+        if c != 0 || self.x.native.stage != HwStage::Cs {
+            return id;
+        }
+        let Val::I32(id) = id else {
+            unreachable!()
+        };
+        let base = self.host_word(RootType::Other(super::shader::USER_GROUP_BASE_X), 0, 0);
+        Val::I32(self.s.m.bin(self.s.entry, Bin::Add, id, base))
     }
 
     fn find_input(&self, row: u8, channel: u8) -> Option<(usize, u8)> {
