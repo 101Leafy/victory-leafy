@@ -667,7 +667,7 @@ mod tests {
         book.note([9; 16], &[c], None);
         let (known, shaders) = read(&dir);
         book.read(known, shaders);
-        flush(&Mutex::new(book));
+        flush_book(&Mutex::new(book));
         assert_eq!(count(&dir), 2);
         assert_eq!(keys(&dir)[1], "09".repeat(16));
         assert_eq!(walk_shaders(&dir, |_, _, _, _| ()), 37 + 12);
