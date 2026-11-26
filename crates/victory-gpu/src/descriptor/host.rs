@@ -2594,7 +2594,8 @@ impl HostHeap {
             && index < self.count
             && !self.texture_slot_made_from(index, handle)
             && let Some(view) = super::view(handle)
-            && let Some(View::Shader(resource, _)) = placed_texture(&view).or(Some(view))
+            && let Some(View::Shader(resource, _)) =
+                placed_texture(&view).map(|placed| placed.view).or(Some(view))
             && crate::resource::buffer_bytes(resource as crate::object::This).is_none()
             && crate::resource::host_resource(resource as crate::object::This).is_some_and(crate::pool::fresh)
             && !crate::texture::ahead::there(resource as crate::object::This)
@@ -4547,7 +4548,7 @@ fn make_twinned(
         }
         View::Placed(unordered, resource, desc) => {
             if let Some(view) = placed_texture(view) {
-                return make(&view, at);
+                return make(&view.view, at);
             }
             const BUFFER: u32 = 1;
             if resource[0] != BUFFER {
@@ -4880,20 +4881,46 @@ fn same_placed_texture(a: &View, b: &View) -> bool {
     }
 }
 
-/// A shader view of a texture the title placed in memory itself, as a view
-/// of the resource made for that memory (on first use).
-pub(crate) fn placed_texture(view: &View) -> Option<View> {
+/// A placed texture view's host view, and the title resource it holds (when
+/// the memory belongs to one).
+pub(crate) struct PlacedTexture {
+    pub(crate) view: View,
+    _owner: Option<crate::resource::ResourceRef>,
+}
+
+/// A placed texture's view on its host resource: of the title resource that
+/// writes the memory when there is one, else of a synthetic copy. UAV
+/// writes must land on the title resource (a synthetic copy would keep
+/// them).
+pub(crate) fn placed_texture(view: &View) -> Option<PlacedTexture> {
     const BUFFER: u32 = 1;
-    let View::Placed(false, resource, desc) = view else {
+    let View::Placed(unordered, resource, desc) = view else {
         return None;
     };
-    if resource[0] == BUFFER {
+    if resource[0] == BUFFER || (*unordered && resource[12] & 4 == 0) {
         return None;
     }
     let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
-    let texture = crate::resource::texture_at(address, resource)?;
+    let owner = if resource[12] & 4 != 0 {
+        crate::resource::writable_texture_at(address, resource)
+    } else {
+        None
+    };
+    let texture = match &owner {
+        Some(owner) => owner.as_ptr(),
+        // Unordered needed a resource the title gave; a synthetic one with
+        // no writable flag would drop writes.
+        None if *unordered => return None,
+        None => crate::resource::texture_at(address, resource)?,
+    };
     crate::resource::want_level(texture, crate::resource::first_mip(desc));
-    Some(View::Shader(texture as usize, desc[..10].try_into().ok()))
+    let words = desc[..10].try_into().ok();
+    let view = if *unordered {
+        View::Unordered(texture as usize, 0, words)
+    } else {
+        View::Shader(texture as usize, words)
+    };
+    Some(PlacedTexture { view, _owner: owner })
 }
 
 /// A null view of the kind `view` is, for a slot whose view the host
