@@ -113,6 +113,19 @@ impl Host {
                     size_of_val(&sm) as u32,
                 )
                 .map_err(err)?;
+            let mut sm67 = D3D12_FEATURE_DATA_SHADER_MODEL {
+                HighestShaderModel: D3D_SHADER_MODEL_6_7,
+            };
+            super::set_helper_lane_waves(
+                device
+                    .CheckFeatureSupport(
+                        D3D12_FEATURE_SHADER_MODEL,
+                        (&raw mut sm67).cast(),
+                        size_of_val(&sm67) as u32,
+                    )
+                    .is_ok()
+                    && sm67.HighestShaderModel.0 >= D3D_SHADER_MODEL_6_7.0,
+            );
             if sm.HighestShaderModel.0 < D3D_SHADER_MODEL_6_6.0 {
                 return Err(format!(
                     "the device supports SM {:#x} only",
@@ -273,6 +286,23 @@ impl Host {
         };
         // SAFETY: the description points at live data.
         unsafe { self.device.CreateComputePipelineState(&desc) }.map_err(|e| self.explained(e))
+    }
+
+    /// The wave sizes this device runs, fewest and most lanes
+    /// (`D3D12_FEATURE_D3D12_OPTIONS1`); a program declaring a wave size
+    /// outside them is refused.
+    pub fn wave_lanes(&self) -> Result<(u32, u32), String> {
+        let mut o = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+        // SAFETY: the feature query writes the structure of the given size.
+        unsafe {
+            self.device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS1,
+                (&raw mut o).cast(),
+                size_of_val(&o) as u32,
+            )
+        }
+        .map_err(err)?;
+        Ok((o.WaveLaneCountMin, o.WaveLaneCountMax))
     }
 
     /// The error with the debug layer's messages since the last call, if

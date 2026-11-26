@@ -359,17 +359,21 @@ fn feature_levels(data: *mut c_void) -> HRESULT {
 ///   metadata for the pixel stage and then the vertex stage. A null pixel
 ///   stage is a depth-only pipeline. The vertex code fetches its own
 ///   vertices through buffer descriptors at the address in user data 0-1,
-///   which no metadata record names.
+///   which no metadata record names. Some descriptions (the 0x200 register
+///   block of call 15) leave the vertex stage null and fill a third pair
+///   instead, likely a mesh stage, so the log reads that one too.
 ///
 /// The metadata is the FSPX resource records behind a short header
 /// (`victory_shader::loose_metadata`). The first calls log every part and
 /// what parsing made of it. With `VICTORY_LOOSE_PIPELINES=1`, a 0x218 call
 /// whose parts make an FSPX program (`victory_shader::loose_compute`) gets
-/// a compute pipeline from that container.
-/// shortcut: graphics pipelines are not made (the register block and input
-/// layout are not decoded), nor compute ones by default: those calls fail
-/// as they always did, with `out` null. Answering `S_OK` without making
-/// the pipeline would hand the title whatever its stack held as an object.
+/// a compute pipeline from that container. With `VICTORY_LOOSE_GRAPHICS=1`,
+/// a 0x1c8 call whose parts make containers (`victory_shader::loose_graphics`)
+/// gets a graphics pipeline whose host pipelines are made at the first draw
+/// into each set of target formats.
+/// Neither is made by default: those calls fail as they always
+/// did, with `out` null. Answering `S_OK` without making the pipeline
+/// would hand the title whatever its stack held as an object.
 extern "system" fn unknown_pipeline<const SLOT: usize>(
     this: This,
     desc: *const u8,
@@ -378,14 +382,14 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
 ) -> HRESULT {
     use std::sync::atomic::{AtomicU32, Ordering};
     static CALLS: [AtomicU32; 2] = [const { AtomicU32::new(0) }; 2];
-    static MAKE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static MAKE: [std::sync::OnceLock<bool>; 2] = [const { std::sync::OnceLock::new() }; 2];
     let calls = CALLS[usize::from(SLOT == 0x218)].fetch_add(1, Ordering::Relaxed) + 1;
     if !out.is_null() {
         // SAFETY: the title's out pointer (a local of its own).
         unsafe { *out = std::ptr::null() };
     }
-    let make = SLOT == 0x218
-        && *MAKE.get_or_init(|| std::env::var("VICTORY_LOOSE_PIPELINES").as_deref() == Ok("1"));
+    let switch = if SLOT == 0x218 { "VICTORY_LOOSE_PIPELINES" } else { "VICTORY_LOOSE_GRAPHICS" };
+    let make = *MAKE[usize::from(SLOT == 0x218)].get_or_init(|| std::env::var(switch).as_deref() == Ok("1"));
     let log = calls <= 4 || calls.is_power_of_two();
     if !make && !log {
         return E_NOTIMPL;
@@ -399,10 +403,12 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
     };
     #[cfg(not(windows))]
     let read = |_: u64, _: u64| None::<Vec<u8>>;
-    let words: Vec<u64> = read(desc as u64, 128)
-        .map(|b| b.as_chunks::<8>().0.iter().map(|c| u64::from_le_bytes(*c)).collect())
-        .unwrap_or_default();
-    let pairs = if SLOT == 0x218 { 4 } else { 6 };
+    let mut bytes = read(desc as u64, 128).unwrap_or_default();
+    if SLOT == 0x1c8 && !bytes.is_empty() {
+        bytes.extend(read(desc as u64 + 128, 16).unwrap_or_default());
+    }
+    let words: Vec<u64> = bytes.as_chunks::<8>().0.iter().map(|c| u64::from_le_bytes(*c)).collect();
+    let pairs = if SLOT == 0x218 { 4 } else { 8 };
     let parts: Vec<Option<Vec<u8>>> = (0..pairs)
         .map(|i| words.get(1 + 2 * i..3 + 2 * i).and_then(|w| read(w[0], w[1])))
         .collect();
@@ -410,6 +416,13 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
     let built = (SLOT == 0x218).then(|| match (part(0), part(2), part(3)) {
         (Some(packet), Some(code), Some(meta)) => {
             victory_shader::loose_compute(packet, code, meta).map_err(|e| e.to_string())
+        }
+        _ => Err("a part is not readable".to_owned()),
+    });
+    let graphics = (SLOT == 0x1c8).then(|| match (part(0), part(1), part(4), part(5)) {
+        (Some(regs), Some(layout), Some(vs), Some(vs_meta)) => {
+            victory_shader::loose_graphics(regs, layout, (vs, vs_meta), part(2).zip(part(3)))
+                .map_err(|e| e.to_string())
         }
         _ => Err("a part is not readable".to_owned()),
     });
@@ -441,6 +454,10 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
             parts = format_args!("{:?}", parts.iter().map(|p| hex(p.as_deref())).collect::<Vec<_>>()),
             metadata = format_args!("{metadata:?}"),
             program = format_args!("{:?}", built.as_ref().map(|b| b.as_ref().map(Vec::len))),
+            graphics = format_args!(
+                "{:?}",
+                graphics.as_ref().map(|g| g.as_ref().map(|g| (g.vs.len(), g.ps.as_ref().map(Vec::len), g.inputs.len())))
+            ),
             make,
             "a pipeline made from loose parts"
         );
@@ -461,7 +478,11 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
             };
             pipeline::create_compute(this, (&raw const head).cast(), iid, out)
         }
-        _ => E_NOTIMPL,
+        _ => match &graphics {
+            #[cfg(windows)]
+            Some(Ok(g)) if make => pipeline::create_loose_graphics(g, iid, out),
+            _ => E_NOTIMPL,
+        },
     }
 }
 
