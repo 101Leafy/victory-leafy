@@ -397,6 +397,11 @@ pub(crate) struct HostHeap {
     /// waited for most (5.6 % of their time, profile waits-1: each descriptor
     /// made for a draw takes it, and lets go of what the slot held under it).
     kept: Box<[Mutex<Option<ID3D12Resource>>]>,
+    /// The slots that go on showing an older view of a texture while the
+    /// newer one waits ([`keep_views`], [`keep_shown`]), with
+    /// [`kept_views_yield`]: what they hold is given up when the card has no
+    /// room ([`HostHeap::yield_kept_views`]).
+    keeping: Mutex<std::collections::BTreeSet<u32>>,
     /// The dynamic slots free and taken (by lists not yet reset): free runs
     /// in shards, so a table gets the smallest run that holds it without
     /// every recording thread queueing for one lock.
@@ -1935,6 +1940,7 @@ impl HostHeap {
             waiting: Mutex::default(),
             away: Mutex::default(),
             kept: (0..count + extra).map(|_| Mutex::new(None)).collect(),
+            keeping: Mutex::default(),
             pool: Pools::new(extra as usize),
             free: std::sync::atomic::AtomicU32::new(extra),
 
@@ -2718,6 +2724,49 @@ impl HostHeap {
         }
     }
 
+    /// The card has no room for the textures the queue waits to make
+    /// ([`kept_views_yield`]): the slots that go on showing an older texture
+    /// while a newer view waits are made null, so that nothing holds what
+    /// they showed and the sweep can let it go; their newer views stay in the
+    /// queue and are made when there is room. Returns how many slots were
+    /// made null.
+    ///
+    /// Each such slot held the host copy of a texture the title had replaced
+    /// there; with the card full the newer one was never made, so the older
+    /// one was never let go: in the world, some 3 GB of the card stayed
+    /// "filled idle but held" while about 3,500 uploads of the queue were
+    /// refused (Skyfrye).
+    pub(crate) fn yield_kept_views(&self) -> u64 {
+        let slots = std::mem::take(&mut *self.keeping.lock().unwrap_or_else(|e| e.into_inner()));
+        let mut n = 0;
+        for index in slots {
+            let _made = self.made.lock(index);
+            if self.made.get(index).is_some_and(|key| key != 0) {
+                self.unmake(index);
+                n += 1;
+            }
+        }
+        let before = KEPT_YIELDED.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+        if n != 0 && (before == 0 || before / 10_000 != (before + n) / 10_000) {
+            tracing::info!(
+                "slots that showed an older texture made null for want of room, since the start: {} (VICTORY_KEPT_VIEWS_YIELD)",
+                before + n
+            );
+        }
+        n
+    }
+
+    fn note_keeping(&self, index: u32) {
+        if kept_views_yield() {
+            self.keeping.lock().unwrap_or_else(|e| e.into_inner()).insert(index);
+        }
+    }
+
+    /// How many slots go on showing an older texture now ([`HostHeap::keeping`]).
+    pub(crate) fn keeping_now(&self) -> usize {
+        self.keeping.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
+
     /// Makes host slot `index` null again, as it is before its view is
     /// made: a null view of the kind it held. Under its lock ([`Made`]).
     fn unmake(&self, index: u32) {
@@ -3092,6 +3141,10 @@ impl HostHeap {
 
     /// Slot `index` now views `resource` (or nothing of the host's).
     fn keep(&self, index: u32, resource: Option<ID3D12Resource>) {
+        // What it shows now is what it was written with, or nothing.
+        if kept_views_yield() {
+            self.keeping.lock().unwrap_or_else(|e| e.into_inner()).remove(&index);
+        }
         let Some(slot) = self.kept.get(index as usize) else {
             return;
         };
@@ -3472,6 +3525,9 @@ impl HostHeap {
                 let kin = kin(&old, &view);
                 if kin == Kin::Same {
                     KEPT_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    // Under the slot's lock: a make after this one takes it
+                    // out again.
+                    self.note_keeping(index);
                     drop(held);
                     self.unmake_stale(index, stale);
                     return Some(view);
@@ -3483,6 +3539,7 @@ impl HostHeap {
                     let kept = kin.kept(keep_shown());
                     rewritten(kin, kept);
                     if kept {
+                        self.note_keeping(index);
                         drop(held);
                         self.unmake_stale(index, stale);
                         return Some(view);
@@ -4651,6 +4708,24 @@ fn keep_views() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_KEEP_VIEWS").is_none_or(|v| v != "0"))
 }
 
+/// Slots made null since the start because they showed an older texture
+/// while the card had no room for the newer one
+/// ([`HostHeap::yield_kept_views`]).
+pub(crate) static KEPT_YIELDED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Slots showing an older texture as of the texture pass's last look.
+pub(crate) static KEEPING_NOW: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Whether a slot that goes on showing an older texture while the newer one
+/// waits ([`keep_views`], [`keep_shown`]) gives it up when the card has no
+/// room for the newer one (`VICTORY_KEPT_VIEWS_YIELD=1`; off by default: it
+/// keeps it until the newer one is made, which with the card full may be
+/// never).
+pub(crate) fn kept_views_yield() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_KEPT_VIEWS_YIELD").is_some_and(|v| v == "1"))
+}
+
 /// What the texture view a slot is written with has to do with the one it
 /// shows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -5415,6 +5490,24 @@ mod tests {
         assert_eq!(constant_bytes(480), 512);
         assert_eq!(constant_bytes(64 << 10), 64 << 10);
         assert_eq!(constant_bytes(u32::MAX), 64 << 10);
+    }
+
+    /// With the card full, a slot that goes on showing an older texture while
+    /// the newer one waits gives it up: it is made null and leaves the set. A
+    /// slot not made is not counted, and one outside the set is left as it is.
+    #[test]
+    fn slots_keeping_an_older_texture_give_it_up_for_room() {
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return; // no host GPU
+        };
+        heap.made.set(2, 1 << 32 | 5);
+        heap.made.set(3, 1 << 32 | 6);
+        heap.keeping.lock().unwrap().extend([2, 4]);
+        assert_eq!(heap.keeping_now(), 2);
+        assert_eq!(heap.yield_kept_views(), 1);
+        assert_eq!([2, 3, 4].map(|i| heap.made.get(i)), [Some(0), Some(1 << 32 | 6), Some(0)]);
+        assert_eq!(heap.keeping_now(), 0);
+        assert_eq!(heap.yield_kept_views(), 0);
     }
 
     #[test]
