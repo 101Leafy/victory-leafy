@@ -52,6 +52,59 @@ pub(crate) struct IndexView {
     format: u32,
 }
 
+/// Why a draw that reached [`State::bind`] or [`State::prepare_for`] is
+/// dropped.
+#[derive(Clone, Copy)]
+enum Refused {
+    /// A descriptor table found no free slots.
+    NoSlots,
+    /// A shader reads title memory by address and the list has no view heap
+    /// for its views.
+    NoHeap,
+    /// The same with a view heap: the host could not hold the memory.
+    NotHeld,
+    /// Its index buffer is in no title buffer the host has a copy of.
+    NoIndex,
+    /// A draw with a mesh pipeline, or the other way round, or a compute one.
+    Kind,
+    /// A root view bound as a one-view table found no slot or no view heap.
+    RootTable,
+}
+
+impl Refused {
+    fn text(self) -> &'static str {
+        match self {
+            Refused::NoSlots => "prepare failed: descriptor table found no free slots",
+            Refused::NoHeap => "prepare failed: reads by address without a view heap",
+            Refused::NotHeld => "prepare failed: memory read by address not held",
+            Refused::NoIndex => "prepare failed: index buffer with no host copy",
+            Refused::Kind => "prepare failed: pipeline kind mismatch",
+            Refused::RootTable => "prepare failed: root view table without a slot or view heap",
+        }
+    }
+}
+
+/// Notes why the draw is dropped ([`REFUSED`], and its counter): false.
+fn refuse(why: Refused) -> bool {
+    REFUSED.set(Some(why));
+    #[cfg(feature = "diagnostics")]
+    {
+        use crate::copystat::{C, add};
+        add(
+            match why {
+                Refused::NoSlots => C::RefusedNoSlots,
+                Refused::NoHeap => C::RefusedNoHeap,
+                Refused::NotHeld => C::RefusedNotHeld,
+                Refused::NoIndex => C::RefusedNoIndex,
+                Refused::Kind => C::RefusedKind,
+                Refused::RootTable => C::RefusedRootTable,
+            },
+            1,
+        );
+    }
+    false
+}
+
 /// Host states of a depth target, and of a texture shaders read.
 const DEPTH_WRITE: u32 = 0x10;
 const DEPTH_READ: u32 = 0x20;
@@ -66,6 +119,10 @@ thread_local! {
     /// While a stage's tables are walked (`State::tables`): whether that
     /// stage's shader can store to buffers (`Translated::stores`).
     static STORES: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    /// Why the last [`State::bind`] or [`State::prepare_for`] refused its
+    /// draw, for the indirect drop reasons (None: it did not, or for a
+    /// reason checked before).
+    static REFUSED: std::cell::Cell<Option<Refused>> = const { std::cell::Cell::new(None) };
     /// While `State::early_textures` runs the texture pass: the
     /// milliseconds and the bytes that run may take, in place of the
     /// pass's own per frame.
@@ -347,6 +404,10 @@ pub(crate) struct State {
     root_srv_slots: std::collections::HashMap<(usize, u64), RootSlot>,
     /// Root UAVs bound as one-view tables in this list, likewise.
     root_uav_slots: std::collections::HashMap<(usize, u64), RootSlot>,
+    /// Tables another list made this frame that this one uses as they are
+    /// ([`SharedTables`]): title heap, first dynamic slot; let go when the
+    /// dynamic slots are given back.
+    shared: Vec<(usize, u32)>,
     /// The list ran and its dynamic slots were given back.
     tables_gone: bool,
     /// This recording, for [`crate::descriptor::host::HostHeap::make_listed`]
@@ -358,6 +419,9 @@ impl Drop for State {
     fn drop(&mut self) {
         for &(heap, first, n) in &self.dynamic {
             crate::descriptor::release_dynamic(heap, first, n);
+        }
+        for &(heap, first) in &self.shared {
+            SharedTables::let_go(heap, first);
         }
     }
 }
@@ -371,7 +435,7 @@ impl State {
     /// shortcut: a list the title runs a second time without a reset then
     /// reads slots others may have taken (logged once).
     pub(crate) fn tables_done(&mut self) {
-        if self.tables_gone && self.dynamic.is_empty() {
+        if self.tables_gone && self.dynamic.is_empty() && self.shared.is_empty() {
             return;
         }
         if self.tables_gone {
@@ -380,6 +444,9 @@ impl State {
         }
         for (heap, first, n) in self.dynamic.drain(..) {
             crate::descriptor::release_dynamic(heap, first, n);
+        }
+        for (heap, first) in self.shared.drain(..) {
+            SharedTables::let_go(heap, first);
         }
         self.fresh_tables.clear();
         self.recording = 0;
@@ -485,8 +552,9 @@ pub(crate) static HEAP_VIEWS_ELSEWHERE: AtomicU64 = AtomicU64::new(0);
 /// index ([`State::heap_buffers`]), and the microseconds they took.
 pub(crate) static HEAP_BUFFER_PASSES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static HEAP_BUFFER_MICROS: AtomicU64 = AtomicU64::new(0);
-/// Of the passes, nanoseconds since the last frame line: looking at slots,
-/// the spans and refreshes of their copies, the texture side.
+/// Of the passes, nanoseconds since the last frame line: looking at slots
+/// (those the rounds ahead left), the spans and refreshes of their copies,
+/// the texture side.
 #[cfg(feature = "diagnostics")]
 pub(crate) static HEAP_SPLIT: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
@@ -501,8 +569,13 @@ pub(crate) static HEAP_TEXTURES_WAITING: AtomicU64 = AtomicU64::new(0);
 pub(crate) static HEAP_TEXTURES_FULL: AtomicU64 = AtomicU64::new(0);
 
 /// Frames after a whole upload of a texture picked by index at which its
-/// memory is looked at again, each counted from the look before.
-const RECHECK_FRAMES: [u64; 5] = [4, 12, 40, 120, 400];
+/// memory is looked at again, each counted from the look before. The last
+/// two: of the changes found in a six-minute run (22,000), more turned up
+/// at the fifth look (400 frames on) than at the fourth, so the memory
+/// keeps changing past it, and a texture changed then kept what the last
+/// look saw for the rest of the run. At 2-3 frames a second 3,600 frames
+/// are about twenty minutes; a look reads 48 KiB.
+const RECHECK_FRAMES: [u64; 7] = [4, 12, 40, 120, 400, 1200, 3600];
 
 /// Looks at uploaded textures picked by index that found the memory as it
 /// was, and that found it changed (uploaded again), since the start.
@@ -524,6 +597,50 @@ pub(crate) static HEAP_TEXTURES_REUPLOADED_FULL: AtomicU64 = AtomicU64::new(0);
 fn full_card_pass() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_FULL_CARD_PASS").is_none_or(|v| v != "0"))
+}
+
+/// Dynamic descriptor slots asked for and not found at first, since the
+/// start: found after the flights in the air were settled (their lists'
+/// slots come back as they land); refused all the same (the draw is
+/// dropped).
+pub(crate) static DYNAMIC_SHORT: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+
+/// `n` dynamic slots of `host` ([`HostHeap::dynamic`]); with none free,
+/// the flights in the air are settled first and the slots asked for again,
+/// once a frame (`VICTORY_TABLE_SETTLE=0`: never; `2`: at every ask that
+/// finds none). A frame of some 18,700 draws in the world ran the ring out
+/// while the frames sent ahead still held theirs, and its draws went
+/// without their tables. The slots the title's lists hold before they are
+/// submitted cannot be had this way: in play-e a settle at every ask came
+/// back with slots for 5,152 of 761,000 asks, and the 15 or so settles a
+/// frame waited 150 to 350 ms a frame for the card (2.3 fps).
+///
+/// [`HostHeap::dynamic`]: crate::descriptor::host::HostHeap::dynamic
+fn dynamic_slots(host: &crate::descriptor::host::HostHeap, n: u32) -> Option<u32> {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    static SETTLED: AtomicU64 = AtomicU64::new(u64::MAX);
+    if let Some(first) = host.dynamic(n) {
+        return Some(first);
+    }
+    let mode = *MODE.get_or_init(|| match std::env::var("VICTORY_TABLE_SETTLE").as_deref().map(str::trim) {
+        Ok("0") => 0,
+        Ok("2") => 2,
+        _ => 1,
+    });
+    if mode == 0 || mode == 1 && !settle_due(&SETTLED, crate::frame::current()) {
+        DYNAMIC_SHORT[1].fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+    crate::host::settle_for_tables();
+    let found = host.dynamic(n);
+    DYNAMIC_SHORT[usize::from(found.is_none())].fetch_add(1, Ordering::Relaxed);
+    found
+}
+
+/// Whether frame `frame` has not settled for tables yet ([`dynamic_slots`]);
+/// it has from now on.
+fn settle_due(settled: &AtomicU64, frame: u64) -> bool {
+    settled.swap(frame, Ordering::Relaxed) != frame
 }
 
 /// Whether a texture that has its host copy is still brought up to date
@@ -624,23 +741,105 @@ fn set(roots: &mut Vec<Root>, slot: u32, root: Root) {
     roots[slot] = root;
 }
 
-/// The pass over the buffer views of `heap` that shaders pick by index
-/// ([`State::heap_buffers`]): their host slots are made, and the host copies
-/// they show are to be refreshed.
-fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::host::HostHeap, frame: u64) -> Vec<crate::host::aside::Refresh> {
-    let started = std::time::Instant::now();
-    // Per host heap: what each slot's buffer view reads, kept from pass to
-    // pass, and which slots are looked at again (`crate::heap_pass`).
-    type Picked = crate::heap_pass::Picked<std::sync::Arc<crate::shadow::Shadow>>;
-    static RANGES: std::sync::Mutex<Option<std::collections::HashMap<usize, Picked>>> = std::sync::Mutex::new(None);
+/// Per host heap: what each slot's buffer view reads, kept from pass to
+/// pass, and which slots are looked at again (`crate::heap_pass`).
+type Picked = crate::heap_pass::Picked<std::sync::Arc<crate::shadow::Shadow>>;
+
+struct Ranges {
+    heaps: std::collections::HashMap<usize, Picked>,
+    /// A round ahead made this frame's sweep (`Picked::plan`).
+    swept: bool,
+}
+
+static RANGES: std::sync::Mutex<Option<Ranges>> = std::sync::Mutex::new(None);
+/// A pass waits for [`RANGES`]: a round ahead stops at its next batch.
+static CLOSING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// The title heap of the last pass, for the rounds ahead (0: none yet).
+static AHEAD_HEAP: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Whether the slots written are looked at between passes as well
+/// ([`start_ahead`]; `VICTORY_HEAP_PASS_AHEAD=0`: no, the pass looks at
+/// all of them).
+fn heap_pass_ahead() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        !crate::heap_pass::full_pass()
+            && crate::host::aside::on()
+            && std::env::var_os("VICTORY_HEAP_PASS_AHEAD").is_none_or(|v| v != "0")
+    })
+}
+
+/// Starts the thread of the rounds ahead, once. After each round of the
+/// heap sync thread it looks at the buffer view slots written since, and
+/// once a frame makes the sweep, so that the pass a list's close waits for
+/// has left only what was written in the last few milliseconds. The pass
+/// used to look at all of them there: 112 ms waited at the close in play.
+fn start_ahead() {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        let made = std::thread::Builder::new().name("victory-heap-ahead".into()).spawn(|| {
+            let mut seen = 0;
+            loop {
+                // shortcut: 8 ms when the sync thread makes no rounds (it
+                // makes them every 4 ms while submissions come).
+                seen = crate::descriptor::sync_round_after(seen, std::time::Duration::from_millis(8));
+                let at = AHEAD_HEAP.load(Ordering::Relaxed);
+                if at == 0 || CLOSING.load(Ordering::Relaxed) {
+                    continue;
+                }
+                #[cfg(feature = "diagnostics")]
+                let started = std::time::Instant::now();
+                let looked = crate::descriptor::with_heap(at, |heap| heap.host().map(|host| heap_round(heap, host)))
+                    .flatten()
+                    .unwrap_or(0);
+                #[cfg(feature = "diagnostics")]
+                if looked > 0 {
+                    use crate::copystat::{C, add};
+                    add(C::HeapAheadRounds, 1);
+                    add(C::HeapAheadLooked, looked as u64);
+                    add(C::HeapAheadNs, started.elapsed().as_nanos() as u64);
+                }
+                #[cfg(not(feature = "diagnostics"))]
+                let _ = looked;
+            }
+        });
+        if made.is_err() {
+            tracing::warn!("no thread for the heap pass's rounds ahead: the pass looks at all slots");
+        }
+    });
+}
+
+/// A round ahead over `heap`: the slots looked at.
+fn heap_round(heap: &crate::descriptor::Heap, host: &crate::descriptor::host::HostHeap) -> usize {
     let mut kept = RANGES.lock().unwrap_or_else(|e| e.into_inner());
-    let heaps = kept.get_or_insert_with(Default::default);
+    if CLOSING.load(Ordering::Relaxed) {
+        return 0;
+    }
+    let ranges = kept.get_or_insert_with(|| Ranges { heaps: Default::default(), swept: false });
+    let sweep = !ranges.swept;
+    ranges.swept = true;
+    heap_looks(ranges, heap, host, crate::frame::current(), sweep, true)
+}
+
+/// Plans and looks at the slots of `heap` due ([`Picked::plan`], with or
+/// without the sweep), and keeps what they show. A round ahead (`ahead`)
+/// stops between batches when a pass waits, and leaves it the rest. The
+/// slots looked at.
+fn heap_looks(
+    ranges: &mut Ranges,
+    heap: &crate::descriptor::Heap,
+    host: &crate::descriptor::host::HostHeap,
+    frame: u64,
+    sweep: bool,
+    ahead: bool,
+) -> usize {
     // Freed table entries are told to every heap's pass.
     let forgotten = crate::descriptor::take_forgotten();
-    for picked in heaps.values_mut() {
+    for picked in ranges.heaps.values_mut() {
         picked.note_forgotten(forgotten.as_deref());
     }
-    let ranges = heaps
+    let ranges = ranges
+        .heaps
         .entry(std::ptr::from_ref(host) as usize)
         .or_insert_with(|| Picked::new(crate::heap_pass::full_pass()));
     let changed = host.buffer_changes();
@@ -648,6 +847,7 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
     let written = changed.len() as u64;
     let slots = ranges.plan(
         changed,
+        sweep,
         || host.buffer_slots(),
         |index| heap.handle(index).map(crate::descriptor::record_words),
         crate::descriptor::record_entry,
@@ -656,7 +856,6 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
     #[cfg(feature = "diagnostics")]
     {
         use crate::copystat::{C, add};
-        add(C::HeapLooked, slots.len() as u64);
         add(C::HeapLookedWritten, if all { 0 } else { written });
     }
     // Whether the device was there before the pass: a view that removes
@@ -711,64 +910,107 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
         let written = crate::picked::on() && view_kind(&view) == Some(ResourceType::Uav);
         (Some(record), Look::Shows((shadow, address, address + len), written))
     };
-    // Some slots at a time, on several threads.
+    // Some slots at a time, on several threads; a round ahead, a batch of
+    // them at a time.
+    // shortcut: 1024 a batch, a few milliseconds of the view threads that
+    // a pass may wait for.
     const AT_A_TIME: usize = 256;
-    let parts: Vec<&[u32]> = slots.chunks(AT_A_TIME).collect();
-    let found: Vec<std::sync::OnceLock<Vec<_>>> = parts.iter().map(|_| Default::default()).collect();
-    crate::land::each_view(false, parts.len(), &|n| {
-        let looked: Vec<_> = parts[n].iter().map(|&index| (index, look(index))).collect();
-        // (After each piece while the device lives: a cheap query.)
-        if alive
-            && let Some(why) = crate::descriptor::host::device_removed()
-            && !GONE.swap(true, Ordering::Relaxed)
-        {
-            let last: Vec<String> = parts[n]
-                .iter()
-                .filter_map(|&i| crate::descriptor::view(heap.handle(i)?).map(|v| format!("{i}: {v:?}")))
-                .map(|s| s.chars().take(200).collect())
-                .collect();
-            tracing::error!(why, "the host device went while buffer views of the heap were made; perhaps one of: {last:#?}");
-            crate::host::log_removal_context();
-        }
-        let _ = found[n].set(looked);
-    });
+    const BATCH: usize = 1024;
+    let mut looked = 0;
     #[cfg(feature = "diagnostics")]
     let mut same = 0u64;
-    for (index, (record, shows)) in found.into_iter().filter_map(std::sync::OnceLock::into_inner).flatten() {
-        #[cfg(feature = "diagnostics")]
-        if !all {
-            let before = ranges.held(index);
-            same += u64::from(match &shows {
-                Look::Shows((shadow, from, to), _) => {
-                    before == Some((std::sync::Arc::as_ptr(shadow) as usize, *from, *to))
-                }
-                _ => before.is_none(),
-            });
+    for (b, batch) in slots.chunks(if ahead { BATCH } else { slots.len().max(1) }).enumerate() {
+        if ahead && CLOSING.load(Ordering::Relaxed) {
+            let rest = &slots[b * BATCH..];
+            ranges.put_back(rest);
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::HeapCarried, rest.len() as u64);
+            break;
         }
-        let entry = record.and_then(crate::descriptor::record_entry);
-        match (record, shows) {
-            (Some(record), Look::Shows(range, written)) => {
-                let (shadow, from, to) = &range;
-                ranges.keep(index, std::sync::Arc::as_ptr(shadow) as usize, shadow, *from, *to, record, entry);
-                if written {
-                    unordered.push(range);
+        let parts: Vec<&[u32]> = batch.chunks(AT_A_TIME).collect();
+        let found: Vec<std::sync::OnceLock<Vec<_>>> = parts.iter().map(|_| Default::default()).collect();
+        crate::land::each_view(false, parts.len(), &|n| {
+            let looked: Vec<_> = parts[n].iter().map(|&index| (index, look(index))).collect();
+            // (After each piece while the device lives: a cheap query.)
+            if alive
+                && let Some(why) = crate::descriptor::host::device_removed()
+                && !GONE.swap(true, Ordering::Relaxed)
+            {
+                let last: Vec<String> = parts[n]
+                    .iter()
+                    .filter_map(|&i| crate::descriptor::view(heap.handle(i)?).map(|v| format!("{i}: {v:?}")))
+                    .map(|s| s.chars().take(200).collect())
+                    .collect();
+                tracing::error!(why, "the host device went while buffer views of the heap were made; perhaps one of: {last:#?}");
+                crate::host::log_removal_context();
+            }
+            let _ = found[n].set(looked);
+        });
+        looked += batch.len();
+        for (index, (record, shows)) in found.into_iter().filter_map(std::sync::OnceLock::into_inner).flatten() {
+            #[cfg(feature = "diagnostics")]
+            if !all {
+                let before = ranges.held(index);
+                same += u64::from(match &shows {
+                    Look::Shows((shadow, from, to), _) => {
+                        before == Some((std::sync::Arc::as_ptr(shadow) as usize, *from, *to))
+                    }
+                    _ => before.is_none(),
+                });
+            }
+            let entry = record.and_then(crate::descriptor::record_entry);
+            match (record, shows) {
+                (Some(record), Look::Shows(range, written)) => {
+                    let (shadow, from, to) = &range;
+                    ranges.keep(index, std::sync::Arc::as_ptr(shadow) as usize, shadow, *from, *to, record, entry);
+                    if written {
+                        unordered.push(range);
+                    }
+                }
+                (Some(record), Look::Later) => ranges.orphan(index, record, entry),
+                _ => {
+                    ranges.forget(index);
                 }
             }
-            (Some(record), Look::Later) => ranges.orphan(index, record, entry),
-            _ => ranges.forget(index),
         }
     }
     #[cfg(feature = "diagnostics")]
-    crate::copystat::add(crate::copystat::C::HeapSameAgain, same);
+    {
+        use crate::copystat::{C, add};
+        add(C::HeapLooked, looked as u64);
+        add(C::HeapSameAgain, same);
+    }
     if crate::picked::on() {
         crate::picked::shown(unordered, all);
     }
+    looked
+}
+
+/// The pass over the buffer views of `heap` that shaders pick by index
+/// ([`State::heap_buffers`]): their host slots are made, and the host copies
+/// they show are to be refreshed. What the rounds ahead left (or all that
+/// is due, without them) is looked at here.
+fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::host::HostHeap, frame: u64) -> Vec<crate::host::aside::Refresh> {
+    let started = std::time::Instant::now();
+    let ahead = heap_pass_ahead();
+    CLOSING.store(true, Ordering::Relaxed);
+    let mut kept = RANGES.lock().unwrap_or_else(|e| e.into_inner());
+    CLOSING.store(false, Ordering::Relaxed);
+    let ranges = kept.get_or_insert_with(|| Ranges { heaps: Default::default(), swept: false });
+    let sweep = !ranges.swept;
+    ranges.swept = false;
+    let slots = heap_looks(ranges, heap, host, frame, sweep, false);
     #[cfg(feature = "diagnostics")]
     let looked = std::time::Instant::now();
     // Per host copy, the span its picked views cover.
+    let ranges = &ranges.heaps[&(std::ptr::from_ref(host) as usize)];
     let views = ranges.views() as u32;
     let spans = ranges.spans();
     drop(kept);
+    if ahead {
+        AHEAD_HEAP.store(std::ptr::from_ref(heap) as usize, Ordering::Relaxed);
+        start_ahead();
+    }
     let bytes: u64 = spans.iter().map(|s| s.2 - s.1).sum();
     // Memory that is not write-watched is copied whole by every refresh.
     // It was once refreshed only every 120 frames (unmapped pages read
@@ -816,7 +1058,7 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
     if u64::from(views) > seen + seen / 2 {
         LOGGED.store(u64::from(views), Ordering::Relaxed);
         tracing::info!(
-            slots = slots.len(),
+            slots,
             views,
             copies = spans.len(),
             mb = bytes >> 20,
@@ -1256,7 +1498,7 @@ impl State {
         };
         if p.compute || p.mesh != mesh {
             once!(mesh, "a draw or mesh dispatch with another kind of pipeline");
-            return false;
+            return refuse(Refused::Kind);
         }
         if p.rects && self.topology != RECTANGLES {
             // Its geometry stage would turn each triangle into a rectangle.
@@ -1296,7 +1538,7 @@ impl State {
         if indexed {
             let v = self.index;
             let Some(shadow) = crate::shadow::find_any(v.address, u64::from(v.size)) else {
-                return false;
+                return refuse(Refused::NoIndex);
             };
             shadow.refresh(list, v.address, u64::from(v.size));
             let view = D3D12_INDEX_BUFFER_VIEW {
@@ -1412,7 +1654,7 @@ impl State {
             STORES.set(true);
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
-                return false;
+                return refuse(Refused::NoSlots);
             }
             if stage.shader.ambient.is_some() {
                 self.ambient_tables.clear();
@@ -1432,8 +1674,13 @@ impl State {
                     crate::memory::Use::Reads
                 };
                 let Some(ready) = self.memory_ready(list, &t, compute, use_) else {
-                    once!("a shader that reads title memory by address without a view heap to hold its views: the draw is dropped");
-                    return false;
+                    let heap = self.heaps[0] != 0 && crate::descriptor::heap(self.heaps[0] as This).host().is_some();
+                    if !heap {
+                        once!("a shader that reads title memory by address without a view heap to hold its views: the draw is dropped");
+                        return refuse(Refused::NoHeap);
+                    }
+                    once!("a shader that reads title memory by address whose memory the host could not hold: the draw is dropped");
+                    return refuse(Refused::NotHeld);
                 };
                 Some(ready)
             } else {
@@ -1518,7 +1765,7 @@ impl State {
                         once!(slot, "a shader reads a root view the title did not set");
                         // A table left unset is undefined: a null view.
                         if tabled && !self.root_srv_table(list, None, param, compute, false) {
-                            return false;
+                            return refuse(Refused::RootTable);
                         }
                         continue;
                     };
@@ -1530,7 +1777,7 @@ impl State {
                         });
                     if tabled {
                         if !self.root_srv_table(list, Some(address), param, compute, biased) {
-                            return false;
+                            return refuse(Refused::RootTable);
                         }
                         continue;
                     }
@@ -1670,7 +1917,7 @@ impl State {
             Some((index, shadow)) => (*index, address.zip(shadow.clone())),
             None => {
                 let shadow = address.and_then(|a| find(a).map(|s| (a, s)));
-                let Some(index) = host.dynamic(1) else {
+                let Some(index) = dynamic_slots(host, 1) else {
                     return false;
                 };
                 self.dynamic.push((key.0, index, 1));
@@ -1741,7 +1988,7 @@ impl State {
             Some((index, shadow)) => (*index, address.zip(shadow.clone())),
             None => {
                 let shadow = address.and_then(|a| crate::shadow::find(a, 1).map(|s| (a, s)));
-                let Some(index) = host.dynamic(1) else {
+                let Some(index) = dynamic_slots(host, 1) else {
                     return false;
                 };
                 self.dynamic.push((key.0, index, 1));
@@ -2522,6 +2769,7 @@ impl State {
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32, flags: u32) {
         // It may write the arguments a window holds clamped.
         self.window = None;
+        self.watch_dispatch([x, y, z]);
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -3019,6 +3267,115 @@ impl State {
         }
     }
 
+    /// `VICTORY_WATCH_SHADER=<hash>` (a compute shader, as the log names
+    /// it): at its dispatches, what it is given (root views, constants,
+    /// tables), and what the title memory its root views and its constant
+    /// pairs that look like addresses name holds by its next dispatch, as
+    /// floats and as words. The first eight dispatches and then each
+    /// power of two. For the boat that sinks once the first mission's
+    /// cutscene ends: `ShallowWaterSim:CS_ResolveHeightLookUps`
+    /// (92b4790eb4c29f6d) answers the title's water height questions; this
+    /// says whether its answers reach title memory.
+    fn watch_dispatch(&self, groups: [u32; 3]) {
+        static HASH: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+        let Some(hash) = HASH.get_or_init(|| std::env::var("VICTORY_WATCH_SHADER").ok().map(|v| v.trim().to_lowercase())) else {
+            return;
+        };
+        if !crate::pipeline::has_shader(self.pipeline as This, hash) {
+            return;
+        }
+        // The previous dispatch's addresses: read now, a frame or so after.
+        static PREVIOUS: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
+        static SEEN: AtomicU64 = AtomicU64::new(0);
+        let n = SEEN.fetch_add(1, Ordering::Relaxed);
+        let mut previous = PREVIOUS.lock().unwrap_or_else(|e| e.into_inner());
+        let mut addresses = Vec::new();
+        let mut given = Vec::new();
+        for (slot, root) in self.compute.iter().enumerate() {
+            match root {
+                Root::None => {}
+                Root::Table(at) => {
+                    given.push(format!("{slot}: table {at:#x}"));
+                    // Its first entries: what each views, and what that
+                    // memory holds as this dispatch is recorded (for an
+                    // output, what the dispatches before wrote).
+                    for k in 0..8u64 {
+                        let Some(view) = crate::descriptor::view(at + k * 32) else {
+                            continue;
+                        };
+                        let (what, memory) = match &view {
+                            View::Constant(address, size) => (format!("constant buffer {size} bytes"), Some(*address)),
+                            View::Shader(r, desc) | View::Unordered(r, _, desc) => {
+                                let kind = if matches!(view, View::Unordered(..)) { "unordered" } else { "shader" };
+                                match crate::resource::buffer_bytes(*r as This) {
+                                    Some((data, width)) => {
+                                        // A buffer view's first element and stride
+                                        // (raw and typed views: 4-byte elements).
+                                        let offset = desc.map_or(0, |d| {
+                                            (u64::from(d[2]) | u64::from(d[3]) << 32) * u64::from(d[5].max(4))
+                                        });
+                                        (
+                                            format!("{kind} buffer view of {width} bytes, desc {desc:x?}"),
+                                            Some(data as u64 + offset),
+                                        )
+                                    }
+                                    None => (format!("{kind} texture view, desc {desc:x?}"), None),
+                                }
+                            }
+                            View::Placed(unordered, _, desc) => (
+                                format!("placed {} view, desc {desc:x?}", if *unordered { "unordered" } else { "shader" }),
+                                Some(u64::from(desc[10]) | u64::from(desc[11]) << 32),
+                            ),
+                            View::Sampler(_) | View::ConsoleSampler(_) => ("sampler".to_owned(), None),
+                        };
+                        let held = memory.and_then(|address| {
+                            let mut bytes = [0u8; 64];
+                            crate::host::read_into(address as *const u8, &mut bytes).then(|| {
+                                let words: Vec<u32> = bytes.as_chunks::<4>().0.iter().map(|w| u32::from_le_bytes(*w)).collect();
+                                let floats: Vec<f32> = words.iter().map(|&w| f32::from_bits(w)).collect();
+                                format!("at {address:#x} floats {floats:?} words {words:x?}")
+                            })
+                        });
+                        given.push(format!("  table {slot} entry {k}: {what}; {}", held.unwrap_or_else(|| "memory not read".to_owned())));
+                    }
+                }
+                Root::View(at) => {
+                    given.push(format!("{slot}: view {at:#x}"));
+                    addresses.push(*at);
+                }
+                Root::Constants(words) => {
+                    given.push(format!("{slot}: constants {:x?}", &words[..words.len().min(16)]));
+                    // A pair whose high word is small and whose value is
+                    // past the first 64 KiB: a 40-bit title address.
+                    for pair in words.chunks_exact(2) {
+                        let at = u64::from(pair[0]) | u64::from(pair[1]) << 32;
+                        if pair[1] < 0x100 && at >= 0x10000 && at % 4 == 0 {
+                            addresses.push(at);
+                        }
+                    }
+                }
+            }
+        }
+        if n < 8 || n.is_power_of_two() {
+            for &at in previous.iter() {
+                let mut bytes = [0u8; 64];
+                if !crate::host::read_into(at as *const u8, &mut bytes) {
+                    tracing::info!(dispatch = n, address = format_args!("{at:#x}"), "watched shader: the previous dispatch's address is not readable");
+                    continue;
+                }
+                let words: Vec<u32> = bytes.as_chunks::<4>().0.iter().map(|w| u32::from_le_bytes(*w)).collect();
+                let floats: Vec<f32> = words.iter().map(|&w| f32::from_bits(w)).collect();
+                tracing::info!(
+                    dispatch = n,
+                    address = format_args!("{at:#x}"),
+                    "watched shader: what the previous dispatch's address holds now: floats {floats:?} words {words:x?}"
+                );
+            }
+            tracing::info!(dispatch = n, ?groups, hash = %hash, "watched shader dispatched with {}", given.join("; "));
+        }
+        *previous = addresses;
+    }
+
     fn roots_ref(&self, compute: bool) -> &Vec<Root> {
         if compute {
             &self.compute
@@ -3162,6 +3519,32 @@ impl State {
             };
             // Who reads of it, and as what, as far as [`readable`] goes by it.
             let reader = (used.as_ptr() as usize, used.len(), STORES.get(), TESTED_DEPTH.get().0);
+            // What the draw reads of a table made before brought up to date;
+            // whether that read the tested depth target.
+            let bring_up = |selected: &[u32]| {
+                let depth_before = TESTED_DEPTH.get();
+                TESTED_DEPTH.set((depth_before.0, false));
+                for u in entries().filter(|u| u.kind != ResourceType::Cbv) {
+                    let handle = table + u64::from(u.table_offset_dwords) * 4;
+                    if let Some(view) = crate::descriptor::view(handle) {
+                        readable(list, u.kind, &view);
+                    }
+                }
+                for &k in selected {
+                    if entries().any(|u| u.table_offset_dwords / 8 == k) {
+                        continue;
+                    }
+                    let handle = table + u64::from(k) * 32;
+                    if let Some(view) = crate::descriptor::view(handle)
+                        && let Some(kind) = view_kind(&view)
+                    {
+                        readable(list, kind, &view);
+                    }
+                }
+                let depth = TESTED_DEPTH.get().1;
+                TESTED_DEPTH.set((depth_before.0, depth_before.1 || depth));
+                depth
+            };
             if let Some(known) = self.fresh_tables.get_mut(&key) {
                 let first = known.first;
                 // This reader had it brought up to date, and nothing in the
@@ -3177,27 +3560,7 @@ impl State {
                     made.push((slot, first * 32));
                     continue;
                 }
-                let depth_before = TESTED_DEPTH.get();
-                TESTED_DEPTH.set((depth_before.0, false));
-                for u in entries().filter(|u| u.kind != ResourceType::Cbv) {
-                    let handle = table + u64::from(u.table_offset_dwords) * 4;
-                    if let Some(view) = crate::descriptor::view(handle) {
-                        readable(list, u.kind, &view);
-                    }
-                }
-                for k in selected {
-                    if entries().any(|u| u.table_offset_dwords / 8 == k) {
-                        continue;
-                    }
-                    let handle = table + u64::from(k) * 32;
-                    if let Some(view) = crate::descriptor::view(handle)
-                        && let Some(kind) = view_kind(&view)
-                    {
-                        readable(list, kind, &view);
-                    }
-                }
-                let depth = TESTED_DEPTH.get().1;
-                TESTED_DEPTH.set((depth_before.0, depth_before.1 || depth));
+                let depth = bring_up(&selected);
                 if once && let Some(known) = self.fresh_tables.get_mut(&key) {
                     // (The epoch as it is now: what this changed itself it
                     // need not do again.)
@@ -3213,30 +3576,35 @@ impl State {
                 made.push((slot, first * 32));
                 continue;
             }
+            let heap_key = (std::ptr::from_ref(heap) as usize, key);
             #[cfg(feature = "diagnostics")]
-            {
-                // Tables made from the same records by another list this frame.
-                type Seen = (u64, std::collections::HashSet<(usize, (u64, u32, u64))>);
-                static SEEN: std::sync::Mutex<Option<Seen>> = std::sync::Mutex::new(None);
-                let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-                let (frame, keys) = seen.get_or_insert_with(Default::default);
-                if *frame != crate::frame::current() {
-                    *frame = crate::frame::current();
-                    keys.clear();
+            FreshSeen::asked(heap_key, n);
+            if shared_tables() && let Some(first) = SharedTables::find(heap_key) {
+                // Another list made it this frame, with no constant views in
+                // it: its slots are used as they are.
+                #[cfg(feature = "diagnostics")]
+                {
+                    crate::copystat::add(crate::copystat::C::FreshShared, 1);
+                    crate::copystat::add(crate::copystat::C::FreshSharedSlots, u64::from(n));
                 }
-                if !keys.insert((std::ptr::from_ref(heap) as usize, key)) {
-                    crate::copystat::add(crate::copystat::C::FreshAgain, 1);
-                }
+                self.shared.push((heap_key.0, first));
+                self.fresh_tables.insert(key, FreshTable { first, epoch: 0, ready: Vec::new() });
+                bring_up(&selected);
+                made.push((slot, first * 32));
+                continue;
             }
-            let Some(first) = host.dynamic(n) else {
+            let Some(first) = dynamic_slots(host, n) else {
                 // No room: the draw must not run with the title's own
                 // offsets (slots never made for it); `bind` drops it.
                 made.push((slot, u32::MAX));
                 continue;
             };
+            #[cfg(feature = "diagnostics")]
+            let started = std::time::Instant::now();
             self.fresh_tables.insert(key, FreshTable { first, epoch: 0, ready: Vec::new() });
-            self.dynamic
-                .push((std::ptr::from_ref(heap) as usize, first, n));
+            // A constant view's bytes are this list's (copied at its
+            // submission), so a table holding one is not shared.
+            let mut constants = false;
             // The title's own slots of this table: what the draw reads of
             // them it brings up to date here, in the dynamic slots.
             let title_first = heap.index(table).filter(|first| first + n <= host.count());
@@ -3315,6 +3683,7 @@ impl State {
                         let slot = (std::ptr::from_ref(heap) as usize, index);
                         list.defer_constants(to, address as *const u8, size as usize, slot);
                         host.constant_at(index, &buffer, gpu, size);
+                        constants = true;
                     }
                     Some(view) => {
                         host.make_at(index, &view);
@@ -3344,6 +3713,21 @@ impl State {
                             once!(slot, "a table entry without a view");
                         }
                     }
+                }
+            }
+            if shared_tables() && !constants {
+                SharedTables::add(heap_key, first, n);
+                self.shared.push((heap_key.0, first));
+            } else {
+                self.dynamic.push((heap_key.0, first, n));
+            }
+            #[cfg(feature = "diagnostics")]
+            {
+                crate::copystat::add(crate::copystat::C::FreshMade, 1);
+                crate::copystat::add(crate::copystat::C::FreshMadeSlots, u64::from(n));
+                crate::copystat::add(crate::copystat::C::FreshNs, started.elapsed().as_nanos() as u64);
+                if constants {
+                    FreshSeen::constants(heap_key);
                 }
             }
             made.push((slot, first * 32));
@@ -3811,6 +4195,7 @@ impl State {
                 (bounded, 0)
             }
         };
+        REFUSED.set(None);
         let ran = match kind {
             DRAW | INDEXED => self.prepare(list, kind == INDEXED),
             MESH => self.prepare_for(list, false, true),
@@ -3818,7 +4203,7 @@ impl State {
             _ => false,
         };
         if !ran {
-            why("prepare failed");
+            why(REFUSED.get().map_or("prepare failed", Refused::text));
             return false;
         }
         #[cfg(feature = "diagnostics")]
@@ -4035,6 +4420,144 @@ struct FreshTable {
 /// through again at every draw).
 fn ready_once() -> bool {
     crate::toggled!("VICTORY_READY_ONCE")
+}
+
+/// Whether a table made afresh with no constant views in it is used as it
+/// is by the frame's other lists that ask for the same one
+/// (`VICTORY_SHARED_TABLES=0`: each list makes its own).
+fn shared_tables() -> bool {
+    crate::toggled!("VICTORY_SHARED_TABLES")
+}
+
+type FreshKey = (usize, (u64, u32, u64));
+
+/// Tables made afresh this frame that other lists use as they are
+/// ([`shared_tables`]). A run of dynamic slots is given back once the last
+/// list using it has run.
+#[derive(Default)]
+struct SharedTables {
+    frame: u64,
+    /// (title heap, table, slot count, contents) → first dynamic slot, made
+    /// this frame.
+    made: std::collections::HashMap<FreshKey, u32, std::hash::BuildHasherDefault<crate::host::AddressHash>>,
+    /// (title heap, first dynamic slot) → slot count, lists using it, key.
+    held: std::collections::HashMap<(usize, u32), (u32, u32, (u64, u32, u64)), std::hash::BuildHasherDefault<crate::host::AddressHash>>,
+}
+
+static SHARED_TABLES: std::sync::Mutex<Option<SharedTables>> = std::sync::Mutex::new(None);
+
+impl SharedTables {
+    fn this_frame(&mut self, frame: u64) {
+        if self.frame != frame {
+            self.frame = frame;
+            self.made.clear();
+        }
+    }
+
+    /// The first slot of the table made this frame for `key`, now used by
+    /// one list more.
+    fn found(&mut self, frame: u64, key: FreshKey) -> Option<u32> {
+        self.this_frame(frame);
+        let first = *self.made.get(&key)?;
+        self.held.get_mut(&(key.0, first))?.1 += 1;
+        Some(first)
+    }
+
+    fn added(&mut self, frame: u64, key: FreshKey, first: u32, n: u32) {
+        self.this_frame(frame);
+        self.made.insert(key, first);
+        self.held.insert((key.0, first), (n, 1, key.1));
+    }
+
+    /// One list less uses the run at `first`: its slot count once none does.
+    fn dropped(&mut self, heap: usize, first: u32) -> Option<u32> {
+        let held = self.held.get_mut(&(heap, first))?;
+        held.1 -= 1;
+        if held.1 > 0 {
+            return None;
+        }
+        let (n, _, key) = self.held.remove(&(heap, first))?;
+        if self.made.get(&(heap, key)) == Some(&first) {
+            self.made.remove(&(heap, key));
+        }
+        Some(n)
+    }
+
+    fn find(key: FreshKey) -> Option<u32> {
+        let mut shared = SHARED_TABLES.lock().unwrap_or_else(|e| e.into_inner());
+        shared.get_or_insert_with(Default::default).found(crate::frame::current(), key)
+    }
+
+    fn add(key: FreshKey, first: u32, n: u32) {
+        let mut shared = SHARED_TABLES.lock().unwrap_or_else(|e| e.into_inner());
+        shared.get_or_insert_with(Default::default).added(crate::frame::current(), key, first, n);
+    }
+
+    fn let_go(heap: usize, first: u32) {
+        let n = SHARED_TABLES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_mut()
+            .and_then(|shared| shared.dropped(heap, first));
+        if let Some(n) = n {
+            crate::descriptor::release_dynamic(heap, first, n);
+        }
+    }
+}
+
+/// The fresh tables asked for this frame, for the counters (diagnostics
+/// builds): ones another list made from the same records at the same table
+/// (`FreshAgain`) or at another table (`FreshSame`), and which of them held
+/// constant views.
+#[cfg(feature = "diagnostics")]
+#[derive(Default)]
+struct FreshSeen {
+    frame: u64,
+    /// Whether the table held constant views.
+    at: std::collections::HashMap<FreshKey, bool>,
+    /// (title heap, slot count, contents) → the table first made from them.
+    records: std::collections::HashMap<(usize, u32, u64), u64>,
+}
+
+#[cfg(feature = "diagnostics")]
+static FRESH_SEEN: std::sync::Mutex<Option<FreshSeen>> = std::sync::Mutex::new(None);
+
+#[cfg(feature = "diagnostics")]
+impl FreshSeen {
+    fn asked(key: FreshKey, n: u32) {
+        use crate::copystat::{C, add};
+        let mut seen = FRESH_SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        let seen = seen.get_or_insert_with(Default::default);
+        if seen.frame != crate::frame::current() {
+            seen.frame = crate::frame::current();
+            seen.at.clear();
+            seen.records.clear();
+        }
+        if let Some(&constants) = seen.at.get(&key) {
+            add(C::FreshAgain, 1);
+            add(C::FreshAgainSlots, u64::from(n));
+            if constants {
+                add(C::FreshAgainCbvSlots, u64::from(n));
+            }
+            return;
+        }
+        seen.at.insert(key, false);
+        let (heap, (table, _, contents)) = key;
+        let first = *seen.records.entry((heap, n, contents)).or_insert(table);
+        if first != table {
+            add(C::FreshSame, 1);
+            add(C::FreshSameSlots, u64::from(n));
+        }
+    }
+
+    fn constants(key: FreshKey) {
+        let mut seen = FRESH_SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(seen) = seen.as_mut()
+            && seen.frame == crate::frame::current()
+        {
+            seen.at.insert(key, true);
+        }
+    }
 }
 
 /// A hash of records' words: 64 bits, two multiplications a record. (The
@@ -4345,7 +4868,7 @@ fn staging_budget_per_frame(vram_budget: Option<u64>) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::staging_budget_per_frame;
+    use super::{SharedTables, settle_due, staging_budget_per_frame};
 
     #[test]
     fn staging_budget_scales_with_vram_budget() {
@@ -4362,6 +4885,48 @@ mod tests {
         assert_eq!(staging_budget_per_frame(Some(20 * GIB)), 384 * MIB);
         assert_eq!(staging_budget_per_frame(Some(24 * GIB)), 384 * MIB);
         assert_eq!(staging_budget_per_frame(Some(32 * GIB)), 384 * MIB);
+    }
+
+    #[test]
+    fn tables_settle_once_a_frame() {
+        let settled = std::sync::atomic::AtomicU64::new(u64::MAX);
+        assert!(settle_due(&settled, 0));
+        assert!(!settle_due(&settled, 0));
+        assert!(!settle_due(&settled, 0));
+        assert!(settle_due(&settled, 1));
+        assert!(!settle_due(&settled, 1));
+        assert!(settle_due(&settled, 7));
+    }
+
+    #[test]
+    fn shared_tables_go_back_with_the_last_list() {
+        let mut shared = SharedTables::default();
+        let (a, b) = ((1, (0x1000, 4, 9)), (1, (0x2000, 4, 9)));
+        assert_eq!(shared.found(5, a), None);
+        shared.added(5, a, 100, 4);
+        // Same records at another table, or another heap: not the same table.
+        assert_eq!(shared.found(5, b), None);
+        assert_eq!(shared.found(5, (2, a.1)), None);
+        assert_eq!(shared.found(5, a), Some(100));
+        assert_eq!(shared.found(5, a), Some(100));
+        assert_eq!(shared.dropped(1, 100), None);
+        assert_eq!(shared.dropped(1, 100), None);
+        // The next frame makes its own; the last list still using the old
+        // run gives it back.
+        assert_eq!(shared.found(6, a), None);
+        assert_eq!(shared.dropped(1, 100), Some(4));
+        assert_eq!(shared.dropped(1, 100), None);
+        // Two lists that made the same table at once: each run goes back
+        // with its own list, and the one found later is the last made.
+        shared.added(6, a, 200, 4);
+        shared.added(6, a, 300, 4);
+        assert_eq!(shared.found(6, a), Some(300));
+        assert_eq!(shared.dropped(1, 200), Some(4));
+        assert_eq!(shared.found(6, a), Some(300));
+        assert_eq!(shared.dropped(1, 300), None);
+        assert_eq!(shared.dropped(1, 300), None);
+        assert_eq!(shared.dropped(1, 300), Some(4));
+        assert_eq!(shared.found(6, a), None);
     }
 }
 

@@ -36,6 +36,9 @@ pub(crate) struct Pending {
     queue_state: AtomicU8,
     /// Taken by a worker from [`Queue::slow`].
     was_slow: AtomicBool,
+    /// When it was first queued, and the list a worker took it from.
+    queued: OnceLock<Instant>,
+    taken_from: AtomicU8,
     made: OnceLock<Option<HostPipeline>>,
     /// What identifies it across runs (shader containers and state), and
     /// whether a draw or dispatch has requested it yet.
@@ -65,6 +68,8 @@ impl Pending {
             graphics,
             queue_state: AtomicU8::new(NOT_QUEUED),
             was_slow: AtomicBool::new(false),
+            queued: OnceLock::new(),
+            taken_from: AtomicU8::new(TAKEN_BY_TITLE),
             made: OnceLock::new(),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
@@ -77,9 +82,13 @@ impl Pending {
 
     fn make(&self) {
         self.made.get_or_init(|| {
+            let run = super::spent::begin();
             let began = Instant::now();
             let made = HostPipeline::new(&self.shaders, self.graphics.as_deref());
             super::library::note_time(&self.key, began.elapsed().as_millis() as u64);
+            let from = ["title", "screen", "requested", "early", "slow"][self.taken_from.load(Ordering::Relaxed) as usize];
+            let queued = self.queued.get().map(|at| began.saturating_duration_since(*at));
+            super::spent::end(run, &self.key, queued, from, made.is_some(), queues);
             made
         });
         let (lock, done) = &DONE;
@@ -264,6 +273,13 @@ fn wait(p: &Pending, frame: u64) {
     );
 }
 
+/// Lists for [`Pending::taken_from`].
+const TAKEN_BY_TITLE: u8 = 0;
+const TAKEN_SCREEN: u8 = 1;
+const TAKEN_REQUESTED: u8 = 2;
+const TAKEN_EARLY: u8 = 3;
+const TAKEN_SLOW: u8 = 4;
+
 const NOT_QUEUED: u8 = 0;
 const EARLY: u8 = 1;
 const REQUESTED: u8 = 2;
@@ -323,6 +339,7 @@ impl Queue {
             return None;
         }
         p.queue_state.store(priority, Ordering::Relaxed);
+        p.queued.get_or_init(Instant::now);
         if priority == REQUESTED && p.screen && screens_first() {
             self.screen.push_back(p.clone());
         } else if priority == REQUESTED {
@@ -341,10 +358,17 @@ impl Queue {
             std::iter::from_fn(|| list.pop_front()).find(|p| p.queue_state.load(Ordering::Relaxed) == EARLY)
         };
         let mut p = self.screen.pop_front();
+        let mut from = TAKEN_SCREEN;
         if p.is_none() && !screens_only {
-            p = self.requested.pop_front().or_else(|| unclaimed(&mut self.early));
+            p = self.requested.pop_front();
+            from = TAKEN_REQUESTED;
+            if p.is_none() {
+                p = unclaimed(&mut self.early);
+                from = TAKEN_EARLY;
+            }
             if p.is_none() && self.slow_now < slow_limit {
                 p = unclaimed(&mut self.slow);
+                from = TAKEN_SLOW;
                 if let Some(p) = &p {
                     p.was_slow.store(true, Ordering::Relaxed);
                     self.slow_now += 1;
@@ -352,6 +376,7 @@ impl Queue {
             }
         }
         let p = p?;
+        p.taken_from.store(from, Ordering::Relaxed);
         p.queue_state.store(MAKING, Ordering::Relaxed);
         Some(p)
     }
@@ -436,7 +461,9 @@ fn workers() -> bool {
                     }
                     loop {
                         let p = next(screens_only);
+                        BUSY.fetch_add(1, Ordering::Relaxed);
                         p.make();
+                        BUSY.fetch_sub(1, Ordering::Relaxed);
                         if p.was_slow.load(Ordering::Relaxed) {
                             let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
                             queue.slow_now -= 1;
@@ -457,6 +484,18 @@ fn workers() -> bool {
         }
         running
     })
+}
+
+/// Workers making a pipeline now.
+static BUSY: AtomicU64 = AtomicU64::new(0);
+
+/// The lists' lengths and the busy workers, for the workers' summary line.
+fn queues() -> super::spent::Queues {
+    let queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+    super::spent::Queues {
+        lists: [queue.screen.len(), queue.requested.len(), queue.early.len(), queue.slow.len()],
+        busy: BUSY.load(Ordering::Relaxed) as usize,
+    }
 }
 
 /// The most pipelines waiting at once since the workers last ran out.
