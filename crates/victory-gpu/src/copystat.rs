@@ -163,8 +163,15 @@ pub(crate) enum C {
     TexHashedTurn,
     TexHashedHot,
     TexTurnSkipped,
+    /// The heap pass's rounds ahead (`draw::start_ahead`): rounds that looked
+    /// at slots, the slots, and their nanoseconds; and slots a round left
+    /// to the pass as it waited.
+    HeapAheadRounds,
+    HeapAheadLooked,
+    HeapAheadNs,
+    HeapCarried,
 }
-const COUNTERS: usize = 96;
+const COUNTERS: usize = 128;
 
 /// The counters' names, in the order of [`C`], for the frame recorder's columns.
 pub(crate) const NAMES: [&str; 92] = [
@@ -180,7 +187,8 @@ pub(crate) const NAMES: [&str; 92] = [
     "NothingBackUs", "WaitsForGroups", "WaitsForBuffers", "IndirectBounded", "HeapLooked",
     "HeapLookedWritten", "HeapSameAgain", "HeapSelfMarks", "DynamicSlots", "DynamicSteps", "DynamicFull",
     "FreshAgain", "ThinDrawNs", "ThinDraws", "ThinSetNs", "ThinBarrierNs", "ThinCopyNs", "ThinOtherNs",
-    "TexHashedTurn", "TexHashedHot", "TexTurnSkipped",
+    "TexHashedTurn", "TexHashedHot", "TexTurnSkipped", "HeapAheadRounds", "HeapAheadLooked", "HeapAheadNs",
+    "HeapCarried",
 ];
 /// One of some sets of counters, each in lines of the processor's memory of
 /// its own: a set for all threads had them wait for each other's lines at
@@ -491,7 +499,7 @@ mod command_tests {
     #[test]
     fn every_counter_is_named() {
         use super::{C, COUNTERS, NAMES};
-        assert_eq!(C::TexTurnSkipped as usize + 1, NAMES.len());
+        assert_eq!(C::HeapCarried as usize + 1, NAMES.len());
         assert_eq!(NAMES[C::Frames as usize], "Frames");
         assert!(NAMES.len() <= COUNTERS);
     }
