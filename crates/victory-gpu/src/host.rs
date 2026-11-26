@@ -827,7 +827,25 @@ pub(crate) fn host() -> Option<&'static Host> {
     .as_ref()
 }
 
+/// Makes the host GPU on its own thread while the title loads, so its first
+/// device call does not wait for the driver (5.4 s of play-g's 8.1 s to the
+/// first frame). `VICTORY_HOST_EARLY=0`: made on first use, as before.
+pub fn start_host() {
+    if std::env::var_os("VICTORY_HOST_EARLY").is_some_and(|v| v == "0") {
+        return;
+    }
+    let spawned = std::thread::Builder::new().name("host device".into()).spawn(|| {
+        let started = std::time::Instant::now();
+        let made = host().is_some();
+        tracing::info!(made, ms = started.elapsed().as_millis() as u64, "host device made ahead of the title");
+    });
+    if let Err(e) = spawned {
+        tracing::warn!(error = %e, "host device thread not started; made on first use");
+    }
+}
+
 fn create() -> windows::core::Result<Host> {
+    let started = std::time::Instant::now();
     // SAFETY: plain D3D12 object creation with valid descriptions.
     unsafe {
         // The debug layer only in builds with diagnostics.
@@ -885,7 +903,9 @@ fn create() -> windows::core::Result<Host> {
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");
         } else {
+            let driver = std::time::Instant::now();
             D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            tracing::info!(ms = driver.elapsed().as_millis() as u64, "D3D12CreateDevice done");
             // Whether a GPU hang ends the run or freezes the PC (#1054).
             crate::tdr::log();
         }
@@ -951,7 +971,7 @@ fn create() -> windows::core::Result<Host> {
         let adapter = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
             .and_then(|factory| factory.EnumAdapterByLuid::<IDXGIAdapter3>(device.GetAdapterLuid()))
             .ok();
-        tracing::info!("host D3D12 device ready");
+        tracing::info!(ms = started.elapsed().as_millis() as u64, "host D3D12 device ready");
         Ok(Host {
             device,
             queue,
@@ -3190,7 +3210,9 @@ pub(crate) fn settle_for_fence() {
 /// lists give theirs back as they land. Counted with the settles for too
 /// much in the air, which it is.
 pub(crate) fn settle_for_tables() {
+    let began = std::time::Instant::now();
     settle_now(WHY_MOST);
+    crate::copystat::lap(crate::copystat::C::SettleTablesNs, began);
 }
 
 /// Resets the host lists of settled flights and keeps them for reuse, as
@@ -5153,9 +5175,13 @@ impl Host {
             self.settle(&mut submitted, WHY_READ);
         } else if most && relay_exact() {
             // Until there are fewer, not until there are none.
+            let began = std::time::Instant::now();
             relay_wait(WHY_MOST, |line| line.lists < late_most());
+            crate::copystat::lap(crate::copystat::C::SettleListsNs, began);
         } else if most {
+            let began = std::time::Instant::now();
             self.settle(&mut submitted, WHY_MOST);
+            crate::copystat::lap(crate::copystat::C::SettleListsNs, began);
         } else {
             LINE_MOVED.notify_one();
         }
@@ -5605,6 +5631,7 @@ impl Host {
             let settling = std::time::Instant::now();
             self.settle(&mut submitted, WHY_MOST);
             settled += settling.elapsed();
+            crate::copystat::lap(crate::copystat::C::SettleResultsNs, settling);
         }
         // What shaders may write through views they pick: last, so that no
         // refresh of this submission leaves it alone.
