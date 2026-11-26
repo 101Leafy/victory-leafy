@@ -45,6 +45,10 @@ mod float64;
 #[path = "lane_join.rs"]
 mod lane_join;
 
+#[cfg(test)]
+#[path = "interp_guard_tests.rs"]
+mod interp_guard_tests;
+
 type Why = &'static str;
 
 /// How an interpolation evaluates an input channel.
@@ -93,6 +97,9 @@ pub(crate) struct Lowered {
     /// Whether depth and stencil are tested before it runs.
     #[cfg(test)]
     pub early_depth: bool,
+    /// Constant integer false-arms of written `select` instructions.
+    #[cfg(test)]
+    pub select_false_ints: Vec<Option<i64>>,
 }
 
 /// `DB_SHADER_CONTROL.DEPTH_BEFORE_SHADER` (AMD's register headers, as in
@@ -2855,6 +2862,8 @@ impl<'a> Lower<'a> {
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
             #[cfg(test)]
             early_depth: self.s.flags & flags::EARLY_DEPTH != 0,
+            #[cfg(test)]
+            select_false_ints: self.s.m.written_select_false_ints(),
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -5144,10 +5153,21 @@ impl<'a> Lower<'a> {
 
     /// [`Self::write`] of a dword already placed (SDWA applied).
     fn write_placed(&mut self, inst: &Inst, reg: Reg, x: V, guard: Option<V>) {
+        self.write_placed_with_old(inst, reg, x, guard, inst.read(reg));
+    }
+
+    fn write_placed_with_old(
+        &mut self,
+        inst: &Inst,
+        reg: Reg,
+        x: V,
+        guard: Option<V>,
+        old_val: Option<Value>,
+    ) {
         let Some(new) = inst.write(reg) else { return };
         let x = match (guard, reg) {
             (Some(g), Reg::V(_)) => {
-                let old = match inst.read(reg).map(|o| self.i32_of(o)) {
+                let old = match old_val.map(|o| self.i32_of(o)) {
                     Some(Ok(o)) => o,
                     // The validator refuses reads of undef.
                     _ => self.s.m.i32(0),
@@ -10959,7 +10979,8 @@ impl<'a> Lower<'a> {
                             f = self.unary(7, f);
                         }
                         let lo = to_f16(self, f);
-                        return self.write_half(inst, lo, None);
+                        let guard = self.guard(site.0, site.1)?;
+                        return self.write_half(inst, lo, guard);
                     }
                     let lo = to_f16(self, f);
                     self.low_half(inst, reg, lo)
@@ -10983,8 +11004,24 @@ impl<'a> Lower<'a> {
                 }
             }
         };
-        // A pixel interpolates in every lane; guards only hide inactive ones.
-        self.write(inst, Reg::V(reg), x, None);
+        let guard = self.guard(site.0, site.1)?;
+        // Honor EXEC masks on guarded interpolations so inactive lanes keep
+        // their prior VGPR value. For a two-instruction VINTRP pair writing
+        // the same VGPR under the same guard, step back over p1 (whose SSA
+        // output is `Val::Missing`) to recover the true pre-p1 value.
+        let mut old_val = inst.read(Reg::V(reg));
+        if guard.is_some()
+            && let Some(v) = old_val
+            && let Interp::Interpolated { first, .. } = interp
+            && let &[p1] = &first[..]
+            && self.x.st.guards[p1.0][p1.1] == self.x.st.guards[site.0][site.1]
+        {
+            let p1_inst = &self.x.p.blocks[p1.0].insts[p1.1];
+            if p1_inst.write(Reg::V(reg)) == Some(v) {
+                old_val = p1_inst.read(Reg::V(reg));
+            }
+        }
+        self.write_placed_with_old(inst, Reg::V(reg), x, guard, old_val);
         Ok(())
     }
 
