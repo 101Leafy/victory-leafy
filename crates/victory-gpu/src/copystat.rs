@@ -205,11 +205,18 @@ pub(crate) enum C {
     /// was hashed earlier in the frame (`texture::first_once`).
     TexHashedFirst,
     TexFirstSkipped,
+    /// The heap pass's rounds ahead (`draw::start_ahead`): rounds that looked
+    /// at slots, the slots, and their nanoseconds; and slots a round left
+    /// to the pass as it waited.
+    HeapAheadRounds,
+    HeapAheadLooked,
+    HeapAheadNs,
+    HeapCarried,
 }
-const COUNTERS: usize = 112;
+const COUNTERS: usize = 128;
 
 /// The counters' names, in the order of [`C`], for the frame recorder's columns.
-pub(crate) const NAMES: [&str; 107] = [
+pub(crate) const NAMES: [&str; 111] = [
     "Submissions", "Copies", "CopyBytes", "Refreshes", "RefreshBytes", "Skipped", "SkippedBytes", "Runs",
     "RunUs", "Queries", "QueryUs", "MoveUs", "Unmapped", "Watches", "WatchUs", "Checked", "Unchanged",
     "Fallbacks", "GuardFaults", "TexWatched", "TexHashed", "TexChanged", "TexHot", "Frames", "RecordCalls",
@@ -226,6 +233,7 @@ pub(crate) const NAMES: [&str; 107] = [
     "BackAgainBytes", "RefreshGapBytes", "LookupQuick", "LookupTables", "LookupLoose", "ThinDrawNs",
     "ThinDraws", "ThinSetNs", "ThinBarrierNs", "ThinCopyNs", "ThinOtherNs", "TexHashedTurn", "TexHashedHot",
     "TexTurnSkipped", "TexHashedFirst", "TexFirstSkipped",
+    "HeapAheadRounds", "HeapAheadLooked", "HeapAheadNs", "HeapCarried",
 ];
 /// One of some sets of counters, each in lines of the processor's memory of
 /// its own: a set for all threads had them wait for each other's lines at
@@ -536,7 +544,7 @@ mod command_tests {
     #[test]
     fn every_counter_is_named() {
         use super::{C, COUNTERS, NAMES};
-        assert_eq!(C::TexFirstSkipped as usize + 1, NAMES.len());
+        assert_eq!(C::HeapCarried as usize + 1, NAMES.len());
         assert_eq!(NAMES[C::Frames as usize], "Frames");
         assert!(NAMES.len() <= COUNTERS);
     }
