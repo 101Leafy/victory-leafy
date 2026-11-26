@@ -310,11 +310,32 @@ pub(crate) enum C {
     DrawBuffersNs,
     DrawStatesNs,
     IndirectArgsNs,
+    /// The texture part of the heap pass (`draw.rs` heap_textures) by
+    /// step: slots held while the card was full, slots of remapped memory,
+    /// of textures short of memory, views made again, flips, uploads left
+    /// waiting, and the due list with the card's accounting.
+    HeapTexRoomNs,
+    HeapTexRemappedNs,
+    HeapTexShortNs,
+    HeapTexRemadeNs,
+    HeapTexFlipNs,
+    HeapTexWaitingNs,
+    HeapTexDueNs,
+    /// The loop over the due slots, and the slots it looked at.
+    HeapTexLoopNs,
+    HeapTexLooks,
+    /// Inside the loop: the look at an uploaded texture's bytes, asking
+    /// how much of a placed texture is mapped, the check that the host
+    /// copy holds the same bytes, and the upload.
+    HeapTexCheckNs,
+    HeapTexMappedNs,
+    HeapTexSameNs,
+    HeapTexUploadNs,
 }
-const COUNTERS: usize = 160;
+const COUNTERS: usize = 192;
 
 /// The counters' names, in the order of [`C`], for the frame recorder's columns.
-pub(crate) const NAMES: [&str; 167] = [
+pub(crate) const NAMES: [&str; 180] = [
     "Submissions", "Copies", "CopyBytes", "Refreshes", "RefreshBytes", "Skipped", "SkippedBytes", "Runs",
     "RunUs", "Queries", "QueryUs", "MoveUs", "Unmapped", "Watches", "WatchUs", "Checked", "Unchanged",
     "Fallbacks", "GuardFaults", "TexWatched", "TexHashed", "TexChanged", "TexHot", "Frames", "RecordCalls",
@@ -344,6 +365,9 @@ pub(crate) const NAMES: [&str; 167] = [
     "HeapDueTwice", "HeapAgainShows", "HeapAgainLater", "HeapAgainTabled", "HeapAgainNothing",
     "DrawEarlyNs", "DrawTablesNs", "DrawMemoryNs", "DrawRootsNs", "DrawBuffersNs", "DrawStatesNs",
     "IndirectArgsNs",
+    "HeapTexRoomNs", "HeapTexRemappedNs", "HeapTexShortNs", "HeapTexRemadeNs", "HeapTexFlipNs", "HeapTexWaitingNs",
+    "HeapTexDueNs", "HeapTexLoopNs", "HeapTexLooks", "HeapTexCheckNs", "HeapTexMappedNs", "HeapTexSameNs",
+    "HeapTexUploadNs",
 ];
 /// One of some sets of counters, each in lines of the processor's memory of
 /// its own: a set for all threads had them wait for each other's lines at
@@ -659,7 +683,7 @@ mod command_tests {
     #[test]
     fn every_counter_is_named() {
         use super::{C, COUNTERS, NAMES};
-        assert_eq!(C::HeapAgainNothing as usize + 1, NAMES.len());
+        assert_eq!(C::HeapTexUploadNs as usize + 1, NAMES.len());
         assert_eq!(NAMES[C::Frames as usize], "Frames");
         assert!(NAMES.len() <= COUNTERS);
     }

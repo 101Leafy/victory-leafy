@@ -2351,26 +2351,47 @@ impl State {
             once!("textures picked by index: the card has no room for more; they wait");
         }
         let mut refused = 0;
+        // Each step's time goes to its counter, from the end of the one
+        // before.
+        #[cfg(feature = "diagnostics")]
+        let mut step = std::time::Instant::now();
+        #[cfg(feature = "diagnostics")]
+        let mut lap = |c: crate::copystat::C| {
+            crate::copystat::lap(c, step);
+            step = std::time::Instant::now();
+        };
         // Room again: the slots held back while the card was full are due
         // now (`full_card_pass`).
         if room {
             host.texture_slots_room(frame);
         }
+        #[cfg(feature = "diagnostics")]
+        lap(crate::copystat::C::HeapTexRoomNs);
         // Slots whose texture's memory the runtime mapped, unmapped or
         // wrote since the last pass are due again.
         host.texture_slots_remapped(frame);
+        #[cfg(feature = "diagnostics")]
+        lap(crate::copystat::C::HeapTexRemappedNs);
         host.texture_slots_short(frame);
+        #[cfg(feature = "diagnostics")]
+        lap(crate::copystat::C::HeapTexShortNs);
         // The slots of textures whose first level with memory (levels on
         // demand), or whose host copy for one with more levels, changed since
         // the last pass are made again from it; those whose new view's upload
         // has run are made from that.
         host.texture_views_remade();
+        #[cfg(feature = "diagnostics")]
+        lap(crate::copystat::C::HeapTexRemadeNs);
         host.texture_slots_flip();
+        #[cfg(feature = "diagnostics")]
+        lap(crate::copystat::C::HeapTexFlipNs);
         // And with room, the textures whose upload left a held level
         // without the card's memory are uploaded again.
         if room {
             host.texture_slots_waiting(frame);
         }
+        #[cfg(feature = "diagnostics")]
+        lap(crate::copystat::C::HeapTexWaitingNs);
         let baking = crate::texture::BAKING.get();
         let (mut due, census) = host.texture_slots_due(frame, if baking { 1 << 16 } else { 4096 });
         // (Those that are due later after all that are due.)
@@ -2390,6 +2411,8 @@ impl State {
         // (`VICTORY_CARD_ACCOUNTING=1`; a line when the card first has no
         // room, and every five seconds after it).
         Self::card_accounting(heap, host, frame, room);
+        #[cfg(feature = "diagnostics")]
+        lap(crate::copystat::C::HeapTexDueNs);
         // The frames in about four seconds, between 16 and 256: how long a
         // slot with nothing to upload waits at most for its next look. In
         // frames alone it was 120: four minutes at the opening cutscene's
@@ -2442,6 +2465,8 @@ impl State {
                 served = false;
                 break;
             }
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::HeapTexLooks, 1);
             // A placed texture whose memory is not mapped (not streamed in
             // yet, or streamed out again: the heap keeps tens of thousands
             // of such views) gets no host texture; looked at again soon (a
@@ -2468,7 +2493,12 @@ impl State {
             // was shown four frames late, over and over.
             let mut again_in = RECHECK_FRAMES[0];
             if let Some((at, len, print, looks, uploaded)) = host.texture_slot_checked(index) {
-                if crate::texture::fingerprint(at, len) == print {
+                #[cfg(feature = "diagnostics")]
+                let started = std::time::Instant::now();
+                let unchanged = crate::texture::fingerprint(at, len) == print;
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::lap(crate::copystat::C::HeapTexCheckNs, started);
+                if unchanged {
                     HEAP_TEXTURES_RECHECKED[0].fetch_add(1, Ordering::Relaxed);
                     match RECHECK_FRAMES.get(usize::from(looks) + 1) {
                         Some(wait) => {
@@ -2509,7 +2539,11 @@ impl State {
                 let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
                 let first = crate::resource::first_mip(&desc);
                 let len = crate::resource::placed_bytes_from(&resource, first).unwrap_or(1);
+                #[cfg(feature = "diagnostics")]
+                let started = std::time::Instant::now();
                 let mapped = crate::texture::mapped_bytes(address as *const u8, len as usize);
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::lap(crate::copystat::C::HeapTexMappedNs, started);
                 if mapped == 0 {
                     HEAP_TEXTURES_AWAY.fetch_add(1, Ordering::Relaxed);
                     // Streamed out: what the slot showed is let go.
@@ -2628,7 +2662,11 @@ impl State {
                 (Some(_), Some(View::Placed(_, _, desc))) => crate::resource::first_mip(desc),
                 _ => 0,
             };
+            #[cfg(feature = "diagnostics")]
+            let started = std::time::Instant::now();
             let same = !tabled && crate::texture::unchanged(resource, first);
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::lap(crate::copystat::C::HeapTexSameNs, started);
             if same {
                 HEAP_TEXTURES_SAME.fetch_add(1, Ordering::Relaxed);
                 if shows_other && let Some(handle) = heap.handle(index) {
@@ -2677,7 +2715,11 @@ impl State {
                 // (What was found mapped of it a moment ago is not asked
                 // again, unless the host copy may need more.)
                 crate::texture::PICKING.set(Some(there.filter(|_| partly.is_none()).unwrap_or(u64::MAX)));
+                #[cfg(feature = "diagnostics")]
+                let started = std::time::Instant::now();
                 readable(list, sampled.kind, view);
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::lap(crate::copystat::C::HeapTexUploadNs, started);
                 crate::texture::PICKING.set(None);
             }
             if shows_other && let Some(handle) = heap.handle(index) {
@@ -2763,6 +2805,8 @@ impl State {
                 None => host.texture_slot_done(index, write, again),
             }
         }
+        #[cfg(feature = "diagnostics")]
+        lap(crate::copystat::C::HeapTexLoopNs);
         if baking && served {
             BAKE_SERVED.store(host.texture_news().0 + 1, Ordering::Relaxed);
         }
