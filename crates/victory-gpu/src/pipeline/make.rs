@@ -469,16 +469,44 @@ const QUIET: Duration = Duration::from_secs(2);
 /// to 5 of the 16 workers were busy, all on the slow list (854 waiting),
 /// while the rest idled; the drive at 06:32 then asked for 519 of them at
 /// once, and draws waited 500 ms a frame. `VICTORY_PIPELINE_SLOW_QUIET=0`:
-/// a quarter at all times, as before.
+/// a quarter at all times, as before. `=all`: every worker. On the first run
+/// after a translator VERSION (play-cold, 24 workers) the title loaded with
+/// nothing but the slow list queued, 868 of them, and 15 to 18 workers were
+/// busy for 140 s while the other 6 idled.
 fn quiet_slow_limit() -> usize {
     static LIMIT: OnceLock<usize> = OnceLock::new();
     *LIMIT.get_or_init(|| {
-        if std::env::var_os("VICTORY_PIPELINE_SLOW_QUIET").is_some_and(|v| v == "0") {
-            slow_limit()
-        } else {
-            (workers_wanted() * 3 / 4).max(slow_limit())
-        }
+        quiet_limit(std::env::var("VICTORY_PIPELINE_SLOW_QUIET").ok().as_deref(), workers_wanted(), slow_limit())
     })
+}
+
+fn quiet_limit(asked: Option<&str>, workers: usize, slow: usize) -> usize {
+    match asked.map(str::trim) {
+        Some("0") => slow,
+        Some("all") => workers.max(slow),
+        _ => (workers * 3 / 4).max(slow),
+    }
+}
+
+/// `VICTORY_PIPELINE_SLOW_FIRST=1`: the slow list's longest first (by the
+/// longest each took before), and those of [`LONG_MS`] or more made at
+/// normal priority. In play-cold one compute program took 130 s to
+/// translate: taken 11 s into the run behind shorter ones, made at 141 s,
+/// the world started at 150 s. It had a processor 94% of the time, but
+/// went from processor 7 to 30.
+fn longest_first() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_SLOW_FIRST").is_some_and(|v| v == "1"))
+}
+
+const LONG_MS: u64 = 10_000;
+
+/// The unclaimed entry of `list` that took longest by `ms` (the first among
+/// equals); claimed ones are dropped from it.
+fn longest(list: &mut VecDeque<Arc<Pending>>, ms: impl Fn(&str) -> u64) -> Option<Arc<Pending>> {
+    list.retain(|p| p.queue_state.load(Ordering::Relaxed) == EARLY);
+    let at = (0..list.len()).max_by_key(|&i| (ms(&list[i].key), std::cmp::Reverse(i)))?;
+    list.remove(at)
 }
 
 /// Graphics pipelines are made before compute ones, and compute ones never
@@ -609,7 +637,11 @@ impl Queue {
                 p = unclaimed(&mut self.early_compute);
             }
             if p.is_none() && self.slow_now < slow_limit {
-                p = unclaimed(&mut self.slow);
+                p = if longest_first() {
+                    longest(&mut self.slow, super::library::slow_ms)
+                } else {
+                    unclaimed(&mut self.slow)
+                };
                 // A compute one waits its turn while compute holds all it may.
                 if let Some(q) = p.take_if(|q| q.graphics.is_none() && !compute_free) {
                     self.slow.push_front(q);
@@ -727,21 +759,31 @@ fn workers() -> bool {
                     // Below the title's own threads (loading, recording),
                     // and the streaming one, which is below normal itself
                     // (`VICTORY_PIPELINE_LOWEST=0`: level with it, as before).
+                    use windows::Win32::System::Threading::*;
                     let lowest = !screens_only && std::env::var_os("VICTORY_PIPELINE_LOWEST").is_none_or(|v| v != "0");
+                    let priority = if lowest { THREAD_PRIORITY_LOWEST } else { THREAD_PRIORITY_BELOW_NORMAL };
                     // SAFETY: a plain call on our own thread.
-                    unsafe {
-                        use windows::Win32::System::Threading::*;
-                        let priority = if lowest { THREAD_PRIORITY_LOWEST } else { THREAD_PRIORITY_BELOW_NORMAL };
+                    let set = |priority| unsafe {
                         let _ = SetThreadPriority(GetCurrentThread(), priority);
-                    }
+                    };
+                    set(priority);
                     loop {
                         let p = next(screens_only);
+                        let long = longest_first()
+                            && p.was_slow.load(Ordering::Relaxed)
+                            && super::library::slow_ms(&p.key) >= LONG_MS;
+                        if long {
+                            set(THREAD_PRIORITY_NORMAL);
+                        }
                         BUSY.fetch_add(1, Ordering::Relaxed);
                         {
                             let _slot = ComputeSlot(p.graphics.is_none());
                             p.make();
                         }
                         BUSY.fetch_sub(1, Ordering::Relaxed);
+                        if long {
+                            set(priority);
+                        }
                         if p.was_slow.load(Ordering::Relaxed) {
                             let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
                             queue.slow_now -= 1;
@@ -976,6 +1018,33 @@ mod tests {
         queue.others_at = Instant::now().checked_sub(QUIET);
         assert_eq!(queue.slow_cap(), quiet_slow_limit());
         assert!(quiet_slow_limit() >= slow_limit());
+    }
+
+    #[test]
+    fn the_quiet_slow_limit_follows_its_switch() {
+        assert_eq!(quiet_limit(None, 24, 6), 18);
+        assert_eq!(quiet_limit(Some("0"), 24, 6), 6);
+        assert_eq!(quiet_limit(Some("all"), 24, 6), 24);
+        assert_eq!(quiet_limit(Some("all"), 1, 1), 1);
+    }
+
+    #[test]
+    fn the_longest_unclaimed_is_taken_first() {
+        let one = |key: &str| {
+            let mut p = Pending::new(Vec::new(), None);
+            p.key = key.to_owned();
+            p.queue_state.store(EARLY, Ordering::Relaxed);
+            Arc::new(p)
+        };
+        let ms = |key: &str| match key {
+            "a" => 5_000,
+            "b" | "c" | "d" => 130_000,
+            _ => 0,
+        };
+        let mut list: VecDeque<_> = ["a", "b", "c", "d", "e"].map(one).into();
+        list[1].queue_state.store(MAKING, Ordering::Relaxed);
+        let taken: Vec<String> = std::iter::from_fn(|| longest(&mut list, ms)).map(|p| p.key.clone()).collect();
+        assert_eq!(taken, ["c", "d", "a", "e"]);
     }
 
     /// Graphics pipelines go before compute ones of the same list, and
