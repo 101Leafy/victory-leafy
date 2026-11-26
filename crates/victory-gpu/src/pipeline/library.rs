@@ -178,10 +178,13 @@ impl Mapped {
     /// As [`Mapped::open`]; `hold` says whether the file stays open with
     /// the mapping.
     fn open_holding(path: &std::path::Path, hold: bool) -> Option<Mapped> {
-        // Opened as the standard library opens a file to read: others may
-        // read, write, rename and delete it meanwhile, so a save still
-        // renames the new library over this one.
-        let file = std::fs::File::open(path).ok()?;
+        // Others may read, rename and delete it meanwhile, so a save still
+        // renames the new library over this one, but not write it: a
+        // write or truncation would change the pages under the mapping.
+        use std::os::windows::fs::OpenOptionsExt;
+        // FILE_SHARE_READ | FILE_SHARE_DELETE
+        const READ_DELETE: u32 = 0x1 | 0x4;
+        let file = std::fs::OpenOptions::new().read(true).share_mode(READ_DELETE).open(path).ok()?;
         let len = usize::try_from(file.metadata().ok()?.len()).ok()?;
         let mut mapped = Mapped::map(&file, len, false)?;
         if hold {
@@ -800,10 +803,14 @@ fn zeroed(n: usize) -> Option<Vec<u8>> {
 /// run may have that file mapped: Windows 11 replaces a mapped file, and
 /// the mapping goes on reading the old one for as long as a handle on it
 /// is open ([`holds`]; with none, only the pages in memory at that moment
-/// stay: the rest read as zeros). Where a system refuses, the new library
-/// is left beside it as [`NEXT_FILE`] for the next start.
+/// stay: the rest read as zeros). It goes through [`NEXT_FILE`]: where a
+/// system refuses, the new library waits there for the next start, and an
+/// older one an earlier save left there cannot take the newer one's place.
 fn replace_library(dir: &std::path::Path, tmp: &std::path::Path) -> std::io::Result<()> {
-    std::fs::rename(tmp, dir.join(LIBRARY_FILE)).or_else(|_| std::fs::rename(tmp, dir.join(NEXT_FILE)))
+    let next = dir.join(NEXT_FILE);
+    std::fs::rename(tmp, &next)?;
+    let _ = std::fs::rename(&next, dir.join(LIBRARY_FILE));
+    Ok(())
 }
 
 /// Writes `bytes` to a temporary file beside `path`, then renames it over
@@ -964,6 +971,8 @@ mod tests {
             file.bytes_mut().copy_from_slice(&new);
         }
         assert_eq!(std::fs::read(&tmp).unwrap(), new);
+        // An older library an earlier save left beside it does not win.
+        std::fs::write(dir.path().join(NEXT_FILE), b"stale").unwrap();
         replace_library(dir.path(), &tmp).unwrap();
         assert!(!tmp.exists());
         // The mapping still reads the old library.
