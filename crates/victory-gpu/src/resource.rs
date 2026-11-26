@@ -703,6 +703,43 @@ impl PlacedFootprint {
         };
         Some((host, [pitch * lines, row, lines, u64::from(self.row_pitch)]))
     }
+
+    /// A 2D upload cut to the rows of the copy's box (`full` bytes of
+    /// it): the footprint at offset 0 with the same pitch, where those rows
+    /// start, and their bytes. The box moves to the cut rows. None, and the
+    /// box left alone, when the whole layout has to go (another slice, a
+    /// box that is not on block rows, or all of it).
+    #[cfg(windows)]
+    pub(crate) fn crop_upload_rows(self, region: &mut [u32; 6], full: u64) -> Option<(Self, u64, u64)> {
+        let [left, top, front, right, bottom, back] = *region;
+        let (element, block) = element(self.format)?;
+        if (self.depth, front, back) != (1, 0, 1)
+            || left >= right
+            || right > self.width
+            || top >= bottom
+            || bottom > self.height
+            || (top == 0 && bottom == self.height)
+            || !u64::from(top).is_multiple_of(block)
+            || !u64::from(bottom).is_multiple_of(block)
+        {
+            return None;
+        }
+        let pitch = u64::from(self.row_pitch);
+        if pitch < u64::from(self.width).div_ceil(block) * element {
+            return None;
+        }
+        let height = bottom - top;
+        let start = pitch * (u64::from(top) / block);
+        let cropped = Self { offset: 0, height, ..self };
+        // The title's footprint may end at the last row's final texel.
+        let bytes = (pitch * (u64::from(height) / block)).min(full.checked_sub(start)?);
+        if bytes < cropped.bytes()? {
+            return None;
+        }
+        region[1] = 0;
+        region[4] = height;
+        Some((cropped, start, bytes))
+    }
 }
 const _: () = assert!(size_of::<PlacedFootprint>() == 32);
 
@@ -3593,6 +3630,35 @@ pub(crate) fn test_buffer(width: u64) -> This {
 
 #[cfg(test)]
 mod tests {
+    /// A boxed upload keeps whole block rows and may end at the last row's
+    /// final texel; a part block row or another slice keeps the whole
+    /// layout (AnyXboxX#332).
+    #[cfg(windows)]
+    #[test]
+    fn boxed_upload_preserves_block_rows_and_tight_last_row() {
+        let original = super::PlacedFootprint {
+            offset: 512,
+            format: 71, // BC1_UNORM
+            width: 17,
+            height: 16,
+            depth: 1,
+            row_pitch: 256,
+        };
+        let mut region = [4, 8, 0, 16, 16, 1];
+        let (cropped, start, bytes) = original.crop_upload_rows(&mut region, original.bytes().unwrap()).unwrap();
+        assert_eq!((cropped.offset, cropped.width, cropped.height, cropped.row_pitch), (0, 17, 8, 256));
+        assert_eq!((start, bytes), (512, 296));
+        assert_eq!(region, [4, 0, 0, 16, 8, 1]);
+        for (footprint, outside) in [
+            (original, [4, 2, 0, 16, 12, 1]),
+            (super::PlacedFootprint { depth: 2, ..original }, [4, 8, 1, 16, 16, 2]),
+        ] {
+            let mut region = outside;
+            assert!(footprint.crop_upload_rows(&mut region, footprint.bytes().unwrap()).is_none());
+            assert_eq!(region, outside);
+        }
+    }
+
     use super::*;
     use crate::object::slot;
 

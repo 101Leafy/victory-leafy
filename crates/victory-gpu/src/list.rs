@@ -1277,6 +1277,8 @@ extern "system" fn copy_texture_region(
             return;
         }
         let mut from = src;
+        // SAFETY: the title passes a box or null.
+        let mut copy_box = unsafe { source_box.as_ref() }.copied();
         // Both sides are the same subresource of one host texture (set below).
         let mut same = false;
         let _upload; // keeps the source alive while this call records it
@@ -1289,17 +1291,29 @@ extern "system" fn copy_texture_region(
             let Some(data) = buffer_range(src.resource, src.footprint.offset, bytes) else {
                 return;
             };
+            let mut staged = bytes;
             let buffer = match list.place_source(data as usize, bytes as usize) {
                 // What shaders wrote to it, at this place of the list.
                 Some(buffer) => buffer,
                 None => {
-                    let Some((buffer, staging)) = list.upload(host, bytes) else {
+                    // A boxed copy stages only the box's rows, the box moved
+                    // to match (AnyXboxX#332).
+                    let (footprint, start, len) = copy_box
+                        .as_mut()
+                        .and_then(|b| src.footprint.crop_upload_rows(b, bytes))
+                        .unwrap_or((src.footprint, 0, bytes));
+                    let (Ok(start), Ok(len)) = (usize::try_from(start), usize::try_from(len)) else {
+                        return;
+                    };
+                    let Some((buffer, staging)) = list.upload(host, len as u64) else {
                         return;
                     };
                     // The list owns this mapped D3D12 upload buffer. Wine can
                     // report its address as MEM_FREE, so use the host-upload
                     // path.
-                    list.defer_fill_buffer(&buffer, staging, data, bytes as usize);
+                    list.defer_fill_buffer(&buffer, staging, data.wrapping_add(start), len);
+                    from.footprint = footprint;
+                    staged = len as u64;
                     buffer
                 }
             };
@@ -1308,8 +1322,10 @@ extern "system" fn copy_texture_region(
             #[cfg(feature = "diagnostics")]
             {
                 // SAFETY: a live buffer.
-                read = Some((unsafe { buffer.GetGPUVirtualAddress() }, bytes));
+                read = Some((unsafe { buffer.GetGPUVirtualAddress() }, staged));
             }
+            #[cfg(not(feature = "diagnostics"))]
+            let _ = staged;
             _upload = buffer;
         } else {
             let Some(texture) = crate::resource::host_resource(src.resource) else {
@@ -1385,12 +1401,12 @@ extern "system" fn copy_texture_region(
         ensure_state(list, dst.resource, COPY_DEST);
         let mut to_location = dst;
         to_location.resource = to.as_raw().cast_const().cast();
-        let host_box = (!source_box.is_null()).then(|| source_box.cast::<D3D12_BOX>());
+        let host_box = copy_box.as_ref().map(|b| std::ptr::from_ref(b).cast::<D3D12_BOX>());
         #[cfg(feature = "diagnostics")]
         {
             let text = || {
                 // SAFETY: a live texture; the box is the title's or null.
-                let (d, b) = unsafe { (to.GetDesc(), host_box.map(|b| *b)) };
+                let (d, b) = unsafe { (to.GetDesc(), source_box.cast::<D3D12_BOX>().as_ref().copied()) };
                 format!(
                     "copy to {:?} {}x{} f{} sub/kind {} at {x},{y},{z} from {:?} kind {} footprint {:?} box {b:?}",
                     dst.resource,
@@ -1411,7 +1427,7 @@ extern "system" fn copy_texture_region(
         const _: () =
             assert!(size_of::<CopyLocation>() == size_of::<D3D12_TEXTURE_COPY_LOCATION>());
         // SAFETY: an open list; both locations in the host's layout, naming
-        // live resources; the box is the title's (same layout).
+        // live resources; the box is a copy of the title's (same layout).
         unsafe {
             list.list.CopyTextureRegion(
                 (&raw const to_location).cast(),
