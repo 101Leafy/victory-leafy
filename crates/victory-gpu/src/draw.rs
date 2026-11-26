@@ -3965,10 +3965,29 @@ impl State {
     /// The stand-in for the indirect light after a dispatch of `p`
     /// (`crate::ambient`). Whether it recorded anything.
     fn ambient(&self, list: &HostList, p: &HostPipeline, role: crate::ambient::Role) -> bool {
-        use crate::ambient::{AIR, DEPTH, LIGHT, RADIANCE, REFLECTIONS, Role, Views};
+        use crate::ambient::{AIR, DEPTH, LIGHT, MISS_DEPTH, MISS_LIGHT, MissNote, RADIANCE, REFLECTIONS, Role, Views};
         let Some(t) = p.stages.first().map(|s| s.translated()) else {
             return false;
         };
+        // Which surfaces the miss program's rays are of (its first root
+        // constant): water's reflections are left as they are (the depth
+        // here is of what lies under it).
+        let layer = match role {
+            Role::Miss => t
+                .used
+                .iter()
+                .find(|u| u.root == RootType::Constants)
+                .and_then(|u| match self.roots_ref(true).get(usize::from(u.slot)) {
+                    Some(Root::Constants(c)) => c.first().copied(),
+                    _ => None,
+                })
+                .unwrap_or(u32::MAX),
+            _ => 0,
+        };
+        if role == Role::Miss && !matches!(layer, crate::ambient::MISS_OPAQUE | crate::ambient::MISS_ALPHA) {
+            crate::ambient::note_miss(MissNote::Water);
+            return false;
+        }
         let Some(heap) = (self.heaps[0] != 0).then(|| crate::descriptor::heap(self.heaps[0] as This).host()).flatten()
         else {
             return false;
@@ -3997,6 +4016,7 @@ impl State {
             Role::Resolve => entry(ResourceType::Uav, LIGHT),
             Role::Radiance => entry(ResourceType::Uav, RADIANCE),
             Role::Air => entry(ResourceType::Uav, AIR),
+            Role::Miss => entry(ResourceType::Uav, MISS_LIGHT),
             // The first of the places that holds a 2D image of the format.
             Role::Reflect => REFLECTIONS.iter().find_map(|&at| {
                 entry(ResourceType::Uav, at).filter(|(d, _)| {
@@ -4006,9 +4026,12 @@ impl State {
         };
         let Some((of, image)) = image else {
             once!(?role, "no stand-in for the indirect light: missing image UAV");
+            if role == Role::Miss {
+                crate::ambient::note_miss(MissNote::NotReady);
+            }
             return false;
         };
-        let depth = match role {
+        let (depth, depth_size) = match role {
             Role::Resolve => {
                 let Some((seen, depth)) = entry(ResourceType::Srv, DEPTH) else {
                     once!(?role, "no stand-in for the indirect light: missing depth SRV");
@@ -4018,26 +4041,60 @@ impl State {
                     once!(?role, "no stand-in for the indirect light: depth dimensions differ");
                     return false;
                 }
-                Some(depth)
+                (Some(depth), [seen.Width as u32, seen.Height])
             }
-            Role::Radiance | Role::Air | Role::Reflect => None,
+            // The miss program's image is of half the picture's size, its
+            // depth (32-bit) of the whole.
+            Role::Miss => {
+                use windows::Win32::Graphics::Dxgi::Common::{
+                    DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_D32_FLOAT_S8X24_UINT, DXGI_FORMAT_R32_FLOAT,
+                    DXGI_FORMAT_R32_TYPELESS, DXGI_FORMAT_R32G8X24_TYPELESS,
+                };
+                let found = entry(ResourceType::Srv, MISS_DEPTH).filter(|(seen, _)| {
+                    matches!(
+                        seen.Format,
+                        DXGI_FORMAT_R32_TYPELESS
+                            | DXGI_FORMAT_R32_FLOAT
+                            | DXGI_FORMAT_D32_FLOAT
+                            | DXGI_FORMAT_R32G8X24_TYPELESS
+                            | DXGI_FORMAT_D32_FLOAT_S8X24_UINT
+                    ) && seen.Width >= of.Width
+                        && seen.Height >= of.Height
+                        && seen.Width <= of.Width * 4
+                });
+                let Some((seen, depth)) = found else {
+                    once!(?role, "no stand-in for the indirect light: missing depth SRV");
+                    crate::ambient::note_miss(MissNote::NotReady);
+                    return false;
+                };
+                (Some(depth), [seen.Width as u32, seen.Height])
+            }
+            Role::Radiance | Role::Air | Role::Reflect => (None, [of.Width as u32, of.Height]),
         };
         // (R32_UINT holding R9G9B9E5; R11G11B10_FLOAT.)
         let format = match role {
             Role::Resolve | Role::Reflect => 42,
-            Role::Radiance | Role::Air => 26,
+            Role::Radiance | Role::Air | Role::Miss => 26,
         };
         let volume = of.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
         if of.Format.0 != format || volume != (role == Role::Air) {
             once!(?role, format = of.Format.0, "no stand-in for the indirect light: another image");
+            if role == Role::Miss {
+                crate::ambient::note_miss(MissNote::NotReady);
+            }
             return false;
         }
-        crate::ambient::after(list, role, &Views {
+        let ran = crate::ambient::after(list, role, &Views {
             image,
             depth,
             size: [of.Width as u32, of.Height],
             slices: u32::from(of.DepthOrArraySize),
-        })
+            depth_size,
+        });
+        if ran && role == Role::Miss {
+            crate::ambient::note_miss(MissNote::Ran(layer));
+        }
+        ran
     }
 
     /// What a draw or dispatch runs, for the device-removed report
