@@ -2445,15 +2445,6 @@ pub(crate) fn host_resource<'a>(
     Some(unsafe { &*std::ptr::from_ref(&host.texture) })
 }
 
-/// Whether `this` is one of our resources (read safely: the title's
-/// pointer may be anything).
-#[cfg(windows)]
-pub(crate) fn is_resource(this: This) -> bool {
-    let mut table = [0; size_of::<usize>()];
-    crate::host::read_into(this.cast(), &mut table)
-        && usize::from_ne_bytes(table) == RESOURCE_FUNCTIONS.0.as_ptr() as usize
-}
-
 /// A title texture's host copy, shared, for a list to hold.
 #[cfg(windows)]
 pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
@@ -2602,7 +2593,6 @@ fn host_texture_as(
         }
     };
     if let Err(e) = &made {
-        crate::residency::allocation_error(e);
         tracing::warn!(error = %e, desc = ?d, reserved, "no host texture");
     }
     if !reserved

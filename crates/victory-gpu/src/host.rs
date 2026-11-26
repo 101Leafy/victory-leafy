@@ -57,11 +57,6 @@ pub(crate) struct Host {
     /// The adapter the device is on, for its memory budget
     /// ([`Host::video_memory`]); `None` if the system does not name it.
     adapter: Option<IDXGIAdapter3>,
-    /// Heaps of one null view and one sampler, bound where a list has no
-    /// heap of that kind: root signatures that index the heaps directly
-    /// need both set ([`Host::fallback_view_heap`]).
-    fallback_view: OnceLock<Option<ID3D12DescriptorHeap>>,
-    fallback_sampler: OnceLock<Option<ID3D12DescriptorHeap>>,
 }
 
 // SAFETY: D3D12 devices, queues, fences and descriptor heaps are
@@ -373,11 +368,7 @@ pub(crate) fn keep_freed() -> bool {
 /// when free physical RAM is low. Never returns less than 2,000 ms.
 /// With plenty of it five minutes ([`keep_freed`]).
 pub(crate) fn ram_idle_ms(avail_phys: Option<u64>) -> u64 {
-    let effective = match (avail_phys, crate::residency::headroom()) {
-        (Some(a), Some(b)) => Some(a.min(b)),
-        (a, b) => a.or(b),
-    };
-    ram_idle_for(effective, keep_freed() && !crate::residency::limited_host_ram())
+    ram_idle_for(avail_phys, keep_freed())
 }
 
 fn ram_idle_for(avail_phys: Option<u64>, keep: bool) -> u64 {
@@ -441,10 +432,6 @@ fn sweep() {
     }
     #[cfg(feature = "diagnostics")]
     crate::book::check();
-    crate::residency::refresh();
-    if crate::residency::pressured() {
-        trim_spare_chunks();
-    }
     crate::pool::room(host().and_then(|h| h.video_memory()));
     crate::pipeline::trim_library();
     crate::shadow::let_go_idle();
@@ -497,23 +484,7 @@ pub(crate) fn retire_resource(object: ID3D12Resource) {
 /// recorded and not yet sent may name them. `VICTORY_BURY_LAG=0`: not.
 fn bury_lag() -> u64 {
     static LAG: OnceLock<u64> = OnceLock::new();
-    *LAG.get_or_init(|| {
-        let default = if crate::residency::limited_host_ram() { 16 } else { 64 };
-        std::env::var("VICTORY_BURY_LAG").ok().and_then(|v| v.parse().ok()).unwrap_or(default)
-    })
-}
-
-/// Whether a flight's lists give their dynamic descriptor slots back when
-/// it lands, as a submission that is waited for does
-/// ([`crate::list::tables_done`]), and not when the lists are reset
-/// [`bury_lag`] landings later (`VICTORY_TABLES_AT_LANDING=0`: then). Held
-/// for 64 landings, the binocular zoom ran the slots out with 4,200 to
-/// 4,600 asks a frame refused and a third of its draws gone (codec_d,
-/// pareto-residency f4b48ad76). The card has read the slots by then; the
-/// objects they name still wait for the bury.
-pub(crate) fn tables_at_landing() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("VICTORY_TABLES_AT_LANDING").map_or(true, |v| v.trim() != "0"))
+    *LAG.get_or_init(|| std::env::var("VICTORY_BURY_LAG").ok().and_then(|v| v.parse().ok()).unwrap_or(64))
 }
 
 /// Drops what waited for submissions up to `finished` ([`bury_lag`]). The
@@ -1032,8 +1003,6 @@ fn create() -> windows::core::Result<Host> {
             next_rtv: AtomicU32::new(0),
             presenter: Mutex::new(None),
             adapter,
-            fallback_view: OnceLock::new(),
-            fallback_sampler: OnceLock::new(),
         })
     }
 }
@@ -2202,12 +2171,7 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
         let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
         for (chunk, size) in chunks {
             let back = if scratch_pool() {
-                let limit = if keep_freed() && !crate::residency::limited_host_ram() {
-                    SPARE_KEPT
-                } else {
-                    SPARE_MOST
-                };
-                spare.give(chunk, size, limit)
+                spare.give(chunk, size, if keep_freed() { SPARE_KEPT } else { SPARE_MOST })
             } else {
                 Some(chunk)
             };
@@ -2225,25 +2189,6 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
         }
     }
     // Freed outside the lock.
-    drop(freed);
-}
-
-/// Drops spare scratch chunks kept idle when host memory is pressured.
-fn trim_spare_chunks() {
-    let freed: Vec<(Chunk, u64)> = {
-        let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
-        if spare.kept.is_empty() {
-            return;
-        }
-        spare.bytes = 0;
-        std::mem::take(&mut spare.kept)
-    };
-    let count = freed.len() as u64;
-    let bytes: u64 = freed.iter().map(|(_, s)| *s).sum();
-    ALIVE[1].fetch_sub(count, Ordering::Relaxed);
-    ALIVE[2].fetch_sub(bytes, Ordering::Relaxed);
-    ALIVE[3].fetch_sub(count, Ordering::Relaxed);
-    ALIVE[4].fetch_sub(bytes, Ordering::Relaxed);
     drop(freed);
 }
 
@@ -4622,8 +4567,6 @@ impl Host {
                     // pass: a wait between each copy and its pass had the
                     // card do them one after the other.
                     let mut sent = Vec::new();
-                    // A buffer twice in `dirty` is moved out of COPY_DEST once.
-                    let mut transitioned = Vec::new();
                     if let Some(own) = &own {
                         own.record(self, list, &dirty, |shadow| looks.as_ref().is_some_and(|l| l.hold(shadow)));
                     }
@@ -4642,15 +4585,11 @@ impl Host {
                         #[cfg(feature = "diagnostics")]
                         traffic::moved(traffic::UP, shadow.span(), ranges.iter().copied());
                         if own.is_none() && before.is_some() && !ranges.is_empty() {
-                            let raw = shadow.buffer.as_raw();
-                            if !transitioned.contains(&raw) {
-                                transitioned.push(raw);
-                                sent.push(transition(
-                                    &shadow.buffer,
-                                    D3D12_RESOURCE_STATE_COPY_DEST,
-                                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-                                ));
-                            }
+                            sent.push(transition(
+                                &shadow.buffer,
+                                D3D12_RESOURCE_STATE_COPY_DEST,
+                                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                            ));
                         }
                     }
                     if !sent.is_empty() {
@@ -5221,7 +5160,7 @@ impl Host {
         let mut telling = std::time::Instant::now();
         for item in items {
             telling = match item {
-                Late::Run(mut flight) => {
+                Late::Run(flight) => {
                     last = flight.number;
                     for &i in &flight.order {
                         read_backs(flight.lists[i].host());
@@ -5231,11 +5170,6 @@ impl Host {
                     }
                     if let Some(own) = flight.own {
                         own.landed();
-                    }
-                    if tables_at_landing() {
-                        for list in &mut flight.lists {
-                            list.release_tables();
-                        }
                     }
                     landed.push((flight.lists, flight.order));
                     crate::land::spent(crate::land::stat::READ_BACKS, telling)
@@ -5440,13 +5374,6 @@ impl Host {
         // Behind what the title's queues were given before it.
         crate::queue::before_sync();
         let _ = self.submit(runs, &[], false);
-    }
-
-    /// [`Host::execute`] of a closed upload-only list of our own, without
-    /// waiting for the title's queues (`queue::before_sync`): safe from
-    /// `VICTORY_THIN=1` recording threads.
-    pub(crate) fn execute_sync_internal(&self, list: &HostList) {
-        let _ = self.submit(&[list], &[], false);
     }
 
     /// A queue's submission with [`late`]: the host lists `lists`, taken
@@ -5710,18 +5637,13 @@ impl Host {
             let mut landed = Vec::new();
             for item in items {
                 match item {
-                    Late::Run(mut flight) => {
+                    Late::Run(flight) => {
                         last = flight.number;
                         for &i in &flight.order {
                             read_backs(flight.lists[i].host());
                         }
                         if let Some(card) = flight.card {
                             self.card_done(card);
-                        }
-                        if tables_at_landing() {
-                            for list in &mut flight.lists {
-                                list.release_tables();
-                            }
                         }
                         landed.push((flight.lists, flight.order));
                     }
@@ -6649,12 +6571,6 @@ impl HostList {
     /// See [`HostList::changed_something`].
     pub(crate) fn epoch(&self) -> u64 {
         self.epoch.load(Ordering::Relaxed)
-    }
-
-    /// Whether steps or texture state changes were recorded since the list
-    /// was made or last reset.
-    pub(crate) fn has_recorded_work(&self) -> bool {
-        !self.deferred().copies.is_empty() || !self.states.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
     }
 
     /// Moves a title texture's host copy to `wanted` (a host state) in this
@@ -9087,7 +9003,6 @@ impl Host {
         match made {
             Ok(()) => Some((buffer?, data.cast())),
             Err(e) => {
-                crate::residency::allocation_error(&e);
                 tracing::warn!(error = %e, size, "no upload buffer");
                 None
             }
@@ -9121,9 +9036,6 @@ struct Presenter {
     ahead: Vec<(HostList, u64)>,
     hwnd: HWND,
     meter: Meter,
-    /// Puts a present's two planes together ([`crate::compose`]); made at
-    /// the first present of two.
-    composer: Option<crate::compose::Composer>,
     #[cfg(feature = "diagnostics")]
     panel: panel::Panel,
     #[cfg(feature = "diagnostics")]
@@ -9474,39 +9386,14 @@ impl Meter {
 
 impl Host {
     /// Shows `texture`, which is in `state` (a host state) and stays in it,
-    /// as frame `frame` (saved if captures are on), with `overlay`, in its
-    /// own host state (which it stays in), put over it ([`crate::compose`]).
-    /// Planes the composer cannot read, or no composer: `texture` alone.
-    /// `None` if nothing was shown; else, in diagnostics builds, whether the
-    /// frame was black.
-    pub(crate) fn present_planes(
-        &self,
-        texture: &ID3D12Resource,
-        state: u32,
-        overlay: Option<(&ID3D12Resource, u32)>,
-        frame: u64,
-    ) -> Option<bool> {
-        static NO_COMPOSER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    /// as frame `frame` (saved if captures are on). `None` if nothing was
+    /// shown; else, in diagnostics builds, whether the frame was black.
+    pub(crate) fn present(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };
-        let planes = overlay.filter(|_| !NO_COMPOSER.load(Ordering::Relaxed)).and_then(|(over, over_state)| {
-            // SAFETY: a live resource.
-            let over_desc = unsafe { over.GetDesc() };
-            Some((
-                over,
-                D3D12_RESOURCE_STATES(over_state as i32),
-                crate::compose::view(&desc)?,
-                crate::compose::view(&over_desc)?,
-            ))
-        });
-        let format = if planes.is_some() {
-            DXGI_FORMAT_R8G8B8A8_UNORM
-        } else {
-            let Some(format) = swap_format(desc.Format) else {
-                tracing::warn!(format = desc.Format.0, "cannot present this format");
-                return None;
-            };
-            format
+        let Some(format) = swap_format(desc.Format) else {
+            tracing::warn!(format = desc.Format.0, "cannot present this format");
+            return None;
         };
         let (width, height) = (desc.Width as u32, desc.Height);
         let mut presenter = self.presenter.lock().unwrap_or_else(|e| e.into_inner());
@@ -9520,20 +9407,6 @@ impl Host {
             };
         }
         let p = presenter.as_mut()?;
-        if planes.is_some() && p.composer.is_none() {
-            match crate::compose::Composer::new(self, format) {
-                Ok(composer) => {
-                    tracing::info!(frame, width, height, "presents of two planes are put together");
-                    p.composer = Some(composer);
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "no composer for two planes; the first is shown alone");
-                    NO_COMPOSER.store(true, Ordering::Relaxed);
-                    drop(presenter);
-                    return self.present_planes(texture, state, None, frame);
-                }
-            }
-        }
         if (p.width, p.height, p.format) != (width, height, format) {
             // Presents sent ahead hold back buffers until they have run.
             settle_now(WHY_SYNC);
@@ -9591,85 +9464,35 @@ impl Host {
             };
             copy.reset();
             let list = &copy.list;
-            let composed = match (planes, p.composer.as_mut()) {
-                (Some((over, over_state, base_view, over_view)), Some(composer)) => {
-                    const READ: D3D12_RESOURCE_STATES = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-                    copy.keep(texture);
-                    copy.keep(over);
-                    let moves = |to_read: bool, back_from: D3D12_RESOURCE_STATES, back_to: D3D12_RESOURCE_STATES| {
-                        let mut moves = Vec::with_capacity(3);
-                        for (plane, at) in [(texture, state), (over, over_state)] {
-                            if at != READ {
-                                moves.push(if to_read { transition(plane, at, READ) } else { transition(plane, READ, at) });
-                            }
-                        }
-                        moves.push(transition(&back, back_from, back_to));
-                        moves
-                    };
-                    list.ResourceBarrier(&moves(true, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET));
-                    let views = slot.map_or(0, |i| i + 1);
-                    match composer.record(self, views, list, [(texture, base_view), (over, over_view)], &back, (width, height)) {
-                        Ok(()) => {
-                            list.ResourceBarrier(&moves(false, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_DEST));
-                            true
-                        }
-                        Err(e) => {
-                            tracing::warn!(error = %e, "two planes not put together; the first is shown alone");
-                            list.ResourceBarrier(&moves(false, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT));
-                            false
-                        }
-                    }
-                }
-                _ => false,
-            };
-            if !composed {
-                list.ResourceBarrier(&[
-                    transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE),
-                    transition(
-                        &back,
-                        D3D12_RESOURCE_STATE_PRESENT,
-                        D3D12_RESOURCE_STATE_COPY_DEST,
-                    ),
-                ]);
-                list.CopyResource(&back, texture);
-            }
-            // (A frame put together is read from the back buffer.)
+            list.ResourceBarrier(&[
+                transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                transition(
+                    &back,
+                    D3D12_RESOURCE_STATE_PRESENT,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                ),
+            ]);
+            list.CopyResource(&back, texture);
             #[cfg(feature = "diagnostics")]
             let capture = crate::capture::wanted(frame)
-                .then(|| {
-                    if !composed {
-                        return crate::capture::read_back(&self.device, list, texture);
-                    }
-                    list.ResourceBarrier(&[transition(&back, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
-                    let read = crate::capture::read_back(&self.device, list, &back);
-                    list.ResourceBarrier(&[transition(&back, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST)]);
-                    read
-                })
+                .then(|| crate::capture::read_back(&self.device, list, texture))
                 .flatten();
             #[cfg(feature = "diagnostics")]
-            let probe = if slot.is_some() || composed { None } else { crate::capture::probe(&self.device, list, texture) };
+            let probe = if slot.is_some() { None } else { crate::capture::probe(&self.device, list, texture) };
             #[cfg(feature = "diagnostics")]
-            let watched = if composed { None } else { crate::popwatch::take(&self.device, list, texture) };
+            let watched = crate::popwatch::take(&self.device, list, texture);
             #[cfg(feature = "diagnostics")]
             p.panel.draw(self, copy, &back, (width, height), format);
             #[cfg(not(feature = "diagnostics"))]
             let _ = frame;
-            if composed {
-                list.ResourceBarrier(&[transition(
+            list.ResourceBarrier(&[
+                transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state),
+                transition(
                     &back,
                     D3D12_RESOURCE_STATE_COPY_DEST,
                     D3D12_RESOURCE_STATE_PRESENT,
-                )]);
-            } else {
-                list.ResourceBarrier(&[
-                    transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state),
-                    transition(
-                        &back,
-                        D3D12_RESOURCE_STATE_COPY_DEST,
-                        D3D12_RESOURCE_STATE_PRESENT,
-                    ),
-                ]);
-            }
+                ),
+            ]);
             copy.close();
             let flown = match slot {
                 Some(i) => {
@@ -9761,7 +9584,6 @@ impl Host {
                 ahead: Vec::new(),
                 hwnd,
                 meter: Meter::new(),
-                composer: None,
                 #[cfg(feature = "diagnostics")]
                 panel: panel::Panel::new(),
                 #[cfg(feature = "diagnostics")]
@@ -9819,66 +9641,6 @@ pub(crate) fn legal_for(flags: u32, state: u32) -> u32 {
 }
 
 impl Host {
-    /// A shader-visible view heap of one null buffer view, for lists that
-    /// set no view heap (codec_d, pareto-residency e05d4633a).
-    pub(crate) fn fallback_view_heap(&self) -> Option<&ID3D12DescriptorHeap> {
-        self.fallback_view
-            .get_or_init(|| {
-                // SAFETY: a heap of one descriptor and a null view in it.
-                unsafe {
-                    let heap: ID3D12DescriptorHeap = self
-                        .device
-                        .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
-                            Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-                            NumDescriptors: 1,
-                            Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
-                            NodeMask: 0,
-                        })
-                        .ok()?;
-                    let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
-                        Format: DXGI_FORMAT_R32_UINT,
-                        ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
-                        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
-                        Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 { Buffer: D3D12_BUFFER_SRV::default() },
-                    };
-                    self.device.CreateShaderResourceView(None, Some(&desc), heap.GetCPUDescriptorHandleForHeapStart());
-                    Some(heap)
-                }
-            })
-            .as_ref()
-    }
-
-    /// A shader-visible sampler heap of one point sampler, for lists that
-    /// set no sampler heap.
-    pub(crate) fn fallback_sampler_heap(&self) -> Option<&ID3D12DescriptorHeap> {
-        self.fallback_sampler
-            .get_or_init(|| {
-                // SAFETY: a heap of one descriptor and a sampler in it.
-                unsafe {
-                    let heap: ID3D12DescriptorHeap = self
-                        .device
-                        .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
-                            Type: D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER,
-                            NumDescriptors: 1,
-                            Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
-                            NodeMask: 0,
-                        })
-                        .ok()?;
-                    let desc = D3D12_SAMPLER_DESC {
-                        Filter: D3D12_FILTER_MIN_MAG_MIP_POINT,
-                        AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
-                        AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
-                        AddressW: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
-                        MaxLOD: f32::MAX,
-                        ..Default::default()
-                    };
-                    self.device.CreateSampler(&desc, heap.GetCPUDescriptorHandleForHeapStart());
-                    Some(heap)
-                }
-            })
-            .as_ref()
-    }
-
     /// The card's memory as the system accounts it to this process, in
     /// bytes: the budget and the use of the card's own memory, then of the
     /// PC's memory shared with the card (where the system moves what does
