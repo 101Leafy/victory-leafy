@@ -643,6 +643,12 @@ fn translate_programs(container: &Container, programs: Vec<NativeProgram>, examp
                     match emit::emit(container, &p, &program, &s, &i, &r) {
                         Ok(shader) => {
                             census_line(&label(), &p, &program, &shader);
+                            // `VICTORY_EMIT_OUT=<dir>`: each emitted shader's DXIL, to read with `dxc -dumpbin`
+                            if let Some(dir) = std::env::var_os("VICTORY_EMIT_OUT") {
+                                let name: String = label().chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect();
+                                let _ = std::fs::create_dir_all(&dir);
+                                let _ = std::fs::write(std::path::Path::new(&dir).join(format!("{name}.dxil")), &shader.dxil);
+                            }
                             *counter(t, p.stage, 1) += 1;
                             check(shader, t, checks, label);
                         }
