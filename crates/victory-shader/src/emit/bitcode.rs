@@ -251,6 +251,21 @@ impl Module {
             .collect()
     }
 
+    /// Constant integer false-arms of every live written `select` instruction.
+    #[cfg(test)]
+    pub fn written_select_false_ints(&self) -> Vec<Option<i64>> {
+        let live = self.live();
+        self.blocks
+            .iter()
+            .flat_map(|b| &b.body)
+            .filter(|&&i| live[i as usize])
+            .filter_map(|&i| match self.insts[i as usize].op {
+                Op::Select(_, _, f) => Some(self.int_value(f)),
+                _ => None,
+            })
+            .collect()
+    }
+
     fn ty(&mut self, def: TypeDef) -> Ty {
         if let Some(&t) = self.type_ids.get(&def) {
             return Ty(t);
