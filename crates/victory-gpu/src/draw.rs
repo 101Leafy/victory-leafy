@@ -760,6 +760,8 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
         .or_insert_with(|| (0, HeapRanges(Vec::new())));
     let changed = host.buffer_changes();
     let all = *passes == 0 || (*passes % HEAP_ROUND == 0 && !heap_spread());
+    // (Where the written ones start among the slots looked at.)
+    let mut written_from = 0;
     let slots = if all {
         ranges.0.clear();
         host.buffer_slots()
@@ -768,11 +770,18 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
         let (part, parts) = ((*passes % HEAP_ROUND) as u32, HEAP_ROUND as u32);
         ranges.forget_part(part, parts);
         let mut slots = host.buffer_slots_of(part, parts);
+        written_from = slots.len();
         slots.extend(changed);
         slots
     } else {
         changed
     };
+    #[cfg(feature = "diagnostics")]
+    {
+        use crate::copystat::{C, add};
+        add(C::HeapLooked, slots.len() as u64);
+        add(C::HeapLookedWritten, if all { 0 } else { (slots.len() - written_from) as u64 });
+    }
     *passes += 1;
     // Whether the device was there before the pass: a view that removes
     // it is named below.
@@ -797,7 +806,7 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
         if host.copied_tabled(index, frame) {
             return None;
         }
-        let view = host.mirror(index, heap.handle(index)?, true)?;
+        let view = host.mirror_for_pass(index, heap.handle(index)?)?;
         // The copy the slot shows (`buffer_copy`), not the one the
         // view's range alone would find.
         let (shadow, address, len) = crate::descriptor::host::buffer_copy(&view)?;
@@ -829,15 +838,30 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
         }
         let _ = found[n].set(looked);
     });
-    for (index, shows) in found.into_iter().filter_map(std::sync::OnceLock::into_inner).flatten() {
+    #[cfg(feature = "diagnostics")]
+    let mut same = 0u64;
+    let looked_at = found.into_iter().filter_map(std::sync::OnceLock::into_inner).flatten();
+    for (at, (index, shows)) in looked_at.enumerate() {
         let range = shows.map(|(range, written)| {
             if written {
                 unordered.push(range.clone());
             }
             range
         });
+        #[cfg(feature = "diagnostics")]
+        if !all && at >= written_from {
+            let before = ranges.0.get(index as usize).and_then(Option::as_ref);
+            let was = |(a, from, to): &(std::sync::Arc<crate::shadow::Shadow>, u64, u64)| {
+                before.is_some_and(|(b, f, t)| std::sync::Arc::ptr_eq(a, b) && f == from && t == to)
+            };
+            same += u64::from(range.as_ref().map_or(before.is_none(), was));
+        }
+        #[cfg(not(feature = "diagnostics"))]
+        let _ = at;
         ranges.set(index, range);
     }
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(crate::copystat::C::HeapSameAgain, same);
     if crate::picked::on() {
         crate::picked::shown(unordered, all);
     }
@@ -3297,6 +3321,21 @@ impl State {
                 }
                 made.push((slot, first * 32));
                 continue;
+            }
+            #[cfg(feature = "diagnostics")]
+            {
+                // Tables made from the same records by another list this frame.
+                type Seen = (u64, std::collections::HashSet<(usize, (u64, u32, u64))>);
+                static SEEN: std::sync::Mutex<Option<Seen>> = std::sync::Mutex::new(None);
+                let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+                let (frame, keys) = seen.get_or_insert_with(Default::default);
+                if *frame != crate::frame::current() {
+                    *frame = crate::frame::current();
+                    keys.clear();
+                }
+                if !keys.insert((std::ptr::from_ref(heap) as usize, key)) {
+                    crate::copystat::add(crate::copystat::C::FreshAgain, 1);
+                }
             }
             let Some(first) = host.dynamic(n) else {
                 // No room: the draw must not run with the title's own
