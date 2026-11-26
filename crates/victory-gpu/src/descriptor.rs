@@ -1021,17 +1021,27 @@ fn shape_of(unordered: bool, resource: &[u32; 14], desc: &[u32; 16]) -> (Shape, 
     // layout, where the title leaves what its stack held (see
     // `crate::resource::texture_at`, which keeps them out of its key for
     // the same reason). Kept in the shape they made a new shape for most
-    // views: 1.5 million shapes by the end of play-g. Nothing that makes a
-    // view reads them. `VICTORY_PLACED_FILLER=1` keeps them, as before.
+    // views: 1.5 million shapes by the end of play-g. The view description
+    // has two such words too: a shader resource view's word 3 (before the
+    // union) and a buffer view's word 9 (after the union's buffer member).
+    // Nothing that makes a view reads them. `VICTORY_PLACED_FILLER=1` keeps
+    // them, as before.
+    const BUFFER: u32 = 1;
     static KEPT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let kept = *KEPT.get_or_init(|| std::env::var_os("VICTORY_PLACED_FILLER").is_some_and(|v| v == "1"));
     let mut resource = *resource;
-    if !*KEPT.get_or_init(|| std::env::var_os("VICTORY_PLACED_FILLER").is_some_and(|v| v == "1")) {
-        resource[1] = 0;
-        resource[13] = 0;
-    }
     let mut rest = [0u32; 14];
     rest[..10].copy_from_slice(&desc[..10]);
     rest[10..].copy_from_slice(&desc[12..]);
+    if !kept {
+        (resource[1], resource[13]) = (0, 0);
+        if !unordered {
+            rest[3] = 0;
+        }
+        if desc[1] == BUFFER {
+            rest[9] = 0;
+        }
+    }
     (
         (unordered, resource, rest),
         u64::from(desc[10]) | u64::from(desc[11]) << 32,
@@ -1987,14 +1997,30 @@ mod tests {
         let mut blank = resource;
         (blank[1], blank[13]) = (0, 0);
         let shapes = || VIEWS.read().unwrap().shapes.iter().filter(|s| s.1 == blank).count();
+        let mut blank_desc = desc;
+        blank_desc[3] = 0;
         for n in 0..100u32 {
-            let mut stack = resource;
-            (stack[1], stack[13]) = (n.wrapping_mul(0x9e37_79b9), !n);
-            create_placed_srv(null, &stack, &desc, at);
+            let (mut stack, mut stack_desc) = (resource, desc);
+            (stack[1], stack[13], stack_desc[3]) = (n.wrapping_mul(0x9e37_79b9), !n, n ^ 0xb717_5a38);
+            create_placed_srv(null, &stack, &stack_desc, at);
             // The view comes back without its filler.
-            assert_eq!(view(at), Some(View::Placed(false, blank, desc)));
+            assert_eq!(view(at), Some(View::Placed(false, blank, blank_desc)));
         }
         assert_eq!(shapes(), 1, "one shape for 100 fillers");
+        // A buffer view's word 9, shader resource and unordered access alike.
+        (desc[1], blank_desc[1]) = (1, 1);
+        blank_desc[9] = 0;
+        for n in 0..100u32 {
+            let mut stack_desc = desc;
+            (stack_desc[3], stack_desc[9]) = (n, n.wrapping_mul(0x9e37_79b9));
+            create_placed_srv(null, &blank, &stack_desc, at);
+            assert_eq!(view(at), Some(View::Placed(false, blank, blank_desc)));
+            create_placed_uav(null, &blank, &stack_desc, at);
+            let mut unordered = blank_desc;
+            unordered[3] = n;
+            assert_eq!(view(at), Some(View::Placed(true, blank, unordered)));
+        }
+        assert_eq!(shapes(), 102, "a buffer shape for views, one for each word 3 of unordered ones");
     }
 
     /// The leak of run 65: a title that writes constant buffer views and
@@ -2009,9 +2035,10 @@ mod tests {
         let slots = [0u64; 4];
         let at = slots.as_ptr() as u64;
         // A resource description and a view no other test uses, with no
-        // filler (words 1 and 13 leave the shape: the test above).
+        // filler (words 1 and 13 and view word 3 leave the shape: the test
+        // above).
         let resource: [u32; 14] = std::array::from_fn(|k| if k == 1 || k == 13 { 0 } else { 0x5ee0_0000 + k as u32 });
-        let mut desc: [u32; 16] = std::array::from_fn(|k| 0x7a70_0000 + k as u32);
+        let mut desc: [u32; 16] = std::array::from_fn(|k| if k == 3 { 0 } else { 0x7a70_0000 + k as u32 });
         let mine = |v: &View| match v {
             View::Constant(address, _) => (0x6_0000_0000..0x6_1000_0000).contains(address),
             View::Placed(_, r, _) => *r == resource,
