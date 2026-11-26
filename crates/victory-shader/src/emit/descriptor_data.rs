@@ -324,7 +324,9 @@ impl<'a> Lower<'a> {
     ///   tests a structured buffer it does not read for being empty, by its record count).
     ///   A raw handle of the structured view the heap holds answers wrong: 2 records for 9
     ///   of 16 bytes on an RTX 5090 (`descriptor_tests`, run with a raw handle).
-    ///   With no entry, a raw view where the code reads the record count (dword 2).
+    ///   A stride of 4 or less may be a typed view's component count, and with no entry
+    ///   nothing tells: those stay refused.
+    /// - An image whose depth or layers (dword 4) the code reads is no 2D texture's.
     // shortcut: an image whose kind nothing tells is taken for a 2D texture; a host view of
     // another kind is queried through a 2D texture's handle.
     fn unused_descriptor_kind(
@@ -353,16 +355,17 @@ impl<'a> Lower<'a> {
         };
         let uav = used.is_some_and(|u| u.kind == ResourceType::Uav);
         let u = if uav { 0x1000 } else { 0 };
+        let layers = inst
+            .write(Reg::S(code + 4))
+            .is_some_and(|v| self.read_as_number(v));
         match count {
-            8 if used.is_none_or(|u| u.dwords == 8) => Some((used, uav, (2 | u, 0x409), Some(2))),
-            4 if used.is_some_and(|u| u.dwords == 4) || used.is_none() && read(2) => {
-                let stride = used.map_or(0, |u| u.stride);
-                let props = if stride >= 4 && stride.is_multiple_of(4) {
-                    (12 | u, stride)
-                } else {
-                    (11 | u, 0)
-                };
-                Some((used, uav, props, None))
+            8 if !layers && (1..5).any(read) && used.is_none_or(|u| u.dwords == 8) => {
+                Some((used, uav, (2 | u, 0x409), Some(2)))
+            }
+            4 => {
+                let used = used.filter(|u| u.dwords == 4)?;
+                (read(2) && used.stride > 4 && used.stride.is_multiple_of(4))
+                    .then_some((Some(used), uav, (12 | u, used.stride), None))
             }
             _ => None,
         }
