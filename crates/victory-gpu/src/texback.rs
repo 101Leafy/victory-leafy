@@ -102,6 +102,7 @@ pub(crate) fn replaced(at: usize) {
 pub(crate) fn remapped(at: usize, len: usize) {
     let end = at.saturating_add(len);
     invalidate(|ticket| at < ticket.end && ticket.at < end);
+    crate::texture::remapped(at, len);
 }
 
 pub(crate) struct Target {
@@ -178,6 +179,7 @@ pub(crate) fn record(list: &ID3D12GraphicsCommandList, target: Target) -> Option
         total = total.max(footprint.Offset.checked_add(pitched)?);
     }
     let buffer = host.read_back_buffer(total)?;
+    crate::host::name(&buffer, || format!("texback read-back buffer of {total} bytes"));
     for (i, footprint) in footprints.iter().enumerate() {
         let to = D3D12_TEXTURE_COPY_LOCATION {
             // SAFETY: a borrowed pointer the location never releases.
