@@ -371,6 +371,9 @@ fn feature_levels(data: *mut c_void) -> HRESULT {
 /// a 0x1c8 call whose parts make containers (`victory_shader::loose_graphics`)
 /// gets a graphics pipeline whose host pipelines are made at the first draw
 /// into each set of target formats.
+/// A compute container that does not translate is no answer either: the
+/// call fails, so the title builds the pipeline from its own DXBC
+/// container instead of drawing without that work (`loose_usable`).
 /// Neither is made by default: those calls fail as they always
 /// did, with `out` null. Answering `S_OK` without making the pipeline
 /// would hand the title whatever its stack held as an object.
@@ -415,7 +418,8 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
     let part = |i: usize| parts.get(i).and_then(|p| p.as_deref());
     let built = (SLOT == 0x218).then(|| match (part(0), part(2), part(3)) {
         (Some(packet), Some(code), Some(meta)) => {
-            victory_shader::loose_compute(packet, code, meta).map_err(|e| e.to_string())
+            let built = victory_shader::loose_compute(packet, code, meta).map_err(|e| e.to_string());
+            if make { loose_usable(built) } else { built }
         }
         _ => Err("a part is not readable".to_owned()),
     });
@@ -484,6 +488,13 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
             _ => E_NOTIMPL,
         },
     }
+}
+
+/// A loose compute container, if it translates. On play-i 820 of the 2,700
+/// built ones did not, and answering those with a pipeline left the start
+/// screen black: the title went without that compute work.
+fn loose_usable(built: Result<Vec<u8>, String>) -> Result<Vec<u8>, String> {
+    built.and_then(|c| crate::shader_cache::host_shader(&c).map(|_| c))
 }
 
 /// The host device's state: the console's device is removed when the host's is
@@ -684,5 +695,37 @@ mod tests {
         assert_eq!(query(&levels, 0x18), (S_OK, 0xc100));
         assert_eq!(query(&levels, 0x10).0, E_INVALIDARG);
         assert_eq!(query(&levels[4..], 0x18).0, UNSUPPORTED);
+    }
+
+    /// The parts of the title's first 0x218 call (victory-shader's
+    /// `loose_compute_takes_the_titles_parts`), with `code` for the code.
+    fn loose_container(code: &[u8]) -> Result<Vec<u8>, String> {
+        let packet = [
+            0x00, 0xcf, 0x05, 0x40, 0x02, 0x01, 0x09, 0x6c, 0x00, 0x00, 0x00, 0x00, 0x08, 0x00, 0x08, 0x00,
+            0x01, 0x00, 0x00, 0x00, 0x43, 0x03, 0x2c, 0x40, 0x8a, 0x0b, 0x00, 0x00,
+        ];
+        let mut meta = vec![0u8; 0x18];
+        meta[0..4].copy_from_slice(&0x403u32.to_le_bytes());
+        meta[0x14..0x18].copy_from_slice(&[0x40, 4, 0, 0]);
+        // The end record alone: no resources.
+        let mut end = vec![0u8; 0x20];
+        end[0] = 0x43;
+        end[0x18..0x1c].copy_from_slice(&u32::MAX.to_le_bytes());
+        meta.extend(end);
+        let size = (meta.len() - 0x14) as u32;
+        meta[4..8].copy_from_slice(&size.to_le_bytes());
+        victory_shader::loose_compute(&packet, code, &meta).map_err(|e| e.to_string())
+    }
+
+    #[test]
+    fn a_loose_container_that_does_not_translate_is_not_handed_out() {
+        let s_endpgm = 0xbf81_0000u32.to_le_bytes();
+        let ends = loose_container(&s_endpgm).unwrap();
+        assert_eq!(loose_usable(Ok(ends.clone())), Ok(ends));
+        // An encoding RDNA2 does not have, then the end.
+        let bad = [u32::MAX.to_le_bytes(), s_endpgm].concat();
+        let refused = loose_container(&bad).unwrap();
+        assert!(loose_usable(Ok(refused)).is_err());
+        assert!(loose_usable(Err("a part is not readable".to_owned())).is_err());
     }
 }
