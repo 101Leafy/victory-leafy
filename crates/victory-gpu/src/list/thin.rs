@@ -357,6 +357,23 @@ pub(crate) fn line(frames: f64) {
         CHUNKS.swap(0, Relaxed) as f64 / frames,
         s[3]
     );
+    #[cfg(feature = "diagnostics")]
+    {
+        let mut ops: Vec<(usize, f64, f64)> = (0..OPS)
+            .map(|op| {
+                let [calls, ns] = [0, 1].map(|k| BY_OP[op][k].swap(0, Relaxed) as f64 / frames);
+                (op, calls, ns)
+            })
+            .filter(|o| o.1 > 0.0)
+            .collect();
+        ops.sort_by(|a, b| b.2.total_cmp(&a.2));
+        let by: Vec<String> = ops
+            .iter()
+            .take(16)
+            .map(|&(op, calls, ns)| format!("{} {calls:.0} {:.1} ms ({:.1} us)", op_name(op), ns / 1e6, ns / 1e3 / calls))
+            .collect();
+        tracing::info!("translated list calls per frame by kind, busiest first (calls, time, each): {}", by.join(", "));
+    }
 }
 
 #[inline]
@@ -398,6 +415,8 @@ macro_rules! plain {
         #[allow(clippy::upper_case_acronyms, non_camel_case_types)]
         #[repr(u64)]
         enum Plain { $($op),* , END }
+        #[cfg(feature = "diagnostics")]
+        const PLAIN_NAMES: [&str; Plain::END as usize] = [$(stringify!($name)),*];
         $(extern "system" fn $name(this: This $(, $a: $t)*) {
             front(this).put(Plain::$op as u64, &[$(Word::word($a)),*]);
         })*
@@ -469,6 +488,54 @@ const TARGETS: u64 = after(13);
 const CLEAR_RTV: u64 = after(14);
 const CLEAR_DSV: u64 = after(15);
 const COPY_TEXTURE: u64 = after(16);
+
+/// Since the last line of the log, by op: the calls translated and the
+/// nanoseconds they took (all threads).
+#[cfg(feature = "diagnostics")]
+const OPS: usize = after(17) as usize;
+#[cfg(feature = "diagnostics")]
+static BY_OP: [[AtomicU64; 2]; OPS] = [const { [const { AtomicU64::new(0) }; 2] }; OPS];
+
+#[cfg(feature = "diagnostics")]
+fn op_name(op: usize) -> &'static str {
+    const AFTER: [&str; 17] = [
+        "reset", "close", "upload", "barrier", "barrier_groups", "viewports", "scissors", "blend_factor", "heaps",
+        "compute_constants", "graphics_constants", "index_buffer", "vertex_buffers", "targets", "clear_rtv",
+        "clear_dsv", "copy_texture",
+    ];
+    PLAIN_NAMES.get(op).or_else(|| AFTER.get(op - PLAIN_NAMES.len())).copied().unwrap_or("?")
+}
+
+/// `op` began at `began` and is done.
+#[cfg(feature = "diagnostics")]
+fn timed(op: u64, began: std::time::Instant) {
+    use crate::copystat::{add, C};
+    let ns = began.elapsed().as_nanos() as u64;
+    let Some(at) = BY_OP.get(op as usize) else { return };
+    at[0].fetch_add(1, Relaxed);
+    at[1].fetch_add(ns, Relaxed);
+    let draws = [Plain::DRAW, Plain::DRAW_INDEXED, Plain::DISPATCH, Plain::DISPATCH_X, Plain::DISPATCH_MESH]
+        .into_iter()
+        .chain([Plain::DISPATCH_MESH_X, Plain::EXECUTE_INDIRECT])
+        .any(|p| p as u64 == op);
+    let copies = [Plain::COPY_BUFFER, Plain::COPY_RESOURCE, Plain::COPY_RESOURCE_X, Plain::COPY_MEMORY, Plain::RESOLVE]
+        .into_iter()
+        .chain([Plain::RESOLVE_QUERIES])
+        .any(|p| p as u64 == op)
+        || [CLEAR_RTV, CLEAR_DSV, COPY_TEXTURE].contains(&op);
+    if draws {
+        add(C::ThinDraws, 1);
+        add(C::ThinDrawNs, ns);
+    } else if copies {
+        add(C::ThinCopyNs, ns);
+    } else if op == BARRIER || op == BARRIER_GROUPS {
+        add(C::ThinBarrierNs, ns);
+    } else if op == RESET || op == CLOSE || (Plain::WRITE32 as u64..Plain::END as u64).contains(&op) {
+        add(C::ThinOtherNs, ns);
+    } else {
+        add(C::ThinSetNs, ns);
+    }
+}
 
 /// The bytes of `count` things at `items` (none if null).
 fn bytes_of<'a, T>(items: *const T, count: usize) -> &'a [u8] {
@@ -702,87 +769,97 @@ fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool)
         if skip && op != CLOSE && op != RESET {
             continue;
         }
-        if run_plain(op, list, w) {
-            continue;
-        }
-        let n = w.first().map_or(0, |&n| n as usize);
-        match op {
-            RESET => {
-                // (Only whether there is an allocator is looked at.)
-                let allocator: This = std::ptr::NonNull::<u64>::dangling().as_ptr().cast_const().cast();
-                super::reset(list, allocator, w[0] as This);
-            }
-            CLOSE => {
-                super::close(list);
-                closed = true;
-            }
-            BARRIER => {
-                super::barrier(list, n as u32, at_or(w, 1));
-            }
-            BARRIER_GROUPS => super::barrier_groups(list, n as u32, std::ptr::null()),
-            VIEWPORTS => state::viewports(list, n as u32, at(w, 1, n)),
-            SCISSORS => state::scissors(list, n as u32, at(w, 1, n)),
-            BLEND_FACTOR => state::blend_factor(list, at(w, 1, n)),
-            HEAPS => state::heaps(list, n as u32, at(w, 1, n)),
-            COMPUTE_CONSTANTS => {
-                state::compute_constants(list, w[0] as u32, w[1] as u32, at(w, 2, w[1] as usize), (w[0] >> 32) as u32)
-            }
-            GRAPHICS_CONSTANTS => {
-                state::graphics_constants(list, w[0] as u32, w[1] as u32, at(w, 2, w[1] as usize), (w[0] >> 32) as u32)
-            }
-            INDEX_BUFFER => state::index_buffer(list, at(w, 1, n)),
-            VERTEX_BUFFERS => {
-                let views = if w[1] != 0 { at_or(w, 2) } else { std::ptr::null() };
-                state::vertex_buffers(list, w[0] as u32, (w[0] >> 32) as u32, views);
-            }
-            TARGETS => {
-                let mut handles = [0u64; 8];
-                let place = |k: usize| w[3 + k * RECORD..].as_ptr() as u64;
-                for (k, h) in handles.iter_mut().enumerate().take(n) {
-                    if w[1] >> k & 1 != 0 {
-                        *h = place(k);
-                    }
-                }
-                let depth = if w[2] != 0 { place(n) } else { 0 };
-                state::targets(list, n as u32, handles.as_ptr(), 0, &depth);
-            }
-            CLEAR_RTV => {
-                super::clear_rtv(
-                    list,
-                    w[1..].as_ptr() as u64,
-                    at_or(w, 1 + RECORD),
-                    n as u32,
-                    at(w, 1 + RECORD + 2, n),
-                );
-            }
-            CLEAR_DSV => {
-                super::clear_dsv(
-                    list,
-                    w[3..].as_ptr() as u64,
-                    w[1] as u32,
-                    Word::unword(w[2]),
-                    (w[1] >> 32) as u8,
-                    n as u32,
-                    at(w, 3 + RECORD, n),
-                );
-            }
-            COPY_TEXTURE => {
-                let step = size_of::<CopyLocation>().div_ceil(8);
-                let boxed = (w[1] >> 32) as usize;
-                super::copy_texture_region(
-                    list,
-                    at_or(w, 2),
-                    w[0] as u32,
-                    (w[0] >> 32) as u32,
-                    w[1] as u32,
-                    at_or(w, 2 + step),
-                    at(w, 2 + 2 * step, boxed),
-                );
-            }
-            _ => {}
-        }
+        #[cfg(feature = "diagnostics")]
+        let began = std::time::Instant::now();
+        closed |= one(list, op, w);
+        #[cfg(feature = "diagnostics")]
+        timed(op, began);
     }
     (calls, closed)
+}
+
+/// Runs `op` with its words `w` on `list`; whether it closed it.
+fn one(list: This, op: u64, w: &[u64]) -> bool {
+    if run_plain(op, list, w) {
+        return false;
+    }
+    let n = w.first().map_or(0, |&n| n as usize);
+    match op {
+        RESET => {
+            // (Only whether there is an allocator is looked at.)
+            let allocator: This = std::ptr::NonNull::<u64>::dangling().as_ptr().cast_const().cast();
+            super::reset(list, allocator, w[0] as This);
+        }
+        CLOSE => {
+            super::close(list);
+            return true;
+        }
+        BARRIER => {
+            super::barrier(list, n as u32, at_or(w, 1));
+        }
+        BARRIER_GROUPS => super::barrier_groups(list, n as u32, std::ptr::null()),
+        VIEWPORTS => state::viewports(list, n as u32, at(w, 1, n)),
+        SCISSORS => state::scissors(list, n as u32, at(w, 1, n)),
+        BLEND_FACTOR => state::blend_factor(list, at(w, 1, n)),
+        HEAPS => state::heaps(list, n as u32, at(w, 1, n)),
+        COMPUTE_CONSTANTS => {
+            state::compute_constants(list, w[0] as u32, w[1] as u32, at(w, 2, w[1] as usize), (w[0] >> 32) as u32)
+        }
+        GRAPHICS_CONSTANTS => {
+            state::graphics_constants(list, w[0] as u32, w[1] as u32, at(w, 2, w[1] as usize), (w[0] >> 32) as u32)
+        }
+        INDEX_BUFFER => state::index_buffer(list, at(w, 1, n)),
+        VERTEX_BUFFERS => {
+            let views = if w[1] != 0 { at_or(w, 2) } else { std::ptr::null() };
+            state::vertex_buffers(list, w[0] as u32, (w[0] >> 32) as u32, views);
+        }
+        TARGETS => {
+            let mut handles = [0u64; 8];
+            let place = |k: usize| w[3 + k * RECORD..].as_ptr() as u64;
+            for (k, h) in handles.iter_mut().enumerate().take(n) {
+                if w[1] >> k & 1 != 0 {
+                    *h = place(k);
+                }
+            }
+            let depth = if w[2] != 0 { place(n) } else { 0 };
+            state::targets(list, n as u32, handles.as_ptr(), 0, &depth);
+        }
+        CLEAR_RTV => {
+            super::clear_rtv(
+                list,
+                w[1..].as_ptr() as u64,
+                at_or(w, 1 + RECORD),
+                n as u32,
+                at(w, 1 + RECORD + 2, n),
+            );
+        }
+        CLEAR_DSV => {
+            super::clear_dsv(
+                list,
+                w[3..].as_ptr() as u64,
+                w[1] as u32,
+                Word::unword(w[2]),
+                (w[1] >> 32) as u8,
+                n as u32,
+                at(w, 3 + RECORD, n),
+            );
+        }
+        COPY_TEXTURE => {
+            let step = size_of::<CopyLocation>().div_ceil(8);
+            let boxed = (w[1] >> 32) as usize;
+            super::copy_texture_region(
+                list,
+                at_or(w, 2),
+                w[0] as u32,
+                (w[0] >> 32) as u32,
+                w[1] as u32,
+                at_or(w, 2 + step),
+                at(w, 2 + 2 * step, boxed),
+            );
+        }
+        _ => {}
+    }
+    false
 }
 
 /// The table of a list whose calls are written down: that of the others with

@@ -157,7 +157,7 @@ pub(crate) struct HostHeap {
     kept: Box<[Mutex<Option<ID3D12Resource>>]>,
     /// Where the search for free dynamic slots starts, and which are taken
     /// (by lists not yet reset).
-    next: Mutex<(u32, Vec<bool>)>,
+    next: Mutex<(u32, super::taken::Taken)>,
     /// How many dynamic slots are free (changed under `next`'s lock): with
     /// fewer than a table needs, the search is not made. Once the world
     /// had taken them all, every later table of the frame searched every
@@ -717,15 +717,63 @@ static PAGE_WRITTEN: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
 /// pass took them; slots of placed textures that held bytes of them when a
 /// pass took them; of those, the slots whose texture had been uploaded
 /// before the write (out of the queue, or in it after an upload): they are
-/// the ones that kept the bytes from before, and the ones made due when
-/// `VICTORY_PAGE_WRITES` asks for it.
-pub(crate) static PAGE_WRITES: [std::sync::atomic::AtomicU64; 4] =
-    [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+/// the ones that kept the bytes from before. Then, with
+/// `VICTORY_PAGE_SETTLE` ([`page_settle`]): writes that found their slot
+/// settling already (one upload for them all); slots made due once their
+/// writes settled; settled slots left as they were (waiting for their
+/// first upload by then, or read through a table lately); and, not a
+/// count, the slots settling at the last pass.
+pub(crate) static PAGE_WRITES: [std::sync::atomic::AtomicU64; 8] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 8];
 
 /// Frames from the pass that takes a written range to the look at its
 /// slots: the levels of one texture arrive in a few requests, and a look
 /// two frames on takes those of the next frame with it.
 const PAGE_WRITE_AFTER: u64 = 2;
+
+/// What a pass does with a slot whose texture was uploaded before a write
+/// the guards do not see landed in its memory
+/// ([`HostHeap::slots_written_under`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum AfterWrite {
+    /// Left as it is: counted only.
+    Leave,
+    /// Due [`PAGE_WRITE_AFTER`] frames on (`VICTORY_PAGE_SETTLE=0` and bit
+    /// 2 of `VICTORY_PAGE_WRITES`).
+    Due,
+    /// Settling from this moment (`crate::host::now_ms`) until its writes
+    /// settle ([`page_settle`]).
+    Settle(u64),
+}
+
+/// A texture settling under writes the guards do not see is read again
+/// once this many milliseconds have passed since the first write, written
+/// since or not: a texture written again and again is not held back for
+/// ever.
+const SETTLE_LONGEST_MS: u64 = 2000;
+
+/// Settled slots one pass makes due; the rest wait for the next pass.
+const SETTLE_MOST: usize = 64;
+
+/// `VICTORY_PAGE_SETTLE`: a texture that was uploaded when a write the
+/// guards do not see landed in its memory (DirectStorage's reads into
+/// physical pages) settles until no such write has landed in it for this
+/// many milliseconds, or [`SETTLE_LONGEST_MS`] since the first, and is
+/// then read again whole: one read for the several requests a texture's
+/// levels arrive in. Staged textures draws read through tables do so in
+/// `crate::texture::page_settled` (`VICTORY_TABLED_REREAD`); slots picked
+/// by index do so here when bit 2 of `VICTORY_PAGE_WRITES` asks for them
+/// ([`HostHeap::slots_settled`], at most [`SETTLE_MOST`] a pass). Default
+/// 200. `0`: read again at the next frame after each write, and slots due
+/// [`PAGE_WRITE_AFTER`] frames on.
+/// shortcut: 200 ms, 2 s and 64 a pass are not measured values
+/// (darkworldhm 08fdf0b4).
+pub(crate) fn page_settle() -> u64 {
+    static MS: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| {
+        std::env::var("VICTORY_PAGE_SETTLE").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(200)
+    });
+    *MS
+}
 
 /// The bytes of a write the guards do not see are in title memory `[at,
 /// at + len)`: the placed textures there changed with no descriptor
@@ -904,6 +952,10 @@ pub(crate) struct TextureQueue {
     /// they need ([`TextureQueue::hold`]), each with the write it was
     /// held as.
     held: std::collections::BTreeMap<u32, u64>,
+    /// Slots of textures uploaded before a write the guards do not see
+    /// landed in their memory, settling ([`page_settle`]): the moments
+    /// (`crate::host::now_ms`) of the first such write and of the last.
+    settling: std::collections::BTreeMap<u32, (u64, u64)>,
 }
 
 impl TextureQueue {
@@ -922,6 +974,48 @@ impl TextureQueue {
 
     fn remove(&mut self, index: u32) {
         self.slots.remove(&index);
+        self.settling.remove(&index);
+    }
+
+    /// Whether slot `index`'s texture was uploaded: out of the queue, or in
+    /// it after an upload (in part, or whole and being looked at again).
+    fn uploaded_before(&self, index: u32) -> bool {
+        self.slots.get(&index).is_none_or(|w| w.mapped > 0 || w.checked.2 != 0)
+    }
+
+    /// Slot `index`'s memory took a write at `now` (ms) after its upload:
+    /// it settles ([`TextureQueue::settled`]). True if it was settling
+    /// already (the writes then take one upload between them).
+    fn settle(&mut self, index: u32, now: u64) -> bool {
+        match self.settling.entry(index) {
+            std::collections::btree_map::Entry::Occupied(mut e) => {
+                e.get_mut().1 = now;
+                true
+            }
+            std::collections::btree_map::Entry::Vacant(e) => {
+                e.insert((now, now));
+                false
+            }
+        }
+    }
+
+    /// The settling slots whose writes have settled at `now` (ms): no write
+    /// for `quiet` ms, or the first `longest` ms ago or more. At most
+    /// `max`, those settling longest first, taken out of settling; the rest
+    /// wait for the next call.
+    fn settled(&mut self, now: u64, quiet: u64, longest: u64, max: usize) -> Vec<u32> {
+        let mut ready: Vec<(u64, u32)> = self
+            .settling
+            .iter()
+            .filter(|&(_, &(first, last))| now.saturating_sub(last) >= quiet || now.saturating_sub(first) >= longest)
+            .map(|(&index, &(first, _))| (first, index))
+            .collect();
+        ready.sort_unstable();
+        ready.truncate(max);
+        for (_, index) in &ready {
+            self.settling.remove(index);
+        }
+        ready.into_iter().map(|(_, index)| index).collect()
     }
 
     /// Up to `max` slots due at `frame`, each with its write number, in
@@ -1252,7 +1346,7 @@ pub(crate) fn slot_story(slot: u32) -> String {
         let mut text = if index < host.count {
             format!("title slot {index}, made from {}", host.describe_slot(index).unwrap_or_default())
         } else {
-            let taken = host.next.lock().unwrap_or_else(|e| e.into_inner()).1.get((index - host.count) as usize).copied();
+            let taken = host.next.lock().unwrap_or_else(|e| e.into_inner()).1.get((index - host.count) as usize);
             format!("dynamic slot {} (taken {taken:?})", index - host.count)
         };
         if twin {
@@ -1542,7 +1636,7 @@ impl HostHeap {
             waiting: Mutex::default(),
             away: Mutex::default(),
             kept: (0..count + extra).map(|_| Mutex::new(None)).collect(),
-            next: Mutex::new((0, vec![false; extra as usize])),
+            next: Mutex::new((0, super::taken::Taken::new(extra as usize))),
             free: std::sync::atomic::AtomicU32::new(extra),
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
             strides,
@@ -1666,29 +1760,9 @@ impl HostHeap {
         let enough = self.free.load(std::sync::atomic::Ordering::Relaxed) >= n
             && n < self.too_long.load(std::sync::atomic::Ordering::Relaxed);
         let n = n as usize;
-        // Search from `next` on, then from the start (extending past cursor by
-        // n - 1 so contiguous runs crossing the cursor are not missed).
-        let cursor = *next as usize;
         let end = self.dynamic as usize;
-        let second_end = cursor.saturating_add(n.saturating_sub(1)).min(end);
-        let starts = (cursor..end).chain(0..second_end);
-        let mut run = 0;
-        let mut found = None;
-        let mut last = usize::MAX;
-        let mut steps = 0u64;
-        for at in starts.take(if enough { usize::MAX } else { 0 }) {
-            // A run cannot wrap past the end.
-            if at != last.wrapping_add(1) {
-                run = 0;
-            }
-            last = at;
-            steps += 1;
-            run = if taken[at] { 0 } else { run + 1 };
-            if run == n {
-                found = Some(at + 1 - n);
-                break;
-            }
-        }
+        // Steps are words of 64 slots looked at.
+        let (found, steps) = if enough { taken.find(*next as usize, n) } else { (None, 0) };
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::DynamicSteps, steps);
         #[cfg(not(feature = "diagnostics"))]
@@ -1710,7 +1784,7 @@ impl HostHeap {
         };
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::DynamicNs, started.elapsed().as_nanos() as u64);
-        taken[first..first + n].fill(true);
+        taken.fill(first, first + n, true);
         self.free.fetch_sub(n as u32, std::sync::atomic::Ordering::Relaxed);
         *next = ((first + n) % end) as u32;
         Some(self.count + first as u32)
@@ -1883,25 +1957,48 @@ impl HostHeap {
     /// placed texture holds bytes of them ([`Spans::slots_holding`]). A
     /// slot whose texture was uploaded before the write shows the bytes
     /// from before: with `VICTORY_PAGE_WRITES` (`crate::watch::page_writes`,
-    /// bit 2) it is due again [`PAGE_WRITE_AFTER`] frames on, as memory
-    /// mapped under it would make it ([`HostHeap::texture_slots_remapped`]);
-    /// its host copy exists, so the upload needs no room on the card. A
+    /// bit 2) it settles and is due again once its writes have settled
+    /// ([`page_settle`], [`HostHeap::slots_settled`]), or
+    /// [`PAGE_WRITE_AFTER`] frames on with `VICTORY_PAGE_SETTLE=0`, as
+    /// memory mapped under it would make it
+    /// ([`HostHeap::texture_slots_remapped`]); its host copy exists, so the
+    /// upload needs no room on the card. A
     /// slot still waiting for its first upload is left as it is: that
     /// upload takes the bytes that are there by then. Slots tables read
-    /// are left to their draws. Counted either way; returns how many slots
-    /// it made due.
+    /// are left out here: the staged textures under the ranges, those
+    /// draws read through tables, settle and are read again by
+    /// `crate::texture` ([`page_settle`], `VICTORY_TABLED_REREAD`).
+    /// Counted either way; returns how many slots it made due.
     fn texture_slots_page_written(&self, frame: u64) -> usize {
         let ranges = std::mem::take(&mut *PAGE_WRITTEN.lock().unwrap_or_else(|e| e.into_inner()));
-        if ranges.is_empty() {
-            return 0;
+        // Not in this file's tests: texture.rs's own test settles textures
+        // on a made-up clock, which the real one here would run past.
+        if crate::texture::tabled_reread() && !cfg!(test) {
+            let now = crate::host::now_ms();
+            if !ranges.is_empty() {
+                crate::texture::page_written(&ranges, now);
+            }
+            crate::texture::page_settled(frame, now, page_settle(), SETTLE_LONGEST_MS);
         }
-        self.slots_written_under(&ranges, frame, crate::watch::page_writes() & 2 != 0)[2]
+        let quiet = page_settle();
+        let then = if crate::watch::page_writes() & 2 == 0 {
+            AfterWrite::Leave
+        } else if quiet > 0 {
+            AfterWrite::Settle(crate::host::now_ms())
+        } else {
+            AfterWrite::Due
+        };
+        let mut due = if ranges.is_empty() { 0 } else { self.slots_written_under(&ranges, frame, then)[2] };
+        if let AfterWrite::Settle(now) = then {
+            due += self.slots_settled(frame, now, quiet);
+        }
+        due
     }
 
     /// [`HostHeap::texture_slots_page_written`] for `ranges` (start, end):
     /// the slots that held bytes of them, those of them uploaded before,
-    /// and those made due (the latter, if `due`).
-    fn slots_written_under(&self, ranges: &[(u64, u64)], frame: u64, due: bool) -> [usize; 3] {
+    /// and those made due (`then` says what becomes of the uploaded ones).
+    fn slots_written_under(&self, ranges: &[(u64, u64)], frame: u64, then: AfterWrite) -> [usize; 3] {
         use std::sync::atomic::Ordering::Relaxed;
         let mut slots: Vec<u32> = {
             let placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
@@ -1912,18 +2009,49 @@ impl HostHeap {
         slots.retain(|&slot| !self.tabled_lately(slot, frame));
         let held = slots.len();
         let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
-        // Uploaded before: out of the queue, or in it after an upload (in
-        // part, or whole and being looked at again).
-        slots.retain(|slot| textures.slots.get(slot).is_none_or(|w| w.mapped > 0 || w.checked.2 != 0));
+        slots.retain(|&slot| textures.uploaded_before(slot));
         PAGE_WRITES[2].fetch_add(held as u64, Relaxed);
         PAGE_WRITES[3].fetch_add(slots.len() as u64, Relaxed);
-        if !due {
-            return [held, slots.len(), 0];
+        match then {
+            AfterWrite::Leave => [held, slots.len(), 0],
+            AfterWrite::Due => {
+                for &slot in &slots {
+                    textures.changed(slot, frame, frame + PAGE_WRITE_AFTER);
+                }
+                [held, slots.len(), slots.len()]
+            }
+            AfterWrite::Settle(now) => {
+                let again = slots.iter().filter(|&&slot| textures.settle(slot, now)).count();
+                PAGE_WRITES[4].fetch_add(again as u64, Relaxed);
+                PAGE_WRITES[7].store(textures.settling.len() as u64, Relaxed);
+                [held, slots.len(), 0]
+            }
         }
-        for &slot in &slots {
-            textures.changed(slot, frame, frame + PAGE_WRITE_AFTER);
+    }
+
+    /// The slots settling under writes the guards do not see whose writes
+    /// have settled by `now` (ms; [`TextureQueue::settled`], at most
+    /// [`SETTLE_MOST`]): those still uploaded before, and not read through
+    /// a table lately, are due at `frame`; a slot waiting for its first
+    /// upload by then is left to it. Returns how many it made due.
+    fn slots_settled(&self, frame: u64, now: u64, quiet: u64) -> usize {
+        use std::sync::atomic::Ordering::Relaxed;
+        let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+        if textures.settling.is_empty() {
+            return 0;
         }
-        [held, slots.len(), slots.len()]
+        let settled = textures.settled(now, quiet, SETTLE_LONGEST_MS, SETTLE_MOST);
+        let mut due = 0;
+        for &slot in &settled {
+            if !self.tabled_lately(slot, frame) && textures.uploaded_before(slot) {
+                textures.changed(slot, frame, frame);
+                due += 1;
+            }
+        }
+        PAGE_WRITES[5].fetch_add(due as u64, Relaxed);
+        PAGE_WRITES[6].fetch_add((settled.len() - due) as u64, Relaxed);
+        PAGE_WRITES[7].store(textures.settling.len() as u64, Relaxed);
+        due
     }
 
     /// Whether host slot `index` is made from the very record the title
@@ -2555,11 +2683,10 @@ impl HostHeap {
         };
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
         let end = (at + n).min(self.dynamic) as usize;
-        if let Some(slots) = guard.1.get_mut(at as usize..end) {
-            let given = slots.iter().filter(|taken| **taken).count() as u32;
+        if at <= self.dynamic {
+            let given = guard.1.fill(at as usize, end, false);
             self.free.fetch_add(given, std::sync::atomic::Ordering::Relaxed);
             self.too_long.store(u32::MAX, std::sync::atomic::Ordering::Relaxed);
-            slots.fill(false);
         }
     }
 
@@ -5299,20 +5426,68 @@ mod tests {
         assert!(heap.note_buffer(1, Some(&view), false).is_empty());
         let written = [(at, at + 0x1000)];
         // Waiting for its first upload: held, not uploaded, nothing done.
-        assert_eq!(heap.slots_written_under(&written, 50, true), [1, 0, 0]);
+        assert_eq!(heap.slots_written_under(&written, 50, AfterWrite::Due), [1, 0, 0]);
         let (queued, write) = heap.texture_slots_due(u64::MAX, 8).0[0];
         assert_eq!(queued, 1);
         heap.texture_slot_done(1, write, None);
         assert_eq!(slots(u64::MAX), []);
         // Uploaded and out of the queue. Memory elsewhere: nothing.
-        assert_eq!(heap.slots_written_under(&[(at + 0x10_0000, at + 0x10_1000)], 60, true), [0, 0, 0]);
+        assert_eq!(heap.slots_written_under(&[(at + 0x10_0000, at + 0x10_1000)], 60, AfterWrite::Due), [0, 0, 0]);
         // Under it, counted only: it stays out of the queue.
-        assert_eq!(heap.slots_written_under(&written, 60, false), [1, 1, 0]);
+        assert_eq!(heap.slots_written_under(&written, 60, AfterWrite::Leave), [1, 1, 0]);
         assert_eq!(slots(u64::MAX), []);
         // Under it, asked for: due two frames on, not before.
-        assert_eq!(heap.slots_written_under(&written, 60, true), [1, 1, 1]);
+        assert_eq!(heap.slots_written_under(&written, 60, AfterWrite::Due), [1, 1, 1]);
         assert_eq!(slots(61), []);
         assert_eq!(slots(62), [1]);
+    }
+
+    /// `VICTORY_PAGE_SETTLE`: writes under an uploaded texture take one
+    /// upload between them, once none has landed for the quiet time, or
+    /// the longest time after the first; a slot the title writes again in
+    /// the meantime is left to its first upload.
+    #[test]
+    fn page_writes_under_an_uploaded_texture_settle_into_one_upload() {
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return; // no host GPU
+        };
+        let slots = |at: u64| -> Vec<u32> { heap.texture_slots_due(at, 8).0.into_iter().map(|d| d.0).collect() };
+        let upload = || {
+            let (queued, write) = heap.texture_slots_due(u64::MAX, 8).0[0];
+            assert_eq!(queued, 1);
+            heap.texture_slot_done(1, write, None);
+        };
+        // 64x64 BC7, one mip, at an address no test and no title uses.
+        let at = 0x7fec_0000_0000u64;
+        let mut desc = [0u32; 16];
+        (desc[10], desc[11]) = (at as u32, (at >> 32) as u32);
+        let view = View::Placed(false, [3, 0, 0, 0, 64, 0, 64, 0x1_0001, 98, 1, 0, 0x105, 0, 0], desc);
+        assert!(heap.note_buffer(1, Some(&view), false).is_empty());
+        upload();
+        let written = [(at, at + 0x1000)];
+        // Two writes 100 ms apart: one slot settling, out of the queue.
+        assert_eq!(heap.slots_written_under(&written, 60, AfterWrite::Settle(1_000)), [1, 1, 0]);
+        assert_eq!(heap.slots_written_under(&written, 61, AfterWrite::Settle(1_100)), [1, 1, 0]);
+        assert_eq!(slots(u64::MAX), []);
+        // 150 ms after the last write: not yet.
+        assert_eq!(heap.slots_settled(62, 1_250, 200), 0);
+        // 200 ms: due at once, and settling no more.
+        assert_eq!(heap.slots_settled(63, 1_300, 200), 1);
+        assert_eq!(slots(63), [1]);
+        upload();
+        assert_eq!(heap.slots_settled(64, 5_000, 200), 0);
+        // Written every 100 ms: due 2 s after the first write.
+        for (k, now) in (10_000..=12_000).step_by(100).enumerate() {
+            assert_eq!(heap.slots_written_under(&written, 70 + k as u64, AfterWrite::Settle(now)), [1, 1, 0]);
+        }
+        assert_eq!(heap.slots_settled(100, 12_050, 200), 1);
+        upload();
+        // Settling, then the title writes the slot again: left to the
+        // upload that write asks for.
+        assert_eq!(heap.slots_written_under(&written, 200, AfterWrite::Settle(20_000)), [1, 1, 0]);
+        assert!(heap.note_buffer(1, Some(&view), false).is_empty());
+        assert_eq!(heap.slots_settled(201, 20_500, 200), 0);
+        assert_eq!(slots(u64::MAX), [1]);
     }
 
     /// `VICTORY_STALE_TEXTURES=0`: nothing is ever stale, and a view that
