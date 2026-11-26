@@ -44,13 +44,72 @@ pub(crate) struct Pending {
     /// whether a draw or dispatch has requested it yet.
     key: String,
     used: AtomicBool,
-    /// A pass over the screen ([`GraphicsState::screen_pass`]).
+    /// A pass over the screen ([`GraphicsState::screen_pass`]), or with
+    /// `VICTORY_SCENE_INPUT=1` one of the opening scene's producers.
     screen: bool,
+    /// One of the opening scene's lighting, tiling or bake producers, made
+    /// at creation even on a cold cache ([`scene_input`]).
+    scene_input: bool,
+    /// Why it is never made ([`left_out`]).
+    left_out: Option<&'static str>,
     /// Whether draws already waited [`GIVE_UP`] for it in vain: later
     /// draws do not wait for it (see [`wait`]).
     given_up: AtomicBool,
     /// What draws waited for it in vain so far, in microseconds.
     waited_us: AtomicU64,
+}
+
+fn named(shaders: &[Arc<Shader>], name: &[u8]) -> bool {
+    shaders
+        .iter()
+        .any(|s| s.stage == "compute" && s.container.windows(name.len()).any(|w| w == name))
+}
+
+/// Ray-tracing programs left out without the structure builder: with
+/// `VICTORY_RT_RESOLVE=0` the ~1,000 `CS_RaytracingResolve` pipelines,
+/// which shade no hits without it and clog a cold compiler queue; with
+/// `VICTORY_ACTIVATE_RAYS=0` `CS_ScreenProbes_ActivateRays`.
+fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
+    static SKIP_RT_RESOLVE: OnceLock<bool> = OnceLock::new();
+    let skip_rt = *SKIP_RT_RESOLVE.get_or_init(|| {
+        let builder = std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1");
+        !builder && std::env::var_os("VICTORY_RT_RESOLVE").is_some_and(|v| v == "0")
+    });
+    if skip_rt && named(shaders, b"CS_RaytracingResolve") {
+        return Some("shades ray-tracing hits without BVH, left out");
+    }
+    static SKIP_ACTIVATE_RAYS: OnceLock<bool> = OnceLock::new();
+    let skip_activate =
+        *SKIP_ACTIVATE_RAYS.get_or_init(|| std::env::var_os("VICTORY_ACTIVATE_RAYS").is_some_and(|v| v == "0"));
+    if skip_activate && named(shaders, b"CS_ScreenProbes_ActivateRays") {
+        return Some("ray activation shader without BVH, left out");
+    }
+    None
+}
+
+/// Whether the opening scene's producers are made first
+/// (`VICTORY_SCENE_INPUT=1`; off): see [`scene_input`].
+fn scene_inputs() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_SCENE_INPUT").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// The opening scene's lighting, tiling and bake programs, so cutscene
+/// lighting and bakes never miss their first frame; and passes over the
+/// screen that use a mesh shader are no longer counted as screen passes.
+fn scene_input(shaders: &[Arc<Shader>]) -> bool {
+    scene_inputs()
+        && shaders.iter().any(|s| {
+            matches!(
+                s.hash.as_str(),
+                "970c4fbb3b017c0e"
+                    | "068c90badc86f1fd"
+                    | "e4a7e088c7780ce8"
+                    | "ebe4e53f031f5249"
+                    | "2cc4c197ee29e291"
+                    | "369cbe906ea72764"
+            ) || crate::draw::BAKE_PIXEL_SHADERS.contains(&s.hash.as_str())
+        })
 }
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
@@ -67,8 +126,15 @@ impl Pending {
             key.update(s.hash.as_bytes());
         }
         key.update(graphics.as_ref().map(|g| g.describe()).unwrap_or_default().as_bytes());
+        let scene_input = scene_input(&shaders);
+        let screen = (graphics.as_ref().is_some_and(|g| g.screen_pass())
+            && !(scene_inputs() && shaders.iter().any(|s| s.stage == "mesh")))
+            || scene_input;
+        let left_out = left_out(&shaders);
         Pending {
-            screen: graphics.as_ref().is_some_and(|g| g.screen_pass()),
+            screen,
+            scene_input,
+            left_out,
             shaders,
             graphics,
             queue_state: AtomicU8::new(NOT_QUEUED),
@@ -175,6 +241,9 @@ pub(crate) fn waiting() -> u64 {
 /// The host pipeline if it is made (or is made within the frame's budget);
 /// queues it on first use.
 pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
+    if p.left_out.is_some() {
+        return None;
+    }
     // A still-pending pipeline was requested by the title too. Prewarm it
     // on the next launch, even if this run never got to use it.
     if !p.used.load(Ordering::Relaxed) && !p.used.swap(true, Ordering::Relaxed) {
@@ -258,6 +327,9 @@ fn dropped(p: &Arc<Pending>, frame: u64) {
 /// Makes `p` on this thread if it is not made yet (waiting for a worker
 /// that is making it); whether it has a host pipeline.
 pub(crate) fn now(p: &Arc<Pending>) -> bool {
+    if p.left_out.is_some() {
+        return false;
+    }
     p.make();
     p.made.get().is_some_and(|made| made.is_some())
 }
@@ -276,11 +348,15 @@ pub(crate) fn state(p: &Pending) -> Option<bool> {
 }
 
 /// At the title's creation of a pipeline: starts it at once if an earlier
-/// run drew with it (during loading, so the world's first frames find it).
+/// run drew with it (during loading, so the world's first frames find it),
+/// or if it is one of the opening scene's producers.
 pub(crate) fn early(p: &Arc<Pending>) {
-    if !p.shaders.is_empty() && super::library::wanted_early(&p.key) {
+    if p.left_out.is_some() {
+        return;
+    }
+    if !p.shaders.is_empty() && (p.scene_input || super::library::wanted_early(&p.key)) {
         super::library::EARLY.fetch_add(1, Ordering::Relaxed);
-        start(p, EARLY);
+        start(p, if p.scene_input { REQUESTED } else { EARLY });
     }
 }
 
@@ -629,8 +705,13 @@ fn next(screens_only: bool) -> Arc<Pending> {
 /// 64), else two thirds of the logical processors, 2 to 16. They run below the
 /// title's own threads, and a cold cache queues hundreds at once.
 fn worker_count(asked: Option<usize>, processors: usize) -> usize {
+    worker_count_for(asked, processors, false)
+}
+
+fn worker_count_for(asked: Option<usize>, processors: usize, limited_ram: bool) -> usize {
     match asked {
         Some(n) => n.clamp(1, 64),
+        None if limited_ram => (processors * 3 / 4).clamp(2, 8),
         None => (processors * 2 / 3).clamp(2, 16),
     }
 }
@@ -644,11 +725,12 @@ fn workers() -> bool {
     static RUNNING: OnceLock<bool> = OnceLock::new();
     *RUNNING.get_or_init(|| {
         let mut running = false;
-        let workers = worker_count(
+        let workers = worker_count_for(
             std::env::var("VICTORY_PIPELINE_WORKERS")
                 .ok()
                 .and_then(|v| v.trim().parse().ok()),
             std::thread::available_parallelism().map_or(2, |n| n.get()),
+            crate::residency::limited_host_ram(),
         );
         tracing::info!(workers, "pipeline workers");
         if graphics_first() {
@@ -777,6 +859,10 @@ mod tests {
         assert_eq!(worker_count(None, 64), 16);
         assert_eq!(worker_count(Some(0), 24), 1);
         assert_eq!(worker_count(Some(20), 24), 20);
+        assert_eq!(worker_count_for(None, 8, true), 6);
+        assert_eq!(worker_count_for(None, 16, true), 8);
+        assert_eq!(worker_count_for(None, 24, true), 8);
+        assert_eq!(worker_count_for(Some(12), 8, true), 12);
     }
 
     /// A pipeline one wait gave up on is not waited for again: nothing makes

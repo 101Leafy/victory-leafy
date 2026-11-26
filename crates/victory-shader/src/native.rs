@@ -546,6 +546,8 @@ fn records(meta: &[u8], from: usize) -> Result<(Vec<RootParam>, Vec<UsedResource
             slot: e[22],
         };
         let sgprs = match root {
+            // Root constants (graphics stages), their words in user data.
+            RootType::Constants => u.dwords.into(),
             RootType::Table => 1,
             RootType::Descriptor => 2,
             // The code holds its words; no user data.
@@ -1408,6 +1410,21 @@ mod tests {
         assert_eq!((m.version, m.code_dwords, m.used[0].kind), (2, 0x66, ResourceType::Cbv));
         v2.push(0);
         assert!(loose_metadata(&v2).is_err());
+    }
+
+    /// A pixel stage's 4 root constants at b500, user data 9, as in the
+    /// title's 0x1c8 calls.
+    #[test]
+    fn loose_metadata_takes_root_constants() {
+        let mut v2 = vec![2, 0, 0, 0, 0, 0, 0, 0, 0x20, 0, 0, 0, 0x40, 8, 1, 0];
+        v2.extend(record(0x41, 2, 0, 0, 0x1f4, 4, 9, 1));
+        v2.extend(record(0x43, 0, 0, 0, 0, 0, 0, 0));
+        let size = (v2.len() - 0xc) as u32;
+        v2[4..8].copy_from_slice(&size.to_le_bytes());
+        let m = loose_metadata(&v2).unwrap();
+        assert_eq!(m.layout.len(), 1);
+        let p = &m.layout[0];
+        assert_eq!((p.root, p.sgprs, p.base_register, p.user_data), (RootType::Constants, 4, 0x1f4, 9));
     }
 
     #[test]

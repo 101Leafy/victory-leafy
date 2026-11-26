@@ -651,6 +651,39 @@ pub(crate) struct Plane {
     count: u32,
     resources: *const This,
 }
+/// A present plane as the retail PresentX passes it: the start above, then
+/// the source rectangles, the destination, a color space and seven option
+/// words. A title presenting one plane may pass the start only.
+#[cfg(windows)]
+#[repr(C)]
+struct RetailPlane {
+    start: Plane,
+    source_rects: *const (),
+    destination: *const (),
+    color_space: u32,
+    options: [u32; 7],
+}
+#[cfg(windows)]
+const _: () = assert!(size_of::<RetailPlane>() == 72);
+
+/// The second plane's first resource, read at the retail stride
+/// ([`RetailPlane`]) without trusting it: `None` unless it is one of ours.
+#[cfg(windows)]
+fn second_plane(parameters: *const Plane) -> Option<This> {
+    let second = parameters.cast::<RetailPlane>().wrapping_add(1).cast::<u8>();
+    let mut start = [0; size_of::<Plane>()];
+    if !crate::host::read_into(second, &mut start) {
+        return None;
+    }
+    // SAFETY: the bytes of a `Plane`, copied.
+    let plane = unsafe { start.as_ptr().cast::<Plane>().read_unaligned() };
+    let mut pointer = [0; size_of::<This>()];
+    if plane.count == 0 || plane.resources.is_null() || !crate::host::read_into(plane.resources.cast(), &mut pointer) {
+        return None;
+    }
+    let resource = usize::from_ne_bytes(pointer) as This;
+    crate::resource::is_resource(resource).then_some(resource)
+}
 /// Submission tagged with the frame it belongs to `(count, lists, frame
 /// token, flags)`; frames are paced elsewhere, so it runs as a plain one.
 extern "system" fn execute_x(this: This, count: u32, lists: *const This, _token: u64, _flags: u32) {
@@ -801,6 +834,9 @@ impl Written {
             } else {
                 at.cast::<u64>().write_unaligned(value);
             }
+            // The title may wait on the address.
+            #[cfg(windows)]
+            windows_sys::Win32::System::Threading::WakeByAddressAll(at.cast());
         }
     }
 }
@@ -927,16 +963,9 @@ extern "system" fn present(
     #[cfg(windows)]
     if behind::on() && !this.is_null() {
         const COPY_SOURCE: u32 = 0x800;
-        let texture = if planes > 0
-            // SAFETY: the title passes `planes` plane descriptions.
-            && let Some(plane) = unsafe { plane_parameters.as_ref() }
-            && plane.count > 0
-            && !plane.resources.is_null()
-        {
-            // SAFETY: the plane lists `count` resources.
-            let resource = unsafe { *plane.resources };
-            // The state the lists recorded so far leave it in (the next
-            // frame's, recorded before this is shown, go on from there).
+        // The state the lists recorded so far leave it in (the next
+        // frame's, recorded before this is shown, go on from there).
+        let hosted = |resource: This| {
             crate::resource::host_copy(resource).map(|copy| {
                 let state = crate::resource::host_transition(resource, COPY_SOURCE).map_or(COPY_SOURCE, |(_, before)| before);
                 crate::resource::host_transition(resource, state);
@@ -945,11 +974,30 @@ extern "system" fn present(
                 let state = if crate::list::thin::wanted() { u32::MAX } else { state };
                 (resource as usize, copy, state)
             })
+        };
+        let texture = if planes > 0
+            // SAFETY: the title passes `planes` plane descriptions.
+            && let Some(plane) = unsafe { plane_parameters.as_ref() }
+            && plane.count > 0
+            && !plane.resources.is_null()
+        {
+            // SAFETY: the plane lists `count` resources.
+            hosted(unsafe { *plane.resources })
         } else {
             None
         };
         let resource = texture.as_ref().map_or(0, |t| t.0);
-        behind::present(this, texture.map(|(_, copy, state)| (copy, state)), Shown { frame, resource });
+        let overlay = (crate::compose::on() && planes > 1 && !plane_parameters.is_null())
+            .then(|| second_plane(plane_parameters))
+            .flatten()
+            .filter(|&over| over as usize != resource)
+            .and_then(hosted);
+        behind::present(
+            this,
+            texture.map(|(_, copy, state)| (copy, state)),
+            overlay.map(|(_, copy, state)| (copy, state)),
+            Shown { frame, resource },
+        );
         called.end();
         #[cfg(feature = "diagnostics")]
         frame_ends();
@@ -969,8 +1017,21 @@ extern "system" fn present(
         const COPY_SOURCE: u32 = 0x800;
         let state = crate::resource::host_transition(resource, COPY_SOURCE)
             .map_or(COPY_SOURCE, |(_, before)| before);
-        show(texture, state, Shown { frame, resource: resource as usize });
+        let overlay = (crate::compose::on() && planes > 1)
+            .then(|| second_plane(plane_parameters))
+            .flatten()
+            .filter(|&over| over != resource)
+            .and_then(|over| {
+                crate::resource::host_resource(over).map(|texture| {
+                    let state = crate::resource::host_transition(over, COPY_SOURCE).map_or(COPY_SOURCE, |(_, before)| before);
+                    (over, texture, state)
+                })
+            });
+        show(texture, state, overlay.map(|(_, texture, state)| (texture, state)), Shown { frame, resource: resource as usize });
         crate::resource::host_transition(resource, state);
+        if let Some((over, _, over_state)) = overlay {
+            crate::resource::host_transition(over, over_state);
+        }
         let _ = host;
     }
     #[cfg(not(windows))]
@@ -1001,13 +1062,19 @@ struct Shown {
     resource: usize,
 }
 
-/// Shows `texture`, in host state `state`, in our window.
+/// Shows `texture`, in host state `state`, in our window, and `overlay`
+/// (in its own state) over it ([`crate::compose`]).
 #[cfg(windows)]
-fn show(texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource, state: u32, what: Shown) {
+fn show(
+    texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    state: u32,
+    overlay: Option<(&windows::Win32::Graphics::Direct3D12::ID3D12Resource, u32)>,
+    what: Shown,
+) {
     let Some(host) = crate::host::host() else {
         return;
     };
-    let shown = host.present(texture, state, what.frame);
+    let shown = host.present_planes(texture, state, overlay, what.frame);
     #[cfg(feature = "diagnostics")]
     blinks(what.frame, what.resource as This, state, shown);
     #[cfg(not(feature = "diagnostics"))]
