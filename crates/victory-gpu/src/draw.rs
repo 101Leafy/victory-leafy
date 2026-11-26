@@ -3381,12 +3381,15 @@ impl State {
             crate::pipeline::note_drop(self.pipeline as This);
             return;
         }
-        // The ray-tracing structure builder's stages run all or none.
-        if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
+        // The ray-tracing structure builder's stages run all or none, and
+        // what walks its structures waits until it has run whole
+        // (`pipeline::builder`, upstream #2118 and #2311).
+        if let Some(why) = crate::pipeline::held_back(self.pipeline as This) {
+            once!(why, "a dispatch held back");
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             {
-                crate::pipeline::note_why("a stage of the ray-tracing structure builder, which is off".to_owned());
+                crate::pipeline::note_why(why.to_owned());
                 self.list_dropped_roots([x, y, z]);
             }
             return;
@@ -4637,7 +4640,10 @@ impl State {
             crate::pipeline::note_drop(self.pipeline as This);
             return false;
         }
-        if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
+        if let Some(held) = crate::pipeline::held_back(self.pipeline as This) {
+            once!(why = held, "an indirect call held back");
+            #[cfg(feature = "diagnostics")]
+            crate::pipeline::note_why(format!("indirect kind {kind}: {held}"));
             return false;
         }
         const DRAW: u32 = 0;
