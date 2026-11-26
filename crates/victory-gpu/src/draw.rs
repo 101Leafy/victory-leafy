@@ -857,6 +857,13 @@ fn heap_looks(
     {
         use crate::copystat::{C, add};
         add(C::HeapLookedWritten, if all { 0 } else { written });
+        let due = ranges.due();
+        add(C::HeapDueFreed, due.freed);
+        add(C::HeapDueSweepPart, due.sweep_part);
+        add(C::HeapDueSweepChanged, due.sweep_changed);
+        add(C::HeapDueOrphanPart, due.orphan_part);
+        add(C::HeapDueOrphanChanged, due.orphan_changed);
+        add(C::HeapDueTwice, due.twice);
     }
     // Whether the device was there before the pass: a view that removes
     // it is named below.
@@ -875,12 +882,13 @@ fn heap_looks(
     }
     let heap = Shared(heap);
     /// What a look at a slot found.
+    #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
     enum Look {
         /// No buffer view of ours.
         Nothing,
         /// A buffer view the pass leaves for now: its memory has no host
-        /// copy yet, or a draw's table brings it up to date.
-        Later,
+        /// copy yet, or a draw's table brings it up to date (`true`).
+        Later(bool),
         /// Its copy and range, and whether it is an unordered view.
         Shows((std::sync::Arc<crate::shadow::Shadow>, u64, u64), bool),
     }
@@ -893,7 +901,7 @@ fn heap_looks(
         let record = crate::descriptor::record_words(handle);
         // A draw's table's: the draw brings what it reads up to date.
         if host.copied_tabled(index, frame) {
-            return (Some(record), Look::Later);
+            return (Some(record), Look::Later(true));
         }
         let Some(view) = host.mirror_for_pass(index, handle) else {
             return (Some(record), Look::Nothing);
@@ -901,7 +909,7 @@ fn heap_looks(
         // The copy the slot shows (`buffer_copy`), not the one the
         // view's range alone would find.
         let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(&view) else {
-            return (Some(record), Look::Later);
+            return (Some(record), Look::Later(false));
         };
         #[cfg(feature = "diagnostics")]
         if host.shows(index, &shadow.buffer) == Some(false) {
@@ -917,8 +925,12 @@ fn heap_looks(
     const AT_A_TIME: usize = 256;
     const BATCH: usize = 1024;
     let mut looked = 0;
+    // Looks that found again what the last one did (a slot newly left for
+    // later or found empty counts as well), and split: the same copy and
+    // range, an orphan still left for later (of which for a draw's table),
+    // still nothing.
     #[cfg(feature = "diagnostics")]
-    let mut same = 0u64;
+    let (mut same, mut shows_same, mut later, mut tabled, mut nothing) = (0u64, 0u64, 0u64, 0u64, 0u64);
     for (b, batch) in slots.chunks(if ahead { BATCH } else { slots.len().max(1) }).enumerate() {
         if ahead && CLOSING.load(Ordering::Relaxed) {
             let rest = &slots[b * BATCH..];
@@ -957,6 +969,17 @@ fn heap_looks(
                     }
                     _ => before.is_none(),
                 });
+                match &shows {
+                    Look::Shows((shadow, from, to), _) => {
+                        shows_same += u64::from(before == Some((std::sync::Arc::as_ptr(shadow) as usize, *from, *to)));
+                    }
+                    Look::Later(draw) if before.is_none() && ranges.orphaned(index) => {
+                        later += 1;
+                        tabled += u64::from(*draw);
+                    }
+                    Look::Nothing if before.is_none() && !ranges.orphaned(index) => nothing += 1,
+                    _ => {}
+                }
             }
             let entry = record.and_then(crate::descriptor::record_entry);
             match (record, shows) {
@@ -967,7 +990,7 @@ fn heap_looks(
                         unordered.push(range);
                     }
                 }
-                (Some(record), Look::Later) => ranges.orphan(index, record, entry),
+                (Some(record), Look::Later(_)) => ranges.orphan(index, record, entry),
                 _ => {
                     ranges.forget(index);
                 }
@@ -979,6 +1002,10 @@ fn heap_looks(
         use crate::copystat::{C, add};
         add(C::HeapLooked, looked as u64);
         add(C::HeapSameAgain, same);
+        add(C::HeapAgainShows, shows_same);
+        add(C::HeapAgainLater, later);
+        add(C::HeapAgainTabled, tabled);
+        add(C::HeapAgainNothing, nothing);
     }
     if crate::picked::on() {
         crate::picked::shown(unordered, all);
