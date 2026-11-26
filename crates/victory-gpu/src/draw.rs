@@ -2767,9 +2767,20 @@ impl State {
                 && heap.handle(index).is_some_and(|handle| !host.texture_slot_made_from(index, handle));
             #[cfg(feature = "diagnostics")]
             let mirroring = std::time::Instant::now();
-            let view = heap.handle(index).and_then(|handle| {
-                if shows_other || late { crate::descriptor::view(handle) } else { host.mirror(index, handle, true) }
+            // (The record is read once: the upload is made of this view, and
+            // the slot made later by this key, whatever the title writes
+            // there meanwhile.)
+            let picked = heap.handle(index).and_then(|handle| {
+                if shows_other || late {
+                    host.prepare_texture_slot(index, handle)
+                } else {
+                    host.mirror(index, handle, true).map(|view| (view, 0))
+                }
             });
+            let (view, key) = match picked {
+                Some((view, key)) => (Some(view), key),
+                None => (None, 0),
+            };
             #[cfg(feature = "diagnostics")]
             crate::copystat::lap(crate::copystat::C::HeapTexMirrorNs, mirroring);
             let at_once = || {
@@ -2827,7 +2838,7 @@ impl State {
                 // Its bytes are in, or on the way there in a list before.
                 if late && texture.is_some_and(crate::pool::fresh) && !crate::texture::ahead::there(resource) {
                     if let Some(handle) = heap.handle(index) {
-                        host.texture_slot_show_after(list, index, handle);
+                        host.texture_slot_show_after(list, index, handle, key);
                     }
                 } else {
                     at_once();
@@ -2858,7 +2869,7 @@ impl State {
                 use crate::texture::ahead::Taken;
                 let (Taken::New(job) | Taken::Known(job)) = ahead;
                 if let Some(handle) = heap.handle(index) {
-                    host.texture_slot_show_ahead(job, index, handle);
+                    host.texture_slot_show_ahead(job, index, handle, key);
                 }
                 if let Taken::New(job) = ahead {
                     crate::texture::ahead::send(job);
@@ -2879,10 +2890,10 @@ impl State {
                 crate::texture::PICKING.set(None);
             }
             if shows_other && let Some(handle) = heap.handle(index) {
-                host.texture_slot_flip(list, index, handle);
+                host.texture_slot_flip(list, index, handle, key);
             }
             if late && let Some(handle) = heap.handle(index) {
-                host.texture_slot_show_after(list, index, handle);
+                host.texture_slot_show_after(list, index, handle, key);
             }
             #[cfg(feature = "diagnostics")]
             if crate::book::on()
