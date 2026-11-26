@@ -1350,6 +1350,21 @@ fn log_memory() {
         mb(below_unsized),
         mb(above),
     );
+    let [ownerless, cap, freed] = crate::descriptor::ownerless_kept();
+    tracing::info!(
+        "memory, view entries no resource owns: {} kept (at most {}, 0: all; VICTORY_OWNERLESS_VIEWS), \
+         {} of them freed under the cap so far",
+        ownerless,
+        cap,
+        freed,
+    );
+    tracing::info!(
+        "placed texture views: slots showing an older texture now {}, made null for want of room so far {} \
+         (VICTORY_KEPT_VIEWS_YIELD=1: {})",
+        crate::descriptor::host::KEEPING_NOW.load(std::sync::atomic::Ordering::Relaxed),
+        crate::descriptor::host::KEPT_YIELDED.load(std::sync::atomic::Ordering::Relaxed),
+        if crate::descriptor::host::kept_views_yield() { "on" } else { "off" },
+    );
 }
 
 /// Microseconds since the first call.

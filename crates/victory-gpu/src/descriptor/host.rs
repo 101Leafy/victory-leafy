@@ -397,6 +397,11 @@ pub(crate) struct HostHeap {
     /// waited for most (5.6 % of their time, profile waits-1: each descriptor
     /// made for a draw takes it, and lets go of what the slot held under it).
     kept: Box<[Mutex<Option<ID3D12Resource>>]>,
+    /// The slots that go on showing an older view of a texture while the
+    /// newer one waits ([`keep_views`], [`keep_shown`]), with
+    /// [`kept_views_yield`]: what they hold is given up when the card has no
+    /// room ([`HostHeap::yield_kept_views`]).
+    keeping: Mutex<std::collections::BTreeSet<u32>>,
     /// The dynamic slots free and taken (by lists not yet reset): free runs
     /// in shards, so a table gets the smallest run that holds it without
     /// every recording thread queueing for one lock.
@@ -1935,6 +1940,7 @@ impl HostHeap {
             waiting: Mutex::default(),
             away: Mutex::default(),
             kept: (0..count + extra).map(|_| Mutex::new(None)).collect(),
+            keeping: Mutex::default(),
             pool: Pools::new(extra as usize),
             free: std::sync::atomic::AtomicU32::new(extra),
 
@@ -2041,6 +2047,12 @@ fn null_sampler(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 }
 
 impl HostHeap {
+    /// Which heap this is ([`NEXT_ID`]): dynamic slots go back only to the
+    /// heap that took them, never to one made later at the same address.
+    pub(crate) fn id(&self) -> u64 {
+        self.id
+    }
+
     /// `n` consecutive free dynamic slots (view heaps only), taken until
     /// [`HostHeap::release`]: the first's index.
     pub(crate) fn dynamic(&self, n: u32) -> Option<u32> {
@@ -2718,6 +2730,49 @@ impl HostHeap {
         }
     }
 
+    /// The card has no room for the textures the queue waits to make
+    /// ([`kept_views_yield`]): the slots that go on showing an older texture
+    /// while a newer view waits are made null, so that nothing holds what
+    /// they showed and the sweep can let it go; their newer views stay in the
+    /// queue and are made when there is room. Returns how many slots were
+    /// made null.
+    ///
+    /// Each such slot held the host copy of a texture the title had replaced
+    /// there; with the card full the newer one was never made, so the older
+    /// one was never let go: in the world, some 3 GB of the card stayed
+    /// "filled idle but held" while about 3,500 uploads of the queue were
+    /// refused (Skyfrye).
+    pub(crate) fn yield_kept_views(&self) -> u64 {
+        let slots = std::mem::take(&mut *self.keeping.lock().unwrap_or_else(|e| e.into_inner()));
+        let mut n = 0;
+        for index in slots {
+            let _made = self.made.lock(index);
+            if self.made.get(index).is_some_and(|key| key != 0) {
+                self.unmake(index);
+                n += 1;
+            }
+        }
+        let before = KEPT_YIELDED.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+        if n != 0 && (before == 0 || before / 10_000 != (before + n) / 10_000) {
+            tracing::info!(
+                "slots that showed an older texture made null for want of room, since the start: {} (VICTORY_KEPT_VIEWS_YIELD)",
+                before + n
+            );
+        }
+        n
+    }
+
+    fn note_keeping(&self, index: u32) {
+        if kept_views_yield() {
+            self.keeping.lock().unwrap_or_else(|e| e.into_inner()).insert(index);
+        }
+    }
+
+    /// How many slots go on showing an older texture now ([`HostHeap::keeping`]).
+    pub(crate) fn keeping_now(&self) -> usize {
+        self.keeping.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
+
     /// Makes host slot `index` null again, as it is before its view is
     /// made: a null view of the kind it held. Under its lock ([`Made`]).
     fn unmake(&self, index: u32) {
@@ -2963,10 +3018,16 @@ impl HostHeap {
     }
 
     /// Gives back `n` dynamic slots from `first` (an index [`dynamic`]
-    /// returned).
+    /// returned), if this heap took them: `id` is [`HostHeap::id`]'s. The
+    /// title can release the heap a list's slots came from and make another
+    /// at the same address; the list's reset then names the old heap, and
+    /// must not free the new one's slots.
     ///
     /// [`dynamic`]: HostHeap::dynamic
-    pub(crate) fn release(&self, first: u32, n: u32) {
+    pub(crate) fn release(&self, id: u64, first: u32, n: u32) {
+        if id != self.id {
+            return;
+        }
         let Some(at) = first.checked_sub(self.count) else {
             return;
         };
@@ -3092,6 +3153,10 @@ impl HostHeap {
 
     /// Slot `index` now views `resource` (or nothing of the host's).
     fn keep(&self, index: u32, resource: Option<ID3D12Resource>) {
+        // What it shows now is what it was written with, or nothing.
+        if kept_views_yield() {
+            self.keeping.lock().unwrap_or_else(|e| e.into_inner()).remove(&index);
+        }
         let Some(slot) = self.kept.get(index as usize) else {
             return;
         };
@@ -3472,6 +3537,9 @@ impl HostHeap {
                 let kin = kin(&old, &view);
                 if kin == Kin::Same {
                     KEPT_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    // Under the slot's lock: a make after this one takes it
+                    // out again.
+                    self.note_keeping(index);
                     drop(held);
                     self.unmake_stale(index, stale);
                     return Some(view);
@@ -3483,6 +3551,7 @@ impl HostHeap {
                     let kept = kin.kept(keep_shown());
                     rewritten(kin, kept);
                     if kept {
+                        self.note_keeping(index);
                         drop(held);
                         self.unmake_stale(index, stale);
                         return Some(view);
@@ -3500,6 +3569,14 @@ impl HostHeap {
             } else {
                 make_twinned(&view, self.at(index), self.twin(index))
             };
+            // A texture the card had no memory for: the slot is not noted as
+            // made from this record, so the next ask makes it again (it kept
+            // its null view for good).
+            let retry = kept.is_none()
+                && matches!(view, View::Shader(resource, _) if crate::resource::retrying(resource as crate::object::This));
+            if retry {
+                self.made.set(index, 0);
+            }
             if kept.is_none() && !self.sampler {
                 null_for(&view, self.at(index));
             }
@@ -3508,7 +3585,7 @@ impl HostHeap {
             }
             self.twin_made(index, kept.is_some() && twinned(&view));
             self.keep(index, kept.flatten());
-            self.quick_is(index, if later { 0 } else { key });
+            self.quick_is(index, if later || retry { 0 } else { key });
             drop(held);
             self.unmake_stale(index, stale);
         }
@@ -4651,6 +4728,24 @@ fn keep_views() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_KEEP_VIEWS").is_none_or(|v| v != "0"))
 }
 
+/// Slots made null since the start because they showed an older texture
+/// while the card had no room for the newer one
+/// ([`HostHeap::yield_kept_views`]).
+pub(crate) static KEPT_YIELDED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Slots showing an older texture as of the texture pass's last look.
+pub(crate) static KEEPING_NOW: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Whether a slot that goes on showing an older texture while the newer one
+/// waits ([`keep_views`], [`keep_shown`]) gives it up when the card has no
+/// room for the newer one (`VICTORY_KEPT_VIEWS_YIELD=1`; off by default: it
+/// keeps it until the newer one is made, which with the card full may be
+/// never).
+pub(crate) fn kept_views_yield() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_KEPT_VIEWS_YIELD").is_some_and(|v| v == "1"))
+}
+
 /// What the texture view a slot is written with has to do with the one it
 /// shows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -5417,6 +5512,24 @@ mod tests {
         assert_eq!(constant_bytes(u32::MAX), 64 << 10);
     }
 
+    /// With the card full, a slot that goes on showing an older texture while
+    /// the newer one waits gives it up: it is made null and leaves the set. A
+    /// slot not made is not counted, and one outside the set is left as it is.
+    #[test]
+    fn slots_keeping_an_older_texture_give_it_up_for_room() {
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return; // no host GPU
+        };
+        heap.made.set(2, 1 << 32 | 5);
+        heap.made.set(3, 1 << 32 | 6);
+        heap.keeping.lock().unwrap().extend([2, 4]);
+        assert_eq!(heap.keeping_now(), 2);
+        assert_eq!(heap.yield_kept_views(), 1);
+        assert_eq!([2, 3, 4].map(|i| heap.made.get(i)), [Some(0), Some(1 << 32 | 6), Some(0)]);
+        assert_eq!(heap.keeping_now(), 0);
+        assert_eq!(heap.yield_kept_views(), 0);
+    }
+
     #[test]
     fn constant_view_from_world_load_fits_the_device() {
         assert_eq!(constant_view_bytes(1_087_744), 65_536);
@@ -6111,9 +6224,27 @@ mod tests {
         assert_eq!((a, b), (4, 4 + heap.dynamic - 100));
         // 40 left at the end: 50 do not fit until something is given back.
         assert_eq!(heap.dynamic(50), None);
-        heap.release(a, 50);
+        heap.release(heap.id, a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
+    }
+
+    /// A run of dynamic slots goes back only to the heap that took it: the
+    /// title can release a heap while a list still holds slots of it, and
+    /// make another at the same address before that list is reset.
+    #[test]
+    fn dynamic_slots_are_given_back_only_to_the_heap_that_took_them() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let (Some(a), Some(b)) = (HostHeap::new(false, 4), HostHeap::new(false, 4)) else {
+            return; // no host GPU
+        };
+        assert_ne!(a.id(), b.id());
+        let first = a.dynamic(2).expect("two dynamic slots");
+        let free = a.free.load(Relaxed);
+        a.release(b.id(), first, 2);
+        assert_eq!(a.free.load(Relaxed), free, "another heap's id gave the run back");
+        a.release(a.id(), first, 2);
+        assert_eq!(a.free.load(Relaxed), free + 2, "the heap that took the run did not get it back");
     }
 
     /// The cursor moves on: a shard with no run that fits is passed over
