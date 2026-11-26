@@ -40,7 +40,9 @@ static SPARES: AtomicUsize = AtomicUsize::new(SPARE);
 
 /// Sets how many empty blocks stay, by the card's memory (budget and use):
 /// [`SPARE_KEPT`] below 85 % ([`crate::host::keep_freed`]), else [`SPARE`].
-/// Asked once a second.
+/// Asked once a second. Fewer than before lets the empty texture blocks
+/// past them go now ([`reclaim_on_tick`]), not when the next texture is made:
+/// up to 4 GiB of them stayed on a card short of room until then.
 pub(crate) fn room(memory: Option<[u64; 4]>) {
     let limit = spares(memory, crate::host::keep_freed());
     SPARES.store(limit, Ordering::Relaxed);
@@ -59,10 +61,15 @@ pub(crate) fn room(memory: Option<[u64; 4]>) {
 }
 
 /// Whether the once a second check also lets go of the empty blocks past the
-/// limit, not only the next allocation. `VICTORY_POOL_RECLAIM=1`.
+/// limit, not only the next allocation. On by default; `VICTORY_POOL_RECLAIM=0`
+/// for before.
 fn reclaim_on_tick() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_POOL_RECLAIM") {
+        return on;
+    }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("VICTORY_POOL_RECLAIM").is_ok_and(|v| v.trim() == "1"))
+    *ON.get_or_init(|| std::env::var("VICTORY_POOL_RECLAIM").map_or(true, |v| v.trim() != "0"))
 }
 
 /// Whether a pool whose block was refused waits 500 ms before asking for
@@ -380,6 +387,12 @@ impl<B: Clone> Pool<B> {
     /// blocks past [`SPARE`].
     fn rested(&mut self, now: u64) {
         self.reclaim(now, SPARES.load(Ordering::Relaxed), false);
+    }
+
+    /// [`Pool::rested`], keeping at most `kept` empty blocks.
+    #[cfg(test)]
+    fn rested_under(&mut self, now: u64, kept: usize) {
+        self.reclaim(now, kept, false);
     }
 
     fn reclaim(&mut self, now: u64, limit: usize, sweep: bool) {
@@ -1083,5 +1096,27 @@ mod tests {
             // SAFETY: plain query.
             assert!(host.device.GetDeviceRemovedReason().is_ok());
         }
+    }
+
+    /// Empty blocks past those kept go when the card runs short of room,
+    /// though no texture is made after (AvatarManz#327).
+    #[test]
+    fn fewer_spares_let_empty_blocks_go_without_a_texture_made() {
+        let mut pool: Pool<u32> = Pool::new(SPARE_KEPT);
+        let mut pieces = Vec::new();
+        for n in 1u32..=5 {
+            let (piece, _, _) = pool.take(BLOCK / 2, 512, 0, || Some(n)).unwrap();
+            pieces.push(piece);
+            // The other half taken too, so the next piece needs a block of its own.
+            let (other, _, _) = pool.take(BLOCK / 2, 512, 0, || unreachable!()).unwrap();
+            pool.give(other, 0);
+        }
+        pool.rested_under(REST + 1, SPARE_KEPT);
+        assert_eq!(pool.blocks(), 5);
+        for piece in pieces {
+            pool.give(piece, 0);
+        }
+        pool.rested_under(REST + 1, SPARE);
+        assert_eq!(pool.blocks(), SPARE);
     }
 }
