@@ -404,6 +404,14 @@ pub(crate) struct State {
     root_srv_slots: std::collections::HashMap<(usize, u64), RootSlot>,
     /// Root UAVs bound as one-view tables in this list, likewise.
     root_uav_slots: std::collections::HashMap<(usize, u64), RootSlot>,
+    /// The tails of host copies the list's root SRV tables asked to be
+    /// brought up to date: host copy → list epoch, lowest address asked.
+    /// A tail runs to the copy's end, so a later ask from at or above that
+    /// address is already covered and one below it needs only the bytes up
+    /// to it. Forgotten when the epoch moves (it moves at every title
+    /// write the list records, and at more). The copies are held by
+    /// `root_srv_slots`, so a key is not another copy's.
+    root_tails: std::collections::HashMap<usize, (u64, u64)>,
     /// Tables another list made this frame that this one uses as they are
     /// ([`SharedTables`]): title heap, first dynamic slot; let go when the
     /// dynamic slots are given back.
@@ -452,6 +460,7 @@ impl State {
         self.recording = 0;
         self.root_srv_slots.clear();
         self.root_uav_slots.clear();
+        self.root_tails.clear();
         self.tables_gone = true;
     }
 }
@@ -2091,7 +2100,7 @@ impl State {
         // buffer is brought up to date. The first 1 MiB only left what lay
         // past it stale (most mesh vertex streams reach further).
         if let Some((a, s)) = &shadow {
-            s.refresh(list, *a, s.left(*a));
+            self.refresh_tail(list, s, *a);
         }
         let handle = host.gpu_handle(index);
         // SAFETY: an open list; the slot is in the bound view heap.
@@ -2103,6 +2112,32 @@ impl State {
             }
         }
         true
+    }
+
+    /// Brings a host copy up to date from `address` to its end for a root
+    /// SRV table, less what an earlier tail of the list since its last
+    /// title write already asked for (`root_tails`). The tails asked made
+    /// 4.5 GB a frame of write-watch asking in play-i for 45 MB copied;
+    /// `VICTORY_ROOT_TAILS=0` asks every one in full again.
+    fn refresh_tail(&mut self, list: &HostList, s: &std::sync::Arc<crate::shadow::Shadow>, address: u64) {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let left = s.left(address);
+        if !*ON.get_or_init(|| std::env::var_os("VICTORY_ROOT_TAILS").is_none_or(|v| v != "0")) {
+            s.refresh(list, address, left);
+            return;
+        }
+        let epoch = list.epoch();
+        let low = match self.root_tails.get(&(std::sync::Arc::as_ptr(s) as usize)) {
+            Some(&(e, low)) if e == epoch => low,
+            _ => u64::MAX,
+        };
+        let len = left.min(low.saturating_sub(address));
+        crate::copystat::add(crate::copystat::C::RootTailAsked, left);
+        crate::copystat::add(crate::copystat::C::RootTailCovered, left - len);
+        if len > 0 {
+            s.refresh(list, address, len);
+            self.root_tails.insert(std::sync::Arc::as_ptr(s) as usize, (epoch, address));
+        }
     }
 
     /// For a shader that picks buffers from the view heap by an index it
