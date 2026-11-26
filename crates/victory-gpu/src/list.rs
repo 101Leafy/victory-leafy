@@ -1079,9 +1079,9 @@ thread_local! {
 /// buffers of ours (the pass reads and writes buffers, bound as root
 /// views, so the title's descriptor heaps stay as they are); the title's
 /// pipeline and root signature are set again by its next draw or
-/// dispatch. Only for host copies of 8-byte texels of half floats
-/// (`R16G16B16A16_FLOAT`, the upscaler's colour and the stand-in of its
-/// output); `false` if not recorded.
+/// dispatch. Reads RGBA half floats and writes either RGBA half floats or
+/// native RGB9E5, according to the host destination. Returns false when
+/// the pass could not be recorded.
 pub fn stretch_texture(list: *const Object, dst: *const Object, src: *const Object, width: u32, height: u32) -> bool {
     #[cfg(windows)]
     {
@@ -1106,18 +1106,34 @@ mod stretch {
 
     /// `R16G16B16A16_FLOAT`.
     const HALF4: u32 = 10;
+    const RGB9E5: u32 = 67;
     const COPY_DEST: u32 = 0x400;
     const COPY_SOURCE: u32 = 0x800;
 
     const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), UAV(u0)"
-cbuffer Sizes : register(b0) { uint sw; uint sh; uint sp; uint dw; uint dh; uint dp; };
+#define RS "RootConstants(num32BitConstants=7, b0), SRV(t0), UAV(u0)"
+cbuffer Sizes : register(b0) { uint sw; uint sh; uint sp; uint dw; uint dh; uint dp; uint packed; };
 ByteAddressBuffer src : register(t0);
 RWByteAddressBuffer dst : register(u0);
 float4 texel(uint x, uint y) {
     uint2 v = src.Load2((y * sp + x) * 8);
     return float4(f16tof32(v.x), f16tof32(v.x >> 16), f16tof32(v.y), f16tof32(v.y >> 16));
 }
+// Shared-exponent packing from the PC FidelityFX path (fxceless/victory-fork#86).
+// RGB9E5 stores three unsigned 9-bit mantissas and one shared 5-bit exponent.
+uint pack_rgb9e5(float3 rgb) {
+    rgb = clamp(rgb, 0.0, 65408.0);
+    float largest = max(rgb.r, max(rgb.g, rgb.b));
+    uint exponent = ((asuint(max(largest, exp2(-16.0))) >> 23) & 255u) - 111u;
+    float scale = exp2(24.0 - float(exponent));
+    if (floor(largest * scale + 0.5) >= 512.0) {
+        exponent++;
+        scale *= 0.5;
+    }
+    uint3 mantissa = uint3(floor(rgb * scale + 0.5));
+    return mantissa.r | (mantissa.g << 9) | (mantissa.b << 18) | (exponent << 27);
+}
+
 [RootSignature(RS)]
 [numthreads(8, 8, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
@@ -1131,7 +1147,11 @@ void main(uint3 id : SV_DispatchThreadID) {
     float ax = fx - x0;
     float ay = fy - y0;
     float4 c = lerp(lerp(texel(x0, y0), texel(x1, y0), ax), lerp(texel(x0, y1), texel(x1, y1), ax), ay);
-    dst.Store2((id.y * dp + id.x) * 8, uint2(f32tof16(c.x) | (f32tof16(c.y) << 16), f32tof16(c.z) | (f32tof16(c.w) << 16)));
+    uint pixel = id.y * dp + id.x;
+    if (packed != 0)
+        dst.Store(pixel * 4, pack_rgb9e5(c.rgb));
+    else
+        dst.Store2(pixel * 8, uint2(f32tof16(c.x) | (f32tof16(c.y) << 16), f32tof16(c.z) | (f32tof16(c.w) << 16)));
 }
 "#;
 
@@ -1144,6 +1164,21 @@ void main(uint3 id : SV_DispatchThreadID) {
     unsafe impl Send for Pass {}
     // SAFETY: as above.
     unsafe impl Sync for Pass {}
+
+    impl Pass {
+        fn dispatch(&self, list: &ID3D12GraphicsCommandList, src: &ID3D12Resource, dst: &ID3D12Resource, sizes: [u32; 7]) {
+            let [_, _, _, width, height, _, _] = sizes;
+            // SAFETY: an open list, our pass, and live buffers in SRV and UAV states respectively.
+            unsafe {
+                list.SetComputeRootSignature(&self.root);
+                list.SetPipelineState(&self.pso);
+                list.SetComputeRoot32BitConstants(0, sizes.len() as u32, sizes.as_ptr().cast(), 0);
+                list.SetComputeRootShaderResourceView(1, src.GetGPUVirtualAddress());
+                list.SetComputeRootUnorderedAccessView(2, dst.GetGPUVirtualAddress());
+                list.Dispatch(width.div_ceil(8), height.div_ceil(8), 1);
+            }
+        }
+    }
 
     /// The two buffers, kept while the sizes stay the same.
     struct Buffers {
@@ -1232,7 +1267,13 @@ void main(uint3 id : SV_DispatchThreadID) {
         let from = crate::resource::host_resource(src)?;
         // SAFETY: live resources; plain queries.
         let (td, fd) = unsafe { (to.GetDesc(), from.GetDesc()) };
-        if td.Format.0 as u32 != HALF4 || fd.Format.0 as u32 != HALF4 {
+        let out_format = td.Format.0 as u32;
+        let out_bytes = match out_format {
+            HALF4 => 8,
+            RGB9E5 => 4,
+            _ => return None,
+        };
+        if fd.Format.0 as u32 != HALF4 {
             return None;
         }
         let (sw, sh) = (width.min(fd.Width as u32), height.min(fd.Height));
@@ -1241,8 +1282,8 @@ void main(uint3 id : SV_DispatchThreadID) {
             return None;
         }
         // Rows pitched as copies to and from buffers need (256 bytes).
-        let pitch = |w: u32| (w * 8).div_ceil(256) * 256;
-        let (sp, dp) = (pitch(sw), pitch(dw));
+        let pitch = |w: u32, bytes: u32| (w * bytes).div_ceil(256) * 256;
+        let (sp, dp) = (pitch(sw, 8), pitch(dw, out_bytes));
         let (a, b) = buffers((u64::from(sp) * u64::from(sh), u64::from(dp) * u64::from(dh)))?;
         list.keep(&a);
         list.keep(&b);
@@ -1271,16 +1312,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         // The stretch, buffer to buffer.
         barrier(l, &a, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         barrier(l, &b, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-        let sizes: [u32; 6] = [sw, sh, sp / 8, dw, dh, dp / 8];
-        // SAFETY: an open list, our pass, live buffers the list keeps.
-        unsafe {
-            l.SetComputeRootSignature(&pass.root);
-            l.SetPipelineState(&pass.pso);
-            l.SetComputeRoot32BitConstants(0, 6, sizes.as_ptr().cast(), 0);
-            l.SetComputeRootShaderResourceView(1, a.GetGPUVirtualAddress());
-            l.SetComputeRootUnorderedAccessView(2, b.GetGPUVirtualAddress());
-            l.Dispatch(dw.div_ceil(8), dh.div_ceil(8), 1);
-        }
+        pass.dispatch(l, &a, &b, [sw, sh, sp / 8, dw, dh, dp / out_bytes, u32::from(out_format == RGB9E5)]);
         list.keep(&pass.root);
         list.keep(&pass.pso);
         // The title's pipeline and root signature again at its next draw
@@ -1299,13 +1331,55 @@ void main(uint3 id : SV_DispatchThreadID) {
         let stretched = CopyLocation {
             resource: raw(&b),
             kind: 1,
-            footprint: crate::resource::PlacedFootprint::rows(HALF4, dw, dh, dp),
+            footprint: crate::resource::PlacedFootprint::rows(out_format, dw, dh, dp),
         };
         // SAFETY: as for the first copy.
         unsafe { list.list.CopyTextureRegion((&raw const out).cast(), 0, 0, 0, (&raw const stretched).cast(), None) };
         barrier(l, &b, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
         Some(())
     }
+    #[test]
+    fn stretch_writes_pitched_half_and_rgb9e5_rows() {
+        let host = crate::host::host().expect("D3D12 test host");
+        let pass = pass().expect("stretch shader and pipeline");
+        let (src, mapped) = host.upload_buffer(512).unwrap();
+        // Two rows of two RGBA16F pixels. Adjacent rows ramp in opposite directions.
+        let black = [0u16, 0, 0, 0x3c00];
+        let color = [0x3c00u16, 0x3800, 0x3400, 0x3c00];
+        let quarter = [0x3400u16, 0x3000, 0x2c00, 0x3c00];
+        let three_quarters = [0x3a00u16, 0x3600, 0x3200, 0x3c00];
+        // SAFETY: the upload is mapped for 512 bytes, with a 256-byte row pitch.
+        unsafe {
+            for (offset, pixel) in [(0, black), (8, color), (256, color), (264, black)] {
+                mapped.add(offset).cast::<[u16; 4]>().write(pixel);
+            }
+        }
+        for packed in [false, true] {
+            let pixel_bytes = if packed { 4 } else { 8 };
+            let row_bytes = 4 * pixel_bytes;
+            let dst = host.uav_buffer(512).unwrap();
+            let back = host.read_back_buffer(512).unwrap();
+            let list = host.new_list().unwrap();
+            barrier(&list.list, &dst, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            pass.dispatch(&list.list, &src, &dst, [2, 2, 32, 4, 2, 256 / pixel_bytes as u32, u32::from(packed)]);
+            barrier(&list.list, &dst, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            // SAFETY: both buffers are 512 bytes and in copy-compatible states.
+            unsafe { list.list.CopyBufferRegion(&back, 0, &dst, 0, 512) };
+            let mut actual = vec![0xcc; 2 * row_bytes];
+            list.defer_read_back(back, std::ptr::null(), actual.as_mut_ptr(), [row_bytes, 2, row_bytes]);
+            list.close();
+            host.execute(&[&list]);
+            let expected: Vec<u8> = if packed {
+                // Quarter intensity has exponent 14, three quarters has 15 and full intensity has 16.
+                [0, 0x71010100, 0x79818180, 0x81010100, 0x81010100, 0x79818180, 0x71010100, 0u32]
+                    .into_iter().flat_map(u32::to_le_bytes).collect()
+            } else {
+                [black, quarter, three_quarters, color, color, three_quarters, quarter, black].into_iter().flatten().flat_map(u16::to_le_bytes).collect()
+            };
+            assert_eq!(actual, expected, "packed={packed}");
+        }
+    }
+
 }
 
 /// Texture to texture on the GPU; buffer to texture through an upload
