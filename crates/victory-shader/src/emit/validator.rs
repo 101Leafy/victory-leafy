@@ -126,6 +126,16 @@ impl Validator {
         let mut versions: Vec<PathBuf> = std::fs::read_dir(&kits)
             .ok()?
             .filter_map(Result::ok)
+                        .filter(|e| {
+                // SDK 10.0.22000.0+ is required for DXIL 1.6 (SM 6.6); older Win10
+                // SDKs (e.g. 10.0.19041.0) crash inside dxil.dll on DXIL 1.6 shaders.
+                e.file_name()
+                    .to_str()
+                    .and_then(|s| s.split('.').nth(2))
+                    .and_then(|b| b.parse::<u32>().ok())
+                    .is_some_and(|build| build >= 22000)
+            })
+
             .map(|e| e.path().join(r"x64\dxil.dll"))
             .filter(|p| p.exists())
             .collect();
