@@ -6,8 +6,7 @@
 //! atomically; an entry that does not read back is translated again.
 //!
 //! The entry is our own encoding of [`HostShader`]: a field added to it
-//! must be added to `encode` and `decode` too (entries of older builds
-//! are ignored anyway).
+//! must be added to `encode` and `decode` too, and [`FORMAT`] raised.
 
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -18,14 +17,32 @@ use victory_shader::emit::{HostShader, StaticSampler, UserData};
 use victory_shader::resource::RootIndexedView;
 use victory_shader::{HwStage, RootType};
 
+/// The form of an entry. This file is not part of the translator's
+/// fingerprint (`build.rs`), so a change to `encode` or `decode` that old
+/// entries do not read back right must raise it.
+pub(crate) const FORMAT: u32 = 1;
+
 static CACHE: OnceLock<Cache> = OnceLock::new();
 static HITS: AtomicU64 = AtomicU64::new(0);
 static MISSES: AtomicU64 = AtomicU64::new(0);
 
 /// Keeps translated shaders in `dir` from now on.
+/// `VICTORY_SHADER_CACHE_DAYS=n`: entries not used for `n` days are removed,
+/// on a thread of their own (a folder kept every translation each translator
+/// change made: 77,082 entries, 2.7 GB).
 pub fn use_shader_cache(dir: PathBuf) {
     match Cache::open(dir) {
         Ok(cache) => {
+            let days = std::env::var("VICTORY_SHADER_CACHE_DAYS").ok().and_then(|v| v.parse::<u64>().ok());
+            if let Some(days) = days.filter(|&d| d > 0) {
+                let cache = cache.clone();
+                let max_age = std::time::Duration::from_secs(days * 24 * 60 * 60);
+                let _ = std::thread::Builder::new()
+                    .name("shader cache prune".into())
+                    .spawn(move || {
+                        cache.prune(max_age);
+                    });
+            }
             let _ = CACHE.set(cache);
         }
         Err(e) => tracing::warn!(error = %e, "no shader cache"),
@@ -55,6 +72,7 @@ fn build() -> [u8; 32] {
             );
         }
         let mut bytes = env!("VICTORY_TRANSLATOR").as_bytes().to_vec();
+        bytes.extend_from_slice(&FORMAT.to_le_bytes());
         bytes.extend_from_slice(&limit.to_le_bytes());
         // Which group barriers wait is part of the translation too.
         bytes.push(victory_shader::emit::group_sync());
@@ -166,14 +184,20 @@ fn cached(
                 (&HITS, "from the cache")
             };
             counter.fetch_add(1, Ordering::Relaxed);
-            tracing::debug!(path = %path.display(), "shader {what}");
+            tracing::debug!(entry = %entry_name(&path), "shader {what}");
             return Ok(shader);
         }
-        tracing::debug!(path = %path.display(), "unreadable shader cache entry; translating again");
+        tracing::debug!(entry = %entry_name(&path), "unreadable shader cache entry; translating again");
         let _ = std::fs::remove_file(&path);
     }
     MISSES.fetch_add(1, Ordering::Relaxed);
     (converter.translate)(container)
+}
+
+/// An entry's name without the folders above it (they are the user's).
+fn entry_name(path: &std::path::Path) -> String {
+    let parent = path.parent().and_then(|p| p.file_name()).unwrap_or_default();
+    format!("<path>/{}/{}", parent.to_string_lossy(), path.file_name().unwrap_or_default().to_string_lossy())
 }
 
 const MAGIC: &[u8; 4] = b"VSH1";
