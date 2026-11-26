@@ -3532,6 +3532,35 @@ mod parts_tests {
     }
 }
 
+/// Whether a refresh of watched memory takes the whole pages it touches
+/// (`VICTORY_WHOLE_PAGES=0`: only the asked bytes, as before). A page copied
+/// in part stays stale, so the next refresh that touches it asks the journal
+/// and compares it again; taken whole it is fresh until written.
+fn whole_pages() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WHOLE_PAGES").is_none_or(|v| v != "0"))
+}
+
+/// `[from, to)` out to the pages it touches, inside the buffer
+/// `[start, end)`.
+fn widen(start: usize, end: usize, from: usize, to: usize) -> (usize, usize) {
+    ((from / PAGE * PAGE).max(start), to.div_ceil(PAGE).saturating_mul(PAGE).min(end))
+}
+
+#[cfg(test)]
+mod widen_tests {
+    use super::*;
+
+    #[test]
+    fn a_partial_refresh_takes_the_whole_page() {
+        let at = |page: usize| page * PAGE;
+        assert_eq!(widen(at(0x100), at(0x104), at(0x101) + 8, at(0x101) + 16), (at(0x101), at(0x102)));
+        assert_eq!(widen(at(0x100), at(0x104), at(0x101), at(0x103)), (at(0x101), at(0x103)));
+        // Never past the buffer's own ends.
+        assert_eq!(widen(at(0x100) + 4, at(0x101) + 12, at(0x100) + 8, at(0x101) + 8), (at(0x100) + 4, at(0x101) + 12));
+    }
+}
+
 #[cfg(test)]
 mod stale_tests {
     use super::*;
@@ -4773,6 +4802,11 @@ impl Shadow {
         if from >= to {
             return 0;
         }
+        let (from, to) = if whole_pages() && self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
+            widen(start, end, from, to)
+        } else {
+            (from, to)
+        };
         let mut busy: Vec<(usize, usize)> = self
             .pending
             .lock()
