@@ -2469,20 +2469,26 @@ fn v_log_f16_matches_rdna2_special_values() {
         .iter()
         .map(|&(input, _)| [u32::from(input), 0, 0, 0xABCD_1234])
         .collect();
-    let shader = build_valu_cs(&[
-        0xBFA5_000F,             // s_denorm_mode 15
-        vop1(0x001, 0, vgpr(4)), // v_mov_b32 v0, v4
-        vop1(0x057, 0, vgpr(1)), // v_log_f16 v0, v1
-    ]);
     let mut failures = Vec::new();
-    run_cases(&shader, &inputs, |backend, i, input, got| {
-        let want = 0xABCD_0000 | u32::from(cases[i].1);
-        if got != want {
-            failures.push(format!(
-                "{backend}: input {:#06x}, got {got:#010x}, want {want:#010x}",
-                input[0]
-            ));
-        }
-    });
+    for nearest in [false, true] {
+        let was = lower::TEST_F16_NEAREST.replace(Some(nearest));
+        let shader = build_valu_cs(&[
+            0xBFA5_000F,             // s_denorm_mode 15
+            vop1(0x001, 0, vgpr(4)), // v_mov_b32 v0, v4
+            vop1(0x057, 0, vgpr(1)), // v_log_f16 v0, v1
+        ]);
+        lower::TEST_F16_NEAREST.set(was);
+        run_cases(&shader, &inputs, |backend, i, input, got| {
+            let want = 0xABCD_0000 | u32::from(cases[i].1);
+            // The host's conversion toward zero (VICTORY_F16_NEAREST off) may land one
+            // step lower where the host's log is not exact (2^-24 gives -23.99..., 0xcdff).
+            if got != want && (nearest || cases[i].0 != 0x0001 || got != want - 1) {
+                failures.push(format!(
+                    "{backend}, nearest {nearest}: input {:#06x}, got {got:#010x}, want {want:#010x}",
+                    input[0]
+                ));
+            }
+        });
+    }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }

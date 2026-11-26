@@ -22,6 +22,7 @@
 //! 18e57db8 found the same).
 
 use std::collections::VecDeque;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -92,10 +93,21 @@ impl Pending {
     }
 
     fn make(&self) {
+        self.make_with(|| HostPipeline::new(&self.shaders, self.graphics.as_deref()));
+    }
+
+    fn make_with(&self, build: impl FnOnce() -> Option<HostPipeline>) {
         self.made.get_or_init(|| {
             let run = super::spent::begin();
             let began = Instant::now();
-            let made = HostPipeline::new(&self.shaders, self.graphics.as_deref());
+            // A failed translation must complete this queue entry and wake its waiters.
+            let made = match catch_unwind(AssertUnwindSafe(build)) {
+                Ok(pipeline) => pipeline,
+                Err(_) => {
+                    tracing::warn!(shaders = ?self.shaders, "host pipeline build panicked");
+                    None
+                }
+            };
             super::library::note_time(&self.key, began.elapsed().as_millis() as u64);
             let from = ["title", "screen", "requested", "early", "slow"][self.taken_from.load(Ordering::Relaxed) as usize];
             let queued = self.queued.get().map(|at| began.saturating_duration_since(*at));
@@ -187,12 +199,85 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     if p.made.get().is_none() {
         start(p, REQUESTED);
         let frame = crate::frame::current();
-        wait(p, frame);
-        if p.made.get().is_none() {
-            dropped(p, frame);
+        if p.graphics.is_none() && compute_waits() && compute_wait_left(frame) {
+            // Made here, or waited for while a worker makes it.
+            let began = Instant::now();
+            p.make();
+            compute_waited(frame, began.elapsed());
+        } else {
+            wait(p, frame);
+            if p.made.get().is_none() {
+                dropped(p, frame);
+            }
         }
     }
     p.made.get()?.as_ref()
+}
+
+/// Whether a dispatch waits for its compute pipeline until it is made,
+/// whatever the frame's budget ([`wait_budget`]); a draw still waits within
+/// the budget and is dropped while its pipeline is not there.
+///
+/// A dropped draw is drawn again in the next frame. A dropped dispatch may
+/// not be: the title runs some compute passes once, when a scene changes
+/// (a buffer reset or cleared), and what they leave is read for as long as
+/// the scene lasts. In the prison corridor a compute program met for the
+/// first time took 4.4 s to make on a 16 GB machine; its one dispatch was
+/// dropped after the half second of budget, and the windows of the room
+/// before stayed blended over the whole picture for minutes (run 195).
+/// A wait of seconds once (the pipeline library has it on the next run)
+/// against a picture wrong until the scene ends.
+/// Off by default until a cold and a warm run show what it costs;
+/// `VICTORY_PIPELINE_COMPUTE_WAIT=1`: on.
+fn compute_waits() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_COMPUTE_WAIT").is_some_and(|v| v == "1"))
+}
+
+/// What a frame may spend making compute pipelines for its dispatches
+/// (`VICTORY_PIPELINE_COMPUTE_WAIT_MS`, 5 s; 0: no cap). A cold library can
+/// meet dozens of new compute programs in one frame, and the title's
+/// watchdog fires at 30 s. Once a frame has spent it, its dispatches wait
+/// within the frame's budget as draws do; the one pipeline being made when
+/// the cap runs out still finishes.
+fn compute_wait_cap() -> Duration {
+    static CAP: OnceLock<Duration> = OnceLock::new();
+    *CAP.get_or_init(|| {
+        let millis = std::env::var("VICTORY_PIPELINE_COMPUTE_WAIT_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(5_000);
+        Duration::from_millis(millis)
+    })
+}
+
+/// Frame and time spent in it making compute pipelines for dispatches.
+static COMPUTE_SPENT: Mutex<(u64, Duration)> = Mutex::new((u64::MAX, Duration::ZERO));
+
+fn compute_wait_left(frame: u64) -> bool {
+    let cap = compute_wait_cap();
+    if cap.is_zero() {
+        return true;
+    }
+    let mut spent = COMPUTE_SPENT.lock().unwrap_or_else(|e| e.into_inner());
+    if spent.0 != frame {
+        *spent = (frame, Duration::ZERO);
+    }
+    spent.1 < cap
+}
+
+fn compute_waited(frame: u64, took: Duration) {
+    let cap = compute_wait_cap();
+    let mut spent = COMPUTE_SPENT.lock().unwrap_or_else(|e| e.into_inner());
+    if spent.0 != frame {
+        *spent = (frame, Duration::ZERO);
+    }
+    let before = spent.1;
+    spent.1 += took;
+    if !cap.is_zero() && before < cap && spent.1 >= cap {
+        tracing::info!(
+            frame,
+            ms = spent.1.as_millis() as u64,
+            "a frame spent its compute wait: its other dispatches wait within the frame's budget (VICTORY_PIPELINE_COMPUTE_WAIT_MS)"
+        );
+    }
 }
 
 /// The pipelines a frame's draws were dropped for, logged when the next
@@ -464,21 +549,54 @@ fn slow_limit() -> usize {
 /// [`quiet_slow_limit`] holds.
 const QUIET: Duration = Duration::from_secs(2);
 
-/// [`slow_limit`] while the title queues nothing else: three quarters of the
-/// workers. In play-g the early list ran out at 06:28 and for four minutes 3
-/// to 5 of the 16 workers were busy, all on the slow list (854 waiting),
-/// while the rest idled; the drive at 06:32 then asked for 519 of them at
-/// once, and draws waited 500 ms a frame. `VICTORY_PIPELINE_SLOW_QUIET=0`:
-/// a quarter at all times, as before.
+/// [`slow_limit`] while the title queues nothing else: every worker. In
+/// play-g the early list ran out at 06:28 and for four minutes 3 to 5 of the
+/// 16 workers were busy, all on the slow list (854 waiting), while the rest
+/// idled; the drive at 06:32 then asked for 519 of them at once, and draws
+/// waited 500 ms a frame. On the first run after a translator VERSION
+/// (play-cold, 24 workers) the title loaded with nothing but the slow list
+/// queued, 868 of them, and with three quarters 15 to 18 workers were busy
+/// for 140 s while the other 6 idled. Cold starts with every worker against
+/// three quarters (sc2 and sc8 against sc1 and sc7): 51k and 65k draws
+/// dropped in the first 340 s against 89k and 87k, and in sc8 the slow list
+/// was made by 245 s (create_ms summed 8871 s against 24291 s, 22 made in
+/// vain against 260) while sc7 still had 230 being made at 565 s.
+/// `VICTORY_PIPELINE_SLOW_QUIET=3/4`: three quarters, as before. `=0`: a
+/// quarter at all times.
 fn quiet_slow_limit() -> usize {
     static LIMIT: OnceLock<usize> = OnceLock::new();
     *LIMIT.get_or_init(|| {
-        if std::env::var_os("VICTORY_PIPELINE_SLOW_QUIET").is_some_and(|v| v == "0") {
-            slow_limit()
-        } else {
-            (workers_wanted() * 3 / 4).max(slow_limit())
-        }
+        quiet_limit(std::env::var("VICTORY_PIPELINE_SLOW_QUIET").ok().as_deref(), workers_wanted(), slow_limit())
     })
+}
+
+fn quiet_limit(asked: Option<&str>, workers: usize, slow: usize) -> usize {
+    match asked.map(str::trim) {
+        Some("0") => slow,
+        Some("3/4") => (workers * 3 / 4).max(slow),
+        _ => workers.max(slow),
+    }
+}
+
+/// `VICTORY_PIPELINE_SLOW_FIRST=1`: the slow list's longest first (by the
+/// longest each took before), and those of [`LONG_MS`] or more made at
+/// normal priority. In play-cold one compute program took 130 s to
+/// translate: taken 11 s into the run behind shorter ones, made at 141 s,
+/// the world started at 150 s. It had a processor 94% of the time, but
+/// went from processor 7 to 30.
+fn longest_first() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_SLOW_FIRST").is_some_and(|v| v == "1"))
+}
+
+const LONG_MS: u64 = 10_000;
+
+/// The unclaimed entry of `list` that took longest by `ms` (the first among
+/// equals); claimed ones are dropped from it.
+fn longest(list: &mut VecDeque<Arc<Pending>>, ms: impl Fn(&str) -> u64) -> Option<Arc<Pending>> {
+    list.retain(|p| p.queue_state.load(Ordering::Relaxed) == EARLY);
+    let at = (0..list.len()).max_by_key(|&i| (ms(&list[i].key), std::cmp::Reverse(i)))?;
+    list.remove(at)
 }
 
 /// Graphics pipelines are made before compute ones, and compute ones never
@@ -609,7 +727,11 @@ impl Queue {
                 p = unclaimed(&mut self.early_compute);
             }
             if p.is_none() && self.slow_now < slow_limit {
-                p = unclaimed(&mut self.slow);
+                p = if longest_first() {
+                    longest(&mut self.slow, super::library::slow_ms)
+                } else {
+                    unclaimed(&mut self.slow)
+                };
                 // A compute one waits its turn while compute holds all it may.
                 if let Some(q) = p.take_if(|q| q.graphics.is_none() && !compute_free) {
                     self.slow.push_front(q);
@@ -727,21 +849,39 @@ fn workers() -> bool {
                     // Below the title's own threads (loading, recording),
                     // and the streaming one, which is below normal itself
                     // (`VICTORY_PIPELINE_LOWEST=0`: level with it, as before).
+                    use windows::Win32::System::Threading::*;
                     let lowest = !screens_only && std::env::var_os("VICTORY_PIPELINE_LOWEST").is_none_or(|v| v != "0");
+                    let priority = if lowest { THREAD_PRIORITY_LOWEST } else { THREAD_PRIORITY_BELOW_NORMAL };
                     // SAFETY: a plain call on our own thread.
-                    unsafe {
-                        use windows::Win32::System::Threading::*;
-                        let priority = if lowest { THREAD_PRIORITY_LOWEST } else { THREAD_PRIORITY_BELOW_NORMAL };
+                    let set = |priority| unsafe {
                         let _ = SetThreadPriority(GetCurrentThread(), priority);
-                    }
+                    };
+                    set(priority);
                     loop {
                         let p = next(screens_only);
+                        let raise = longest_first();
+                        let hold = crate::cores::hold_long_on_fast_cores();
+                        let long = (raise || hold)
+                            && p.was_slow.load(Ordering::Relaxed)
+                            && super::library::slow_ms(&p.key) >= LONG_MS;
+                        if long && raise {
+                            set(THREAD_PRIORITY_NORMAL);
+                        }
+                        if long && hold {
+                            crate::cores::hold_on_fast_cores(true);
+                        }
                         BUSY.fetch_add(1, Ordering::Relaxed);
                         {
                             let _slot = ComputeSlot(p.graphics.is_none());
                             p.make();
                         }
                         BUSY.fetch_sub(1, Ordering::Relaxed);
+                        if long && raise {
+                            set(priority);
+                        }
+                        if long && hold {
+                            crate::cores::hold_on_fast_cores(false);
+                        }
                         if p.was_slow.load(Ordering::Relaxed) {
                             let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
                             queue.slow_now -= 1;
@@ -828,6 +968,24 @@ fn drained() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_panicking_pipeline_is_refused_and_the_worker_continues() {
+        let bad = Arc::new(Pending::new(Vec::new(), None));
+        let good = Arc::new(Pending::new(Vec::new(), None));
+        let failed = bad.clone();
+        let next = good.clone();
+        let worker = std::thread::spawn(move || {
+            failed.make_with(|| panic!("synthetic pipeline build panic"));
+            next.make_with(|| None);
+        });
+
+        worker.join().expect("the pipeline worker should survive");
+        assert!(matches!(bad.made.get(), Some(None)));
+        assert!(matches!(good.made.get(), Some(None)));
+
+        bad.make_with(|| panic!("the refused pipeline should stay complete"));
+    }
 
     #[test]
     fn worker_count_follows_the_processors_and_the_switch() {
@@ -976,6 +1134,50 @@ mod tests {
         queue.others_at = Instant::now().checked_sub(QUIET);
         assert_eq!(queue.slow_cap(), quiet_slow_limit());
         assert!(quiet_slow_limit() >= slow_limit());
+    }
+
+    #[test]
+    fn the_quiet_slow_limit_follows_its_switch() {
+        assert_eq!(quiet_limit(None, 24, 6), 24);
+        assert_eq!(quiet_limit(Some("3/4"), 24, 6), 18);
+        assert_eq!(quiet_limit(Some("3/4"), 4, 2), 3);
+        assert_eq!(quiet_limit(Some("0"), 24, 6), 6);
+        assert_eq!(quiet_limit(Some("all"), 24, 6), 24);
+        assert_eq!(quiet_limit(Some("all"), 1, 1), 1);
+    }
+
+    #[test]
+    fn a_frame_stops_making_compute_pipelines_at_its_cap() {
+        let cap = compute_wait_cap();
+        if cap.is_zero() {
+            return;
+        }
+        let frame = u64::MAX - 7;
+        assert!(compute_wait_left(frame));
+        compute_waited(frame, cap / 2);
+        assert!(compute_wait_left(frame));
+        compute_waited(frame, cap);
+        assert!(!compute_wait_left(frame));
+        assert!(compute_wait_left(frame + 1));
+    }
+
+    #[test]
+    fn the_longest_unclaimed_is_taken_first() {
+        let one = |key: &str| {
+            let mut p = Pending::new(Vec::new(), None);
+            p.key = key.to_owned();
+            p.queue_state.store(EARLY, Ordering::Relaxed);
+            Arc::new(p)
+        };
+        let ms = |key: &str| match key {
+            "a" => 5_000,
+            "b" | "c" | "d" => 130_000,
+            _ => 0,
+        };
+        let mut list: VecDeque<_> = ["a", "b", "c", "d", "e"].map(one).into();
+        list[1].queue_state.store(MAKING, Ordering::Relaxed);
+        let taken: Vec<String> = std::iter::from_fn(|| longest(&mut list, ms)).map(|p| p.key.clone()).collect();
+        assert_eq!(taken, ["c", "d", "a", "e"]);
     }
 
     /// Graphics pipelines go before compute ones of the same list, and

@@ -2,6 +2,8 @@
 //! so fence signals complete at once.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
+#[cfg(windows)]
+use std::sync::{Arc, Mutex, Weak};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::object::{self, E_INVALIDARG, HRESULT, Iid, Object, QUEUE, S_OK, Table, This, guid};
@@ -40,27 +42,49 @@ struct Queue {
     /// What the queue was given after a wait for a fence that had not been
     /// reached, in order; it runs when the fence gets there.
     #[cfg(windows)]
-    held: std::sync::Mutex<Vec<Held>>,
+    held: Arc<Mutex<Vec<Held>>>,
 }
 const _: () = assert!(std::mem::offset_of!(Queue, kind) == 0x10);
 
 /// One thing a waiting queue holds back.
 #[cfg(windows)]
 enum Held {
-    /// The queue waits for the fence (its address) to reach the value.
-    Wait(usize, u64),
+    /// The queue waits for the fence to reach the value.
+    Wait(crate::fence::Kept, u64),
     /// A list of the next submission waits for a memory value.
     Value(crate::list::ValueWait),
     /// A submission: the lists' host sides, taken from the title's lists
     /// (which it may reset meanwhile), and the order they run in.
     Run(Vec<crate::list::Detached>, Vec<usize>),
     /// A signal of the queue's, due after what it holds before it.
-    Signal(usize, u64),
+    Signal(crate::fence::Kept, u64),
 }
 
-/// The queues that hold something (their addresses).
+// SAFETY: D3D12 COM objects retained inside `Detached`/`HostList` are
+// free-threaded, and `Held` is already consumed across threads in `release_held`.
 #[cfg(windows)]
-static WAITING: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+unsafe impl Send for Held {}
+
+/// The queues that hold something: `(queue_addr, weak_held)` so `release_held`
+/// upgrades the `Arc` safely without dereferencing a concurrently freed `Queue`.
+/// Each entry holds a reference to its queue ([`register_waiting`]): a title
+/// that lets go of a queue while it waits does not lose what it holds. A
+/// present runs what is held ([`forces`]), so it lasts a frame at most.
+#[cfg(windows)]
+static WAITING: Mutex<Vec<(usize, Weak<Mutex<Vec<Held>>>)>> = Mutex::new(Vec::new());
+
+#[cfg(windows)]
+fn register_waiting(this: This) {
+    let id = this as usize;
+    let weak = Arc::downgrade(&queue(this).held);
+    let mut waiting = lock(&WAITING);
+    if !waiting.iter().any(|(q, w)| *q == id && w.ptr_eq(&weak)) {
+        // (One left from a queue that was freed holds no reference.)
+        waiting.retain(|(q, _)| *q != id);
+        object::add_ref(this);
+        waiting.push((id, weak));
+    }
+}
 
 #[cfg(windows)]
 fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -196,10 +220,7 @@ fn submit_cut(this: This, lists: &[This]) {
                 held.push(Held::Run(taken, order));
             }
         }
-        let mut waiting = lock(&WAITING);
-        if !waiting.contains(&(this as usize)) {
-            waiting.push(this as usize);
-        }
+        register_waiting(this);
     }
     // What ran may be what another queue waits for, and what was just
     // given to the queue may be free to run already.
@@ -244,6 +265,12 @@ fn submit_split(this: This, lists: &[This]) {
             .filter_map(|&l| crate::list::host_list(l))
             .collect();
         host.execute(&now);
+        // They have run: their descriptor tables' slots are free again, as
+        // in `submit_cut` (which does this after the same call, for the
+        // same reason: the lists are not detached here, so nothing else
+        // gives their fresh tables' dynamic slots back before the title
+        // resets them).
+        crate::list::tables_done(&lists[..cut]);
     }
     if cut < lists.len() {
         static SEEN: AtomicU64 = AtomicU64::new(0);
@@ -278,10 +305,7 @@ fn submit_split(this: This, lists: &[This]) {
             from = to;
         }
         lock(&queue(this).held).extend(pieces);
-        let mut waiting = lock(&WAITING);
-        if !waiting.contains(&(this as usize)) {
-            waiting.push(this as usize);
-        }
+        register_waiting(this);
     }
     // What ran may be what another queue waits for, and what was just held
     // may be free to run already.
@@ -325,15 +349,17 @@ pub(crate) fn release_held(all: bool) {
     loop {
         let queues = lock(&WAITING).clone();
         let mut moved = false;
-        for q in queues {
-            // SAFETY: a live queue: one released is taken off the list.
-            let held = unsafe { &(*(q as *const Queue)).held };
-            let mut held = lock(held);
+        for (q, weak) in queues {
+            let Some(held_arc) = weak.upgrade() else {
+                lock(&WAITING).retain(|(_, w)| !w.ptr_eq(&weak));
+                continue;
+            };
+            let mut held = lock(&*held_arc);
             loop {
                 match held.first() {
                     None => break,
-                    Some(&Held::Wait(fence, value))
-                        if !all && crate::fence::completed(fence as This) < value =>
+                    Some(Held::Wait(fence, value))
+                        if !all && crate::fence::completed(fence.this()) < *value =>
                     {
                         break;
                     }
@@ -415,15 +441,25 @@ pub(crate) fn release_held(all: bool) {
                     // Behind what was sent to the card and not waited
                     // for, if anything was.
                     Held::Signal(fence, value) => {
-                        if !crate::host::late_signal(fence, value) {
-                            crate::fence::set(fence as This, value);
+                        if !crate::host::late_signal(fence.at(), value) {
+                            crate::fence::set(fence.this(), value);
                         }
                     }
                 }
                 moved = true;
             }
-            if held.is_empty() {
-                lock(&WAITING).retain(|&w| w != q);
+            let off = held.is_empty() && {
+                let mut waiting = lock(&WAITING);
+                let before = waiting.len();
+                waiting.retain(|(_, w)| !w.ptr_eq(&weak));
+                waiting.len() < before
+            };
+            drop(held);
+            drop(held_arc);
+            // The list's reference, let go of with nothing locked: it may be
+            // the last one.
+            if off {
+                release(q as This);
             }
         }
         if !moved {
@@ -555,10 +591,22 @@ extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT
     )
 }
 extern "system" fn release(this: This) -> u32 {
+    // Not while it is on the waiting list, which holds a reference.
+    #[cfg(windows)]
+    if !this.is_null() && object::refs(this) == 1 && !lock(&queue(this).held).is_empty() {
+        static ONCE: AtomicBool = AtomicBool::new(false);
+        if !ONCE.swap(true, Ordering::Relaxed) {
+            tracing::warn!(kind = queue(this).kind, "a queue is let go of while it holds work: the work is dropped");
+        }
+    }
+    #[cfg(windows)]
+    let weak = (!this.is_null()).then(|| Arc::downgrade(&queue(this).held));
     let left = object::release_boxed::<Queue>(this);
     #[cfg(windows)]
-    if left == 0 {
-        lock(&WAITING).retain(|&q| q != this as usize);
+    if left == 0
+        && let Some(weak) = weak
+    {
+        lock(&WAITING).retain(|(_, w)| !w.ptr_eq(&weak));
     }
     left
 }
@@ -598,10 +646,7 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
                     tracing::info!(kind = queue(this).kind, ?unmet, "a submission is held for a memory value");
                 }
                 lock(&queue(this).held).extend(unmet.into_iter().map(Held::Value));
-                let mut waiting = lock(&WAITING);
-                if !waiting.contains(&(this as usize)) {
-                    waiting.push(this as usize);
-                }
+                register_waiting(this);
             }
         }
         let kept = hold(this, || {
@@ -669,6 +714,19 @@ extern "system" fn signal2_x(
 }
 /// Markers and events only matter to profilers.
 extern "system" fn marker(_: This) {}
+/// `SuspendX(flags)`: on the console, a title's suspend routine stops its
+/// queues' GPU work (`ResumeX` restarts it). Our submissions have run when
+/// Execute returns (work held for a wait runs as soon as the wait is met),
+/// and a suspended title is never resumed here, since the process ends
+/// (`lifecycle::end_title`), so there is nothing to stop.
+extern "system" fn suspend_x(_: This, flags: u32) -> HRESULT {
+    tracing::debug!(flags, "command queue suspended");
+    S_OK
+}
+/// `ResumeX`: nothing was stopped (see [`suspend_x`]).
+extern "system" fn resume_x(_: This) -> HRESULT {
+    S_OK
+}
 extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
     if fence.is_null() {
         return E_INVALIDARG;
@@ -681,7 +739,7 @@ extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
     }
     // A queue that waits signals after what it holds.
     #[cfg(windows)]
-    if hold(this, || Held::Signal(fence as usize, value)) {
+    if hold(this, || Held::Signal(crate::fence::Kept::new(fence), value)) {
         return S_OK;
     }
     // Behind the submissions sent to the card and not waited for: the
@@ -723,9 +781,10 @@ extern "system" fn wait(this: This, fence: This, value: u64) -> HRESULT {
         }
         let behind = {
             let mut held = lock(&queue(this).held);
-            let behind = !held.is_empty() || now < value;
+            // Read again under the lock: a signal may have got it there.
+            let behind = !held.is_empty() || crate::fence::completed(fence) < value;
             if behind && waits() {
-                held.push(Held::Wait(fence as usize, value));
+                held.push(Held::Wait(crate::fence::Kept::new(fence), value));
             }
             behind
         };
@@ -742,12 +801,7 @@ extern "system" fn wait(this: This, fence: This, value: u64) -> HRESULT {
             }
         }
         if behind && waits() {
-            {
-                let mut waiting = lock(&WAITING);
-                if !waiting.contains(&(this as usize)) {
-                    waiting.push(this as usize);
-                }
-            }
+            register_waiting(this);
             // The fence may have got there meanwhile.
             release_held(false);
         }
@@ -808,6 +862,7 @@ impl Written {
                 at.cast::<u64>().write_unaligned(value);
             }
         }
+        crate::watch::told(&[(at as usize, bytes)]);
     }
 }
 
@@ -1151,7 +1206,7 @@ extern "system" fn desc(this: This, out: *mut QueueDesc) {
 /// The queue methods by their slot in older titles' queues (the 2020-era
 /// layout): IUnknown 3, object 4, device child 1, queue 26 (12 as on PC,
 /// then console ones).
-const METHODS: [(usize, *const ()); 15] = [
+const METHODS: [(usize, *const ()); 17] = [
     (0, query as *const ()),
     (2, release as *const ()),
     (7, object::parent_device as *const ()), // 0x38
@@ -1162,6 +1217,8 @@ const METHODS: [(usize, *const ()); 15] = [
     (14, signal as *const ()),               // 0x70
     (15, wait as *const ()),                 // 0x78
     (16, timestamp_frequency as *const ()),  // 0x80
+    (21, suspend_x as *const ()),            // 0xa8
+    (22, resume_x as *const ()),             // 0xb0
     (26, desc as *const ()),                 // 0xd0
     (29, copy_page_mappings as *const ()),   // 0xe8 page mapping batch
     (30, present as *const ()),              // 0xf0
@@ -1240,7 +1297,63 @@ mod tests {
         assert_eq!(slot::<extern "system" fn(This) -> u32>(q, 0x10)(q), 0);
     }
 
+    /// D3D12's Wait keeps the fence until the wait is met: the title may
+    /// release it right after the call, and the held wait still reads it.
+    #[cfg(windows)]
+    #[test]
+    fn a_held_wait_keeps_its_fence() {
+        if behind::on() || !waits() {
+            return;
+        }
+        let null = std::ptr::null();
+        let desc = QueueDesc {
+            kind: 0,
+            priority: 0,
+            flags: 0,
+            nodes: 0,
+        };
+        let mut q = null;
+        assert_eq!(create(null, &desc, &QUEUE_IIDS[0], &mut q), S_OK);
+        let mut fence = null;
+        assert_eq!(crate::fence::create(null, 0, 0, &crate::fence::FENCE_IIDS[0], &mut fence), S_OK);
+        let wait = slot::<extern "system" fn(This, This, u64) -> HRESULT>(q, signal_slot(q) + 8);
+        assert_eq!(wait(q, fence, 1), S_OK);
+        assert!(matches!(lock(&queue(q).held).first(), Some(Held::Wait(..))));
+        let release = slot::<extern "system" fn(This) -> u32>(fence, 0x10);
+        assert_eq!(release(fence), 1, "the held wait keeps a reference");
+        assert_eq!(crate::fence::completed(fence), 0);
+        // Met: the wait goes, and with it the last reference.
+        assert_eq!(slot::<extern "system" fn(This, u64) -> HRESULT>(fence, 0x50)(fence, 1), S_OK);
+        assert!(lock(&queue(q).held).is_empty());
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(q, 0x10)(q), 0);
+    }
+
     /// The title's compute queue: `{COMPUTE, 0, pipe 1, queue 0}`.
+    #[cfg(windows)]
+    #[test]
+    fn a_queue_let_go_of_while_it_waits_lives_until_the_wait_is_met() {
+        let null = std::ptr::null();
+        let desc = QueueDesc {
+            kind: 0,
+            priority: 0,
+            flags: 0,
+            nodes: 0,
+        };
+        let mut q = null;
+        assert_eq!(create(null, &desc, &QUEUE_IIDS[0], &mut q), S_OK);
+        let mut fence = null;
+        let fence_iid = &crate::fence::FENCE_IIDS[0];
+        assert_eq!(crate::fence::create(null, 0, 0, fence_iid, &mut fence), S_OK);
+        assert_eq!(wait(q, fence, 5), S_OK);
+        assert!(lock(&WAITING).iter().any(|(at, _)| *at == q as usize));
+        assert_eq!(release(q), 1, "the waiting list's reference");
+        assert!(!lock(&queue(q).held).is_empty());
+        crate::fence::set(fence, 5);
+        release_held(false);
+        assert!(!lock(&WAITING).iter().any(|(at, _)| *at == q as usize));
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(fence, 0x10)(fence), 0);
+    }
+
     #[test]
     fn console_queues_are_created_as_on_pc() {
         let null = std::ptr::null();
@@ -1266,6 +1379,36 @@ mod tests {
         assert_eq!(new[35], execute_x as *const ()); // 0x118
     }
 
+    /// Grand Theft Auto VI's suspend routine calls `SuspendX(0)` at 0xb8;
+    /// `ResumeX` follows at 0xc0. Both succeed, in either queue layout.
+    #[test]
+    fn queues_suspend_and_resume() {
+        let (old, new) = (queue_table(false), queue_table(true));
+        assert_eq!(new[23], suspend_x as *const ()); // 0xb8
+        assert_eq!(new[24], resume_x as *const ()); // 0xc0
+        assert_eq!(old[21], new[23]); // 0xa8 in older queues
+        assert_eq!(old[22], new[24]); // 0xb0
+        for (table, at) in [(&FUNCTIONS, 0xa8), (&NEWER_FUNCTIONS, 0xb8)] {
+            let object = Queue {
+                object: Object::new(table),
+                kind: 0,
+                desc: QueueDesc {
+                    kind: 0,
+                    priority: 0,
+                    flags: 0,
+                    nodes: 0,
+                },
+                #[cfg(windows)]
+                held: Default::default(),
+            };
+            let q: This = std::ptr::from_ref(&object).cast();
+            let suspend = slot::<extern "system" fn(This, u32) -> HRESULT>(q, at);
+            let resume = slot::<extern "system" fn(This) -> HRESULT>(q, at + 8);
+            assert_eq!(suspend(q, 0), S_OK);
+            assert_eq!(resume(q), S_OK);
+        }
+    }
+
     #[test]
     fn a_pair_of_timestamps_shows_the_load_it_is_given() {
         let (start, end) = (0xd0419_6698, 0xd0419_6690);
@@ -1284,5 +1427,90 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(2));
         Written::GpuTimestamp.write(at[1..].as_mut_ptr().cast(), 8);
         assert!(at[1] > first);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn releasing_waiting_queue_prunes_waiting_and_never_uafs_on_release_held() {
+        let null = std::ptr::null();
+        let desc = QueueDesc {
+            kind: 0,
+            priority: 0,
+            flags: 0,
+            nodes: 0,
+        };
+        let mut q = null;
+        assert_eq!(create(null, &desc, &QUEUE_IIDS[0], &mut q), S_OK);
+        let mut fence = null;
+        assert_eq!(
+            crate::fence::create(null, 0, 0, &crate::fence::FENCE_IIDS[0], &mut fence),
+            S_OK
+        );
+
+        let wait_fn = slot::<extern "system" fn(This, This, u64) -> HRESULT>(q, signal_slot(q) + 8);
+        assert_eq!(wait_fn(q, fence, 99), S_OK);
+
+        let id = q as usize;
+        let weak = lock(&WAITING)
+            .iter()
+            .find(|(addr, _)| *addr == id)
+            .map(|(_, w)| w.clone())
+            .expect("waiting queue must be registered");
+
+        // The waiting list keeps the queue until what it holds has run; then
+        // its strong Arc<Mutex<Vec<Held>>> is dropped and the entry removed.
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(q, 0x10)(q), 1);
+        assert!(weak.upgrade().is_some());
+        release_held(true);
+        assert!(weak.upgrade().is_none());
+        assert!(!lock(&WAITING).iter().any(|(_, w)| w.ptr_eq(&weak)));
+
+        // Even if a stale entry lingered in WAITING when release_held runs,
+        // release_held skips and prunes it without touching freed Queue memory.
+        lock(&WAITING).push((id, weak.clone()));
+        release_held(true);
+        assert!(!lock(&WAITING).iter().any(|(_, w)| w.ptr_eq(&weak)));
+
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(fence, 0x10)(fence), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn concurrent_release_held_and_queue_release_do_not_uaf() {
+        use std::sync::Barrier;
+
+        let null = std::ptr::null();
+        let desc = QueueDesc {
+            kind: 0,
+            priority: 0,
+            flags: 0,
+            nodes: 0,
+        };
+        let mut fence = null;
+        assert_eq!(
+            crate::fence::create(null, 0, 0, &crate::fence::FENCE_IIDS[0], &mut fence),
+            S_OK
+        );
+        for _ in 0..64 {
+            let mut q = null;
+            assert_eq!(create(null, &desc, &QUEUE_IIDS[0], &mut q), S_OK);
+            let wait_fn =
+                slot::<extern "system" fn(This, This, u64) -> HRESULT>(q, signal_slot(q) + 8);
+            assert_eq!(wait_fn(q, fence, 100), S_OK);
+            let weak = Arc::downgrade(&queue(q).held);
+
+            let barrier = Arc::new(Barrier::new(2));
+            let b2 = barrier.clone();
+            let releaser = std::thread::spawn(move || {
+                b2.wait();
+                release_held(true);
+            });
+            barrier.wait();
+            // 1 if the waiting list still has it, 0 if it ran first.
+            assert!(slot::<extern "system" fn(This) -> u32>(q, 0x10)(q) <= 1);
+            releaser.join().unwrap();
+            assert!(weak.upgrade().is_none());
+        }
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(fence, 0x10)(fence), 0);
     }
 }
