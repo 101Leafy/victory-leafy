@@ -1128,7 +1128,7 @@ fn emit_program(
         }
         _ => 0,
     };
-    let l = lower::lower(&lower::Parts {
+    let parts = lower::Parts {
         native,
         p,
         st,
@@ -1138,7 +1138,33 @@ fn emit_program(
         outputs,
         prims,
         mesh_stride,
-    })?;
+    };
+    // A console wave64 program on a host of 32-lane waves, dispatched by a count of threads:
+    // the threads past the count cannot leave at the start when the two host waves of a
+    // console wave exchange (each meets the other at group barriers). With EXEC on entry the
+    // launched lanes ([`structure::with_launched_exec`]) they run on with their EXEC bit
+    // clear, as the console's lanes past the count do. (`VICTORY_LAUNCHED_EXEC=0`: not tried.)
+    let launched = (lower::counted_in_launched_lanes(&parts)
+        && std::env::var_os("VICTORY_LAUNCHED_EXEC").is_none_or(|v| v != "0"))
+    .then(|| {
+        let st = structure::with_launched_exec(|| structure::structure_wide(p, &st.wide)).ok()?;
+        let res = resource::track(p, &native.layout, native.stage, Some(&st)).ok()?;
+        let parts = lower::Parts {
+            st: &st,
+            res: &res,
+            inputs: parts.inputs.clone(),
+            outputs: parts.outputs.clone(),
+            prims: parts.prims.clone(),
+            ..parts
+        };
+        let l = lower::lower_counted(&parts, true).ok()?;
+        (l.wave_size != Some(64)).then(|| (l, res.root_indexed_views.clone()))
+    })
+    .flatten();
+    let (l, root_indexed_views) = match launched {
+        Some(done) => done,
+        None => (lower::lower(&parts)?, res.root_indexed_views.clone()),
+    };
     let wave_size = l.wave_size;
     let shader = HostShader {
         stage: native.stage,
@@ -1160,7 +1186,7 @@ fn emit_program(
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
         root_uavs: l.root_uavs,
-        root_indexed_views: res.root_indexed_views.clone(),
+        root_indexed_views,
     };
     Ok((shader, wave_size))
 }
