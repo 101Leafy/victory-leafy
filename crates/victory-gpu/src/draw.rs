@@ -357,11 +357,12 @@ pub(crate) struct State {
     topology: u32,
     /// What the title set that goes straight onto the host list, kept for
     /// the host list that continues this one after a cut ([`State::replay`]):
-    /// whether a topology was set, the render target and depth handles, the
-    /// viewports, the scissors, the blend factor and the stencil reference.
+    /// whether a topology was set, the render target and depth views as
+    /// their descriptors were when the title set them, the viewports, the
+    /// scissors, the blend factor and the stencil reference.
     topology_set: bool,
-    target_handles: Vec<u64>,
-    depth_handle: u64,
+    target_views: Vec<Target<D3D12_RENDER_TARGET_VIEW_DESC>>,
+    depth_view: Option<Target<D3D12_DEPTH_STENCIL_VIEW_DESC>>,
     targets_set: bool,
     /// The render target views and the depth view the host list has, once
     /// it has any ([`State::set_targets`]): per view the host texture (0:
@@ -710,6 +711,15 @@ pub(crate) fn dispatched() -> u64 {
 /// What a render target or depth view of the host is made from: the host
 /// texture, and [`crate::descriptor::RtvRecord::key`].
 type TargetKey = (usize, (usize, [u32; 7]));
+
+/// A view the title set as a render target or depth: its resource and
+/// description words (`crate::descriptor::RtvRecord::key`) and its host
+/// description.
+#[derive(Clone, Copy)]
+struct Target<D> {
+    key: (usize, [u32; 7]),
+    desc: Option<D>,
+}
 
 /// The host address of a root view: its buffer's host copy, or for a
 /// constant buffer not 256-byte aligned there (the console needs 16) a
@@ -1215,17 +1225,11 @@ impl State {
     /// again, each time a host view per target and a call of the driver
     /// (25,662 times in a frame of another fork). `VICTORY_BIND_CACHE=0`
     /// sets them every time.
+    /// The views are read from the descriptors now and kept: the title may
+    /// write other views into those descriptors, or release their heap,
+    /// right after the call (the console reads them only here too).
     pub(crate) fn set_targets(&mut self, list: &HostList, handles: &[u64], depth: u64) {
-        let Some(host) = crate::host::host() else {
-            return;
-        };
-        self.target_handles.clear();
-        self.target_handles.extend_from_slice(handles);
-        self.depth_handle = depth;
-        self.targets_set = true;
-        self.targets.clear();
-        let mut views = Vec::with_capacity(handles.len());
-        let mut keys = Vec::with_capacity(handles.len());
+        self.target_views.clear();
         for &h in handles {
             let Some(record) = crate::descriptor::rtv_record(h) else {
                 once!(
@@ -1234,42 +1238,64 @@ impl State {
                 );
                 continue;
             };
-            let Some(texture) = crate::resource::host_resource(record.resource) else {
+            self.target_views.push(Target {
+                key: record.key(),
+                desc: record.desc(),
+            });
+        }
+        self.depth_view = crate::descriptor::dsv_record(depth).map(|record| Target {
+            key: record.key(),
+            desc: record.depth_desc(),
+        });
+        self.targets_set = true;
+        self.bind_targets(list);
+    }
+
+    /// The kept target views ([`State::set_targets`]) set on the host list.
+    fn bind_targets(&mut self, list: &HostList) {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        self.targets.clear();
+        let mut views = Vec::with_capacity(self.target_views.len());
+        let mut keys = Vec::with_capacity(self.target_views.len());
+        for t in &self.target_views {
+            let resource = t.key.0 as This;
+            let Some(texture) = crate::resource::host_resource(resource) else {
                 // A typed null view (or a target without a host copy) still
                 // takes its slot: left out, the next live target would move
                 // into it and the pixel shader's outputs reach the wrong
                 // targets.
                 // shortcut: a view without a description or a format has no
                 // null view to stand for it and is left out, as before.
-                let null = record
-                    .desc()
-                    .filter(|d| d.Format.0 != 0 && d.ViewDimension.0 != 0);
+                let null = t.desc.filter(|d| d.Format.0 != 0 && d.ViewDimension.0 != 0);
                 if let Some(desc) = null {
                     views.push((None, Some(desc)));
-                    keys.push((0, record.key()));
+                    keys.push((0, t.key));
                 }
                 continue;
             };
-            self.targets.push(record.resource as usize);
+            self.targets.push(t.key.0);
             #[cfg(feature = "diagnostics")]
-            crate::capture::note_target(record.resource);
-            views.push((Some(texture), record.desc()));
-            keys.push((texture.as_raw() as usize, record.key()));
+            crate::capture::note_target(resource);
+            views.push((Some(texture), t.desc));
+            keys.push((texture.as_raw() as usize, t.key));
         }
         self.depth = 0;
         self.depth_state = DEPTH_WRITE;
-        let dsv = crate::descriptor::dsv_record(depth).and_then(|record| {
-            let texture = crate::resource::host_resource(record.resource)?;
-            self.depth = record.resource as usize;
-            self.depth_state = depth_state(texture, record.depth_desc().as_ref());
-            if crate::resource::depth_and_unordered(record.resource) {
+        let dsv = self.depth_view.and_then(|t| {
+            let resource = t.key.0 as This;
+            let texture = crate::resource::host_resource(resource)?;
+            self.depth = t.key.0;
+            self.depth_state = depth_state(texture, t.desc.as_ref());
+            if crate::resource::depth_and_unordered(resource) {
                 crate::resource::DEPTH_UNORDERED[1].fetch_add(1, Ordering::Relaxed);
             }
             #[cfg(feature = "diagnostics")]
-            crate::capture::note_target(record.resource);
-            Some((texture, record))
+            crate::capture::note_target(resource);
+            Some((texture, t))
         });
-        let now = (keys, dsv.as_ref().map(|(texture, record)| (texture.as_raw() as usize, record.key())));
+        let now = (keys, dsv.as_ref().map(|(texture, t)| (texture.as_raw() as usize, t.key)));
         static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if *CACHE.get_or_init(|| std::env::var("VICTORY_BIND_CACHE").map_or(true, |v| v != "0"))
             && self.host_targets.as_ref() == Some(&now)
@@ -1278,7 +1304,7 @@ impl State {
         }
         self.host_targets = Some(now);
         let rtvs: Vec<_> = views.iter().map(|(texture, desc)| host.rtv(*texture, desc.as_ref())).collect();
-        let dsv = dsv.map(|(texture, record)| host.dsv(texture, record.depth_desc().as_ref()));
+        let dsv = dsv.map(|(texture, t)| host.dsv(texture, t.desc.as_ref()));
         // SAFETY: an open list; the views were just made.
         unsafe {
             list.list.OMSetRenderTargets(
@@ -1354,10 +1380,8 @@ impl State {
     /// none); root arguments, vertex and index buffers are set by every
     /// draw anyway. The dynamic descriptor slots and the tables made in
     /// them stay: the parts before the cut have not run yet, and they are
-    /// given back when the title's list is reset.
-    /// shortcut: the render target views are made again from the handles'
-    /// descriptors as they are now, not as they were when the title set
-    /// the targets (a descriptor rewritten in between names another view).
+    /// given back when the title's list is reset. The render target views
+    /// are the ones the title's descriptors held when it set them.
     pub(crate) fn replay(&mut self, list: &HostList) {
         self.host_pipeline = 0;
         self.host_roots = [0; 2];
@@ -1367,8 +1391,7 @@ impl State {
         }
         self.host_targets = None;
         if self.targets_set {
-            let handles = std::mem::take(&mut self.target_handles);
-            self.set_targets(list, &handles, self.depth_handle);
+            self.bind_targets(list);
         }
         if !self.viewports.is_empty() {
             crate::draw::viewports(list, &self.viewports);
@@ -5363,6 +5386,67 @@ mod tests {
         assert_eq!(staging_budget_per_frame(Some(20 * GIB)), 384 * MIB);
         assert_eq!(staging_budget_per_frame(Some(24 * GIB)), 384 * MIB);
         assert_eq!(staging_budget_per_frame(Some(32 * GIB)), 384 * MIB);
+    }
+
+    /// A 4x4 target (`flags` 1) or depth (2) texture of the title's.
+    fn target_texture(format: u32, flags: u32) -> crate::object::This {
+        let null = std::ptr::null();
+        let iid = crate::object::guid(
+            0x696442be,
+            0xa72e,
+            0x4059,
+            [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
+        );
+        let heap: [u32; 5] = [1, 0, 0, 0, 0];
+        let desc: [u32; 14] = [3, 0, 0, 0, 4, 0, 4, 1 | (1 << 16), format, 1, 0, 0, flags, 0];
+        let mut out = null;
+        assert_eq!(
+            crate::resource::create_committed(
+                null,
+                heap.as_ptr().cast(),
+                0,
+                desc.as_ptr().cast(),
+                0,
+                null.cast(),
+                &iid,
+                &mut out,
+            ),
+            crate::object::S_OK
+        );
+        out
+    }
+
+    /// The title may write other views into its target descriptors, or
+    /// free them, once it has set the targets: the host list after a cut
+    /// binds the views the descriptors held when they were set.
+    #[test]
+    fn a_cut_binds_the_targets_as_they_were_set() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let null = std::ptr::null();
+        let (a, b) = (target_texture(28, 1), target_texture(28, 1));
+        let depth = target_texture(40, 2);
+        let mut slots = [[0u8; 112]; 2];
+        let (rtv, dsv) = (slots[0].as_mut_ptr() as u64, slots[1].as_mut_ptr() as u64);
+        crate::descriptor::create_rtv(null, a, null.cast(), rtv);
+        crate::descriptor::create_dsv(null, depth, null.cast(), dsv);
+
+        let list = host.new_list().unwrap();
+        let mut state = super::State::default();
+        state.set_targets(&list, &[rtv], dsv);
+        crate::descriptor::create_rtv(null, b, null.cast(), rtv);
+        slots[1] = [0; 112];
+        state.replay(&list);
+        assert_eq!(state.targets, [a as usize]);
+        assert_eq!(state.depth, depth as usize);
+        let (keys, dsv) = state.host_targets.clone().unwrap();
+        assert_eq!(keys.iter().map(|k| k.1.0).collect::<Vec<_>>(), [a as usize]);
+        assert_eq!(dsv.map(|k| k.1.0), Some(depth as usize));
+        list.close();
+        for t in [a, b, depth] {
+            crate::object::release(t);
+        }
     }
 
     #[test]
