@@ -205,11 +205,20 @@ pub(crate) enum C {
     /// was hashed earlier in the frame (`texture::first_once`).
     TexHashedFirst,
     TexFirstSkipped,
+    /// `list::copy_texture_region` by step (`list::CopyLaps`), its calls,
+    /// and the calls of 4 ms or more.
+    CopyTexBackNs,
+    CopyTexSourceNs,
+    CopyTexFirstNs,
+    CopyTexLevelsNs,
+    CopyTexRecordNs,
+    CopyTexCalls,
+    CopyTexSlow,
 }
-const COUNTERS: usize = 112;
+const COUNTERS: usize = 120;
 
 /// The counters' names, in the order of [`C`], for the frame recorder's columns.
-pub(crate) const NAMES: [&str; 107] = [
+pub(crate) const NAMES: [&str; 114] = [
     "Submissions", "Copies", "CopyBytes", "Refreshes", "RefreshBytes", "Skipped", "SkippedBytes", "Runs",
     "RunUs", "Queries", "QueryUs", "MoveUs", "Unmapped", "Watches", "WatchUs", "Checked", "Unchanged",
     "Fallbacks", "GuardFaults", "TexWatched", "TexHashed", "TexChanged", "TexHot", "Frames", "RecordCalls",
@@ -225,7 +234,8 @@ pub(crate) const NAMES: [&str; 107] = [
     "AskRefused", "AskRefusedUs", "AskRefusedAgain", "AskSkipped", "AskAgain", "AskAgainBytes", "GuardAgain",
     "BackAgainBytes", "RefreshGapBytes", "LookupQuick", "LookupTables", "LookupLoose", "ThinDrawNs",
     "ThinDraws", "ThinSetNs", "ThinBarrierNs", "ThinCopyNs", "ThinOtherNs", "TexHashedTurn", "TexHashedHot",
-    "TexTurnSkipped", "TexHashedFirst", "TexFirstSkipped",
+    "TexTurnSkipped", "TexHashedFirst", "TexFirstSkipped", "CopyTexBackNs", "CopyTexSourceNs", "CopyTexFirstNs",
+    "CopyTexLevelsNs", "CopyTexRecordNs", "CopyTexCalls", "CopyTexSlow",
 ];
 /// One of some sets of counters, each in lines of the processor's memory of
 /// its own: a set for all threads had them wait for each other's lines at
@@ -536,7 +546,7 @@ mod command_tests {
     #[test]
     fn every_counter_is_named() {
         use super::{C, COUNTERS, NAMES};
-        assert_eq!(C::TexFirstSkipped as usize + 1, NAMES.len());
+        assert_eq!(C::CopyTexSlow as usize + 1, NAMES.len());
         assert_eq!(NAMES[C::Frames as usize], "Frames");
         assert!(NAMES.len() <= COUNTERS);
     }
