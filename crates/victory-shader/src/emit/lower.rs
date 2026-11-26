@@ -53,6 +53,10 @@ mod interp_guard_tests;
 #[path = "wave_prefix_tests.rs"]
 mod wave_prefix_tests;
 
+#[cfg(all(test, windows))]
+#[path = "guard_run_tests.rs"]
+mod guard_run_tests;
+
 type Why = &'static str;
 
 /// How an interpolation evaluates an input channel.
@@ -112,6 +116,9 @@ pub(crate) struct Lowered {
     pub wave_prefix_f32_args: Vec<Vec<Option<i64>>>,
     #[cfg(test)]
     pub wave_prefix_i32_args: Vec<Vec<Option<i64>>>,
+    /// Runs lowered in every lane ([`Lower::guarded_run`]): block, first and end index.
+    #[cfg(test)]
+    pub guard_runs: Vec<(usize, usize, usize)>,
 }
 
 /// `DB_SHADER_CONTROL.DEPTH_BEFORE_SHADER` (AMD's register headers, as in
@@ -461,6 +468,8 @@ struct Lower<'a> {
     /// With [`super::guard_runs`]: per value, the last instruction of its own
     /// block that reads it, none where a phi or another block reads it.
     last_read: HashMap<Value, Option<usize>>,
+    #[cfg(test)]
+    runs_taken: Vec<(usize, usize, usize)>,
     /// Values written in a section that code outside it reads.
     section_out: HashSet<Value>,
     /// The program's constant table (the code from the first byte read
@@ -1999,6 +2008,8 @@ impl<'a> Lower<'a> {
             sections: HashMap::new(),
             spec: None,
             last_read: HashMap::new(),
+            #[cfg(test)]
+            runs_taken: Vec::new(),
             section_out: HashSet::new(),
             code_table: None,
             #[cfg(test)]
@@ -2917,6 +2928,8 @@ impl<'a> Lower<'a> {
             wave_prefix_f32_args: self.s.m.written_call_int_args("dx.op.wavePrefixOp.f32"),
             #[cfg(test)]
             wave_prefix_i32_args: self.s.m.written_call_int_args("dx.op.wavePrefixOp.i32"),
+            #[cfg(test)]
+            guard_runs: self.runs_taken,
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -5281,6 +5294,8 @@ impl<'a> Lower<'a> {
         let offset = p.blocks[b].insts[start].machine.offset;
         let g = self.guard(b, start).map_err(|w| unsupported(offset, w))?.expect("a guarded run");
         self.spec = Some((b, start, end));
+        #[cfg(test)]
+        self.runs_taken.push((b, start, end));
         let r = (start..end).try_for_each(|i| self.inst(b, i));
         self.spec = None;
         r?;
