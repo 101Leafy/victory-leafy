@@ -1675,6 +1675,14 @@ fn texture_floor_bytes(vram_budget: Option<u64>) -> u64 {
     }
 }
 
+/// Free space in the pool's blocks of textures and free tiles in the pool
+/// of levels on demand: the card's memory the host counts as used, where
+/// new textures and levels go first.
+#[cfg(windows)]
+fn free_room() -> u64 {
+    crate::pool::texture_room() + crate::tiles::free_bytes()
+}
+
 /// Whether more host copies of textures the title fills may be made for
 /// shaders that pick textures by index (`draw.rs` `heap_textures`): always
 /// up to [`texture_floor_bytes`] bytes of them, beyond that while the card's
@@ -1707,7 +1715,7 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
         // world makes in its first frame ([`targets_room_kept`]) counts as
         // used.
         Some([budget, used, ..]) => {
-            used.saturating_sub(crate::pool::texture_room()) + crate::shadow::card_room_kept() + targets_room_kept()
+            used.saturating_sub(free_room()) + crate::shadow::card_room_kept() + targets_room_kept()
                 < budget / 100 * room_percent()
         }
         None => filled < WITHOUT_BUDGET,
@@ -2049,7 +2057,7 @@ pub(crate) fn let_go_idle() {
         .get_or_init(|| !matches!(std::env::var("VICTORY_TEXTURE_KEEP").as_deref(), Ok("0") | Ok("1")));
     let (idle_ms, most) = match memory {
         Some([budget, used, ..]) if keep => {
-            let used = used.saturating_sub(crate::pool::texture_room())
+            let used = used.saturating_sub(free_room())
                 + crate::shadow::card_room_kept()
                 + targets_room_kept();
             crate::host::vram_keep(budget, used)
@@ -2152,7 +2160,7 @@ pub(crate) fn let_go_idle() {
                 UNMAPPED_GONE[1].fetch_add(host.bytes, Relaxed);
             }
             went += 1;
-            bytes += host.bytes;
+            bytes += host.held_bytes();
             if first.is_none() {
                 first = Some(at);
             }
@@ -2366,6 +2374,13 @@ impl HostTexture {
             ahead: crate::texture::ahead::fresh(),
             flags,
         }
+    }
+
+    /// The card's memory it holds now: its allocation, or for a tiled one
+    /// (counted as 0 bytes) the tiles its levels have. What letting it go
+    /// frees.
+    pub(crate) fn held_bytes(&self) -> u64 {
+        self.tiled.as_ref().map_or(self.bytes, crate::tiles::Tiled::given_bytes)
     }
 
     /// A texture made without memory of its own (`crate::tiles`): counted

@@ -147,6 +147,13 @@ impl Heap {
 /// the card (a texture names its heaps by place).
 static POOL: Mutex<Vec<Option<Heap>>> = Mutex::new(Vec::new());
 
+/// The bytes of the pool's heaps no texture holds (counted by the host as
+/// in use).
+pub(crate) fn free_bytes() -> u64 {
+    let pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+    pool.iter().flatten().map(|h| u64::from(h.free_tiles())).sum::<u64>() * TILE
+}
+
 /// `count` tiles of one heap, in as many runs as it takes, the lowest free
 /// tiles first (single free tiles are used up before a long run is cut):
 /// the heap, its place in the pool and the runs (first tile, tiles). A new
