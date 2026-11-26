@@ -874,6 +874,265 @@ fn input_comp(format: u32) -> u8 {
     }
 }
 
+/// Channel width in bits, channel count, and numeric format of a DXGI
+/// format whose channels are all one width, in register order.
+fn dxgi_channels(format: u32) -> Option<(u32, u32, crate::emit::lower::Numeric)> {
+    use crate::emit::lower::Numeric::*;
+    Some(match format {
+        2 => (32, 4, Float),
+        3 => (32, 4, Uint),
+        4 => (32, 4, Sint),
+        6 => (32, 3, Float),
+        7 => (32, 3, Uint),
+        8 => (32, 3, Sint),
+        10 => (16, 4, Float),
+        11 => (16, 4, Unorm),
+        12 => (16, 4, Uint),
+        13 => (16, 4, Snorm),
+        14 => (16, 4, Sint),
+        16 => (32, 2, Float),
+        17 => (32, 2, Uint),
+        18 => (32, 2, Sint),
+        28 => (8, 4, Unorm),
+        30 => (8, 4, Uint),
+        31 => (8, 4, Snorm),
+        32 => (8, 4, Sint),
+        34 => (16, 2, Float),
+        35 => (16, 2, Unorm),
+        36 => (16, 2, Uint),
+        37 => (16, 2, Snorm),
+        38 => (16, 2, Sint),
+        41 => (32, 1, Float),
+        42 => (32, 1, Uint),
+        43 => (32, 1, Sint),
+        49 => (8, 2, Unorm),
+        50 => (8, 2, Uint),
+        51 => (8, 2, Snorm),
+        52 => (8, 2, Sint),
+        54 => (16, 1, Float),
+        56 => (16, 1, Unorm),
+        57 => (16, 1, Uint),
+        58 => (16, 1, Snorm),
+        59 => (16, 1, Sint),
+        61 => (8, 1, Unorm),
+        62 => (8, 1, Uint),
+        63 => (8, 1, Snorm),
+        64 => (8, 1, Sint),
+        _ => return None,
+    })
+}
+
+/// User data 0-1 of a loose vertex program: the address of its vertex
+/// buffer table, 16-byte buffer descriptors by input slot.
+const VERTEX_TABLE: u8 = 0;
+const S_NOP: u32 = 0xBF80_0000;
+
+fn v_mov(dst: u8, src: u32) -> u32 {
+    0x7E00_0200 | u32::from(dst) << 17 | src
+}
+
+/// Scalar registers an instruction reads and writes, as (first, count).
+fn scalar_operands(f: &crate::gfx10::Fields) -> (Vec<(u8, u8)>, Vec<(u8, u8)>) {
+    use crate::gfx10::{Fields, Operand};
+    let s = |o: &Option<Operand>| match *o {
+        Some(Operand::Scalar { code, dwords }) if code < 106 => Some((code, dwords)),
+        _ => None,
+    };
+    let all = |v: &[Operand]| v.iter().filter_map(|o| s(&Some(*o))).collect::<Vec<_>>();
+    match f {
+        Fields::Sop { dst, src, .. } => (all(src), s(dst).into_iter().collect()),
+        Fields::Smem { data, base, soffset, .. } => (all(&[*base, *soffset]), s(data).into_iter().collect()),
+        Fields::Valu(v) => (all(&v.src), [s(&v.dst), s(&v.carry)].into_iter().flatten().collect()),
+        Fields::Buffer { rsrc, soffset, .. } => (all(&[*rsrc, *soffset]), vec![]),
+        Fields::Image { rsrc, sampler, .. } => {
+            let mut v = vec![*rsrc];
+            v.extend(*sampler);
+            (all(&v), vec![])
+        }
+        Fields::Flat { saddr, .. } => (s(saddr).into_iter().collect(), vec![]),
+        _ => (vec![], vec![]),
+    }
+}
+
+/// Rewrites the vertex fetch of a loose vertex program into reads of the
+/// input VGPRs [`loose_graphics`] declares (element i's channels from
+/// `base + 4i`), so the program reads no vertex buffers.
+///
+/// GTA's programs copy the table address from user data 0-1 (masking its
+/// high half), load buffer descriptors from it with `s_load_dwordx4`, and
+/// fetch each element by vertex index (`idxen`), with raw dword loads or
+/// typed loads at the element's own channel width; the immediate offset is
+/// the byte offset in the vertex. Descriptor loads become `s_nop`, each
+/// fetch `v_mov_b32` from the input VGPRs (typed loads past the format's
+/// channels get 0, 0, 1 as the hardware does). Only the straight-line run
+/// from the entry is lifted; any other use of the table or its descriptors
+/// is refused, as is code there that reads its own address. Programs whose
+/// metadata places a root parameter in user data 0-1 come back as they are.
+fn lift_vertex_fetch(code: &[u8], inputs: &[InputElement], base: u16, m: &LooseMetadata) -> Result<Vec<u8>, ShaderError> {
+    use crate::emit::lower::{Numeric, buffer_format};
+    use crate::gfx10::{Encoding, Fields, Flow, NULL, Operand};
+    let table = VERTEX_TABLE..VERTEX_TABLE + 2;
+    if m.layout.iter().any(|e| {
+        let ud = u32::from(e.user_data);
+        ud < table.end.into() && ud + e.sgprs.max(1) > table.start.into()
+    }) {
+        return Ok(code.to_vec());
+    }
+    let insts = crate::gfx10::decode(code)?;
+    let refuse = |offset, what| ShaderError::Unsupported { offset, what };
+    let mut targets = std::collections::BTreeSet::new();
+    for i in &insts {
+        if let Flow::Jump(t) | Flow::Branch(t) = crate::gfx10::control(i, code.len(), |_| None)? {
+            targets.insert(t);
+        }
+    }
+    // Every edit lies before the first branch and the first branch target,
+    // so no branch offset changes.
+    let straight = insts
+        .iter()
+        .position(|i| targets.contains(&i.offset) || i.name().is_some_and(|n| n.starts_with("s_cbranch_") || matches!(n, "s_branch" | "s_call_b64" | "s_setpc_b64" | "s_swappc_b64")))
+        .unwrap_or(insts.len());
+
+    let mut pairs = std::collections::BTreeSet::from([VERTEX_TABLE]);
+    let mut vsharps = std::collections::BTreeMap::<u8, u32>::new();
+    let mut edits = std::collections::BTreeMap::<usize, Vec<u32>>::new();
+    let overlaps = |r: u8, n: u8, (c, d): (u8, u8)| r < c + d && c < r + n;
+    for (n, i) in insts.iter().enumerate() {
+        let f = i.fields(false);
+        let (reads, writes) = scalar_operands(&f);
+        let name = i.name().unwrap_or("");
+        let lifting = n < straight;
+        match &f {
+            Fields::Sop { dst: Some(Operand::Scalar { code: d, .. }), src, .. }
+                if lifting && name == "s_mov_b64" && matches!(src[..], [Operand::Scalar { code, .. }] if pairs.contains(&code)) =>
+            {
+                pairs.retain(|&p| !overlaps(p, 2, (*d, 2)));
+                vsharps.retain(|&r, _| !overlaps(r, 4, (*d, 2)));
+                pairs.insert(*d);
+                continue;
+            }
+            // Masks the table address to 40 bits or more: still the table.
+            Fields::Sop { dst: Some(Operand::Scalar { code: d, .. }), src, .. }
+                if lifting
+                    && name == "s_bfe_u32"
+                    && pairs.contains(&d.wrapping_sub(1))
+                    && matches!(src[..], [Operand::Scalar { code, .. }, Operand::Literal(l)] if code == *d && l & 0x1F == 0 && l >> 16 & 0x7F >= 8) =>
+            {
+                continue;
+            }
+            Fields::Smem { data: Some(Operand::Scalar { code: d, dwords }), base: Operand::Scalar { code: b, .. }, offset, soffset, .. }
+                if pairs.contains(b) =>
+            {
+                let descriptors = lifting
+                    && name.starts_with("s_load_dwordx")
+                    && dwords % 4 == 0
+                    && *soffset == (Operand::Scalar { code: NULL, dwords: 1 })
+                    && *offset >= 0
+                    && offset % 16 == 0;
+                if !descriptors {
+                    return Err(refuse(i.offset, "a vertex buffer table read the fetch lift does not know"));
+                }
+                pairs.retain(|&p| !overlaps(p, 2, (*d, *dwords)));
+                vsharps.retain(|&r, _| !overlaps(r, 4, (*d, *dwords)));
+                for j in 0..dwords / 4 {
+                    vsharps.insert(d + 4 * j, *offset as u32 / 16 + u32::from(j));
+                }
+                edits.insert(i.offset, vec![S_NOP; i.words.len()]);
+                continue;
+            }
+            Fields::Buffer { data: Some(Operand::Vector { reg, dwords }), rsrc: Operand::Scalar { code: r, .. }, soffset, offset, offen, idxen, format, lds, tfe, .. }
+                if vsharps.contains_key(r) =>
+            {
+                let typed = match (i.encoding, name) {
+                    (Encoding::Mtbuf, n) if n.starts_with("tbuffer_load_format_") && !n.contains("d16") => true,
+                    (Encoding::Mubuf, n) if n.starts_with("buffer_load_format_") && !n.contains("d16") => true,
+                    (Encoding::Mubuf, n) if n.starts_with("buffer_load_dword") => false,
+                    _ => return Err(refuse(i.offset, "a vertex buffer access the fetch lift does not know")),
+                };
+                if !lifting || !idxen || *offen || *lds || *tfe || *soffset != Operand::Const(128) {
+                    return Err(refuse(i.offset, "a vertex fetch the lift does not know"));
+                }
+                let slot = vsharps[r];
+                let at = u32::from(*offset);
+                let found = inputs.iter().enumerate().find_map(|(k, e)| {
+                    let (bits, count, numeric) = dxgi_channels(e.format)?;
+                    (e.slot == slot && (e.offset..e.offset + bits / 8 * count).contains(&at)).then_some((k, e, bits, count, numeric))
+                });
+                let Some((k, e, bits, count, numeric)) = found else {
+                    return Err(refuse(i.offset, "a vertex fetch outside the input layout"));
+                };
+                if e.class != 0 {
+                    return Err(refuse(i.offset, "an instanced loose vertex input"));
+                }
+                // Channels the load reads from memory; past them a typed
+                // load fills in 0, 0, 1.
+                let (width, have, one) = match *format {
+                    Some(fmt) => {
+                        let (widths, n) = buffer_format(fmt).ok_or(refuse(i.offset, "an unknown vertex fetch format"))?;
+                        if widths.iter().any(|&w| w != bits) || n != numeric {
+                            return Err(refuse(i.offset, "a vertex fetch format unlike its element's"));
+                        }
+                        let int = matches!(n, Numeric::Uint | Numeric::Sint);
+                        (bits, widths.len() as u32, if int { 129 } else { 0xF2 })
+                    }
+                    None if typed => (bits, 4, 0xF2),
+                    None if bits == 32 => (32, count, 0),
+                    None => return Err(refuse(i.offset, "a raw vertex fetch of a packed element")),
+                };
+                let comp = (at - e.offset) / (width / 8);
+                if (at - e.offset) % (width / 8) != 0 || (!typed && comp + u32::from(*dwords) > count) || comp + u32::from(*dwords).min(have) > 4 {
+                    return Err(refuse(i.offset, "a vertex fetch across its element"));
+                }
+                let first = u32::from(base) + 4 * k as u32 + comp;
+                let mut words: Vec<u32> = (0..u32::from(*dwords))
+                    .map(|c| {
+                        let src = match c {
+                            c if c < have => 0x100 + first + c,
+                            3 => one,
+                            _ => 0x80,
+                        };
+                        v_mov(reg + c as u8, src)
+                    })
+                    .collect();
+                words.resize(words.len().max(i.words.len()), S_NOP);
+                edits.insert(i.offset, words);
+                continue;
+            }
+            _ => {}
+        }
+        if reads.iter().any(|&o| pairs.iter().any(|&p| overlaps(p, 2, o)) || vsharps.keys().any(|&r| overlaps(r, 4, o))) {
+            return Err(refuse(i.offset, "a vertex buffer descriptor read the fetch lift does not know"));
+        }
+        for &o in &writes {
+            pairs.retain(|&p| !overlaps(p, 2, o));
+            vsharps.retain(|&r, _| !overlaps(r, 4, o));
+        }
+    }
+    if edits.is_empty() {
+        return Ok(code.to_vec());
+    }
+
+    let mut out = Vec::with_capacity(code.len());
+    let mut from = 0;
+    for i in &insts {
+        out.extend(&code[from..i.offset]);
+        let end = i.offset + 4 * i.words.len();
+        match edits.get(&i.offset) {
+            Some(words) => words.iter().for_each(|w| out.extend(w.to_le_bytes())),
+            None => out.extend(&code[i.offset..end]),
+        }
+        from = end;
+    }
+    out.extend(&code[from..]);
+    if out.len() != code.len()
+        && let Some(i) = insts[..straight].iter().find(|i| i.name() == Some("s_getpc_b64"))
+    {
+        return Err(refuse(i.offset, "code that reads its own address, moved by the fetch lift"));
+    }
+    crate::gfx10::decode(&out)?;
+    Ok(out)
+}
+
 /// Fourcc of the part in a [`loose_graphics`] vertex container saying where
 /// the vertex fetch reads: u32 element count, then per element of the input
 /// layout u32 slot, offset, DXGI format, and the VGPR its first channel
@@ -896,7 +1155,9 @@ pub struct LooseGraphics {
 /// the parts say:
 ///
 /// - vertex inputs: one row per layout element, its four channels in VGPRs
-///   past the ones the program uses (the [`VERTEX_FETCH`] part says which);
+///   past the ones the program uses (the [`VERTEX_FETCH`] part says which),
+///   which the program's own vertex fetch is rewritten to read
+///   ([`lift_vertex_fetch`]);
 /// - vertex outputs: `SV_Position` in row 0, then `TEXCOORD<p>` in row
 ///   1 + p for each `exp param<p>` and each parameter the pixel program reads;
 /// - pixel inputs: `SV_Position`, the parameters SPI_PS_INPUT_CNTL names in
@@ -916,7 +1177,12 @@ pub fn loose_graphics(
     let regs = loose_regs(regs)?;
     let inputs = loose_input_layout(layout)?;
     let vs_meta = loose_metadata(vs.1)?;
-    let vs_code = loose_code(vs.0, &vs_meta)?;
+    let base = wave32_vgprs(regs.vs_rsrc1);
+    let vs_vgprs = base + 4 * inputs.len() as u16;
+    if vs_vgprs > 256 {
+        return Err(refuse("loose vertex inputs past v255"));
+    }
+    let vs_code = &lift_vertex_fetch(loose_code(vs.0, &vs_meta)?, &inputs, base, &vs_meta)?[..];
     let mut params = std::collections::BTreeSet::new();
     for t in export_targets(vs_code)? {
         match t {
@@ -947,11 +1213,6 @@ pub fn loose_graphics(
     }
     let comp = |p: &u8| if flat.get(p) == Some(&true) { 5 } else { 9 };
 
-    let base = wave32_vgprs(regs.vs_rsrc1);
-    let vs_vgprs = base + 4 * inputs.len() as u16;
-    if vs_vgprs > 256 {
-        return Err(refuse("loose vertex inputs past v255"));
-    }
     let mut data = vec![0; VS_OUTPUT_COUNT + 4];
     let mut isg1 = Vec::new();
     let mut fetch = (inputs.len() as u32).to_le_bytes().to_vec();
@@ -1946,5 +2207,56 @@ mod tests {
         let default = graphics_regs(0x20);
         assert!(loose_graphics(&default, &layout, (&vs, &vs_meta), Some((&mrt0, &ps_meta))).is_err());
         assert!(loose_graphics(&regs[..regs.len() - 4], &layout, (&vs, &vs_meta), None).is_err());
+    }
+
+    /// Call 1's vertex program: POSITION by a raw x3 load, COLOR by a typed
+    /// 8_8_8_8 load, both through the table at user data 0-1.
+    fn fetching_vs(position: u32, color: u32) -> Vec<u32> {
+        vec![
+            0xbe88_0400, 0x9389_ff09, 0x0008_0000, 0xf408_0204, 0xfa00_0000, 0x4a00_0002, 0xbf8c_c07f,
+            position, 0x8002_0100, color, 0x8002_0400, 0x7e10_02f2,
+            0xf800_08cf, 0x0803_0201, EXP_PARAM0[0], EXP_PARAM0[1], S_ENDPGM,
+        ]
+    }
+
+    #[test]
+    fn lift_vertex_fetch_reads_the_input_vgprs() {
+        let inputs = loose_input_layout(&graphics_layout()).unwrap();
+        let vs = fetching_vs(0xe03c_2000, 0xe9c3_200c);
+        let meta = loose_metadata(&graphics_meta(vs.len() as u8, &[])).unwrap();
+        let out = lift_vertex_fetch(&words(&vs), &inputs, 32, &meta).unwrap();
+        let mut want = vs[..3].to_vec();
+        want.extend([S_NOP, S_NOP]);
+        want.extend(&vs[5..7]);
+        want.extend((1..4).map(|r| v_mov(r, 0x100 + 31 + u32::from(r))));
+        want.extend((4..8).map(|r| v_mov(r, 0x100 + 32 + u32::from(r))));
+        want.extend(&vs[11..]);
+        assert_eq!(out, words(&want));
+
+        let regs = graphics_regs(0);
+        let layout = graphics_layout();
+        let ps = words(&[EXP_MRT0[0], EXP_MRT0[1], S_ENDPGM]);
+        let ps_meta = graphics_meta(3, &[]);
+        let g = loose_graphics(&regs, &layout, (&words(&vs), &graphics_meta(vs.len() as u8, &[])), Some((&ps, &ps_meta))).unwrap();
+        let c = crate::Container::parse(&g.vs).unwrap();
+        let p = native_programs(c.part(crate::FourCC::ACCC).unwrap().data).unwrap().remove(0);
+        assert_eq!(p.code, words(&want));
+    }
+
+    #[test]
+    fn lift_vertex_fetch_refuses_what_it_cannot_place() {
+        let inputs = loose_input_layout(&graphics_layout()).unwrap();
+        let meta = loose_metadata(&graphics_meta(17, &[])).unwrap();
+        let lift = |position, color| lift_vertex_fetch(&words(&fetching_vs(position, color)), &inputs, 32, &meta);
+        // An 8-bit typed load of the 32-bit POSITION.
+        assert!(lift(0xe03c_2000, 0xe80b_2000).is_err());
+        // A load past the last element.
+        assert!(lift(0xe03c_2040, 0xe9c3_200c).is_err());
+        // An offset load rather than an index load.
+        assert!(lift(0xe03c_1000, 0xe9c3_200c).is_err());
+
+        let rooted = loose_metadata(&graphics_meta(17, &[record(0x41, 2, 3, 0, 0, 2, 0, 0)])).unwrap();
+        let vs = words(&fetching_vs(0xe03c_2000, 0xe9c3_200c));
+        assert_eq!(lift_vertex_fetch(&vs, &inputs, 32, &rooted).unwrap(), vs);
     }
 }
