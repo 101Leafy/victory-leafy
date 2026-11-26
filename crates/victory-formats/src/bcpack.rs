@@ -129,8 +129,9 @@ impl Tables {
     /// alpha 64 B and colour 256 B, BC4 64 B, BC5 64 B), 512 u16 BC7 control
     /// words, then 255 dictionary entries per format in format order: BC1
     /// 6 + 16 B, BC3 8 + 32 B, BC4 2 + 16 B, BC5 4 + 32 B, BC6H (u8 mode,
-    /// 12 u16, u8 mode, 16 i16), BC7 (u16 control, 24 u16, 2 u8, 2 B,
-    /// 16 + 15 i16). Little-endian, no padding. Every model must tile 65536.
+    /// 12 u16, u8 mode, 16 i16), BC7 (u16 control, 24 u16, 2 u8, then 32 i16
+    /// in the first entry, 2 B and 16 + 15 i16 in the rest). Little-endian, no
+    /// padding. Every model must tile 65536.
     pub fn parse(bytes: &[u8]) -> Result<Tables, Error> {
         if bytes.len() != TABLES_SIZE {
             return Err(Error("table file has the wrong size"));
@@ -210,7 +211,7 @@ impl Tables {
             })
             .collect();
         let bc7 = (0..DICTIONARY)
-            .map(|_| {
+            .map(|entry| {
                 let mut ep = Bc7Ep {
                     ctrl: r.u16(),
                     ..Default::default()
@@ -222,11 +223,18 @@ impl Tables {
                     bits: [r.u8(), r.u8()],
                     ..Default::default()
                 };
-                // Unused: the widths again in all entries but the first.
-                r.u16();
-                // Only 15 slots for set 1, which no entry uses (0 bits).
-                for v in &mut ix.ix.as_flattened_mut()[..31] {
-                    *v = r.u16() as i16;
+                if entry == 0 {
+                    // The first entry has all 32 indices right after the
+                    // width bytes; every later entry repeats the widths first.
+                    for v in ix.ix.as_flattened_mut() {
+                        *v = r.u16() as i16;
+                    }
+                } else {
+                    r.u16();
+                    // Only 15 slots for set 1, which no entry uses (0 bits).
+                    for v in &mut ix.ix.as_flattened_mut()[..31] {
+                        *v = r.u16() as i16;
+                    }
                 }
                 (ep, ix)
             })
@@ -1166,6 +1174,14 @@ mod tests {
     #[test]
     fn the_shipped_tables_parse() {
         assert!(super::Tables::builtin().is_ok());
+    }
+
+    #[test]
+    fn bc7_dictionary_entries_keep_their_indices() {
+        let t = super::Tables::builtin().unwrap();
+        // Entry 0 has no repeated width word; later entries repeat the widths.
+        assert_eq!(t.bc7[0].1.ix[0][..3], [2, 1, 0]);
+        assert_eq!(t.bc7[1].1.ix[0][..3], [1, 0, 0]);
     }
 
     use super::*;
