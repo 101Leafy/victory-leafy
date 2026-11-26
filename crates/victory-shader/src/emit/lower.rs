@@ -235,7 +235,7 @@ fn inline_f16(c: u8) -> u32 {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Numeric {
+pub(crate) enum Numeric {
     Unorm,
     Snorm,
     Uscaled,
@@ -250,7 +250,7 @@ enum Numeric {
 /// Formats are numbered in families (`8`, `16`, `8_8`, ...: AMD names
 /// list channels from the highest bits), each with its numeric formats in
 /// the order unorm, snorm, uscaled, sscaled, uint, sint, float.
-fn buffer_format(format: u8) -> Option<(&'static [u32], Numeric)> {
+pub(crate) fn buffer_format(format: u8) -> Option<(&'static [u32], Numeric)> {
     use Numeric::*;
     const NORM: &[Numeric] = &[Unorm, Snorm, Uscaled, Sscaled, Uint, Sint];
     const ALL: &[Numeric] = &[Unorm, Snorm, Uscaled, Sscaled, Uint, Sint, Float];

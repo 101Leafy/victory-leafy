@@ -97,7 +97,7 @@ mod intersect_tests;
 pub mod host;
 mod idiom;
 mod link;
-mod lower;
+pub(crate) mod lower;
 mod own_bits;
 #[cfg(all(test, windows))]
 mod permlane_tests;
