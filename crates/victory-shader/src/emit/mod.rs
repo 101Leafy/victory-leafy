@@ -2167,6 +2167,112 @@ mod tests {
         }
     }
 
+    /// A pixel program exporting 1e6, a NaN, -1e6 and 1: as they are, and with
+    /// `VICTORY_COLOR_FINITE` held to 65024, 0, -65024 and 1.
+    #[test]
+    #[cfg(windows)]
+    fn color_exports_are_held_finite_when_asked_to() {
+        use super::host::{Draw, Host, Root};
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_SHADER_VISIBILITY_MESH, D3D12_SHADER_VISIBILITY_PIXEL,
+        };
+        let _one = super::valu_tests::ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let words = [
+            0x7E08_02FF,
+            0x4974_2400, // v_mov_b32 v4, 1e6
+            0x7E0A_02FF,
+            0x7FC0_0000, // v_mov_b32 v5, NaN
+            0x7E0C_02FF,
+            0xC974_2400, // v_mov_b32 v6, -1e6
+            0x7E0E_02F2, // v_mov_b32 v7, 1.0
+            0xF800_180F,
+            0x0706_0504, // exp mrt0 v4, v5, v6, v7 done vm
+            0xBF81_0000,
+        ];
+        let mut native = emit_native(&words, 1 << 1 | 1 << 8 | 1 << 9);
+        native.vgprs = 8;
+        let out = SigElement {
+            name: "SV_Target".into(),
+            index: 0,
+            kind: 16,
+            comp: 9,
+            interp: 0,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 15,
+            half: false,
+        };
+        let position = SigElement {
+            name: "SV_Position".into(),
+            index: 0,
+            kind: 3,
+            comp: 9,
+            interp: 4,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 3,
+            half: false,
+        };
+        let isg1 = container::signature(&[position], true);
+        let osg1 = container::signature(&[out], false);
+        let bytes = crate::dxbc::build(&[(FourCC::ISG1, &isg1), (FourCC::OSG1, &osg1)]);
+        let c = Container::parse(&bytes).unwrap();
+        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let ms = triangle_mesh_to(TRIANGLE, 1.3).unwrap();
+        for finite in [false, true] {
+            let was = super::lower::TEST_COLOR_FINITE.replace(Some(finite));
+            let ps = emit(&c, &native, &p, &st, &io, &res);
+            super::lower::TEST_COLOR_FINITE.set(was);
+            let ps = ps.unwrap();
+            if let Some(path) = super::validator::Validator::default_path() {
+                let mut v = super::validator::Validator::load(Some(&path)).unwrap();
+                v.validate(&mut ps.dxil.clone()).unwrap();
+            }
+            let Ok(host) = Host::new(false) else {
+                eprintln!("no hardware device; not run");
+                return;
+            };
+            let root = host
+                .root_signature_for(&[
+                    (&ms, D3D12_SHADER_VISIBILITY_MESH),
+                    (&ps, D3D12_SHADER_VISIBILITY_PIXEL),
+                ])
+                .unwrap();
+            let Ok(pso) = host.mesh_pipeline_with(&root, &ms.dxil, &ps.dxil) else {
+                eprintln!("no mesh pipeline; not run");
+                return;
+            };
+            let texels = host
+                .draw(
+                    &root,
+                    &pso,
+                    &Draw {
+                        roots: vec![(0, Root::Constants(vec![0])), (1, Root::Constants(vec![0]))],
+                        textures: &[],
+                        samplers: &[],
+                        vertices: &[],
+                        stride: 0,
+                        size: (16, 16),
+                        mesh_groups: 1,
+                    },
+                )
+                .unwrap();
+            let t = texels.iter().find(|t| t[3] == 1.0).expect("a lit texel");
+            if finite {
+                assert_eq!(*t, [65024.0, 0.0, -65024.0, 1.0]);
+            } else {
+                assert!(t[0] == 1e6 && t[1].is_nan() && t[2] == -1e6, "{t:?}");
+            }
+        }
+    }
+
     /// Triangle (0, 1, 2), each corner's 9-bit index in its 10-bit field.
     const TRIANGLE: u32 = 1 << 10 | 2 << 20;
     /// The edge flags of the three corners (bits 9, 19 and 29).
