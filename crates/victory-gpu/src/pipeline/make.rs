@@ -769,11 +769,16 @@ fn workers() -> bool {
                     set(priority);
                     loop {
                         let p = next(screens_only);
-                        let long = longest_first()
+                        let raise = longest_first();
+                        let hold = crate::cores::hold_long_on_fast_cores();
+                        let long = (raise || hold)
                             && p.was_slow.load(Ordering::Relaxed)
                             && super::library::slow_ms(&p.key) >= LONG_MS;
-                        if long {
+                        if long && raise {
                             set(THREAD_PRIORITY_NORMAL);
+                        }
+                        if long && hold {
+                            crate::cores::hold_on_fast_cores(true);
                         }
                         BUSY.fetch_add(1, Ordering::Relaxed);
                         {
@@ -781,8 +786,11 @@ fn workers() -> bool {
                             p.make();
                         }
                         BUSY.fetch_sub(1, Ordering::Relaxed);
-                        if long {
+                        if long && raise {
                             set(priority);
+                        }
+                        if long && hold {
+                            crate::cores::hold_on_fast_cores(false);
                         }
                         if p.was_slow.load(Ordering::Relaxed) {
                             let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
