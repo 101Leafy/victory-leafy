@@ -100,6 +100,9 @@ pub(crate) struct Lowered {
     /// Constant integer false-arms of written `select` instructions.
     #[cfg(test)]
     pub select_false_ints: Vec<Option<i64>>,
+    /// The constant table's first byte and dwords, if the program has one.
+    #[cfg(test)]
+    pub code_table: Option<(u32, Vec<u32>)>,
 }
 
 /// `DB_SHADER_CONTROL.DEPTH_BEFORE_SHADER` (AMD's register headers, as in
@@ -448,6 +451,9 @@ struct Lower<'a> {
     /// The program's constant table (the code from the first byte read
     /// through `s_getpc_b64` on): global, first byte, dwords.
     code_table: Option<(V, u32, u32)>,
+    /// The table's dwords, for a test to check where it starts.
+    #[cfg(test)]
+    code_words: Vec<u32>,
     /// Loop headers' iteration counters (see [`LOOP_LIMIT`]): the phi by
     /// IR block, and its incoming (value, DXIL block) pairs.
     counters: HashMap<usize, (V, Vec<(V, usize)>)>,
@@ -1974,6 +1980,8 @@ impl<'a> Lower<'a> {
             sections: HashMap::new(),
             section_out: HashSet::new(),
             code_table: None,
+            #[cfg(test)]
+            code_words: Vec::new(),
             counters: HashMap::new(),
             traces: p.blocks.iter().any(|b| b.insts.iter().any(|i| i.name().starts_with("image_bvh"))),
             abort: None,
@@ -2058,6 +2066,10 @@ impl<'a> Lower<'a> {
                             _ => None,
                         })
                     }))
+                    // A built descriptor's base is not the byte a load
+                    // through it reads: that is the base plus the load's own
+                    // offset, which can lie below the base.
+                    .chain(self.x.res.code_reads.iter().copied())
                     .filter(|a| a.param == CODE)
                     .map(|a| a.offset & !3)
                     .min()
@@ -2082,6 +2094,10 @@ impl<'a> Lower<'a> {
                 let g = self.s.m.constant_global("code", init);
                 let t = (g, first, words.len() as u32);
                 self.code_table = Some(t);
+                #[cfg(test)]
+                {
+                    self.code_words = words;
+                }
                 t
             }
         };
@@ -2864,6 +2880,8 @@ impl<'a> Lower<'a> {
             early_depth: self.s.flags & flags::EARLY_DEPTH != 0,
             #[cfg(test)]
             select_false_ints: self.s.m.written_select_false_ints(),
+            #[cfg(test)]
+            code_table: self.code_table.map(|t| (t.1, self.code_words)),
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -13559,6 +13577,10 @@ mod tests {
     ) -> Result<Lowered, crate::ShaderError> {
         lower_wave(words, layout, used, false)
     }
+
+    // Where the constant table starts when a built descriptor's loads read below its base:
+    // kept in its own file (lower.rs is at the size limit).
+    mod code_table;
 
     /// [`lower_with`] in wave64 if `wave64`.
     fn lower_wave(
