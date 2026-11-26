@@ -182,9 +182,77 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     }
     if p.made.get().is_none() {
         start(p, REQUESTED);
-        wait(p, crate::frame::current());
+        let frame = crate::frame::current();
+        wait(p, frame);
+        if p.made.get().is_none() {
+            dropped(p, frame);
+        }
     }
     p.made.get()?.as_ref()
+}
+
+/// The pipelines a frame's draws were dropped for, logged when the next
+/// frame drops one (at most 4 lines a second, `VICTORY_PIPELINE_DROP_LOG=0`:
+/// none). play-g's binoculars dropped 550-930 draws a frame for 30 frames
+/// and the zoom came and went; with a warm cache these say which ones.
+#[derive(Default)]
+struct Dropped {
+    frame: u64,
+    draws: u64,
+    pipelines: std::collections::HashSet<usize>,
+    keys: Vec<String>,
+    given_up: usize,
+    logged_at: Option<Instant>,
+    lines: u32,
+    skipped: u64,
+}
+
+fn dropped(p: &Arc<Pending>, frame: u64) {
+    static ON: OnceLock<bool> = OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_DROP_LOG").is_none_or(|v| v != "0")) {
+        return;
+    }
+    static DROPPED: Mutex<Option<Dropped>> = Mutex::new(None);
+    let mut d = DROPPED.lock().unwrap_or_else(|e| e.into_inner());
+    let d = d.get_or_insert_with(Dropped::default);
+    if d.frame != frame {
+        if d.draws > 0 {
+            let now = Instant::now();
+            if d.logged_at.is_none_or(|at| now - at >= Duration::from_secs(1)) {
+                d.logged_at = Some(now);
+                d.lines = 0;
+            }
+            if d.lines < 4 {
+                d.lines += 1;
+                tracing::info!(
+                    frame = d.frame,
+                    draws = d.draws,
+                    pipelines = d.pipelines.len(),
+                    given_up = d.given_up,
+                    frames_not_logged = d.skipped,
+                    keys = %d.keys.join(" "),
+                    "draws dropped for pipelines not made yet"
+                );
+                d.skipped = 0;
+            } else {
+                d.skipped += 1;
+            }
+        }
+        d.frame = frame;
+        d.draws = 0;
+        d.pipelines.clear();
+        d.keys.clear();
+        d.given_up = 0;
+    }
+    d.draws += 1;
+    if d.pipelines.insert(Arc::as_ptr(p) as usize) {
+        if p.given_up.load(Ordering::Relaxed) {
+            d.given_up += 1;
+        }
+        if d.keys.len() < 16 {
+            d.keys.push(p.key.clone());
+        }
+    }
 }
 
 /// Makes `p` on this thread if it is not made yet (waiting for a worker
