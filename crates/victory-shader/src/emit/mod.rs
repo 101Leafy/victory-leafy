@@ -247,6 +247,38 @@ fn parse_group_sync(value: Option<&str>) -> u8 {
     }
 }
 
+/// Whether a float result under a lane guard keeps its float form: the
+/// guard's select is on floats and later float reads take it as it is
+/// (`VICTORY_GUARD_FLOAT=0`: the select is on the bits). Part of the
+/// translation: the shader cache keys on it.
+pub fn guard_float() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_GUARD_FLOAT.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_GUARD_FLOAT").is_none_or(|v| v != "0"))
+}
+
+/// Whether a run of VALU instructions under one lane guard computes in every
+/// lane and selects only the registers it leaves, one select per register
+/// instead of one per write (`VICTORY_GUARD_RUNS=0`: one per write). Part
+/// of the translation: the shader cache keys on it.
+pub fn guard_runs() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_GUARD_RUNS.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_GUARD_RUNS").is_none_or(|v| v != "0"))
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_GUARD_FLOAT: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    static TEST_GUARD_RUNS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
 /// Whether buffer atomics of the ray-tracing structure builder stand between
 /// two fences (`VICTORY_BVH_FENCES=0`: they do not). Part of the
 /// translation: the shader cache keys on it.
