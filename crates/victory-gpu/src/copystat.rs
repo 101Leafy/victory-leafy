@@ -212,11 +212,31 @@ pub(crate) enum C {
     HeapAheadLooked,
     HeapAheadNs,
     HeapCarried,
+    /// Host lists closed, and the nanoseconds of each step of the close:
+    /// depth twins copied back, textures read back, the indirect and
+    /// batched clamps' common work, the card budget's notes copied out, the
+    /// wait for refreshes still to come from the heap pass beside the
+    /// recording (here only with `VICTORY_COMING_AT_CLOSE=1`; otherwise the
+    /// submission waits), the timestamp
+    /// query's end and resolve, and the driver's Close.
+    Closes,
+    CloseTwinsNs,
+    CloseTexBackNs,
+    CloseIndirectNs,
+    CloseBatchesNs,
+    CloseBudgetNs,
+    CloseComingNs,
+    CloseQueryNs,
+    CloseDriverNs,
+    /// Read-back buffers made, and given again from the pool
+    /// (`Host::read_back_buffer`).
+    ReadBacksMade,
+    ReadBacksReused,
 }
 const COUNTERS: usize = 128;
 
 /// The counters' names, in the order of [`C`], for the frame recorder's columns.
-pub(crate) const NAMES: [&str; 111] = [
+pub(crate) const NAMES: [&str; 122] = [
     "Submissions", "Copies", "CopyBytes", "Refreshes", "RefreshBytes", "Skipped", "SkippedBytes", "Runs",
     "RunUs", "Queries", "QueryUs", "MoveUs", "Unmapped", "Watches", "WatchUs", "Checked", "Unchanged",
     "Fallbacks", "GuardFaults", "TexWatched", "TexHashed", "TexChanged", "TexHot", "Frames", "RecordCalls",
@@ -234,6 +254,8 @@ pub(crate) const NAMES: [&str; 111] = [
     "ThinDraws", "ThinSetNs", "ThinBarrierNs", "ThinCopyNs", "ThinOtherNs", "TexHashedTurn", "TexHashedHot",
     "TexTurnSkipped", "TexHashedFirst", "TexFirstSkipped",
     "HeapAheadRounds", "HeapAheadLooked", "HeapAheadNs", "HeapCarried",
+    "Closes", "CloseTwinsNs", "CloseTexBackNs", "CloseIndirectNs", "CloseBatchesNs",
+    "CloseBudgetNs", "CloseComingNs", "CloseQueryNs", "CloseDriverNs", "ReadBacksMade", "ReadBacksReused",
 ];
 /// One of some sets of counters, each in lines of the processor's memory of
 /// its own: a set for all threads had them wait for each other's lines at
@@ -544,7 +566,7 @@ mod command_tests {
     #[test]
     fn every_counter_is_named() {
         use super::{C, COUNTERS, NAMES};
-        assert_eq!(C::HeapCarried as usize + 1, NAMES.len());
+        assert_eq!(C::ReadBacksReused as usize + 1, NAMES.len());
         assert_eq!(NAMES[C::Frames as usize], "Frames");
         assert!(NAMES.len() <= COUNTERS);
     }
