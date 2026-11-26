@@ -856,13 +856,13 @@ fn host_barrier(list: &crate::host::HostList, b: &Barrier) -> Option<Barrier> {
             // shortcut: whole resources, from the state the list tracked
             // (`HostList::transition`); subresources are not told apart.
             let wanted = crate::host::texture_state(b.last as u32);
-            let (texture, before) = list.transition(b.first, wanted)?;
+            let (texture, before, state) = list.transition(b.first, wanted)?;
             Some(Barrier {
                 kind: 0,
                 flags: 0,
                 first: texture.as_raw().cast_const().cast(),
                 second: 0xffff_ffff | (u64::from(before) << 32),
-                last: u64::from(crate::host::legal_state(texture, wanted)),
+                last: u64::from(state),
             })
         }
         1 => Some(Barrier {
@@ -996,8 +996,7 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
 #[cfg(windows)]
 pub(crate) fn ensure_state(list: &crate::host::HostList, resource: This, state: u32) {
     use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATES as State;
-    if let Some((texture, before)) = list.transition(resource, state) {
-        let state = crate::host::legal_state(texture, state);
+    if let Some((texture, before, state)) = list.transition(resource, state) {
         let barrier = crate::host::transition(texture, State(before as i32), State(state as i32));
         // SAFETY: an open list and a live texture.
         unsafe { list.list.ResourceBarrier(&[barrier]) };
