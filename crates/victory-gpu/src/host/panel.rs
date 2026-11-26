@@ -371,6 +371,7 @@ pub(super) struct Panel {
     changed: bool,
     buffers: Option<Buffers>,
     failed: bool,
+    frozen_at: Option<Instant>,
 }
 
 impl Panel {
@@ -387,6 +388,7 @@ impl Panel {
             changed: false,
             buffers: None,
             failed: false,
+            frozen_at: None,
         }
     }
 
@@ -406,7 +408,18 @@ impl Panel {
             CURRENT_PAGE.fetch_xor(1, Ordering::Relaxed);
         }
         if pressed_f5() {
-            IS_FROZEN.fetch_xor(true, Ordering::Relaxed);
+            let was_frozen = IS_FROZEN.fetch_xor(true, Ordering::Relaxed);
+            if was_frozen {
+                if let Some(start) = self.frozen_at.take() {
+                    let freeze_ms = start.elapsed().as_secs_f64() * 1e3;
+                    self.worst = self.worst.max(freeze_ms);
+                }
+                let now = Instant::now();
+                (self.since, self.last, self.before) = (now, now, Counters::now());
+                self.frames = 0;
+            } else {
+                self.frozen_at = Some(Instant::now());
+            }
         }
         let frozen = IS_FROZEN.load(Ordering::Relaxed);
         if frozen && !page_switched {
