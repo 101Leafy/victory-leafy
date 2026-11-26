@@ -414,6 +414,14 @@ impl<B: Clone> Pool<B> {
     fn blocks(&self) -> usize {
         self.blocks.iter().flatten().count()
     }
+
+    /// Bytes of its blocks no piece holds, resting ones held too; with what
+    /// rested long enough made free first, so a budget check can find room
+    /// again without a texture taken.
+    fn reusable_bytes(&mut self, now: u64) -> u64 {
+        self.rested(now);
+        self.blocks.iter().flatten().map(|b| BLOCK - b.taken).sum()
+    }
 }
 
 /// A mapped upload buffer's memory.
@@ -438,10 +446,11 @@ static HELD: AtomicU64 = AtomicU64::new(0);
 /// The same for shared buffers.
 static SHARED_HELD: AtomicU64 = AtomicU64::new(0);
 
-/// Bytes of the texture blocks no texture holds: the card's memory in use
-/// by us that new textures take first.
+/// Bytes of the texture blocks no texture holds, pieces still resting
+/// counted as held: the card's memory in use by us that new textures take
+/// first. All blocks together; one texture that big may still not fit.
 pub(crate) fn texture_room() -> u64 {
-    (lock(&TEXTURES).blocks() as u64 * BLOCK).saturating_sub(HELD.load(Ordering::Relaxed))
+    lock(&TEXTURES).reusable_bytes(now())
 }
 
 /// For the memory line: blocks of textures and of staging buffers, in MiB.
@@ -978,6 +987,67 @@ mod tests {
 
     /// A pooled texture's piece comes back when its last reference goes, not
     /// before; its staging piece begins as zeros.
+    #[test]
+    fn room_leaves_out_pieces_taken_and_resting() {
+        let mut pool: Pool<u32> = Pool::new(SPARE);
+        let (piece, _, _) = pool.take(BLOCK / 2, 1, 0, || Some(1)).unwrap();
+        // Taken before CreatePlacedResource is asked to place a texture there.
+        assert_eq!(pool.reusable_bytes(0), BLOCK / 2);
+        pool.give(piece, 0);
+        assert_eq!(pool.reusable_bytes(REST - 1), BLOCK / 2);
+        // The check alone makes the rested piece free again.
+        assert_eq!(pool.reusable_bytes(REST), BLOCK);
+        // And lets the block go when none are kept.
+        let mut none: Pool<u32> = Pool::new(0);
+        let (piece, _, _) = none.take(BLOCK / 2, 1, 0, || Some(1)).unwrap();
+        none.give(piece, 0);
+        assert_eq!(none.reusable_bytes(REST), 0);
+        assert_eq!(none.blocks(), 0);
+    }
+
+    #[test]
+    fn room_counts_alignment_gaps_and_blocks_made_again() {
+        let mut pool: Pool<u32> = Pool::new(0);
+        let (first, _, _) = pool.take(100, 64, 0, || Some(1)).unwrap();
+        let (second, _, _) = pool.take(100, 64, 0, || Some(1)).unwrap();
+        assert_eq!((first.start, second.start), (0, 128));
+        assert_eq!(pool.reusable_bytes(0), BLOCK - 200);
+        // The gap left for alignment still takes a smaller piece.
+        let (gap, _, _) = pool.take(28, 4, 0, || None).unwrap();
+        assert_eq!(gap.start, 100);
+        assert_eq!(pool.reusable_bytes(0), BLOCK - 228);
+        for piece in [first, second, gap] {
+            pool.give(piece, 0);
+        }
+        assert_eq!(pool.reusable_bytes(REST), 0);
+        let (next, _, _) = pool.take(512, 512, REST, || Some(2)).unwrap();
+        assert_eq!(next.block, first.block);
+        assert_eq!(pool.reusable_bytes(REST), BLOCK - 512);
+    }
+
+    #[test]
+    fn room_is_the_free_ranges_through_taking_and_giving_back() {
+        let mut pool: Pool<u32> = Pool::new(SPARE);
+        let mut held = VecDeque::new();
+        for tick in 0..400u64 {
+            let now = tick * 100;
+            let ripe = Ripe { started: tick, finished: tick.saturating_sub(2), ahead: 2 };
+            let (piece, _, _) = pool.take_ripe((tick % 7 + 1) * 65536, 65536, now, ripe, false, || Some(1)).unwrap();
+            held.push_back(piece);
+            if held.len() > 7 {
+                pool.give(held.pop_front().unwrap(), now);
+            }
+            let room = pool.reusable_bytes(now);
+            let free: u64 = pool.blocks.iter().flatten().flat_map(|b| b.free.0.values()).sum();
+            assert_eq!(room, free, "tick {tick}");
+        }
+        for piece in held {
+            pool.give(piece, 40000);
+        }
+        assert_eq!(pool.reusable_bytes(40000 + REST), pool.blocks() as u64 * BLOCK);
+        assert!(pool.blocks.iter().flatten().all(|b| b.taken == 0));
+    }
+
     #[test]
     fn a_texture_gives_its_piece_back_when_it_goes() {
         let Some(host) = crate::host::host() else { return };
