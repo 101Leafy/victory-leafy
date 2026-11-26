@@ -727,6 +727,28 @@ pub(crate) static PAGE_WRITES: [std::sync::atomic::AtomicU64; 4] =
 /// two frames on takes those of the next frame with it.
 const PAGE_WRITE_AFTER: u64 = 2;
 
+/// A staged texture settling under writes the guards do not see is read
+/// again once this many milliseconds have passed since the first write,
+/// written since or not: a texture written again and again is not held
+/// back for ever.
+const SETTLE_LONGEST_MS: u64 = 2000;
+
+/// `VICTORY_PAGE_SETTLE`: a staged texture that was uploaded when a write
+/// the guards do not see landed in its memory (DirectStorage's reads into
+/// physical pages) settles until no such write has landed in it for this
+/// many milliseconds, or [`SETTLE_LONGEST_MS`] since the first, and is
+/// then read again whole (`crate::texture::page_settled`,
+/// `VICTORY_TABLED_REREAD`): one read for the several requests a
+/// texture's levels arrive in. Default 200. `0`: read again at the next
+/// frame after each write.
+/// shortcut: 200 ms and 2 s are not measured values (darkworldhm 08fdf0b4).
+pub(crate) fn page_settle() -> u64 {
+    static MS: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| {
+        std::env::var("VICTORY_PAGE_SETTLE").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(200)
+    });
+    *MS
+}
+
 /// The bytes of a write the guards do not see are in title memory `[at,
 /// at + len)`: the placed textures there changed with no descriptor
 /// written and nothing mapped. Kept for the next texture pass
@@ -1868,10 +1890,21 @@ impl HostHeap {
     /// its host copy exists, so the upload needs no room on the card. A
     /// slot still waiting for its first upload is left as it is: that
     /// upload takes the bytes that are there by then. Slots tables read
-    /// are left to their draws. Counted either way; returns how many slots
-    /// it made due.
+    /// are left out here: the staged textures under the ranges, those
+    /// draws read through tables, settle and are read again by
+    /// `crate::texture` ([`page_settle`], `VICTORY_TABLED_REREAD`).
+    /// Counted either way; returns how many slots it made due.
     fn texture_slots_page_written(&self, frame: u64) -> usize {
         let ranges = std::mem::take(&mut *PAGE_WRITTEN.lock().unwrap_or_else(|e| e.into_inner()));
+        // Not in this file's tests: texture.rs's own test settles textures
+        // on a made-up clock, which the real one here would run past.
+        if crate::texture::tabled_reread() && !cfg!(test) {
+            let now = crate::host::now_ms();
+            if !ranges.is_empty() {
+                crate::texture::page_written(&ranges, now);
+            }
+            crate::texture::page_settled(frame, now, page_settle(), SETTLE_LONGEST_MS);
+        }
         if ranges.is_empty() {
             return 0;
         }
