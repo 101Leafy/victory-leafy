@@ -2424,12 +2424,6 @@ impl HostHeap {
         self.buffers.all(|_| true)
     }
 
-    /// Of [`HostHeap::buffer_slots`], those of one of `parts` parts: every
-    /// slot is in the same part each time.
-    pub(crate) fn buffer_slots_of(&self, part: u32, parts: u32) -> Vec<u32> {
-        self.buffers.all(|slot| slot % parts == part)
-    }
-
     /// [`HostHeap::mirror`] for a draw, asked by the heap's buffer-view
     /// pass: what it finds does not put the slot back in the written set,
     /// which would have the next pass look at it again for nothing (a title
