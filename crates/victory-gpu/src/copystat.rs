@@ -362,6 +362,9 @@ pub(crate) enum C {
     /// counted when their list is reset after it ran.
     ClampPassNs,
     ClampPasses,
+    /// Bytes of texture memory read for the rows a watched write touched
+    /// (`texture::Staging::detile_written`).
+    TexRowsDetiled,
 }
 const COUNTERS: usize = 256;
 
@@ -404,6 +407,7 @@ pub(crate) const NAMES: [&str; 195] = [
     "SubmitLockDoneNs", "SubmitLockSettleNs",
     "ReadBackPoolNs", "ReadBacksMadeNs",
     "ClampPassNs", "ClampPasses",
+    "TexRowsDetiled",
 ];
 /// One of some sets of counters, each in lines of the processor's memory of
 /// its own: a set for all threads had them wait for each other's lines at
@@ -719,7 +723,7 @@ mod command_tests {
     #[test]
     fn every_counter_is_named() {
         use super::{C, COUNTERS, NAMES};
-        assert_eq!(C::ClampPasses as usize + 1, NAMES.len());
+        assert_eq!(C::TexRowsDetiled as usize + 1, NAMES.len());
         assert_eq!(NAMES[C::Frames as usize], "Frames");
         assert!(NAMES.len() <= COUNTERS);
     }
