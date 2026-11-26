@@ -967,8 +967,11 @@ fn create() -> windows::core::Result<Host> {
             tracing::info!(min = o1.WaveLaneCountMin, max = o1.WaveLaneCountMax, "host wave lanes");
             victory_shader::emit::set_host_max_wave(o1.WaveLaneCountMax);
             // (RDNA has waves of 32 and 64, the vendor's older cards of 64 alone.)
+            // `VICTORY_HOST_RDNA=1` takes any card for one, to time `VICTORY_RDNA_FLOAT`'s
+            // host-neutral bits (2, the legacy products) elsewhere.
             let amd = crate::indirect::amd(&device);
-            victory_shader::emit::set_host_rdna(amd && o1.WaveLaneCountMin == 32 && o1.WaveLaneCountMax == 64);
+            let forced = std::env::var_os("VICTORY_HOST_RDNA").is_some_and(|v| v == "1");
+            victory_shader::emit::set_host_rdna(forced || amd && o1.WaveLaneCountMin == 32 && o1.WaveLaneCountMax == 64);
         }
         let mut model = D3D12_FEATURE_DATA_SHADER_MODEL {
             HighestShaderModel: D3D_SHADER_MODEL_6_7,
