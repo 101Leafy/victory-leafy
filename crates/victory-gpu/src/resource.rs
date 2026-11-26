@@ -1425,6 +1425,23 @@ static TARGETS_AT: std::sync::Mutex<std::collections::BTreeMap<u64, Vec<usize>>>
 /// of one level and one layer, as at first.
 #[cfg(windows)]
 pub(crate) fn alias_of(this: This) -> Option<This> {
+    alias_with(this, Some)
+}
+
+/// [`alias_of`], with a reference on the texture found: taken under the
+/// lock its release must take, so the title letting it go meanwhile does
+/// not free it while a copy from it is recorded.
+#[cfg(windows)]
+pub(crate) fn held_alias_of(this: This) -> Option<ResourceRef> {
+    alias_with(this, |other| {
+        object::try_add_ref(other).then(|| ResourceRef(other as usize))
+    })
+}
+
+/// The texture [`alias_of`] finds, handed to `found` while the lock that
+/// keeps it from being freed is held.
+#[cfg(windows)]
+fn alias_with<T>(this: This, found: impl FnOnce(This) -> Option<T>) -> Option<T> {
     use std::sync::atomic::Ordering::Relaxed;
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if this.is_null()
@@ -1485,7 +1502,7 @@ pub(crate) fn alias_of(this: This) -> Option<This> {
             );
         }
     }
-    same.then_some(other)
+    if same { found(other) } else { None }
 }
 
 /// Whether host copies are made on first use. On by default;
@@ -4842,5 +4859,32 @@ float4 lit() : SV_Target { return 1.0; }
         let d = unsafe { more.texture.GetDesc() };
         assert_eq!((more.base, d.Width, d.MipLevels), (0, 256, 9));
         assert!(more.serial != copy.serial && more.grown.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_held_alias_source_outlives_the_titles_release() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+        if crate::host::host().is_none() {
+            return;
+        }
+        // A 256x256 R32_UINT view placed where a render target of the same
+        // texel width lies.
+        let desc = [3u32, 0, 0, 0, 256, 0, 256, 0x1_0001, 42, 1, 0, 0x105, 0, 0];
+        let bytes = placed_bytes(&desc).unwrap();
+        // SAFETY: memory of our own that stays.
+        let at = unsafe { VirtualAlloc(std::ptr::null(), bytes as usize, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) };
+        let null = std::ptr::null();
+        let mut target = null;
+        let written = ResourceDesc { flags: 0x1, ..texture(256, 256, 28, 1) };
+        let hr = create_at_address(null, at as u64, &written, 0, null.cast(), &RESOURCE_IIDS[0], &mut target);
+        assert_eq!(hr, S_OK);
+        let placed = texture_at(at as u64, &desc).unwrap();
+        assert_eq!(alias_of(placed), Some(target));
+        let held = held_alias_of(placed).unwrap();
+        assert_eq!(held.as_ptr(), target);
+        assert_eq!(slot::<Release>(target, 0x10)(target), 1);
+        drop(held);
+        assert_eq!(alias_of(placed), None);
     }
 }
