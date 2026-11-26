@@ -10,7 +10,9 @@ use super::{Lowered, Parts, lower};
 use crate::native::{
     ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
 };
+use crate::ir::Reg;
 use crate::{io, ir, resource, structure};
+use std::collections::BTreeSet;
 
 const VCC: u16 = 106;
 const EXEC: u8 = 126;
@@ -57,6 +59,11 @@ const fn vopc(op: u32, src0: u16, vsrc1: u32) -> u32 {
     0x7C00_0000 | op << 17 | vsrc1 << 9 | src0 as u32
 }
 
+/// SOP2 `op` of `src0` and a literal.
+const fn sop2_literal(op: u32, sdst: u8, src0: u8, literal: u32) -> [u32; 2] {
+    [0x8000_0000 | op << 23 | (sdst as u32) << 16 | (LITERAL as u32) << 8 | src0 as u32, literal]
+}
+
 /// VOP3 (VOP3b when `sdst` is not 0).
 const fn vop3(op: u32, vdst: u32, sdst: u32, src: [u16; 3]) -> [u32; 2] {
     [
@@ -86,6 +93,12 @@ fn program(body: &[u32], sample: bool) -> NativeProgram {
         w.extend([0xE070_1000 | r * 4, 0x8002_000F | r << 8]); // buffer_store_dword vr, v15 offen
     }
     w.push(S_ENDPGM);
+    native(&w, sample, 16)
+}
+
+/// The program of `code`: s0..s3 root constants, the UAV at dword 0 of the table in s4, and with
+/// `sample` an SRV at dword 8 and a sampler table in s6.
+fn native(code: &[u32], sample: bool, vgprs: u16) -> NativeProgram {
     let table = |user_data, slot| RootParam {
         root: RootType::Table,
         table_offset_dwords: 0,
@@ -124,14 +137,14 @@ fn program(body: &[u32], sample: bool) -> NativeProgram {
     NativeProgram {
         stage: HwStage::Cs,
         wave64: false,
-        vgprs: 16,
+        vgprs,
         layout,
         used,
         io: StageIo::Cs(ComputeIo {
             rsrc2: if sample { 7 << 1 } else { 5 << 1 },
             threads: [32, 1, 1],
         }),
-        code: w.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        code: code.iter().flat_map(|w| w.to_le_bytes()).collect(),
     }
 }
 
@@ -168,6 +181,44 @@ fn lowered(native: &NativeProgram, float: bool, runs: bool) -> (Lowered, Vec<Vec
         v.validate(&mut copy).expect("DXIL validation failed");
     }
     (l, names)
+}
+
+fn host_shader(l: Lowered) -> HostShader {
+    HostShader {
+        stage: HwStage::Cs,
+        dxil: l.dxil,
+        user_data: l.user_data,
+        samplers: l.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: l.root_cbvs,
+        root_srvs: l.root_srvs,
+        root_uavs: l.root_uavs,
+        root_indexed_views: Vec::new(),
+    }
+}
+
+/// One group of `shader` with s0..s3 = `inputs`, and the `dwords` of its UAV after.
+fn run(host: &Host, shader: &HostShader, inputs: &[u32; 4], dwords: u32) -> Vec<u32> {
+    let (root, pso) = host.compute_pipeline(shader).unwrap();
+    let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+    for u in &shader.user_data {
+        ud[u.index as usize] = match (u.root, u.slot) {
+            (RootType::Constants, 0) => inputs[u.dword as usize],
+            _ => 0,
+        };
+    }
+    host.dispatch(
+        &root,
+        &pso,
+        &Dispatch {
+            roots: vec![(0, Root::Constants(ud))],
+            views: &[View::RawUav(dwords)],
+            samplers: &[],
+            groups: [1, 1, 1],
+        },
+    )
+    .unwrap()
+    .swap_remove(0)
 }
 
 fn runs_of(body: &[u32], sample: bool) -> Vec<Vec<&'static str>> {
@@ -328,18 +379,7 @@ fn guarded_runs_and_float_selects_change_no_lane() {
         .map(|(float, runs)| {
             let (l, names) = lowered(&native, float, runs);
             assert_eq!(names.is_empty(), !runs, "runs {names:?}");
-            let shader = HostShader {
-                stage: HwStage::Cs,
-                dxil: l.dxil,
-                user_data: l.user_data,
-                samplers: l.samplers,
-                static_samplers: Vec::new(),
-                root_cbvs: l.root_cbvs,
-                root_srvs: l.root_srvs,
-                root_uavs: l.root_uavs,
-                root_indexed_views: Vec::new(),
-            };
-            (shader, names.len())
+            (host_shader(l), names.len())
         })
         .collect();
     let _one = super::super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
@@ -353,27 +393,7 @@ fn guarded_runs_and_float_selects_change_no_lane() {
         for (c, inputs) in cases.iter().enumerate() {
             let mut first: Option<Vec<u32>> = None;
             for (n, (shader, _)) in shaders.iter().enumerate() {
-                let (root, pso) = host.compute_pipeline(shader).unwrap();
-                let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
-                for u in &shader.user_data {
-                    ud[u.index as usize] = match (u.root, u.slot) {
-                        (RootType::Constants, 0) => inputs[u.dword as usize],
-                        _ => 0,
-                    };
-                }
-                let out = host
-                    .dispatch(
-                        &root,
-                        &pso,
-                        &Dispatch {
-                            roots: vec![(0, Root::Constants(ud))],
-                            views: &[View::RawUav(256)],
-                            samplers: &[],
-                            groups: [1, 1, 1],
-                        },
-                    )
-                    .unwrap()
-                    .swap_remove(0);
+                let out = run(&host, shader, inputs, 256);
                 for lane in 0..32u32 {
                     if inputs[0] >> lane & 1 == 0 {
                         for r in 1..8 {
@@ -403,4 +423,251 @@ fn guarded_runs_and_float_selects_change_no_lane() {
         }
     }
     assert!(ran > 0, "no SM 6.6 device");
+}
+
+/// What a lifted run's registers start from (XORed with the lane for VGPRs): NaN payloads,
+/// denormals, infinities, signed zero, f16 pairs.
+const SEEDS: [u32; 12] = [
+    0x3F80_0000,
+    0xC049_0FDB,
+    0x0000_0F0F,
+    0x7FC0_1234,
+    0xFF80_0000,
+    0x4B00_0000,
+    0x0000_0040,
+    0x8000_0000,
+    0x3C00_BC00,
+    0x7E00_0001,
+    0xFF80_0001,
+    0x8000_0101,
+];
+
+fn seed(n: usize) -> u32 {
+    SEEDS[n * 7 % SEEDS.len()]
+}
+
+struct Lcg(u64);
+
+impl Lcg {
+    fn below(&mut self, n: usize) -> usize {
+        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((self.0 >> 33) % n as u64) as usize
+    }
+}
+
+/// A run in the program [`lift`] makes: EXEC is s0 ^ `exec` while it runs, and after it every
+/// VGPR in `stored` (with what it held before the run) goes to the next 32 dwords.
+struct Lifted {
+    insts: usize,
+    exec: u32,
+    stored: Vec<(u8, u32)>,
+}
+
+/// SGPRs and VGPRs `run` touches, or None when it reads a special register other than VCC
+/// and M0.
+fn touched(run: &[ir::Inst]) -> Option<(BTreeSet<u8>, BTreeSet<u8>)> {
+    let (mut s, mut v) = (BTreeSet::new(), BTreeSet::new());
+    for i in run {
+        for &(r, _) in i.reads.iter().chain(&i.writes) {
+            match r {
+                Reg::S(c) if c <= ir::VCC + 1 || c == ir::M0 => {
+                    s.insert(c);
+                }
+                Reg::V(n) => {
+                    v.insert(n);
+                }
+                _ => return None,
+            }
+        }
+    }
+    Some((s, v))
+}
+
+/// Registers no run uses for the program around them: a quad for the UAV, copies of s0, s1
+/// and s3, the lane and the store address.
+fn spare(s: &BTreeSet<u8>, v: &BTreeSet<u8>) -> Option<([u8; 4], [u8; 2])> {
+    let quad = (8..=100u8).rev().step_by(4).find(|&q| (q..q + 4).all(|c| !s.contains(&c)))?;
+    let singles: Vec<u8> = (6..=105u8)
+        .rev()
+        .filter(|c| !s.contains(c) && !(quad..quad + 4).contains(c))
+        .take(3)
+        .collect();
+    let lanes: Vec<u8> = (0..=255u8).rev().filter(|n| !v.contains(n)).take(2).collect();
+    (singles.len() == 3 && lanes.len() == 2)
+        .then(|| ([quad, singles[0], singles[1], singles[2]], [lanes[0], lanes[1]]))
+}
+
+/// One program of `runs`, copied word for word: before each, every register it reads or
+/// writes gets a value of its own (VCC the lanes below s3), and EXEC a mix of s0. Runs that
+/// leave no spare registers are left out.
+fn lift(runs: &[Vec<ir::Inst>]) -> (Vec<u32>, Vec<Lifted>) {
+    let (mut used_s, mut used_v) = (BTreeSet::new(), BTreeSet::new());
+    let mut taken = Vec::new();
+    for run in runs {
+        let Some((s, v)) = touched(run) else {
+            continue;
+        };
+        let us: BTreeSet<u8> = used_s.union(&s).copied().collect();
+        let uv: BTreeSet<u8> = used_v.union(&v).copied().collect();
+        if spare(&us, &uv).is_some() {
+            (used_s, used_v) = (us, uv);
+            taken.push((run, s, v));
+        }
+    }
+    let ([quad, c0, c1, c3], [lane, at]) = spare(&used_s, &used_v).unwrap();
+    let mut w = vec![s_mov_b32(5, 0x80)];
+    w.extend(s_load(2, quad as u32, 4, 0));
+    w.extend([s_mov_b32(c0, 0), s_mov_b32(c1, 1), s_mov_b32(c3, 3)]);
+    w.push(vop1(0x01, lane as u32, v(0))); // v_mov_b32 lane, v0
+    w.push(vop2(0x1A, at as u32, k(2), lane as u32)); // v_lshlrev_b32 at, 2, lane
+    let mut lifted = Vec::new();
+    for (j, (run, s, regs)) in taken.into_iter().enumerate() {
+        for c in s {
+            if c == ir::VCC {
+                w.push(vopc(0xC4, c3 as u16, lane as u32)); // v_cmp_gt_u32 vcc, s3, lane
+            } else {
+                w.extend(sop2_literal(0x12, c, c1, seed(c as usize + j))); // s_xor_b32
+            }
+        }
+        for &r in &regs {
+            w.extend([vop2(0x1D, r as u32, LITERAL, lane as u32), seed(r as usize + 3 * j)]);
+        }
+        let exec = (j as u32).wrapping_mul(0x9E37_79B9);
+        w.extend(sop2_literal(0x12, EXEC, c0, exec));
+        for i in run {
+            w.extend(&i.machine.words);
+        }
+        w.push(s_mov_b32(EXEC, 193));
+        let written: BTreeSet<u8> = run
+            .iter()
+            .flat_map(|i| &i.writes)
+            .filter_map(|w| match w.0 {
+                Reg::V(n) => Some(n),
+                _ => None,
+            })
+            .collect();
+        let mut stored = Vec::new();
+        for r in written {
+            // buffer_store_dword r, at offen, then at += 128
+            w.extend([0xE070_1000, 0x80 << 24 | (quad as u32 / 4) << 16 | (r as u32) << 8 | at as u32]);
+            w.extend([vop2(0x25, at as u32, LITERAL, at as u32), 128]);
+            stored.push((r, seed(r as usize + 3 * j)));
+        }
+        lifted.push(Lifted { insts: run.len(), exec, stored });
+    }
+    w.push(S_ENDPGM);
+    (w, lifted)
+}
+
+/// The guarded runs of the slow compute shaders in `VICTORY_SLOW_CS` (`list.txt` of
+/// `<hash> <ms> ...` slowest first, and `<hash>.bin` containers): the ten slowest and 50 of
+/// the others picked with a fixed seed, per shader the eight longest runs and 16 others.
+/// Each shader's runs are lifted into one program ([`lift`]) and lowered four ways, with the
+/// float selects and the runs on and off. All four have to agree in every lane, on hardware
+/// and WARP, and lanes outside EXEC keep what the registers held. Every write of a lifted run
+/// is left to the store after it, so the writes [`super::Lower::guarded_run`] skips because
+/// nothing reads them are only checked by the tests above.
+#[test]
+#[ignore = "needs VICTORY_SLOW_CS"]
+fn lifted_runs_of_the_slow_shaders_change_no_lane() {
+    let Ok(dir) = std::env::var("VICTORY_SLOW_CS") else {
+        eprintln!("VICTORY_SLOW_CS unset; skipped");
+        return;
+    };
+    let list = std::fs::read_to_string(format!("{dir}/list.txt")).unwrap();
+    let names: Vec<&str> = list.lines().filter_map(|l| l.split_whitespace().next()).collect();
+    let mut lcg = Lcg(0x51_0D_C5);
+    let mut picked: Vec<&str> = names.iter().take(10).copied().collect();
+    let mut rest: Vec<&str> = names.iter().skip(10).copied().collect();
+    for _ in 0..rest.len().min(50) {
+        picked.push(rest.swap_remove(lcg.below(rest.len())));
+    }
+    let cases: [[u32; 4]; 3] = [
+        [0xA5C3_0F96, 0x0000_0000, 0, 13],
+        [0x0000_FFFF, 0x8000_0001, 0, 0],
+        [0xFFFF_FFFE, 0x7F80_0000, 0, 31],
+    ];
+    let _one = super::super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let hosts: Vec<(&str, Host)> = [("hardware", false), ("warp", true)]
+        .into_iter()
+        .filter_map(|(label, warp)| match Host::new(warp) {
+            Ok(h) => Some((label, h)),
+            Err(_) => {
+                eprintln!("no SM 6.6 {label} device; skipped");
+                None
+            }
+        })
+        .collect();
+    assert!(!hosts.is_empty(), "no SM 6.6 device");
+    let (mut shaders, mut runs, mut insts, mut as_runs, mut compared) = (0, 0, 0, 0, 0u64);
+    for name in picked {
+        let container = std::fs::read(format!("{dir}/{name}.bin")).unwrap();
+        super::RUNS_SEEN.set(Some(Vec::new()));
+        TEST_GUARD_FLOAT.set(Some(true));
+        TEST_GUARD_RUNS.set(Some(true));
+        let translated = super::super::translate(&container);
+        TEST_GUARD_FLOAT.set(None);
+        TEST_GUARD_RUNS.set(None);
+        let mut seen = super::RUNS_SEEN.take().unwrap_or_default();
+        if let Err(e) = translated {
+            eprintln!("{name}: {e}");
+        }
+        seen.sort_by_key(|r| (r[0].machine.offset, r.len()));
+        seen.dedup_by_key(|r| (r[0].machine.offset, r.len()));
+        seen.sort_by_key(|r| std::cmp::Reverse(r.len()));
+        let mut chosen: Vec<Vec<ir::Inst>> = seen.drain(..seen.len().min(8)).collect();
+        for _ in 0..seen.len().min(16) {
+            chosen.push(seen.swap_remove(lcg.below(seen.len())));
+        }
+        let (code, lifted) = lift(&chosen);
+        if lifted.is_empty() {
+            eprintln!("{name}: no runs");
+            continue;
+        }
+        let native = native(&code, false, 256);
+        let dwords = (lifted.iter().map(|l| l.stored.len()).sum::<usize>() * 32) as u32;
+        let lowerings: Vec<HostShader> = [(false, false), (true, false), (false, true), (true, true)]
+            .into_iter()
+            .map(|(float, runs)| {
+                let (l, names) = lowered(&native, float, runs);
+                if float && runs {
+                    as_runs += names.iter().map(Vec::len).sum::<usize>();
+                }
+                host_shader(l)
+            })
+            .collect();
+        for (label, host) in &hosts {
+            for (c, inputs) in cases.iter().enumerate() {
+                let outs: Vec<Vec<u32>> = lowerings.iter().map(|s| run(host, s, inputs, dwords)).collect();
+                let mut at = 0;
+                for (j, l) in lifted.iter().enumerate() {
+                    let exec = inputs[0] ^ l.exec;
+                    for &(r, old) in &l.stored {
+                        for lane in 0..32u32 {
+                            let i = at + lane as usize;
+                            for (n, out) in outs.iter().enumerate() {
+                                let place = || format!("{name} {label} case {c} run {j} lowering {n} lane {lane} v{r}");
+                                assert_eq!(out[i], outs[0][i], "{}", place());
+                                if exec >> lane & 1 == 0 {
+                                    assert_eq!(out[i], old ^ lane, "{} outside EXEC", place());
+                                }
+                            }
+                        }
+                        at += 32;
+                    }
+                }
+                compared += dwords as u64 * outs.len() as u64;
+            }
+        }
+        let n: usize = lifted.iter().map(|l| l.insts).sum();
+        eprintln!("{name}: {} runs, {n} insts, {dwords} dwords", lifted.len());
+        shaders += 1;
+        runs += lifted.len();
+        insts += n;
+    }
+    eprintln!(
+        "{shaders} shaders, {runs} runs of {insts} insts ({as_runs} lowered as runs in the lifted \
+         programs), {compared} lane results compared"
+    );
+    assert!(shaders > 0, "no shader had runs");
 }
