@@ -13326,6 +13326,13 @@ impl Meter {
                         crate::descriptor::host::HOST_TEXTURES_LEFT_OUT.load(Ordering::Relaxed)
                     );
                 }
+                if crate::descriptor::host::show_new_later() {
+                    tracing::info!(
+                        "slots of textures made while lists sent before them ran, shown once those had run \
+                         (VICTORY_SHOW_NEW_LATER=1), since the start: {}",
+                        crate::descriptor::host::NEW_LATER.load(Ordering::Relaxed)
+                    );
+                }
             }
             if crate::resource::held_only() {
                 let [copies, bytes, grown, whole] = [0, 1, 2, 3].map(|i| crate::resource::HELD[i].load(Ordering::Relaxed));
