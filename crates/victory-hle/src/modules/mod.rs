@@ -16,7 +16,6 @@ pub mod clock;
 pub mod d3d12x;
 pub mod display;
 pub mod dsp;
-pub mod fidelityfx;
 #[cfg(windows)]
 pub mod dstorage;
 #[cfg(windows)]
@@ -57,7 +56,6 @@ pub(crate) fn all() -> Vec<HleModule> {
         audio::module(),
         dsp::module(),
         xg::module(),
-        fidelityfx::module(),
     ];
     #[cfg(windows)]
     all.push(apu::module());

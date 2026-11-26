@@ -1,7 +1,8 @@
 //! The title's output size and render scale (`VICTORY_OUTPUT`,
-//! `VICTORY_RENDER_SCALE`, `VICTORY_UPSCALER`; each off without it): places
-//! in the title's code changed at load, each compared byte for byte first
-//! and left alone, said so, if it differs (another build of the title).
+//! `VICTORY_RENDER_SCALE`, each off without it) and its upscaler (always its
+//! own): places in the title's code changed at load, each compared byte for
+//! byte first and left alone, said so, if it differs (another build of the
+//! title).
 //!
 //! What the title does (game_scarlett_master.exe 1.0.2.1, image offsets):
 //!
@@ -24,16 +25,17 @@
 //!   they are placed in (+0x247ad10, 64 MB) unused, and the title's check
 //!   that no more than 2 MB is left (+0x247af2b) breaks into the debugger:
 //!   that check is skipped with any `VICTORY_OUTPUT`.
-//! - **Render scale.** The upscaler the title picks (+0x7e93f0: 6, its own,
-//!   except on Series S with a flag, 7, AMD FidelityFX) gives the render
-//!   size from the output size (+0x7e92f0 → the upscaler's +0x50 method):
-//!   its own (+0x7e9440) multiplies by a scale at +0x90 of it, set to 2/3 at
-//!   +0x28f1e78 (so 2560x1440 for 4K, 1280x720 for 1080p); FidelityFX's
-//!   (+0x28ef680) by 1.0 on Series X, 2/3 on Series S. Both take the
-//!   scale asked for: the first constant replaced, the second's two loads
-//!   pointed at a constant in its padding (as pull request #53 did).
-//! - **Upscaler.** `VICTORY_UPSCALER=<kind>` makes the picker return
-//!   `kind` (pull request #53): 6 the title's own, 7 FidelityFX.
+//! - **Upscaler.** The title picks one at +0x7e93f0: 6, its own, except on
+//!   Series S with a flag, 7, AMD FidelityFX. The picker is made to return 6
+//!   every time, so FidelityFX never runs. We don't add upscalers or frame
+//!   generation, and we don't run the title's FidelityFX either.
+//!   `VICTORY_UPSCALER` is still read, and only 6 is taken.
+//! - **Render scale.** The upscaler gives the render size from the output
+//!   size (+0x7e92f0 → the upscaler's +0x50 method): the title's own
+//!   (+0x7e9440) multiplies by a scale at +0x90 of it, set to 2/3 at
+//!   +0x28f1e78 (so 2560x1440 for 4K, 1280x720 for 1080p).
+//!   `VICTORY_RENDER_SCALE` replaces that constant (as pull request #53
+//!   did); 1.0 renders at the output size, with no upscaling.
 
 use crate::frame_rate::Patched;
 
@@ -72,12 +74,16 @@ pub fn parse_render_scale(spec: &str) -> Option<f32> {
     spec.trim().parse::<f32>().ok().filter(|s| (0.5..=1.0).contains(s))
 }
 
-/// `VICTORY_UPSCALER=<kind>`: 6 (the title's own) or 7 (FidelityFX).
+/// The title's own upscaler, the one kind the picker returns.
+pub const OWN_UPSCALER: u32 = 6;
+
+/// `VICTORY_UPSCALER=<kind>`: only 6 (the title's own) is taken; FidelityFX
+/// (7) is gone. `None` if unset or anything else (said why).
 pub fn asked_upscaler() -> Option<u32> {
     let spec = std::env::var("VICTORY_UPSCALER").ok()?;
-    let kind = spec.trim().parse::<u32>().ok().filter(|k| matches!(k, 6 | 7));
+    let kind = spec.trim().parse::<u32>().ok().filter(|&k| k == OWN_UPSCALER);
     if kind.is_none() {
-        eprintln!("VIctory: VICTORY_UPSCALER={spec}: expected 6 (the title's own) or 7 (FidelityFX)");
+        eprintln!("VIctory: VICTORY_UPSCALER={spec}: only 6, the title's own, is left; the picker returns 6 anyway");
     }
     kind
 }
@@ -132,22 +138,6 @@ pub const OWN_SCALE: Site = Site {
     bytes: &[0xc7, 0x81, 0x90, 0x00, 0x00, 0x00, 0xab, 0xaa, 0x2a, 0x3f],
 };
 
-/// FidelityFX's render size method, +0x28ef680, and its padding: the scale
-/// is 1.0 (+0x5fc6ed8) or, on Series S, 2/3 (+0x615d95c), loaded at +0x28
-/// and +0x32.
-pub const FFX_SCALE: Site = Site {
-    at: 0x28ef680,
-    what: "FidelityFX's render scale",
-    bytes: &[
-        0x41, 0x56, 0x56, 0x57, 0x53, 0x48, 0x83, 0xec, 0x28, 0x44, 0x89, 0xcb, 0x4c, 0x89, 0xc6, 0x48, 0x89, 0xd7, 0x49, 0x89,
-        0xce, 0xe8, 0xa6, 0x5a, 0x78, 0xfd, 0x0f, 0xb6, 0xc0, 0x41, 0x89, 0x86, 0x90, 0x00, 0x00, 0x00, 0x84, 0xc0, 0x75, 0x0a,
-        0xc5, 0xfa, 0x10, 0x05, 0x28, 0x78, 0x6d, 0x03, 0xeb, 0x08, 0xc5, 0xfa, 0x10, 0x05, 0xa2, 0xe2, 0x86, 0x03, 0xc5, 0xf2,
-        0x2a, 0x54, 0x24, 0x70, 0xc5, 0xf2, 0x2a, 0xcb, 0xc5, 0xfa, 0x59, 0xc9, 0xc5, 0xfa, 0x2c, 0xc1, 0x89, 0x07, 0xc5, 0xfa,
-        0x59, 0xc2, 0xc5, 0xfa, 0x2c, 0xc0, 0x89, 0x06, 0x48, 0x83, 0xc4, 0x28, 0x5b, 0x5f, 0x5e, 0x41, 0x5e, 0xc3, 0xcc, 0xcc,
-        0xcc, 0xcc, 0xcc, 0xcc,
-    ],
-};
-
 /// The upscaler picker, +0x7e93f0, to its first `ret`.
 pub const PICKER: Site = Site {
     at: 0x7e93f0,
@@ -193,19 +183,6 @@ pub fn output_code(width: u32, height: u32) -> Vec<u8> {
 pub fn own_scale_code(scale: f32) -> Vec<u8> {
     let mut c = OWN_SCALE.bytes[..6].to_vec();
     c.extend(scale.to_le_bytes());
-    c
-}
-
-/// What goes at [`FFX_SCALE`] for `scale`: both loads read `scale`, written
-/// into the padding at +0x64.
-pub fn ffx_scale_code(scale: f32) -> Vec<u8> {
-    const LOADS: [usize; 2] = [0x28, 0x32];
-    const SLOT: usize = 0x64;
-    let mut c = FFX_SCALE.bytes.to_vec();
-    c[SLOT..SLOT + 4].copy_from_slice(&scale.to_le_bytes());
-    for l in LOADS {
-        c[l + 4..l + 8].copy_from_slice(&((SLOT - (l + 8)) as i32).to_le_bytes());
-    }
     c
 }
 
@@ -262,8 +239,8 @@ pub unsafe fn write(base: usize, size: usize, site: &Site, code: &[u8]) -> Patch
     Patched::Done
 }
 
-/// Applies what the switches ask for; a line each in the log and on
-/// standard output.
+/// Applies what the switches ask for and the picker's 6; a line each in the
+/// log and on standard output.
 ///
 /// # Safety
 /// The image of `size` bytes at `base` stays mapped and no thread runs its
@@ -277,11 +254,9 @@ pub unsafe fn apply_asked(base: usize, size: usize) {
     }
     if let Some(s) = asked_render_scale() {
         asked.push((&OWN_SCALE, own_scale_code(s), format!("{s}")));
-        asked.push((&FFX_SCALE, ffx_scale_code(s), format!("{s}")));
     }
-    if let Some(kind) = asked_upscaler() {
-        asked.push((&PICKER, picker_code(kind), format!("returns {kind}")));
-    }
+    asked_upscaler();
+    asked.push((&PICKER, picker_code(OWN_UPSCALER), format!("returns {OWN_UPSCALER}")));
     for (site, code, value) in asked {
         // SAFETY: the caller's promise.
         let done = unsafe { write(base, size, site, &code) };
@@ -359,18 +334,8 @@ mod tests {
         assert_eq!(own[..6], OWN_SCALE.bytes[..6]);
         assert_eq!(own[6..], 0.5f32.to_le_bytes());
         assert_eq!(OWN_SCALE.bytes[6..], (2.0f32 / 3.0).to_le_bytes());
-        let ffx = ffx_scale_code(0.75);
-        assert_eq!(ffx.len(), FFX_SCALE.bytes.len());
-        assert_eq!(ffx[0x64..0x68], 0.75f32.to_le_bytes());
-        for at in [0x28, 0x32] {
-            assert_eq!(ffx[at..at + 4], [0xc5, 0xfa, 0x10, 0x05], "vmovss xmm0, [rip+d]");
-            let disp = i32::from_le_bytes(ffx[at + 4..at + 8].try_into().unwrap());
-            assert_eq!(at as i32 + 8 + disp, 0x64);
-        }
-        // Only the two displacements and the padding change.
-        let changed: Vec<usize> = (0..ffx.len()).filter(|&i| ffx[i] != FFX_SCALE.bytes[i]).collect();
-        assert!(changed.iter().all(|&i| (0x2c..0x30).contains(&i) || (0x36..0x3a).contains(&i) || (0x64..0x68).contains(&i)));
-        assert_eq!(picker_code(7), [0xb8, 7, 0, 0, 0, 0xc3]);
+        assert_eq!(picker_code(OWN_UPSCALER), [0xb8, 6, 0, 0, 0, 0xc3]);
+        assert!(picker_code(OWN_UPSCALER).len() <= PICKER.bytes.len());
         assert_eq!(POOL_LEFT.at + 2 + POOL_LEFT.bytes[1] as usize, POOL_LEFT.at + 3, "jbe lands past the int3");
     }
 

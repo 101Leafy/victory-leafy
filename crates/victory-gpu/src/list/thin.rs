@@ -488,21 +488,20 @@ const TARGETS: u64 = after(13);
 const CLEAR_RTV: u64 = after(14);
 const CLEAR_DSV: u64 = after(15);
 const COPY_TEXTURE: u64 = after(16);
-const STAND_IN: u64 = after(17);
 
 /// Since the last line of the log, by op: the calls translated and the
 /// nanoseconds they took (all threads).
 #[cfg(feature = "diagnostics")]
-const OPS: usize = after(18) as usize;
+const OPS: usize = after(17) as usize;
 #[cfg(feature = "diagnostics")]
 static BY_OP: [[AtomicU64; 2]; OPS] = [const { [const { AtomicU64::new(0) }; 2] }; OPS];
 
 #[cfg(feature = "diagnostics")]
 fn op_name(op: usize) -> &'static str {
-    const AFTER: [&str; 18] = [
+    const AFTER: [&str; 17] = [
         "reset", "close", "upload", "barrier", "barrier_groups", "viewports", "scissors", "blend_factor", "heaps",
         "compute_constants", "graphics_constants", "index_buffer", "vertex_buffers", "targets", "clear_rtv",
-        "clear_dsv", "copy_texture", "stand_in",
+        "clear_dsv", "copy_texture",
     ];
     PLAIN_NAMES.get(op).or_else(|| AFTER.get(op - PLAIN_NAMES.len())).copied().unwrap_or("?")
 }
@@ -746,24 +745,6 @@ extern "system" fn copy_texture_region_x(
     copy_texture_region(this, dst, x, y, z, src, source_box);
 }
 
-/// The AMD upscaler stand-in's picture (`super::stretch_texture`, or with
-/// `stretch` false `super::copy_texture_top_left`) written down on a list
-/// whose calls are written down; `false` if `this` is not one. Those calls
-/// come from code of ours, not through the list's table, so without this
-/// they found no host list and recorded nothing: the Series S world, drawn
-/// through the upscaler, was black.
-pub(super) fn stand_in(this: This, dst: This, src: This, width: u32, height: u32, stretch: bool) -> bool {
-    if this.is_null() {
-        return false;
-    }
-    let front = front(this);
-    if front.closed || front.recording.is_none() {
-        return false;
-    }
-    front.put(STAND_IN, &[dst as u64, src as u64, u64::from(width) | u64::from(height) << 32, u64::from(stretch)]);
-    true
-}
-
 /// Makes the calls of a stream on `list`: how many, and whether the last one
 /// closed it. Once `left` says so only what must not be lost is done.
 fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool) {
@@ -875,13 +856,6 @@ fn one(list: This, op: u64, w: &[u64]) -> bool {
                 at_or(w, 2 + step),
                 at(w, 2 + 2 * step, boxed),
             );
-        }
-        STAND_IN => {
-            let (dst, src) = (w[0] as This, w[1] as This);
-            let (width, height) = (w[2] as u32, (w[2] >> 32) as u32);
-            if w[3] == 0 || !super::stretch_texture(list, dst, src, width, height) {
-                super::copy_texture_top_left(list, dst, src, width, height);
-            }
         }
         _ => {}
     }
