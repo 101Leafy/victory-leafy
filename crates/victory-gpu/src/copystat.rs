@@ -262,11 +262,27 @@ pub(crate) enum C {
     GuardPartAliased,
     GuardPartBlocks,
     GuardPartParts,
+    /// Draws: fresh tables built and their slots, asks another list made at
+    /// the same table this frame (slots, those holding constant views), asks
+    /// made from the same records at another table, build time, and asks
+    /// served from another list's table (`VICTORY_SHARED_TABLES`).
+    FreshMade,
+    FreshMadeSlots,
+    FreshAgainSlots,
+    FreshAgainCbvSlots,
+    FreshSame,
+    FreshSameSlots,
+    FreshNs,
+    FreshShared,
+    FreshSharedSlots,
+    /// The bytes of the read-back buffers made (`ReadBacksMade`), after
+    /// rounding.
+    ReadBacksMadeBytes,
 }
-const COUNTERS: usize = 144;
+const COUNTERS: usize = 160;
 
 /// The counters' names, in the order of [`C`], for the frame recorder's columns.
-pub(crate) const NAMES: [&str; 140] = [
+pub(crate) const NAMES: [&str; 150] = [
     "Submissions", "Copies", "CopyBytes", "Refreshes", "RefreshBytes", "Skipped", "SkippedBytes", "Runs",
     "RunUs", "Queries", "QueryUs", "MoveUs", "Unmapped", "Watches", "WatchUs", "Checked", "Unchanged",
     "Fallbacks", "GuardFaults", "TexWatched", "TexHashed", "TexChanged", "TexHot", "Frames", "RecordCalls",
@@ -290,6 +306,8 @@ pub(crate) const NAMES: [&str; 140] = [
     "CopyTexBackNs", "CopyTexSourceNs", "CopyTexFirstNs", "CopyTexLevelsNs", "CopyTexRecordNs", "CopyTexCalls",
     "CopyTexSlow",
     "GuardPartFaults", "GuardPartWhole", "GuardPartAliased", "GuardPartBlocks", "GuardPartParts",
+    "FreshMade", "FreshMadeSlots", "FreshAgainSlots", "FreshAgainCbvSlots", "FreshSame", "FreshSameSlots",
+    "FreshNs", "FreshShared", "FreshSharedSlots", "ReadBacksMadeBytes",
 ];
 /// One of some sets of counters, each in lines of the processor's memory of
 /// its own: a set for all threads had them wait for each other's lines at
@@ -600,7 +618,7 @@ mod command_tests {
     #[test]
     fn every_counter_is_named() {
         use super::{C, COUNTERS, NAMES};
-        assert_eq!(C::GuardPartParts as usize + 1, NAMES.len());
+        assert_eq!(C::FreshSharedSlots as usize + 1, NAMES.len());
         assert_eq!(NAMES[C::Frames as usize], "Frames");
         assert!(NAMES.len() <= COUNTERS);
     }

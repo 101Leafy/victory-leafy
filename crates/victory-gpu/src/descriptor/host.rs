@@ -1514,19 +1514,55 @@ pub(crate) const DYNAMIC: u32 = 1 << 18;
 /// host that takes more than [`PORTABLE_VIEWS`]; `VICTORY_DYNAMIC_SLOTS`
 /// sets the most). 2^18 ran out in the title's bigger places (session
 /// play-1125-0127: 27,000 to 35,000 tables a frame, up to 3,285 of them
-/// refused, with 2,639 indirect draws and dispatches).
+/// refused, with 2,639 indirect draws and dispatches). A capped host heap
+/// that does not hold the title's whole gives up the title's upper slots
+/// ([`capped_dynamic_slots`]).
 fn dynamic_slots(count: u32, null: u32) -> u32 {
-    static MOST: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    let most = *MOST.get_or_init(|| {
+    static SET: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    let set = *SET.get_or_init(|| {
         std::env::var("VICTORY_DYNAMIC_SLOTS")
             .ok()
             .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(DYNAMIC << 2)
     });
-    if null < PORTABLE_VIEWS {
+    if null == 0 {
         return DYNAMIC;
     }
-    null.saturating_sub(count).min(most).max(DYNAMIC)
+    if null < PORTABLE_VIEWS {
+        if count + DYNAMIC <= null {
+            return DYNAMIC;
+        }
+        return capped_dynamic_slots(count, null, set);
+    }
+    null.saturating_sub(count).min(set.unwrap_or(DYNAMIC << 2)).max(DYNAMIC)
+}
+
+/// The fewest title slots a capped host heap keeps, however many dynamic
+/// slots `VICTORY_DYNAMIC_SLOTS` asks for.
+const LEAST_TITLE: u32 = 1 << 16;
+
+/// The dynamic slots of a host heap capped below [`PORTABLE_VIEWS`]
+/// (NVIDIA, null slot `null`) for a title heap of `count` slots that does
+/// not fit in it with [`DYNAMIC`] more: they come out of the title's upper
+/// slots. `set` is `VICTORY_DYNAMIC_SLOTS`, held to at least [`DYNAMIC`]
+/// (the old split) and to leaving the title [`LEAST_TITLE`].
+///
+/// Unset, the title keeps its lower 393,215 slots. From slot 393,216 on,
+/// the retail heap (1,245,184 slots) is a ring of tables the title writes
+/// for each draw, and a draw reaching past the title's host slots has its
+/// table made afresh in the dynamic slots anyway, so host slots kept for
+/// that ring stood unused while 262,144 dynamic ones ran out (play-d:
+/// 301,608 slots asked a frame, 2,757 tables refused). After upstream PR
+/// DexNom-VIctory-68, measured there on an RTX 5060 Ti with none refused
+/// and 350,000 left at the fewest; shortcut: not measured in this tree.
+/// Tables reaching those slots from the root are made afresh, but a shader
+/// picking a view by an index it computes is clamped only at `null`: an
+/// index into the title's slots 393,216-737,854 now reads a dynamic slot,
+/// as one past 737,854 did before. That no shader does so is taken from
+/// that PR; `VICTORY_DYNAMIC_SLOTS=262144` gives the old split to compare.
+fn capped_dynamic_slots(count: u32, null: u32, set: Option<u32>) -> u32 {
+    const CAPPED_TITLE: u32 = 393_215;
+    let most = null.saturating_sub(LEAST_TITLE).max(DYNAMIC);
+    set.unwrap_or(null.saturating_sub(CAPPED_TITLE.min(count))).clamp(DYNAMIC, most)
 }
 
 impl HostHeap {
@@ -1768,8 +1804,17 @@ impl HostHeap {
         #[cfg(not(feature = "diagnostics"))]
         let _ = steps;
         let Some(first) = found else {
+            // Asks longer than the longest free run fail without a search
+            // until slots come back (`release`). Shorter ones
+            // used to search the whole ring and fail as well: 37 ms a frame
+            // in play-e with thousands refused.
             if enough {
-                self.too_long.fetch_min(n as u32, std::sync::atomic::Ordering::Relaxed);
+                let (most, looked) = taken.longest();
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::DynamicSteps, looked);
+                #[cfg(not(feature = "diagnostics"))]
+                let _ = looked;
+                self.too_long.fetch_min(most.min(n - 1) as u32 + 1, std::sync::atomic::Ordering::Relaxed);
             }
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!(n, "no free dynamic descriptor slots: a table is not made"));
@@ -4755,6 +4800,22 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A title heap too big for a capped host heap (NVIDIA, null slot at
+    /// 999,999) keeps its lower 393,215 slots unless `VICTORY_DYNAMIC_SLOTS`
+    /// says how many are dynamic; one that fits keeps [`DYNAMIC`].
+    #[test]
+    fn a_capped_heap_gives_its_upper_slots_to_dynamic_ones() {
+        let null = 999_999;
+        assert_eq!(capped_dynamic_slots(1_245_184, null, None), 606_784);
+        assert_eq!(capped_dynamic_slots(800_000, null, None), 606_784);
+        assert_eq!(capped_dynamic_slots(1_245_184, null, Some(DYNAMIC)), DYNAMIC);
+        assert_eq!(capped_dynamic_slots(1_245_184, null, Some(500_000)), 500_000);
+        assert_eq!(capped_dynamic_slots(1_245_184, null, Some(10)), DYNAMIC);
+        assert_eq!(capped_dynamic_slots(1_245_184, null, Some(u32::MAX)), null - LEAST_TITLE);
+        assert_eq!(dynamic_slots(500_000, null), DYNAMIC);
+        assert_eq!(dynamic_slots(1_245_184, 0), DYNAMIC);
+    }
 
     /// A view of a host copy that begins at a later level shows the same
     /// levels of it.

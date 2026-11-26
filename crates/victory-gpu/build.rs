@@ -4,6 +4,9 @@
 //! out, and of `Cargo.lock` only the packages the translator is built from:
 //! an edit that changes neither used to translate every shader again. The
 //! form entries are kept in has its own number, `shader_cache::FORMAT`.
+//! `VICTORY_TRANSLATOR_DEPS` is the same without the source: the cache keys
+//! on it and `emit::VERSION`, and on the whole only when a check finds a
+//! source change gave other output.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -261,6 +264,7 @@ fn main() {
     files(&source, &mut all);
     all.sort();
     let mut hash = blake3::Hasher::new();
+    let mut deps = blake3::Hasher::new();
     for path in &all {
         println!("cargo:rerun-if-changed={}", path.display());
         // Names and line endings as they are in every checkout.
@@ -280,13 +284,24 @@ fn main() {
         } else {
             text
         };
-        hash.update(name.as_bytes());
-        hash.update(&(bytes.len() as u64).to_le_bytes());
-        hash.update(bytes.as_bytes());
+        let parts = [name.as_bytes(), &(bytes.len() as u64).to_le_bytes(), bytes.as_bytes()];
+        for part in parts {
+            hash.update(part);
+            if !path.starts_with(&source) {
+                deps.update(part);
+            }
+        }
     }
     println!("cargo:rerun-if-changed=build.rs");
     println!(
         "cargo:rustc-env=VICTORY_TRANSLATOR={}",
         hash.finalize().to_hex()
+    );
+    // What the translator is built from beside its source (its manifest,
+    // locked dependencies, compiler): with `emit::VERSION` the key a source
+    // change alone does not move.
+    println!(
+        "cargo:rustc-env=VICTORY_TRANSLATOR_DEPS={}",
+        deps.finalize().to_hex()
     );
 }
