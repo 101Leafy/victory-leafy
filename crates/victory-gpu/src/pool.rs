@@ -42,9 +42,10 @@ static SPARES: AtomicUsize = AtomicUsize::new(SPARE);
 /// [`SPARE_KEPT`] below 85 % ([`crate::host::keep_freed`]), else [`SPARE`].
 /// Asked once a second.
 pub(crate) fn room(memory: Option<[u64; 4]>) {
-    let limit = spares(memory, crate::host::keep_freed());
+    let pressure = crate::residency::pressured();
+    let limit = spares(memory, crate::host::keep_freed() && !pressure);
     SPARES.store(limit, Ordering::Relaxed);
-    if !reclaim_on_tick() {
+    if !reclaim_on_tick() && !crate::residency::on() {
         return;
     }
     // A full pool can become idle while another subsystem needs the VRAM.
@@ -54,7 +55,14 @@ pub(crate) fn room(memory: Option<[u64; 4]>) {
         pool.reclaim(tick, limit, true);
     }
     if let Ok(mut pool) = STAGING.try_lock() {
-        pool.reclaim(tick, limit, true);
+        let staging_limit = if crate::residency::critical_commit() {
+            0
+        } else if pressure {
+            1
+        } else {
+            limit
+        };
+        pool.reclaim(tick, staging_limit, true);
     }
 }
 
@@ -443,6 +451,13 @@ pub(crate) fn staging(host: &crate::host::Host, bytes: u64) -> Option<(StagingPi
     // Copies from a buffer begin at multiples of 512.
     let bytes = bytes.next_multiple_of(512);
     let (piece, memory, again) = lock(&STAGING).take(bytes, 512, now(), || {
+        // Only gate speculative bindless prefetch on staging-pool growth
+        // headroom; table-bound textures and decoration bakes are sampled
+        // immediately and would otherwise read uninitialized/reused VRAM.
+        let speculative = crate::texture::PICKING.get().is_some() && !crate::texture::BAKING.get();
+        if speculative && !crate::residency::allow_staging_growth(false) {
+            return None;
+        }
         let (buffer, data) = host.upload_buffer(BLOCK)?;
         crate::host::name(&buffer, || "staging of textures (a block)".into());
         Some(Upload(buffer, data))
@@ -582,6 +597,7 @@ pub(crate) unsafe fn texture(
         let mut heap: Option<ID3D12Heap> = None;
         // SAFETY: plain creation.
         if let Err(e) = unsafe { device.CreateHeap(&desc, &mut heap) } {
+            crate::residency::allocation_error(&e);
             tracing::warn!(error = %e, "no block of texture memory");
         }
         if let Some(h) = &heap
