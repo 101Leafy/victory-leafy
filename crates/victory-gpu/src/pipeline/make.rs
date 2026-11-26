@@ -334,6 +334,28 @@ fn slow_limit() -> usize {
     })
 }
 
+/// How long nothing but known slow pipelines must have been queued before
+/// [`quiet_slow_limit`] holds.
+const QUIET: Duration = Duration::from_secs(2);
+
+/// [`slow_limit`] while the title queues nothing else: three quarters of the
+/// workers. In play-g the early list ran out at 06:28 and for four minutes 3
+/// to 5 of the 16 workers were busy, all on the slow list (854 waiting),
+/// while the rest idled; the drive at 06:32 then asked for 519 of them at
+/// once, and draws waited 500 ms a frame. `VICTORY_PIPELINE_SLOW_QUIET=0`:
+/// a quarter at all times, as before.
+fn quiet_slow_limit() -> usize {
+    static LIMIT: OnceLock<usize> = OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        if std::env::var_os("VICTORY_PIPELINE_SLOW_QUIET").is_some_and(|v| v == "0") {
+            slow_limit()
+        } else {
+            (worker_count(None, std::thread::available_parallelism().map_or(2, |n| n.get())) * 3 / 4)
+                .max(slow_limit())
+        }
+    })
+}
+
 struct Queue {
     /// Requested passes over the screen: before all others, and the only ones
     /// [`SCREEN_WORKERS`] take.
@@ -344,6 +366,8 @@ struct Queue {
     slow: VecDeque<Arc<Pending>>,
     slow_now: usize,
     requested: VecDeque<Arc<Pending>>,
+    /// When a pipeline last went into a list other than the slow one.
+    others_at: Option<Instant>,
 }
 
 impl Queue {
@@ -354,7 +378,13 @@ impl Queue {
             slow: VecDeque::new(),
             slow_now: 0,
             requested: VecDeque::new(),
+            others_at: None,
         }
+    }
+
+    /// How many slow pipelines may be made at once now.
+    fn slow_cap(&self) -> usize {
+        if self.others_at.is_none_or(|at| at.elapsed() >= QUIET) { quiet_slow_limit() } else { slow_limit() }
     }
 
     /// Queues an unrequested pipeline or promotes one queued at creation.
@@ -370,6 +400,9 @@ impl Queue {
         }
         p.queue_state.store(priority, Ordering::Relaxed);
         p.queued.get_or_init(Instant::now);
+        if priority == REQUESTED || !slow {
+            self.others_at = Some(Instant::now());
+        }
         if priority == REQUESTED && p.screen && screens_first() {
             self.screen.push_back(p.clone());
         } else if priority == REQUESTED {
@@ -444,10 +477,12 @@ const SCREEN_WORKERS: usize = 2;
 fn next(screens_only: bool) -> Arc<Pending> {
     let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
     loop {
-        if let Some(p) = queue.pop(screens_only, slow_limit()) {
+        let cap = queue.slow_cap();
+        if let Some(p) = queue.pop(screens_only, cap) {
             return p;
         }
-        queue = AVAILABLE.wait(queue).unwrap_or_else(|e| e.into_inner());
+        // (Woken again after QUIET: the slow list's limit can have risen.)
+        queue = AVAILABLE.wait_timeout(queue, QUIET).unwrap_or_else(|e| e.into_inner()).0;
     }
 }
 
@@ -645,6 +680,21 @@ mod tests {
         queue.slow_now -= 1;
         assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &longer));
         assert!(queue.pop(false, 1).is_none());
+    }
+
+    #[test]
+    fn slow_pipelines_get_more_workers_while_nothing_else_is_queued() {
+        let mut queue = Queue::new();
+        assert_eq!(queue.slow_cap(), quiet_slow_limit());
+        let long = Arc::new(Pending::new(Vec::new(), None));
+        assert_eq!(queue.push_as(&long, EARLY, true), Some(true));
+        assert_eq!(queue.slow_cap(), quiet_slow_limit());
+        let quick = Arc::new(Pending::new(Vec::new(), None));
+        assert_eq!(queue.push_as(&quick, EARLY, false), Some(true));
+        assert_eq!(queue.slow_cap(), slow_limit());
+        queue.others_at = Instant::now().checked_sub(QUIET);
+        assert_eq!(queue.slow_cap(), quiet_slow_limit());
+        assert!(quiet_slow_limit() >= slow_limit());
     }
 
     /// Passes over the screen go before all others, and workers of their own
