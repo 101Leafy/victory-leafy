@@ -537,15 +537,20 @@ fn slow_limit() -> usize {
 /// [`quiet_slow_limit`] holds.
 const QUIET: Duration = Duration::from_secs(2);
 
-/// [`slow_limit`] while the title queues nothing else: three quarters of the
-/// workers. In play-g the early list ran out at 06:28 and for four minutes 3
-/// to 5 of the 16 workers were busy, all on the slow list (854 waiting),
-/// while the rest idled; the drive at 06:32 then asked for 519 of them at
-/// once, and draws waited 500 ms a frame. `VICTORY_PIPELINE_SLOW_QUIET=0`:
-/// a quarter at all times, as before. `=all`: every worker. On the first run
-/// after a translator VERSION (play-cold, 24 workers) the title loaded with
-/// nothing but the slow list queued, 868 of them, and 15 to 18 workers were
-/// busy for 140 s while the other 6 idled.
+/// [`slow_limit`] while the title queues nothing else: every worker. In
+/// play-g the early list ran out at 06:28 and for four minutes 3 to 5 of the
+/// 16 workers were busy, all on the slow list (854 waiting), while the rest
+/// idled; the drive at 06:32 then asked for 519 of them at once, and draws
+/// waited 500 ms a frame. On the first run after a translator VERSION
+/// (play-cold, 24 workers) the title loaded with nothing but the slow list
+/// queued, 868 of them, and with three quarters 15 to 18 workers were busy
+/// for 140 s while the other 6 idled. Cold starts with every worker against
+/// three quarters (sc2 and sc8 against sc1 and sc7): 51k and 65k draws
+/// dropped in the first 340 s against 89k and 87k, and in sc8 the slow list
+/// was made by 245 s (create_ms summed 8871 s against 24291 s, 22 made in
+/// vain against 260) while sc7 still had 230 being made at 565 s.
+/// `VICTORY_PIPELINE_SLOW_QUIET=3/4`: three quarters, as before. `=0`: a
+/// quarter at all times.
 fn quiet_slow_limit() -> usize {
     static LIMIT: OnceLock<usize> = OnceLock::new();
     *LIMIT.get_or_init(|| {
@@ -556,8 +561,8 @@ fn quiet_slow_limit() -> usize {
 fn quiet_limit(asked: Option<&str>, workers: usize, slow: usize) -> usize {
     match asked.map(str::trim) {
         Some("0") => slow,
-        Some("all") => workers.max(slow),
-        _ => (workers * 3 / 4).max(slow),
+        Some("3/4") => (workers * 3 / 4).max(slow),
+        _ => workers.max(slow),
     }
 }
 
@@ -1103,7 +1108,9 @@ mod tests {
 
     #[test]
     fn the_quiet_slow_limit_follows_its_switch() {
-        assert_eq!(quiet_limit(None, 24, 6), 18);
+        assert_eq!(quiet_limit(None, 24, 6), 24);
+        assert_eq!(quiet_limit(Some("3/4"), 24, 6), 18);
+        assert_eq!(quiet_limit(Some("3/4"), 4, 2), 3);
         assert_eq!(quiet_limit(Some("0"), 24, 6), 6);
         assert_eq!(quiet_limit(Some("all"), 24, 6), 24);
         assert_eq!(quiet_limit(Some("all"), 1, 1), 1);
