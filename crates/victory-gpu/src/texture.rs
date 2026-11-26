@@ -61,12 +61,21 @@ pub(crate) struct Staging {
     copied: std::sync::atomic::AtomicU64,
 }
 
+/// A texture memory's fingerprint, compared with the last one to see whether
+/// it changed. Never kept across runs, so a fast non-cryptographic digest
+/// (`xxh3`) suffices; `blake3` stays for persisted disk caches.
+type Digest = u128;
+
+fn digest(bytes: &[u8]) -> Digest {
+    xxhash_rust::xxh3::xxh3_128(bytes)
+}
+
 /// What was last detiled: the hash of the memory (not tracked), or of each
 /// subresource's bytes (tracked).
 #[derive(Default)]
 struct Last {
-    hash: Option<blake3::Hash>,
-    hashes: Vec<Option<blake3::Hash>>,
+    hash: Option<Digest>,
+    hashes: Vec<Option<Digest>>,
 }
 
 /// Per subresource of `layout` (`mips` per array slice; a 3D texture's
@@ -611,7 +620,7 @@ impl Staging {
                         last.hashes[i] = None;
                         return true;
                     }
-                    let hash = blake3::hash(&read[a..b]);
+                    let hash = digest(&read[a..b]);
                     last.hashes[i].replace(hash) != Some(hash)
                 })
                 .map(|i| i as u32)
@@ -645,12 +654,12 @@ impl Staging {
             let zeros = vec![0u8; size];
             let every = all();
             let buffer = self.detile(&zeros, &every);
-            last.hash = buffer.is_some().then(|| blake3::hash(&zeros));
+            last.hash = buffer.is_some().then(|| digest(&zeros));
             return (0, buffer.map(|(b, at)| (b, at, every)));
         }
         // SAFETY: committed memory of the texture's layout size.
         let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
-        let hash = blake3::hash(tiled);
+        let hash = digest(tiled);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
         if last.hash == Some(hash) {
@@ -877,5 +886,32 @@ mod tests {
         assert!(committed(rw.cast::<u8>(), 4096));
         // SAFETY: freeing the allocation above.
         unsafe { VirtualFree(rw, 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn digest_distinguishes_lengths_and_byte_changes() {
+        let zeros = [0u8; 400];
+        let mut seen: Vec<Digest> = (0..=zeros.len()).map(|n| digest(&zeros[..n])).collect();
+        for at in 0..zeros.len() {
+            for value in [1u8, 0x80, 0xff] {
+                let mut bytes = zeros;
+                bytes[at] = value;
+                seen.push(digest(&bytes));
+            }
+        }
+        let text: Vec<u8> = (0..400u32).map(|i| ((i * 37) >> 2) as u8).collect();
+        for at in 0..text.len() - 1 {
+            let mut bytes = text.clone();
+            bytes.swap(at, at + 1);
+            if bytes != text {
+                seen.push(digest(&bytes));
+            }
+        }
+        seen.push(digest(&text));
+        let n = seen.len();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), n);
+        assert_eq!(digest(&text), digest(&text.clone()));
     }
 }

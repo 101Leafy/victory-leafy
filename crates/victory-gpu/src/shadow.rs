@@ -16,8 +16,8 @@
 //! themselves, every buffer range the heap's views reach
 //! (`crate::bindless`).
 
-use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::collections::{BTreeMap, HashMap};
+use std::sync::{Arc, Mutex, RwLock};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 
@@ -970,48 +970,133 @@ struct Entry {
 }
 
 /// Title buffers by (start address, resource), with their copy once made.
-static BUFFERS: Mutex<BTreeMap<(u64, usize), Entry>> = Mutex::new(BTreeMap::new());
+///
+/// Read on the hot recording path (`find`); mutated only on buffer
+/// registration, release, and first-use copy creation.
+static BUFFERS: RwLock<BTreeMap<(u64, usize), Entry>> = RwLock::new(BTreeMap::new());
 
-fn buffers() -> std::sync::MutexGuard<'static, BTreeMap<(u64, usize), Entry>> {
-    BUFFERS.lock().unwrap_or_else(|e| e.into_inner())
+fn buffers_read() -> std::sync::RwLockReadGuard<'static, BTreeMap<(u64, usize), Entry>> {
+    BUFFERS.read().unwrap_or_else(|e| e.into_inner())
+}
+
+fn buffers_write() -> std::sync::RwLockWriteGuard<'static, BTreeMap<(u64, usize), Entry>> {
+    BUFFERS.write().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Counts copies made and title buffers released: [`all`] may differ when
 /// it changed.
 static GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Counts table and copy changes that invalidate per-thread lookup caches
+/// (`FOUND`). Bumped after insertions and before removals while the table
+/// write lock is held so cached answers cannot outlive a table change.
+static LOOKUP_GENERATION: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// The generation of [`all`]: read it before calling that.
 pub(crate) fn generation() -> u64 {
     GENERATION.load(std::sync::atomic::Ordering::Acquire)
 }
 
+fn lookup_changed() {
+    LOOKUP_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+}
+
 fn changed() {
     GENERATION.fetch_add(1, std::sync::atomic::Ordering::Release);
+    lookup_changed();
 }
 
 /// A title buffer exists at `start` (`len` bytes).
 pub(crate) fn register(resource: usize, start: u64, len: u64) {
-    buffers().insert(
+    let mut map = buffers_write();
+    map.insert(
         (start, resource),
         Entry {
             end: start + len,
             shadow: None,
         },
     );
+    // Bump after inserting while holding the write lock so no reader can
+    // record the pre-insert table under the post-insert generation.
+    lookup_changed();
 }
 
 /// The title released it; lists that still hold its copy keep it alive.
 pub(crate) fn unregister(resource: usize, start: u64) {
-    if buffers().remove(&(start, resource)).is_some_and(|e| e.shadow.is_some()) {
-        changed();
+    let mut map = buffers_write();
+    // Bump before removing while holding the write lock so any concurrent
+    // thread-local cache hit re-checking `LOOKUP_GENERATION` misses and waits
+    // on the table lock.
+    lookup_changed();
+    if map
+        .remove(&(start, resource))
+        .is_some_and(|e| e.shadow.is_some())
+    {
+        GENERATION.fetch_add(1, std::sync::atomic::Ordering::Release);
     }
 }
 
 /// The copy of the innermost title buffer holding `[address, address +
 /// len)`, made on first use.
 pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    if !lookup_cache_enabled() {
+        return find_uncached(address, len);
+    }
+
+    let key = (address, len.max(1));
+    let generation = LOOKUP_GENERATION.load(std::sync::atomic::Ordering::Acquire);
+    let cached = FOUND.with(|found| {
+        let mut found = found.borrow_mut();
+        if found.0 != generation {
+            found.1.clear();
+            found.0 = generation;
+        }
+        found.1.get(&key).and_then(std::sync::Weak::upgrade)
+    });
+    if let Some(shadow) = cached
+        && LOOKUP_GENERATION.load(std::sync::atomic::Ordering::SeqCst) == generation
+    {
+        return Some(shadow);
+    }
+
+    let shadow = find_uncached(address, len)?;
+    FOUND.with(|found| {
+        let mut found = found.borrow_mut();
+        if found.0 == generation {
+            if found.1.len() >= FOUND_LIMIT {
+                found.1.clear();
+            }
+            found.1.insert(key, Arc::downgrade(&shadow));
+        }
+    });
+    Some(shadow)
+}
+
+fn find_uncached(address: u64, len: u64) -> Option<Arc<Shadow>> {
     let end = address.checked_add(len.max(1))?;
-    let mut map = buffers();
+    // Fast path: once a buffer's host copy exists, recording threads only
+    // need the shared read lock.
+    let needs_copy = {
+        let map = buffers_read();
+        match map
+            .range(..=(address, usize::MAX))
+            .rev()
+            .take(64)
+            .find(|(_, e)| e.end >= end)
+        {
+            Some((_, entry)) => match &entry.shadow {
+                Some(shadow) => return Some(shadow.clone()),
+                None => true,
+            },
+            None => false,
+        }
+    };
+    if !needs_copy {
+        return loose(address, end);
+    }
+
+    let mut map = buffers_write();
     let key = map
         .range(..=(address, usize::MAX))
         .rev()
@@ -1048,6 +1133,26 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
         changed();
     }
     entry.shadow.clone()
+}
+
+const FOUND_LIMIT: usize = 8192;
+
+type Found = HashMap<(u64, u64), std::sync::Weak<Shadow>>;
+
+thread_local! {
+    static FOUND: std::cell::RefCell<(u64, Found)> =
+        std::cell::RefCell::new((u64::MAX, Found::new()));
+}
+
+fn lookup_cache_enabled_value(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_none_or(|v| v != "0")
+}
+
+fn lookup_cache_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        lookup_cache_enabled_value(std::env::var_os("VICTORY_LOOKUP_CACHE").as_deref())
+    })
 }
 
 /// Titles also use memory outside any buffer object as GPU memory (Grand
@@ -1265,7 +1370,10 @@ impl Arena {
 
 /// Every host copy of title memory made so far (buffers and windows).
 pub(crate) fn all() -> Vec<Arc<Shadow>> {
-    let mut all: Vec<Arc<Shadow>> = buffers().values().filter_map(|e| e.shadow.clone()).collect();
+    let mut all: Vec<Arc<Shadow>> = buffers_read()
+        .values()
+        .filter_map(|e| e.shadow.clone())
+        .collect();
     all.extend(LOOSE.lock().unwrap_or_else(|e| e.into_inner()).values().cloned());
     all
 }
@@ -1273,7 +1381,7 @@ pub(crate) fn all() -> Vec<Arc<Shadow>> {
 /// For device-removed reports: the copy of title memory whose host range
 /// starts closest below host GPU address `va`, and where `va` is in it.
 pub(crate) fn near(va: u64) -> String {
-    let mut all: Vec<(u64, u64, u64)> = buffers()
+    let mut all: Vec<(u64, u64, u64)> = buffers_read()
         .values()
         .filter_map(|e| e.shadow.as_deref().map(|s| (s.gpu, s.start, s.len)))
         .collect();
@@ -1656,5 +1764,70 @@ pub(crate) mod tests {
         assert_eq!(m.take(5), Some(0));
         assert_eq!(pages(0x1_fff0, 0x20), 2, "a range across a page boundary");
         assert_eq!(pages(0x2_0000, 0x1_0000), 1);
+    }
+
+    #[test]
+    fn lookup_cache_switch_defaults_on_and_opts_out_with_zero() {
+        use std::ffi::OsStr;
+        assert!(lookup_cache_enabled_value(None));
+        assert!(lookup_cache_enabled_value(Some(OsStr::new("1"))));
+        assert!(lookup_cache_enabled_value(Some(OsStr::new(""))));
+        assert!(!lookup_cache_enabled_value(Some(OsStr::new("0"))));
+    }
+
+    #[test]
+    fn register_updates_generation_after_insert_under_write_lock() {
+        use std::sync::{Barrier, atomic::Ordering};
+        let slot = 0u64;
+        let start = (&raw const slot) as u64;
+        let resource = start as usize;
+        let table = buffers_read();
+        let initial = LOOKUP_GENERATION.load(Ordering::Acquire);
+        let ready = Barrier::new(2);
+        let observed = std::thread::scope(|scope| {
+            let writer = scope.spawn(|| {
+                ready.wait();
+                register(resource, start, 64);
+            });
+            ready.wait();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            let gen_while_read_locked = LOOKUP_GENERATION.load(Ordering::Acquire);
+            drop(table);
+            writer.join().unwrap();
+            gen_while_read_locked
+        });
+        assert_eq!(observed, initial, "generation must stay unchanged until the write lock is acquired");
+        assert!(LOOKUP_GENERATION.load(Ordering::Acquire) > initial);
+        unregister(resource, start);
+    }
+
+    #[test]
+    fn lookup_cache_invalidates_across_inner_register_and_unregister() {
+        let p = crate::watch::tests::pool(2);
+        let outer = (2 * PAGE) as u64;
+        let inner = PAGE as u64;
+        register(p, p as u64, outer);
+        let Some(first) = find(p as u64 + 16, 16) else {
+            unregister(p, p as u64);
+            return; // no host GPU here
+        };
+        // Second call hits the thread-local cache and returns the same Arc.
+        let cached = find(p as u64 + 16, 16).expect("cached outer shadow");
+        assert!(Arc::ptr_eq(&first, &cached));
+        // Zero-length lookup shares the normalized (addr, 1) entry.
+        let cached_zero = find(p as u64 + 16, 0).expect("cached zero-len shadow");
+        assert!(Arc::ptr_eq(&first, &cached_zero));
+
+        // Registering an enclosing/inner buffer invalidates the thread-local cache.
+        register(p + 1, p as u64, inner);
+        let inner_copy = find(p as u64 + 16, 16).expect("inner shadow");
+        assert!(!Arc::ptr_eq(&first, &inner_copy));
+
+        // Unregistering the inner buffer invalidates back to the outer buffer.
+        unregister(p + 1, p as u64);
+        let restored = find(p as u64 + 16, 16).expect("restored outer shadow");
+        assert!(Arc::ptr_eq(&first, &restored));
+
+        unregister(p, p as u64);
     }
 }
