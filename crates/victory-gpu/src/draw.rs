@@ -3434,7 +3434,7 @@ impl State {
                         since_asked += bytes;
                         if room && since_asked >= 32 << 20 {
                             since_asked = 0;
-                            room = crate::resource::room();
+                            room = crate::resource::room(crate::host::host().and_then(|h| h.video_memory()));
                         }
                         laps.lap(Laps::LOOK);
                         continue;
