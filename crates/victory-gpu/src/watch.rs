@@ -1316,17 +1316,26 @@ pub fn title_memory_allocated(at: usize, len: usize) {
 /// Once a frame: a hundredth of the known holes are looked at, in case one
 /// was filled with nobody telling ([`title_memory_allocated`],
 /// [`title_memory_remapped`]), which no title we know does.
-pub(crate) fn look_at_holes() {
+///
+/// The nanoseconds it waited for the guards' lock and held it, for the heap
+/// pass's counters (`HolesWaitNs`, `HolesHoldNs`).
+pub(crate) fn look_at_holes() -> [u64; 2] {
     const PARTS: usize = 100;
     if !known_holes() {
-        return;
+        return [0; 2];
     }
+    let mut lock = [0u64; 2];
     static FROM: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let blocks: Vec<usize> = {
+        let asked = std::time::Instant::now();
         let g = guards();
+        let got = std::time::Instant::now();
         let from = FROM.load(std::sync::atomic::Ordering::Relaxed);
         let part: Vec<usize> = g.held.range(from..).take(g.held.len() / PARTS + 1).collect();
         FROM.store(part.last().map_or(0, |b| b + 1), std::sync::atomic::Ordering::Relaxed);
+        drop(g);
+        lock[0] += (got - asked).as_nanos() as u64;
+        lock[1] += got.elapsed().as_nanos() as u64;
         part
     };
     let mut until = 0;
@@ -1337,7 +1346,9 @@ pub(crate) fn look_at_holes() {
         if block >= until {
             // (Or unmapped memory was mapped since the part was taken: told
             // already, and forgotten.)
+            let asked = std::time::Instant::now();
             let mut g = guards();
+            let got = std::time::Instant::now();
             if g.held.remove(block) {
                 PUBLISHED.clear(block);
                 static SAID: std::sync::Once = std::sync::Once::new();
@@ -1348,8 +1359,12 @@ pub(crate) fn look_at_holes() {
                     );
                 });
             }
+            drop(g);
+            lock[0] += (got - asked).as_nanos() as u64;
+            lock[1] += got.elapsed().as_nanos() as u64;
         }
     }
+    lock
 }
 
 /// Whether a block of `[start, end)` is view memory read-only by our hand:
