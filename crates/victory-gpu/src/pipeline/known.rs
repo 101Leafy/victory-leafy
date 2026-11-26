@@ -45,6 +45,10 @@ fn on() -> bool {
 
 struct Book {
     dir: PathBuf,
+    /// The files are read on the book's own thread; until they are, what the
+    /// title creates waits in `waiting`.
+    loaded: bool,
+    waiting: Vec<Noted>,
     keys: HashSet<[u8; 16]>,
     shaders: HashSet<[u8; 32]>,
     /// Not yet written: shaders, then pipelines.
@@ -52,86 +56,135 @@ struct Book {
     added: usize,
 }
 
-static BOOK: OnceLock<Option<Mutex<Book>>> = OnceLock::new();
-
-fn book() -> Option<&'static Mutex<Book>> {
-    BOOK.get_or_init(|| {
-        let dir = super::library::folder().filter(|_| on())?;
-        std::fs::create_dir_all(&dir).ok()?;
-        let mut keys = HashSet::new();
-        let mut shaders = HashSet::new();
-        let ends = [
-            walk_shaders(&dir, |_, hash, _, _| drop(shaders.insert(hash))),
-            walk_pipelines(&dir, |_, bytes| {
-                keys.extend(bytes.first_chunk::<16>().copied());
-            }),
-        ];
-        for (file, end) in [SHADERS, PIPELINES].iter().zip(ends) {
-            let path = dir.join(file);
-            if std::fs::metadata(&path).is_ok_and(|m| m.len() > end)
-                && let Ok(f) = std::fs::OpenOptions::new().write(true).open(&path)
-            {
-                let _ = f.set_len(end);
-            }
-        }
-        tracing::info!(pipelines = keys.len(), shaders = shaders.len(), "title pipelines known from earlier runs");
-        let spawned = std::thread::Builder::new().name("victory-known".into()).spawn(|| {
-            loop {
-                std::thread::sleep(std::time::Duration::from_secs(2));
-                flush();
-            }
-        });
-        spawned.ok()?;
-        Some(Mutex::new(Book { dir, keys, shaders, new: Default::default(), added: 0 }))
-    })
-    .as_ref()
+struct Noted {
+    id: [u8; 16],
+    shaders: Vec<Arc<Shader>>,
+    state: Option<Vec<u8>>,
 }
 
-/// The title created a pipeline.
+impl Book {
+    fn new(dir: PathBuf) -> Self {
+        Book {
+            dir,
+            loaded: false,
+            waiting: Vec::new(),
+            keys: HashSet::new(),
+            shaders: HashSet::new(),
+            new: Default::default(),
+            added: 0,
+        }
+    }
+
+    fn note(&mut self, id: [u8; 16], shaders: &[Arc<Shader>], state: Option<&[u8]>) {
+        if !self.loaded {
+            self.waiting.push(Noted { id, shaders: shaders.to_vec(), state: state.map(<[u8]>::to_vec) });
+            return;
+        }
+        if shaders.is_empty() || !self.keys.insert(id) {
+            return;
+        }
+        let mut entry = id.to_vec();
+        entry.push(shaders.len() as u8);
+        for s in shaders {
+            let hash = *blake3::hash(&s.container).as_bytes();
+            let stage = STAGES.iter().position(|&x| x == s.stage).unwrap_or(0) as u8;
+            entry.push(stage);
+            entry.extend(hash);
+            if self.shaders.insert(hash) {
+                let new = &mut self.new[0];
+                new.push(stage);
+                new.extend(hash);
+                new.extend((s.container.len() as u32).to_le_bytes());
+                new.extend(&s.container);
+            }
+        }
+        entry.push(u8::from(state.is_some()));
+        entry.extend(state.unwrap_or_default());
+        self.new[1].extend((entry.len() as u32).to_le_bytes());
+        self.new[1].extend(entry);
+        self.added += 1;
+    }
+
+    /// The files were read: what waited is noted against them.
+    fn read(&mut self, keys: HashSet<[u8; 16]>, shaders: HashSet<[u8; 32]>) {
+        self.keys.extend(keys);
+        self.shaders.extend(shaders);
+        self.loaded = true;
+        for w in std::mem::take(&mut self.waiting) {
+            self.note(w.id, &w.shaders, w.state.as_deref());
+        }
+    }
+
+    /// What is to be written, and where.
+    fn take(&mut self) -> Option<(PathBuf, [Vec<u8>; 2], usize)> {
+        (self.added > 0).then(|| (self.dir.clone(), std::mem::take(&mut self.new), std::mem::take(&mut self.added)))
+    }
+}
+
+static BOOK: OnceLock<Option<&'static Mutex<Book>>> = OnceLock::new();
+
+fn book() -> Option<&'static Mutex<Book>> {
+    *BOOK.get_or_init(|| {
+        let dir = super::library::folder().filter(|_| on())?;
+        let book: &'static Mutex<Book> = Box::leak(Box::new(Mutex::new(Book::new(dir.clone()))));
+        let spawned = std::thread::Builder::new().name("victory-known".into()).spawn(move || {
+            let (keys, shaders) = read(&dir);
+            tracing::info!(pipelines = keys.len(), shaders = shaders.len(), "title pipelines known from earlier runs");
+            book.lock().unwrap_or_else(|e| e.into_inner()).read(keys, shaders);
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                flush(book);
+            }
+        });
+        spawned.ok().map(|_| book)
+    })
+}
+
+/// The keys and shaders in the files in `dir`, each file cut back to its
+/// last whole entry so that what is added after it can be read.
+fn read(dir: &Path) -> (HashSet<[u8; 16]>, HashSet<[u8; 32]>) {
+    let _ = std::fs::create_dir_all(dir);
+    let mut keys = HashSet::new();
+    let mut shaders = HashSet::new();
+    let ends = [
+        walk_shaders(dir, |_, hash, _, _| drop(shaders.insert(hash))),
+        walk_pipelines(dir, |_, bytes| {
+            keys.extend(bytes.first_chunk::<16>().copied());
+        }),
+    ];
+    for (file, end) in [SHADERS, PIPELINES].iter().zip(ends) {
+        let path = dir.join(file);
+        if std::fs::metadata(&path).is_ok_and(|m| m.len() > end)
+            && let Ok(f) = std::fs::OpenOptions::new().write(true).open(&path)
+        {
+            let _ = f.set_len(end);
+        }
+    }
+    (keys, shaders)
+}
+
+/// The title created a pipeline. The book is read on its own thread, so the
+/// first of these does not wait for the files.
 pub(super) fn note(key: &str, shaders: &[Arc<Shader>], graphics: Option<&GraphicsState>) {
     let Some(book) = book() else { return };
+    if shaders.is_empty() {
+        return;
+    }
     let mut id = [0u8; 16];
     for (at, b) in id.iter_mut().enumerate() {
         *b = key.get(2 * at..2 * at + 2).and_then(|x| u8::from_str_radix(x, 16).ok()).unwrap_or(0);
     }
-    let mut book = book.lock().unwrap_or_else(|e| e.into_inner());
-    if shaders.is_empty() || !book.keys.insert(id) {
-        return;
-    }
-    let mut entry = id.to_vec();
-    entry.push(shaders.len() as u8);
-    for s in shaders {
-        let hash = *blake3::hash(&s.container).as_bytes();
-        let stage = STAGES.iter().position(|&x| x == s.stage).unwrap_or(0) as u8;
-        entry.push(stage);
-        entry.extend(hash);
-        if book.shaders.insert(hash) {
-            let new = &mut book.new[0];
-            new.push(stage);
-            new.extend(hash);
-            new.extend((s.container.len() as u32).to_le_bytes());
-            new.extend(&s.container);
-        }
-    }
-    entry.push(u8::from(graphics.is_some()));
-    if let Some(g) = graphics {
-        g.put(&mut entry);
-    }
-    book.new[1].extend((entry.len() as u32).to_le_bytes());
-    book.new[1].extend(entry);
-    book.added += 1;
+    let state = graphics.map(|g| {
+        let mut bytes = Vec::new();
+        g.put(&mut bytes);
+        bytes
+    });
+    book.lock().unwrap_or_else(|e| e.into_inner()).note(id, shaders, state.as_deref());
 }
 
 /// Writes what was noted.
-fn flush() {
-    let Some(Some(book)) = BOOK.get() else { return };
-    let (dir, new, added) = {
-        let mut book = book.lock().unwrap_or_else(|e| e.into_inner());
-        if book.added == 0 {
-            return;
-        }
-        (book.dir.clone(), std::mem::take(&mut book.new), std::mem::take(&mut book.added))
-    };
+fn flush(book: &Mutex<Book>) {
+    let Some((dir, new, added)) = book.lock().unwrap_or_else(|e| e.into_inner()).take() else { return };
     for (file, bytes) in [SHADERS, PIPELINES].iter().zip(&new) {
         let written = std::fs::OpenOptions::new()
             .create(true)
@@ -475,6 +528,66 @@ mod tests {
         let mut seen = Vec::new();
         assert_eq!(walk_shaders(&dir, |stage, hash, at, len| seen.push((stage, hash[0], at, len))), one);
         assert_eq!(seen, [(5, 9, 37, 4)]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("victory-known-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn what_waited_is_noted_against_the_files() {
+        let dir = scratch("waited");
+        let a = super::super::shader("pixel", b"known test a");
+        let b = super::super::shader("pixel", b"known test b");
+        let mut book = Book::new(dir.clone());
+        book.note([1; 16], std::slice::from_ref(&a), None);
+        book.note([2; 16], &[a.clone(), b.clone()], Some(&[7, 8]));
+        book.note([2; 16], &[a.clone(), b.clone()], Some(&[7, 8]));
+        book.note([3; 16], &[], None);
+        assert!(book.take().is_none());
+        let mut shader = vec![1u8];
+        shader.extend(blake3::hash(&a.container).as_bytes());
+        shader.extend((a.container.len() as u32).to_le_bytes());
+        shader.extend(&a.container);
+        std::fs::write(dir.join(SHADERS), &shader).unwrap();
+        let mut entry = 17u32.to_le_bytes().to_vec();
+        entry.extend([1; 16]);
+        entry.push(0);
+        std::fs::write(dir.join(PIPELINES), &entry).unwrap();
+        let (keys, shaders) = read(&dir);
+        book.read(keys, shaders);
+        assert!(book.waiting.is_empty());
+        let (_, new, added) = book.take().expect("one new pipeline");
+        assert_eq!(added, 1);
+        assert_eq!(new[0].len(), 37 + b.container.len());
+        assert_eq!(&new[0][1..33], blake3::hash(&b.container).as_bytes());
+        assert_eq!(&new[1][4..20], &[2; 16]);
+        assert_eq!(&new[1][new[1].len() - 3..], &[1, 7, 8]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_torn_end_is_cut_before_anything_is_added() {
+        let dir = scratch("cut");
+        let mut bytes = Vec::new();
+        for n in 0..2u8 {
+            bytes.extend(20u32.to_le_bytes());
+            bytes.extend([n; 20]);
+        }
+        std::fs::write(dir.join(PIPELINES), &bytes[..bytes.len() - 5]).unwrap();
+        let c = super::super::shader("pixel", b"known test c");
+        let mut book = Book::new(dir.clone());
+        book.note([9; 16], &[c], None);
+        let (known, shaders) = read(&dir);
+        book.read(known, shaders);
+        flush(&Mutex::new(book));
+        assert_eq!(count(&dir), 2);
+        assert_eq!(keys(&dir)[1], "09".repeat(16));
+        assert_eq!(walk_shaders(&dir, |_, _, _, _| ()), 37 + 12);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
