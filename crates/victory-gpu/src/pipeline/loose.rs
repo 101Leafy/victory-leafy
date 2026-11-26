@@ -223,6 +223,16 @@ impl Loose {
         // SAFETY: `self.made` holds `p`, and so what it made, while self lives.
         Some(unsafe { &*made })
     }
+
+    /// Why the last draw on this thread had no host pipeline (diagnostics).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn missing(&self) -> Option<String> {
+        let p = CHOSEN.with_borrow(|c| c.as_ref().filter(|(id, _)| *id == self.id).map(|(_, p)| p.clone()));
+        match p {
+            Some(p) => make::missing(&p),
+            None => Some("loose, no targets chosen".into()),
+        }
+    }
 }
 
 #[cfg(test)]
