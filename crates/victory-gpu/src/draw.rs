@@ -1535,6 +1535,7 @@ impl State {
             return false;
         }
         let l = &list.list;
+        let began = std::time::Instant::now();
         // Vertex buffers the input layout reads.
         let mut views = [D3D12_VERTEX_BUFFER_VIEW::default(); 32];
         let mut count = 0;
@@ -1576,6 +1577,8 @@ impl State {
             // SAFETY: an open list; the view names a live host buffer.
             unsafe { l.IASetIndexBuffer(Some(&view)) };
         }
+        crate::copystat::lap(crate::copystat::C::DrawBuffersNs, began);
+        let began = std::time::Instant::now();
         const RENDER_TARGET: u32 = 0x4;
         for &t in &self.targets {
             crate::list::ensure_state(list, t as This, RENDER_TARGET);
@@ -1600,6 +1603,7 @@ impl State {
             };
             crate::list::ensure_state(list, self.depth as This, state);
         }
+        crate::copystat::lap(crate::copystat::C::DrawStatesNs, began);
         true
     }
 
@@ -1612,11 +1616,13 @@ impl State {
     /// could not be given a view.
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
         let l = &list.list;
+        let began = std::time::Instant::now();
         // Textures picked by index, before anything asks for them.
         self.early_textures(list, p, compute);
         if crate::host::walls_trace() {
             self.walls_census(p, compute);
         }
+        crate::copystat::lap(crate::copystat::C::DrawEarlyNs, began);
         // A list without a view heap: one of the title's for the views the
         // host itself puts into heap slots.
         if self.heaps[0] == 0
@@ -1677,7 +1683,9 @@ impl State {
             if t.stores && crate::picked::on() && crate::picked::picks(&stage.shader, &t.picks) {
                 crate::picked::runs_in(list);
             }
+            let began = std::time::Instant::now();
             let made = self.tables(list, &t.used, &t.host.root_indexed_views, compute);
+            crate::copystat::lap(crate::copystat::C::DrawTablesNs, began);
             STORES.set(true);
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
@@ -1691,6 +1699,7 @@ impl State {
             // copied back into title memory afterwards.
             let writes = (t.stores || !write_skip())
                 && !crate::pipeline::builder_quarantined(self.pipeline as This);
+            let began = std::time::Instant::now();
             // Title memory by address: what the shader finds it by.
             let memory = if t.host.root_srvs.contains(&victory_shader::emit::SLOT_MEMORY) {
                 // Only through a store by address: what it stores through
@@ -1713,6 +1722,8 @@ impl State {
             } else {
                 None
             };
+            crate::copystat::lap(crate::copystat::C::DrawMemoryNs, began);
+            let began = std::time::Instant::now();
             if let Some((param, dwords)) = stage.user_data {
                 // (A root signature holds 64 dwords.)
                 let mut room = [0u32; 64];
@@ -1858,6 +1869,7 @@ impl State {
                     return false;
                 }
             }
+            crate::copystat::lap(crate::copystat::C::DrawRootsNs, began);
         }
         // Depth textures it writes through unordered access: their colour
         // twins hold what they lack from here on.
@@ -4131,6 +4143,7 @@ impl State {
             why("mesh draws are switched off (VICTORY_MESH_TEST=skip)");
             return false;
         }
+        let began = std::time::Instant::now();
         // One record without a count: clamped in a batch (`batches`).
         let batch = if batches() > 0 && max == 1 && count.is_none() {
             args.refresh(list, arguments, len);
@@ -4222,6 +4235,7 @@ impl State {
                 (bounded, 0)
             }
         };
+        crate::copystat::lap(crate::copystat::C::IndirectArgsNs, began);
         REFUSED.set(None);
         let ran = match kind {
             DRAW | INDEXED => self.prepare(list, kind == INDEXED),
