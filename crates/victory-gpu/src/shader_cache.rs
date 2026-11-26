@@ -99,6 +99,7 @@ fn build(translator: &str) -> [u8; 32] {
             "VICTORY_BVH_BOUNDS",
             "VICTORY_WAVE_PAIRS",
             "VICTORY_LAUNCHED_EXEC",
+            "VICTORY_WAVE32_LOWERING",
         ] {
             bytes.extend_from_slice(name.as_bytes());
             bytes.push(b'=');
