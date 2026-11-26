@@ -1350,6 +1350,14 @@ fn log_memory() {
         mb(below_unsized),
         mb(above),
     );
+    let [ownerless, cap, freed] = crate::descriptor::ownerless_kept();
+    tracing::info!(
+        "memory, view entries no resource owns: {} kept (at most {}, 0: all; VICTORY_OWNERLESS_VIEWS), \
+         {} of them freed under the cap so far",
+        ownerless,
+        cap,
+        freed,
+    );
 }
 
 /// Microseconds since the first call.
