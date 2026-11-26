@@ -965,6 +965,19 @@ fn log_memory() {
     {
         let [textures, staging] = crate::pool::memory();
         tracing::info!("memory in blocks (VICTORY_TEXTURE_POOL=0 turns them off): {textures} MB of textures, {staging} MB of their staging buffers");
+        let (blocks, free, let_go, fullest) = crate::pool::fill();
+        tracing::info!(
+            "texture blocks by how much is taken (VICTORY_POOL_FULLEST={}): {} empty, {} under a quarter with {} MB free, {} under half with {} MB free, {} half or more with {} MB free; {} let go so far",
+            u8::from(fullest),
+            blocks[0],
+            blocks[1],
+            free[1],
+            blocks[2],
+            free[2],
+            blocks[3],
+            free[3],
+            let_go
+        );
     }
     let targets = crate::resource::targets_census();
     tracing::info!(
