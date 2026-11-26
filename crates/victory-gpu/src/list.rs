@@ -1293,7 +1293,12 @@ fn read_back(
     let bytes = pitch * (rows - 1) + row;
     let data = buffer_range(dst.resource, dst.footprint.offset, bytes).ok_or("a destination outside its buffer")?;
     let texture = crate::resource::host_resource(src.resource).ok_or("no host texture")?;
-    let buffer = host.read_back_buffer(size).ok_or("no read-back buffer")?;
+    // Space in the list's read-back chunks (upstream #2818), else a buffer
+    // of its own from the pool.
+    let (buffer, offset, mapped) = match list.readback_space(size) {
+        Some(space) => space,
+        None => (host.read_back_buffer(size).ok_or("no read-back buffer")?, 0, std::ptr::null()),
+    };
     // As a texture source of any copy: what shaders wrote to a depth twin
     // and what the title wrote itself first, then the state.
     list.twin_use(src.resource, false, false);
@@ -1306,6 +1311,7 @@ fn read_back(
     let mut to = dst;
     to.resource = buffer.as_raw().cast_const().cast();
     to.footprint = footprint;
+    to.footprint.offset = offset;
     let host_box = (!source_box.is_null()).then(|| source_box.cast::<D3D12_BOX>());
     #[cfg(feature = "diagnostics")]
     list.note_op(|| {
@@ -1321,7 +1327,7 @@ fn read_back(
         list.list
             .CopyTextureRegion((&raw const to).cast(), 0, 0, 0, (&raw const from).cast(), host_box)
     };
-    list.defer_read_back(buffer, data, [row as usize, rows as usize, pitch as usize]);
+    list.defer_read_back(buffer, mapped, data, [row as usize, rows as usize, pitch as usize]);
     Ok(())
 }
 
