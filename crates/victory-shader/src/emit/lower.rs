@@ -7339,7 +7339,7 @@ impl<'a> Lower<'a> {
                 self.s.flags |= flags::WAVE_OPS;
                 let i32t = self.s.t.i32;
                 let first = self.s.op(c, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[d]);
-                d = if self.s.pixel && super::helper_own() {
+                d = if self.s.pixel && super::helper_own() && !super::helper_lane_waves() {
                     let helper = self.helper_lane();
                     self.s.m.select(c, helper, d, first)
                 } else {
