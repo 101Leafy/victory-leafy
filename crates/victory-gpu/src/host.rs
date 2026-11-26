@@ -3436,8 +3436,10 @@ pub(crate) fn settle_now(why: usize) {
         return;
     }
     let mut submitted = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+    #[cfg(feature = "diagnostics")]
     let held = std::time::Instant::now();
     host.settle(&mut submitted, why);
+    #[cfg(feature = "diagnostics")]
     crate::copystat::lap(crate::copystat::C::SubmitLockSettleNs, held);
 }
 
@@ -3464,8 +3466,10 @@ pub(crate) fn settle_for_fence() {
 /// lists give theirs back as they land. Counted with the settles for too
 /// much in the air, which it is.
 pub(crate) fn settle_for_tables() {
+    #[cfg(feature = "diagnostics")]
     let began = std::time::Instant::now();
     settle_now(WHY_MOST);
+    #[cfg(feature = "diagnostics")]
     crate::copystat::lap(crate::copystat::C::SettleTablesNs, began);
 }
 
@@ -3536,8 +3540,10 @@ fn late_helper() {
             if line().target != target {
                 continue;
             }
+            #[cfg(feature = "diagnostics")]
             let held = std::time::Instant::now();
             host.settle(&mut submitted, WHY_CARD_DONE);
+            #[cfg(feature = "diagnostics")]
             crate::copystat::lap(crate::copystat::C::SubmitLockDoneNs, held);
         }
         land();
@@ -5441,12 +5447,16 @@ impl Host {
             self.settle(&mut submitted, WHY_READ);
         } else if most && relay_exact() {
             // Until there are fewer, not until there are none.
+            #[cfg(feature = "diagnostics")]
             let began = std::time::Instant::now();
             relay_wait(WHY_MOST, |line| line.lists < late_most());
+            #[cfg(feature = "diagnostics")]
             crate::copystat::lap(crate::copystat::C::SettleListsNs, began);
         } else if most {
+            #[cfg(feature = "diagnostics")]
             let began = std::time::Instant::now();
             self.settle(&mut submitted, WHY_MOST);
+            #[cfg(feature = "diagnostics")]
             crate::copystat::lap(crate::copystat::C::SettleListsNs, began);
         } else {
             LINE_MOVED.notify_one();
@@ -5897,6 +5907,7 @@ impl Host {
             let settling = std::time::Instant::now();
             self.settle(&mut submitted, WHY_MOST);
             settled += settling.elapsed();
+            #[cfg(feature = "diagnostics")]
             crate::copystat::lap(crate::copystat::C::SettleResultsNs, settling);
         }
         // What shaders may write through views they pick: last, so that no
