@@ -1646,7 +1646,12 @@ pub(crate) fn log(frames: f64) {
     tracing::info!(
         "guarded runs made read-only with the guards' lock let go (VICTORY_PROTECT_LATER=0 for none), since the start: \
          {runs} runs, {blocks} blocks; {reopened} blocks opened meanwhile and made writable again; \
-         {failed} runs guarded under the lock after"
+         {failed} runs guarded under the lock after (block by block with it let go: VICTORY_GUARD_FALLBACK_LATER=1)"
+    );
+    let [aliases, failed] = [0, 1].map(|n| crate::watch::ALIAS_LATER[n].load(std::sync::atomic::Ordering::Relaxed));
+    tracing::info!(
+        "other views of guarded pages made read-only with the guards' lock let go (VICTORY_ALIAS_LATER=1), \
+         since the start: {aliases}; {failed} failed or opened meanwhile"
     );
     let [blocks, bytes, freed] =
         [0, 1, 2].map(|n| crate::watch::GRAPHICS_BLOCKS[n].load(std::sync::atomic::Ordering::Relaxed));
