@@ -1358,6 +1358,13 @@ fn log_memory() {
         cap,
         freed,
     );
+    tracing::info!(
+        "placed texture views: slots showing an older texture now {}, made null for want of room so far {} \
+         (VICTORY_KEPT_VIEWS_YIELD=1: {})",
+        crate::descriptor::host::KEEPING_NOW.load(std::sync::atomic::Ordering::Relaxed),
+        crate::descriptor::host::KEPT_YIELDED.load(std::sync::atomic::Ordering::Relaxed),
+        if crate::descriptor::host::kept_views_yield() { "on" } else { "off" },
+    );
 }
 
 /// Microseconds since the first call.
