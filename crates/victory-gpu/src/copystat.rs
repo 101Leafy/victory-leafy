@@ -275,11 +275,35 @@ pub(crate) enum C {
     FreshNs,
     FreshShared,
     FreshSharedSlots,
+    /// The bytes of the read-back buffers made (`ReadBacksMade`), after
+    /// rounding.
+    ReadBacksMadeBytes,
+    /// Slots the heap pass planned under a freed table entry.
+    HeapDueFreed,
+    /// Held slots it planned in the sweep's part of 256.
+    HeapDueSweepPart,
+    /// Held slots out of that part it planned for a changed record.
+    HeapDueSweepChanged,
+    /// Orphan slots it planned in the sweep's part of 16.
+    HeapDueOrphanPart,
+    /// Orphan slots out of that part it planned for a changed record.
+    HeapDueOrphanChanged,
+    /// Slots it planned more than once in a plan.
+    HeapDueTwice,
+    /// Looks that found the same copy and range as the last one.
+    HeapAgainShows,
+    /// Looks at an orphan that found it still left for later.
+    HeapAgainLater,
+    /// Of those, the ones left because a draw's table copies it.
+    HeapAgainTabled,
+    /// Looks at a slot neither held nor orphaned that found no buffer
+    /// view of ours again.
+    HeapAgainNothing,
 }
 const COUNTERS: usize = 160;
 
 /// The counters' names, in the order of [`C`], for the frame recorder's columns.
-pub(crate) const NAMES: [&str; 149] = [
+pub(crate) const NAMES: [&str; 160] = [
     "Submissions", "Copies", "CopyBytes", "Refreshes", "RefreshBytes", "Skipped", "SkippedBytes", "Runs",
     "RunUs", "Queries", "QueryUs", "MoveUs", "Unmapped", "Watches", "WatchUs", "Checked", "Unchanged",
     "Fallbacks", "GuardFaults", "TexWatched", "TexHashed", "TexChanged", "TexHot", "Frames", "RecordCalls",
@@ -304,7 +328,9 @@ pub(crate) const NAMES: [&str; 149] = [
     "CopyTexSlow",
     "GuardPartFaults", "GuardPartWhole", "GuardPartAliased", "GuardPartBlocks", "GuardPartParts",
     "FreshMade", "FreshMadeSlots", "FreshAgainSlots", "FreshAgainCbvSlots", "FreshSame", "FreshSameSlots",
-    "FreshNs", "FreshShared", "FreshSharedSlots",
+    "FreshNs", "FreshShared", "FreshSharedSlots", "ReadBacksMadeBytes",
+    "HeapDueFreed", "HeapDueSweepPart", "HeapDueSweepChanged", "HeapDueOrphanPart", "HeapDueOrphanChanged",
+    "HeapDueTwice", "HeapAgainShows", "HeapAgainLater", "HeapAgainTabled", "HeapAgainNothing",
 ];
 /// One of some sets of counters, each in lines of the processor's memory of
 /// its own: a set for all threads had them wait for each other's lines at
@@ -615,7 +641,7 @@ mod command_tests {
     #[test]
     fn every_counter_is_named() {
         use super::{C, COUNTERS, NAMES};
-        assert_eq!(C::FreshSharedSlots as usize + 1, NAMES.len());
+        assert_eq!(C::HeapAgainNothing as usize + 1, NAMES.len());
         assert_eq!(NAMES[C::Frames as usize], "Frames");
         assert!(NAMES.len() <= COUNTERS);
     }
