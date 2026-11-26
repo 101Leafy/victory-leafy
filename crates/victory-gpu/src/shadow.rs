@@ -4969,6 +4969,8 @@ impl Shadow {
         let (mut runs, mut run) = (Vec::new(), None::<(usize, bool)>);
         // Pages taken before and written since: in the order of their runs.
         let mut again_at: Vec<(usize, u64)> = Vec::new();
+        #[cfg(feature = "diagnostics")]
+        let (mut whole_bytes, mut part_bytes) = (0u64, 0u64);
         let last = (to - 1) / PAGE;
         for page in from / PAGE..=last {
             let write = match writes.peek() {
@@ -4984,8 +4986,18 @@ impl Shadow {
                 // A page only partly in the range is copied in part: it
                 // stays stale for the rest.
                 let (start, end) = (self.start as usize, (self.start + self.len) as usize);
-                if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
+                let whole = (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to;
+                if whole {
                     *at = now;
+                }
+                #[cfg(feature = "diagnostics")]
+                {
+                    let n = (((page + 1) * PAGE).min(to) - (page * PAGE).max(from)) as u64;
+                    if whole {
+                        whole_bytes += n;
+                    } else {
+                        part_bytes += n;
+                    }
                 }
                 // Cut where pages taken before meet pages never taken.
                 let again = taken != 0;
@@ -5006,6 +5018,11 @@ impl Shadow {
         // Cut to the range: next to it shaders may be writing the copy.
         if let Some((first, known)) = run {
             runs.push(((first * PAGE).max(from), ((last + 1) * PAGE).min(to), known));
+        }
+        #[cfg(feature = "diagnostics")]
+        {
+            crate::copystat::add(crate::copystat::C::TakenWholeBytes, whole_bytes);
+            crate::copystat::add(crate::copystat::C::TakenPartBytes, part_bytes);
         }
         let runs = by_parts(runs, &again_at, &crate::watch::parts_written(&again_at));
         let bytes = self.take_all(runs);

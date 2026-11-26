@@ -468,11 +468,16 @@ pub(crate) enum C {
     /// nothing ran since the last one (`VICTORY_WAIT_SHARE=1`).
     BatchArgsWritten,
     WaitsLeftOut,
+    /// Bytes `Shadow::copy_stale` took of pages whole in the range (noted
+    /// in `copied`), and of pages it held in part (left stale, taken again
+    /// at the next refresh).
+    TakenWholeBytes,
+    TakenPartBytes,
 }
 const COUNTERS: usize = 256;
 
 /// The counters' names, in the order of [`C`], for the frame recorder's columns.
-pub(crate) const NAMES: [&str; 245] = [
+pub(crate) const NAMES: [&str; 247] = [
     "Submissions", "Copies", "CopyBytes", "Refreshes", "RefreshBytes", "Skipped", "SkippedBytes", "Runs",
     "RunUs", "Queries", "QueryUs", "MoveUs", "Unmapped", "Watches", "WatchUs", "Checked", "Unchanged",
     "Fallbacks", "GuardFaults", "TexWatched", "TexHashed", "TexChanged", "TexHot", "Frames", "RecordCalls",
@@ -528,6 +533,7 @@ pub(crate) const NAMES: [&str; 245] = [
     "TexUploadBytes", "TexForced", "TexForcedBytes", "TexForcedSame", "TexForcedSameBytes",
     "TableEntries", "TableEntriesSame",
     "BatchArgsWritten", "WaitsLeftOut",
+    "TakenWholeBytes", "TakenPartBytes",
 ];
 /// One of some sets of counters, each in lines of the processor's memory of
 /// its own: a set for all threads had them wait for each other's lines at
@@ -906,7 +912,7 @@ mod command_tests {
     #[test]
     fn every_counter_is_named() {
         use super::{C, COUNTERS, NAMES};
-        assert_eq!(C::WaitsLeftOut as usize + 1, NAMES.len());
+        assert_eq!(C::TakenPartBytes as usize + 1, NAMES.len());
         assert_eq!(NAMES[C::Frames as usize], "Frames");
         assert!(NAMES.len() <= COUNTERS);
     }
