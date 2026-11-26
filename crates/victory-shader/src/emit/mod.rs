@@ -801,7 +801,17 @@ fn emit_forms(
         // lost the card in a submission of two programs that had just moved to it
         // (`ptfx_CS_lightAtlas_Sprite` and `_Trail`). The 32-lane programs' form below, which
         // has no barrier, stays on.
-        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1") || WIDE_HERE.get();
+        // With `VICTORY_WAVE32_LOWERING=1`, two archived scene kernels of one logical wave
+        // per group are on by default (their wave32 forms were checked on RTX); an explicit
+        // `VICTORY_WAVE_WIDE` still wins.
+        let scene_kernel = wave32_lowering()
+            && matches!(&native.io, crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 64)
+            && matches!(
+                c.digest,
+                [0x58, 0x1d, 0xab, 0x2c, 0xd8, 0xbc, 0xf2, 0x2e, 0x5c, 0x96, 0x4b, 0x98, 0xe9, 0x03, 0x48, 0xd1]
+                    | [0x24, 0x31, 0xbb, 0xe7, 0xdc, 0x15, 0x4a, 0xd7, 0x59, 0xd2, 0x0b, 0xc9, 0x54, 0x82, 0x9c, 0x1c]
+            );
+        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").map_or(scene_kernel, |v| v == "1") || WIDE_HERE.get();
         // A single guest wave can iterate an active-lane loop until both host
         // halves have finished. The precise latch and convergence conditions
         // for the driver compute route are checked by widen().
@@ -944,6 +954,16 @@ fn emit_forms(
         }
         other => other,
     };
+    // With `VICTORY_WAVE32_LOWERING=1` a form that still asks for 64-lane waves on a host
+    // of 32 is refused here, so the retries below and the paired form get their turn.
+    let supported = |(shader, wave): (HostShader, Option<u32>)| {
+        if wave32_lowering() && wave == Some(64) && lower::host_max_wave() == 32 {
+            Err(ShaderError::Unsupported { offset: 0, what: "no wave32 lowering for this wave64 program" })
+        } else {
+            Ok((shader, wave))
+        }
+    };
+    let original = original.and_then(supported);
     // Retry unsupported programs only. Threading can separate an unknown
     // register value from its apparent use on a mutually exclusive path.
     if !matches!(original, Err(ShaderError::Unsupported { .. })) {
@@ -957,7 +977,7 @@ fn emit_forms(
     let st = structure::structure(&p)?;
     let io = io::raise(&p, native)?;
     let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
-    emit_program(c, native, &p, &st, &io, &res)
+    emit_program(c, native, &p, &st, &io, &res).and_then(supported)
 }
 
 /// `p` translated with the joins of its descriptors chosen by control flow copied for each way
