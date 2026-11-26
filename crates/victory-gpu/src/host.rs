@@ -9512,6 +9512,29 @@ struct Presenter {
     frames: frames::Frames,
 }
 
+/// The times between presents over the last 5 s: their median, 95th and
+/// 99th percentiles, the longest, and how many were over 50 and 100 ms (a
+/// frame rate's steadiness, which the averages of the frame-rate line hide).
+#[cfg(feature = "diagnostics")]
+fn frame_times_line(mut ms: Vec<f32>) {
+    if ms.is_empty() {
+        return;
+    }
+    ms.sort_by(f32::total_cmp);
+    let at = |q: f32| ms[((ms.len() - 1) as f32 * q).round() as usize];
+    let over = |limit: f32| ms.iter().filter(|&&m| m > limit).count();
+    tracing::info!(
+        "frame times over the last 5 s: {} frames, median {:.1} ms, p95 {:.1}, p99 {:.1}, longest {:.1}; {} over 50 ms, {} over 100 ms",
+        ms.len(),
+        at(0.5),
+        at(0.95),
+        at(0.99),
+        ms[ms.len() - 1],
+        over(50.0),
+        over(100.0)
+    );
+}
+
 /// The frame rate, shown in the window's caption every second and logged
 /// every few seconds.
 struct Meter {
@@ -9523,6 +9546,12 @@ struct Meter {
     logged: std::time::Instant,
     /// The caption the window had, once read.
     caption: Option<Vec<u16>>,
+    /// The last present, and the times between presents since the last
+    /// line of every 5 s (ms), for the frame-time line ([`frame_times_line`]).
+    #[cfg(feature = "diagnostics")]
+    last_frame: std::time::Instant,
+    #[cfg(feature = "diagnostics")]
+    intervals: Vec<f32>,
 }
 
 impl Meter {
@@ -9536,6 +9565,10 @@ impl Meter {
             drawn: crate::draw::drawn(),
             logged: now,
             caption: None,
+            #[cfg(feature = "diagnostics")]
+            last_frame: now,
+            #[cfg(feature = "diagnostics")]
+            intervals: Vec::with_capacity(512),
         }
     }
 
@@ -9575,6 +9608,9 @@ impl Meter {
         #[cfg(feature = "diagnostics")]
         {
             self.copy_stats_frames += 1;
+            let now = std::time::Instant::now();
+            self.intervals.push((now - self.last_frame).as_secs_f32() * 1000.0);
+            self.last_frame = now;
         }
         let elapsed = self.since.elapsed();
         if elapsed < std::time::Duration::from_secs(1) {
@@ -9675,6 +9711,8 @@ impl Meter {
         let drops = crate::pipeline::take_drops();
         if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
             self.logged = std::time::Instant::now();
+            #[cfg(feature = "diagnostics")]
+            frame_times_line(std::mem::take(&mut self.intervals));
             tracing::info!(
                 "placed texture views: {} writes of another view of the texture a slot showed (it kept the old view until the new was made)",
                 crate::descriptor::host::KEPT_VIEWS.load(Ordering::Relaxed)
