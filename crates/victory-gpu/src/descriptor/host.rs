@@ -351,6 +351,10 @@ impl Pools {
 }
 pub(crate) struct HostHeap {
     pub(crate) heap: ID3D12DescriptorHeap,
+    /// Which heap this is, never given to another: what its flips
+    /// ([`FLIPS`]) are filed under. Its address was not enough: a heap made
+    /// where a dropped one had been took over the flips that one left.
+    id: u64,
     cpu: usize,
     step: u32,
     /// Slots mirroring the title's; view heaps have `dynamic` more.
@@ -494,9 +498,7 @@ static RESHOWN_AFTER: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
 struct Flip {
     /// The submission to wait for.
     after: u64,
-    /// The heap (its address), the slot, where its record is and which
-    /// record it was.
-    heap: usize,
+    /// The slot, where its record is and which record it was.
     index: u32,
     handle: u64,
     key: u64,
@@ -648,7 +650,18 @@ fn neutral_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<ID3D12Res
     Some(texture.clone())
 }
 
-static FLIPS: Mutex<Vec<Flip>> = Mutex::new(Vec::new());
+/// The flips waiting, by heap ([`HostHeap::id`]). A heap's queue is made
+/// with it and goes when it is dropped, so a flip asked for a heap that is
+/// gone (an upload that ran after) finds none and is let go.
+static FLIPS: Mutex<std::collections::BTreeMap<u64, Vec<Flip>>> = Mutex::new(std::collections::BTreeMap::new());
+
+static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn queue_flip(heap: u64, flip: Flip) {
+    if let Some(queue) = FLIPS.lock().unwrap_or_else(|e| e.into_inner()).get_mut(&heap) {
+        queue.push(flip);
+    }
+}
 
 /// Makes the slots whose new texture's upload has run
 /// ([`HostHeap::texture_slots_flip`]); on any thread. Not if the heap is at
@@ -1795,6 +1808,12 @@ fn capped_dynamic_slots(count: u32, null: u32, set: Option<u32>) -> u32 {
     set.unwrap_or(null.saturating_sub(CAPPED_TITLE.min(count))).clamp(DYNAMIC, most)
 }
 
+impl Drop for HostHeap {
+    fn drop(&mut self) {
+        FLIPS.lock().unwrap_or_else(|e| e.into_inner()).remove(&self.id);
+    }
+}
+
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
         let host = host()?;
@@ -1898,6 +1917,7 @@ impl HostHeap {
             .flatten();
         let h = HostHeap {
             heap,
+            id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             cpu,
             step,
             count,
@@ -1936,6 +1956,7 @@ impl HostHeap {
                 spans
             },
         };
+        FLIPS.lock().unwrap_or_else(|e| e.into_inner()).insert(h.id, Vec::new());
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no
         // used-resource entry names) read a wild address. Every slot starts
@@ -2578,11 +2599,10 @@ impl HostHeap {
         if !self.show_later(index, handle) {
             return;
         }
-        let (heap, key) = (std::ptr::from_ref(self) as usize, record_key(handle));
+        let (heap, key) = (self.id, record_key(handle));
         let late = Some(crate::frame::current());
         job.then(move || {
-            let flip = Flip { after: 0, heap, index, handle, key, late };
-            FLIPS.lock().unwrap_or_else(|e| e.into_inner()).push(flip);
+            queue_flip(heap, Flip { after: 0, index, handle, key, late });
         });
     }
 
@@ -2606,11 +2626,10 @@ impl HostHeap {
     }
 
     fn flip(&self, list: &crate::host::HostList, index: u32, handle: u64, late: Option<u64>) {
-        let (heap, key) = (std::ptr::from_ref(self) as usize, record_key(handle));
+        let (heap, key) = (self.id, record_key(handle));
         list.defer_host(move || {
             let after = crate::host::submissions().0;
-            let flip = Flip { after, heap, index, handle, key, late };
-            FLIPS.lock().unwrap_or_else(|e| e.into_inner()).push(flip);
+            queue_flip(heap, Flip { after, index, handle, key, late });
         });
     }
 
@@ -2621,14 +2640,10 @@ impl HostHeap {
         let finished = crate::host::submissions().1;
         let ready: Vec<Flip> = {
             let mut flips = FLIPS.lock().unwrap_or_else(|e| e.into_inner());
-            if flips.is_empty() {
+            let Some(queue) = flips.get_mut(&self.id) else {
                 return 0;
-            }
-            let own = std::ptr::from_ref(self) as usize;
-            let (ready, wait): (Vec<Flip>, Vec<Flip>) =
-                flips.drain(..).partition(|f| f.after <= finished && f.heap == own);
-            *flips = wait;
-            ready
+            };
+            queue.extract_if(.., |f| f.after <= finished).collect()
         };
         let mut flipped = 0;
         for f in ready {
@@ -6048,6 +6063,42 @@ mod tests {
         // SAFETY: a plain query of a live heap.
         let total = unsafe { heap.heap.GetDesc() }.NumDescriptors;
         assert_eq!(total, D3D12_MAX_SHADER_VISIBLE_SAMPLER_HEAP_SIZE);
+    }
+
+    /// A heap made where a dropped one was gets its own flips, not the
+    /// ones the dropped heap left waiting.
+    #[test]
+    fn heap_id_changes_when_the_same_address_is_reused() {
+        let Some(heap) = HostHeap::new(true, 1) else {
+            return; // no host GPU
+        };
+        let mut heap = Box::new(heap);
+        let (address, id) = (std::ptr::from_ref(&*heap) as usize, heap.id);
+        queue_flip(id, Flip { after: 0, index: 0, handle: 0, key: 0, late: None });
+        *heap = HostHeap::new(true, 1).unwrap();
+        assert_eq!(std::ptr::from_ref(&*heap) as usize, address);
+        assert!(heap.id > id);
+        assert!(!FLIPS.lock().unwrap().contains_key(&id));
+        assert_eq!(heap.texture_slots_flip(), 0);
+    }
+
+    #[test]
+    fn dropping_a_heap_removes_only_its_pending_work() {
+        let (Some(a), Some(b)) = (HostHeap::new(true, 1), HostHeap::new(true, 1)) else {
+            return; // no host GPU
+        };
+        let flip = || Flip { after: u64::MAX, index: 0, handle: 0, key: 0, late: None };
+        let (gone, kept) = (a.id, b.id);
+        queue_flip(gone, flip());
+        queue_flip(kept, flip());
+        drop(a);
+        queue_flip(gone, flip());
+        let flips = FLIPS.lock().unwrap();
+        assert!(!flips.contains_key(&gone));
+        assert_eq!(flips.get(&kept).map(Vec::len), Some(1));
+        drop(flips);
+        drop(b);
+        assert!(!FLIPS.lock().unwrap().contains_key(&kept));
     }
 
     #[test]
