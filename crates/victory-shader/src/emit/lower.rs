@@ -1350,6 +1350,8 @@ impl<'a> Lower<'a> {
         let mut exchange: Option<(u32, bool, Vec<bool>)> = None;
         // a console wave64 program in host waves of 32: the LDS dword of `wave_base`'s counter
         let mut halves: Option<u32> = None;
+        // D3D12 caps thread-group shared memory at 32 KiB (8,192 dwords).
+        const MAX_LDS_DWORDS: u32 = 8192;
         let paired = PAIRED.get() && x.native.wave64 && host_max_wave() == 32;
         if let StageIo::Cs(cs) = x.native.io
             && paired
@@ -1362,7 +1364,7 @@ impl<'a> Lower<'a> {
             if waves > 1 {
                 // `wave_base`'s counter: a dword past the program's LDS, or the program's
                 // first where it takes all a host group has (32 KiB)
-                let slot = if s.lds_dwords < 8192 { s.lds_dwords } else { 0 };
+                let slot = if s.lds_dwords < MAX_LDS_DWORDS { s.lds_dwords } else { 0 };
                 s.lds_dwords = s.lds_dwords.max(slot + 1);
                 halves = Some(slot);
             }
@@ -1440,14 +1442,15 @@ impl<'a> Lower<'a> {
                                 }
                             }
                         }
-                        if lds_ok {
+                        let exchange_dwords = if crosses { 2 * group.div_ceil(64) } else { 0 };
+                        if lds_ok && s.lds_dwords.saturating_add(exchange_dwords) <= MAX_LDS_DWORDS {
                             wave = 32;
                             split_lds = s.lds_dwords > 0 && group > 32;
                             if crosses {
                                 // lanes 32..63 are the other host wave: masks, lane reads and lane
                                 // numbers go through two exchange dwords past the program's LDS
                                 exchange = Some((s.lds_dwords, group <= 32, all));
-                                s.lds_dwords += 2 * group.div_ceil(64);
+                                s.lds_dwords += exchange_dwords;
                             }
                         }
                     }
@@ -1487,14 +1490,20 @@ impl<'a> Lower<'a> {
                             Some(_) => {}
                         }
                     }
+                    if crosses && s.lds_dwords.saturating_add(2 * group.div_ceil(64)) > MAX_LDS_DWORDS {
+                        why.push("LDS exchange past 32 KiB");
+                    }
                     why.sort_unstable();
                     eprintln!("WAVE64-WHY group={group} lds={} [{}]", s.lds_dwords > 0, why.join(", "));
                 }
             }
             if wave == 32 && x.native.wave64 {
-                // console threads go to host waves in the order the waves take them (`wave_base`)
-                halves = Some(s.lds_dwords);
-                s.lds_dwords += 1;
+                // console threads go to host waves in the order the waves take them (`wave_base`):
+                // a dword past the program's LDS, or the program's first where it is already at
+                // the 32 KiB cap (`wave_base` syncs the group before the program runs)
+                let slot = if s.lds_dwords < MAX_LDS_DWORDS { s.lds_dwords } else { 0 };
+                s.lds_dwords = s.lds_dwords.max(slot + 1);
+                halves = Some(slot);
             }
             if console_lanes || one_wave && s.lds_dwords > 0 {
                 s.wave_size = Some(wave);
