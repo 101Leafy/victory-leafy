@@ -998,7 +998,8 @@ fn sync_copy_source(
     src: This,
     texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
 ) {
-    let aliased = crate::resource::alias_of(src).is_some_and(|source| crate::texture::alias(list, src, source));
+    let aliased = crate::resource::held_alias_of(src)
+        .is_some_and(|source| crate::texture::alias(list, src, source.as_ptr()));
     if !aliased && crate::texture::title_written(texture) {
         crate::texture::upload(list, src, texture);
     }
