@@ -6,19 +6,21 @@
 //! the frame-rate line, memory and textures; a frame itself only copies the
 //! box out of a buffer in the card's memory. Copied onto the swap chain's
 //! buffer, behind the title's picture: saved frames and the frame recorder
-//! see the title's own.
+//! see the title's own. F4 turns to a second page, the last dropped draws
+//! and late textures ([`log_event`]); F5 holds what is shown.
 //!
 //! Nothing on it says whose PC it is: numbers, the card's name with the
 //! user and computer names taken out, and whether frame lines are written
 //! (`VICTORY_FRAMES`, [`super::frames`]).
 
-use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_F3};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_F3, VK_F4, VK_F5};
 use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
 
 use super::{Host, HostList, transition};
@@ -38,6 +40,20 @@ const RIM: u32 = 3;
 /// at most half a second old.
 const UPLOADS: usize = 4;
 
+/// Live diagnostic log ticker ring.
+static LOG_RING: Mutex<VecDeque<String>> = Mutex::new(VecDeque::new());
+static CURRENT_PAGE: AtomicUsize = AtomicUsize::new(0);
+static IS_FROZEN: AtomicBool = AtomicBool::new(false);
+
+/// Pushes an event message to the live on-screen diagnostic log ticker.
+pub fn log_event(message: impl Into<String>) {
+    let mut ring = LOG_RING.lock().unwrap_or_else(|e| e.into_inner());
+    if ring.len() >= 64 {
+        ring.pop_front();
+    }
+    ring.push_back(message.into());
+}
+
 fn asked() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| crate::switch::on("VICTORY_PANEL"))
@@ -49,18 +65,34 @@ fn shown() -> &'static AtomicBool {
     SHOWN.get_or_init(|| AtomicBool::new(asked()))
 }
 
-/// F3 was pressed since the last call, with one of our windows in front.
-fn pressed() -> bool {
-    static DOWN: AtomicBool = AtomicBool::new(false);
+fn key_pressed(vk: u32, down_flag: &'static AtomicBool) -> bool {
     // SAFETY: a plain query.
-    let down = unsafe { GetAsyncKeyState(i32::from(VK_F3)) } < 0;
-    if DOWN.swap(down, Ordering::Relaxed) || !down {
+    let down = unsafe { GetAsyncKeyState(vk as i32) } < 0;
+    if down_flag.swap(down, Ordering::Relaxed) || !down {
         return false;
     }
     let mut process = 0;
     // SAFETY: plain queries; room for the answer.
     unsafe { GetWindowThreadProcessId(GetForegroundWindow(), &mut process) };
     process == std::process::id()
+}
+
+/// F3 was pressed since the last call, with one of our windows in front.
+fn pressed() -> bool {
+    static DOWN: AtomicBool = AtomicBool::new(false);
+    key_pressed(VK_F3 as u32, &DOWN)
+}
+
+/// F4 was pressed (cycles between telemetry and ticker pages).
+fn pressed_f4() -> bool {
+    static DOWN: AtomicBool = AtomicBool::new(false);
+    key_pressed(VK_F4 as u32, &DOWN)
+}
+
+/// F5 was pressed (freezes / unfreezes the on-screen display).
+fn pressed_f5() -> bool {
+    static DOWN: AtomicBool = AtomicBool::new(false);
+    key_pressed(VK_F5 as u32, &DOWN)
 }
 
 /// Seven rows of five dots, the leftmost the highest bit.
@@ -214,23 +246,40 @@ impl Counters {
 /// The text. `c`: [`Counters`] per frame, `ms` a frame's time, `worst` the
 /// longest frame's, `cost` what this takes of a frame, in microseconds.
 fn text(c: &[f64; COUNTERS], ms: f64, worst: f64, cost: f64, host: &Host) -> Vec<String> {
-    let gb = |bytes: u64| bytes as f64 / (1u64 << 30) as f64;
-    let (working, private) = crate::copystat::process_memory();
-    let [budget, used, _, shared] = host.video_memory().unwrap_or_default();
-    let idle = (c[1] / 1e3).min(ms);
-    vec![
-        format!("FPS {:.1}  FRAME {ms:.1} MS  LONGEST {worst:.0}", 1e3 / ms.max(0.001)),
-        format!("DRAWS {:.0}  DROPPED {:.0}", c[10], c[8]),
-        format!("SUBMIT BUSY {:.1}  WAITS FOR GPU {:.1}", c[0] / 1e3, c[3] / 1e3),
-        format!("GPU BUSY {:.1}  IDLE BEHIND US {:.1}", ms - idle, c[2] / 1e3),
-        format!("RECORDING {:.0} MS  COPY BACK {:.1}", c[9] / 1e6, c[5] / 1e3),
-        format!("MB UP {:.0}  TEXTURES {:.0}  BACK {:.0}", c[7] / 1e6, c[4] / 1e6, c[6] / 1e6),
-        format!("RAM {:.1} GB  IN MEMORY {:.1}", gb(private), gb(working)),
-        format!("VRAM {:.1}/{:.1} GB  SHARED {:.1}", gb(used), gb(budget), gb(shared)),
-        format!("HEAP PASSES {:.1}  HEAP {:.2} MS", c[11], c[12] / 1e3),
-        format!("THIS PANEL {:.0} US A FRAME  {}", cost, recording()),
-        card(host),
-    ]
+    if CURRENT_PAGE.load(Ordering::Relaxed) == 1 {
+        let mut out = Vec::with_capacity(LINES as usize);
+        let ring = LOG_RING.lock().unwrap_or_else(|e| e.into_inner());
+        let count = (LINES as usize).saturating_sub(1);
+        let start = ring.len().saturating_sub(count);
+        for msg in ring.iter().skip(start) {
+            let line: String = msg.chars().take(COLUMNS as usize).collect();
+            out.push(line);
+        }
+        while out.len() < (LINES - 1) as usize {
+            out.push(" ".to_string());
+        }
+        let frozen_text = if IS_FROZEN.load(Ordering::Relaxed) { "FROZEN" } else { "PAGE 2/2" };
+        out.push(format!("{frozen_text}  EVENTS {}", ring.len()));
+        out
+    } else {
+        let gb = |bytes: u64| bytes as f64 / (1u64 << 30) as f64;
+        let (working, private) = crate::copystat::process_memory();
+        let [budget, used, _, shared] = host.video_memory().unwrap_or_default();
+        let idle = (c[1] / 1e3).min(ms);
+        vec![
+            format!("FPS {:.1}  FRAME {ms:.1} MS  LONGEST {worst:.0}", 1e3 / ms.max(0.001)),
+            format!("DRAWS {:.0}  DROPPED {:.0}", c[10], c[8]),
+            format!("SUBMIT BUSY {:.1}  WAITS FOR GPU {:.1}", c[0] / 1e3, c[3] / 1e3),
+            format!("GPU BUSY {:.1}  IDLE BEHIND US {:.1}", ms - idle, c[2] / 1e3),
+            format!("RECORDING {:.0} MS  COPY BACK {:.1}", c[9] / 1e6, c[5] / 1e3),
+            format!("MB UP {:.0}  TEXTURES {:.0}  BACK {:.0}", c[7] / 1e6, c[4] / 1e6, c[6] / 1e6),
+            format!("RAM {:.1} GB  IN MEMORY {:.1}", gb(private), gb(working)),
+            format!("VRAM {:.1}/{:.1} GB  SHARED {:.1}", gb(used), gb(budget), gb(shared)),
+            format!("HEAP PASSES {:.1}  HEAP {:.2} MS", c[11], c[12] / 1e3),
+            format!("THIS PANEL {:.0} US A FRAME  {}", cost, recording()),
+            card(host),
+        ]
+    }
 }
 
 fn recording() -> String {
@@ -347,8 +396,20 @@ impl Panel {
         if pressed() {
             shown().fetch_xor(true, Ordering::Relaxed);
         }
+        // Keep F4 and F5 quiet while the panel is hidden.
         if !shown().load(Ordering::Relaxed) {
             self.frames = 0;
+            return;
+        }
+        let page_switched = pressed_f4();
+        if page_switched {
+            CURRENT_PAGE.fetch_xor(1, Ordering::Relaxed);
+        }
+        if pressed_f5() {
+            IS_FROZEN.fetch_xor(true, Ordering::Relaxed);
+        }
+        let frozen = IS_FROZEN.load(Ordering::Relaxed);
+        if frozen && !page_switched {
             return;
         }
         let now = Instant::now();
@@ -361,18 +422,22 @@ impl Panel {
         self.worst = self.worst.max((now - self.last).as_secs_f64() * 1e3);
         self.last = now;
         let elapsed = now - self.since;
-        if elapsed < EVERY && !(line && elapsed * 2 >= EVERY) {
+        if !page_switched && elapsed < EVERY && !(line && elapsed * 2 >= EVERY) {
             return;
         }
         let Some(host) = super::host() else { return };
-        let frames = f64::from(self.frames);
+        let frames = f64::from(self.frames.max(1));
         let counters = Counters::now();
         let c = counters.since(self.before, frames);
-        self.before = counters;
+        if !frozen {
+            self.before = counters;
+        }
         let cost = self.cost.as_secs_f64() * 1e6 / frames;
         self.lines = text(&c, elapsed.as_secs_f64() * 1e3 / frames, self.worst, cost, host);
         self.changed = true;
-        (self.since, self.frames, self.worst) = (now, 0, 0.0);
+        if !frozen {
+            (self.since, self.frames, self.worst) = (now, 0, 0.0);
+        }
         self.cost = now.elapsed();
     }
 

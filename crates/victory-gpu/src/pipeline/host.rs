@@ -1460,14 +1460,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let vs = compile(&dxc, dir.path(), VS, "vs_6_5");
         let ps = compile(&dxc, dir.path(), PS, "ps_6_5");
-            let (root, root_blob) = match root_signature(&host.device, &[], &[], false) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("no SM 6.6 root signature support (Win10 without Agility SDK?): {e}; skipped");
-            return;
-        }
-    };
-
+        let (root, root_blob) = match root_signature(&host.device, &[], &[], false) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("no SM 6.6 root signature support (Win10 without Agility SDK?): {e}; skipped");
+                return;
+            }
+        };
 
         let mut g = GraphicsState::default();
         // Subobject 21 (`DEPTH_STENCIL1`) with `DepthBoundsTestEnable = true`,
