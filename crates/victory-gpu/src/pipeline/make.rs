@@ -46,9 +46,11 @@ pub(crate) struct Pending {
     used: AtomicBool,
     /// A pass over the screen ([`GraphicsState::screen_pass`]).
     screen: bool,
-    /// Whether a draw already waited [`GIVE_UP`] for it in vain: later
+    /// Whether draws already waited [`GIVE_UP`] for it in vain: later
     /// draws do not wait for it (see [`wait`]).
     given_up: AtomicBool,
+    /// What draws waited for it in vain so far, in microseconds.
+    waited_us: AtomicU64,
 }
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
@@ -77,6 +79,7 @@ impl Pending {
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
             given_up: AtomicBool::new(false),
+            waited_us: AtomicU64::new(0),
         }
     }
 
@@ -213,14 +216,16 @@ fn shared_budget() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_WAIT_SHARED").is_none_or(|v| v != "0"))
 }
 
-/// How long one wait for a pipeline may last in vain before later draws
-/// stop waiting for it. A pipeline the driver takes seconds for otherwise
+/// How long draws may wait for a pipeline in vain, all frames together,
+/// before later draws stop waiting for it. A pipeline the driver takes seconds for otherwise
 /// costs every frame the whole budget: in play-g's drive into the world
 /// the frames waited 470-500 ms each for three minutes while pipelines
 /// took 6-16 s each. Given up, it is still made in the background and its
 /// draws are dropped until then, as they are once the budget is spent.
-/// Passes over the screen keep waiting. `VICTORY_PIPELINE_GIVE_UP=0` waits
-/// as before.
+/// Counted over frames: in play-g's minute 27 the binoculars' pipelines
+/// took the 500 ms of 30 frames in a row, most frames sharing it among
+/// several, so no single wait reached 100 ms. Passes over the screen keep
+/// waiting. `VICTORY_PIPELINE_GIVE_UP=0` waits as before.
 const GIVE_UP: Duration = Duration::from_millis(100);
 
 fn give_up() -> bool {
@@ -270,9 +275,9 @@ fn wait(p: &Pending, frame: u64) {
     }
     drop(held);
     let waited = started.elapsed().min(left);
-    if !screen && p.made.get().is_none() && waited >= GIVE_UP && give_up() && !p.given_up.swap(true, Ordering::Relaxed) {
+    if !screen && p.made.get().is_none() && give_up() && waited_in_vain(p, waited) {
         tracing::info!(
-            ms = waited.as_millis() as u64,
+            ms = p.waited_us.load(Ordering::Relaxed) / 1000,
             key = %p.key,
             "a pipeline waited for in vain: later draws do not wait for it (VICTORY_PIPELINE_GIVE_UP=0: they do)"
         );
@@ -305,6 +310,14 @@ fn wait(p: &Pending, frame: u64) {
 
 /// Lists for [`Pending::taken_from`].
 const TAKEN_BY_TITLE: u8 = 0;
+/// Adds `waited` to what draws waited for `p` in vain: whether that has now
+/// reached [`GIVE_UP`] (true once).
+fn waited_in_vain(p: &Pending, waited: Duration) -> bool {
+    let us = waited.as_micros() as u64;
+    let total = p.waited_us.fetch_add(us, Ordering::Relaxed) + us;
+    total >= GIVE_UP.as_micros() as u64 && !p.given_up.swap(true, Ordering::Relaxed)
+}
+
 const TAKEN_SCREEN: u8 = 1;
 const TAKEN_REQUESTED: u8 = 2;
 const TAKEN_EARLY: u8 = 3;
@@ -547,6 +560,17 @@ fn workers() -> bool {
                 running = true;
             }
         }
+        // The workers save after a pipeline (at most every 20 s), so the
+        // last of a burst waited for the next pipeline, and with none made
+        // until the window was closed they were lost: the binoculars' in
+        // play-g. Saves nothing when nothing was added.
+        let saver = std::thread::Builder::new().name("victory-pipelines-save".into()).spawn(|| loop {
+            std::thread::sleep(Duration::from_secs(20));
+            super::library::save(false);
+        });
+        if let Err(e) = saver {
+            tracing::warn!(error = %e, "no pipeline library saver");
+        }
         running
     })
 }
@@ -609,6 +633,19 @@ mod tests {
         let again = Instant::now();
         wait(&p, frame - 1);
         assert!(again.elapsed() < GIVE_UP / 10, "{:?}", again.elapsed());
+    }
+
+    /// Short waits in vain add up over frames until draws stop waiting.
+    #[test]
+    fn short_waits_in_vain_add_up() {
+        let p = Pending::new(Vec::new(), None);
+        let short = GIVE_UP / 3;
+        assert!(!waited_in_vain(&p, short));
+        assert!(!waited_in_vain(&p, short));
+        assert!(!p.given_up.load(Ordering::Relaxed));
+        assert!(waited_in_vain(&p, short * 2));
+        assert!(p.given_up.load(Ordering::Relaxed));
+        assert!(!waited_in_vain(&p, short));
     }
 
     /// A first use queues the pipeline and, within the budget, gets the
