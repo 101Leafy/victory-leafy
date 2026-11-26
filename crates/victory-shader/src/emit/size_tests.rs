@@ -181,11 +181,11 @@ fn the_record_count_of_a_structured_buffer_nothing_reads() {
     let words = [TABLE, COUNT, STORE].concat();
     let shader = build(&words, (4, 16)).expect("translates");
     let (data, texel) = ([0u32; 12], [[0.0; 4]; 1]);
-    // The runtime makes structured views raw.
+    // The heap's view as the title made it (descriptor_data.rs, unused_descriptor_kind).
     let views = [
         View::Buffer {
             data: &data,
-            stride: Stride::Raw,
+            stride: Stride::Structured(16),
         },
         View::Texture(1, 1, &texel),
         View::RawUav(2),
