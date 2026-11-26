@@ -919,10 +919,15 @@ impl Bits {
     }
 
     fn set(&self, block: usize) {
+        self.put(block);
+    }
+
+    /// Sets it; whether it was not set before.
+    fn put(&self, block: usize) -> bool {
         use std::sync::atomic::Ordering::{AcqRel, Acquire, SeqCst};
         let word = block / 64;
         let Some(place) = self.0.get(word / Bits::WORDS) else {
-            return;
+            return false;
         };
         if place.load(Acquire).is_null() {
             let piece: Box<BitsPiece> = Box::new([const { std::sync::atomic::AtomicU64::new(0) }; Bits::WORDS]);
@@ -932,9 +937,8 @@ impl Bits {
                 drop(unsafe { Box::from_raw(piece) });
             }
         }
-        if let Some(piece) = self.piece(word) {
-            piece[word % Bits::WORDS].fetch_or(1 << (block % 64), SeqCst);
-        }
+        let bit = 1 << (block % 64);
+        self.piece(word).is_some_and(|piece| piece[word % Bits::WORDS].fetch_or(bit, SeqCst) & bit == 0)
     }
 
     /// Sixty-four of them.
@@ -1047,6 +1051,111 @@ static PUT: [std::sync::atomic::AtomicU32; 1 << 13] = [const { std::sync::atomic
 /// ([`part_open`]).
 static FINE: Bits = Bits::new();
 
+/// The guarded blocks a write fault opened with no lock ([`open_loose`])
+/// that the guards' notes still have guarded and clean. Who holds the lock
+/// and finds a block's bit here goes by the bit, not the notes ([`loose`]).
+///
+/// The title's threads spent 13-14% of their time in the fault handler,
+/// nearly all of it waiting for the guards' lock while askings of whole
+/// ranges held it (play-g, 2026-11-26).
+static LOOSE: Bits = Bits::new();
+
+/// The blocks a write fault is opening with no lock right now, one thread a
+/// block: set before the block's [`LOOSE`] bit, cleared after its
+/// [`PROTECTED`] bit.
+static OPENING: Bits = Bits::new();
+
+/// The blocks of `Guards::aliased`, for who takes no lock: a write through
+/// one is a write of its other views as well, which only [`open`] sees to.
+static ALIASED: Bits = Bits::new();
+
+/// Whether write faults of guarded blocks with no other view and no parts
+/// open them with no lock (`VICTORY_LOOSE_FAULTS=0`: every fault waits for
+/// the guards' lock, as before).
+fn loose_faults() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LOOSE_FAULTS").is_none_or(|v| v != "0"))
+}
+
+/// Diagnostics: write faults that opened their block with no lock, those
+/// that began so and went on to the lock, and blocks so opened that a
+/// holder of the lock took into the notes after; since the start.
+#[cfg(feature = "diagnostics")]
+pub(crate) static LOOSE_OPENS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// Opens guarded `block` for a write fault in it, with no lock, if it has no
+/// other view and no parts: whether it is open. The notes have it guarded
+/// and clean until a holder of the lock finds its [`LOOSE`] bit.
+fn open_loose(block: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE, VirtualProtect};
+    if !loose_faults() || FINE.any(block, block + 1) || ALIASED.any(block, block + 1) {
+        return false;
+    }
+    if !OPENING.put(block) {
+        // Another thread's fault in it: open when that is done, or that one
+        // went on to the lock.
+        while OPENING.any(block, block + 1) {
+            std::thread::yield_now();
+        }
+        return !PROTECTED.any(block, block + 1);
+    }
+    let mut opened = false;
+    // The bit before the look at `ALIASED`, as `cover` sets that before
+    // its look here.
+    if PROTECTED.any(block, block + 1) && LOOSE.put(block) {
+        if !ALIASED.any(block, block + 1) {
+            // Before the block can be written.
+            PUBLISHED.clear(block);
+            let mut old = 0;
+            // SAFETY: a block we made read-only.
+            let done = unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) } != 0;
+            opened = done && old == PAGE_READONLY;
+            if done && !matches!(old, PAGE_READONLY | PAGE_READWRITE) {
+                // Not what we left there: as it was.
+                // SAFETY: as above.
+                unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, old, &mut old) };
+            }
+        }
+        if opened {
+            PROTECTED.clear(block);
+        } else {
+            LOOSE.clear(block);
+        }
+    }
+    OPENING.clear(block);
+    #[cfg(feature = "diagnostics")]
+    LOOSE_OPENS[usize::from(!opened)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    opened
+}
+
+/// For a holder of the guards' lock: whether `block` was opened by a write
+/// fault with no lock ([`open_loose`]). One that is open now leaves
+/// [`LOOSE`] and is noted open (written, not guarded); one a fault is
+/// opening right now stays as noted, and counts as written; one guarded
+/// again since it was opened leaves `LOOSE` and is as noted.
+fn loose(g: &mut Guards, block: usize) -> bool {
+    if !LOOSE.any(block, block + 1) {
+        return false;
+    }
+    if OPENING.any(block, block + 1) {
+        return true;
+    }
+    if PROTECTED.any(block, block + 1) {
+        // (Set under the lock only.)
+        LOOSE.clear(block);
+        return false;
+    }
+    if LOOSE.take(block) {
+        g.protected.remove(block);
+        g.clean.remove(block);
+        g.parted.remove(&block);
+        g.opened(block);
+        #[cfg(feature = "diagnostics")]
+        LOOSE_OPENS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    true
+}
+
 fn put_count(block: usize) -> &'static std::sync::atomic::AtomicU32 {
     &PUT[block % PUT.len()]
 }
@@ -1123,9 +1232,9 @@ fn publish(pages: &[usize]) {
     for &page in pages {
         if g.clean.contains(page) || g.held.contains(page) {
             PUBLISHED.set(page);
-            // (Put there since: whoever did clears the bit after this is
-            // set, or its own bit is found here.)
-            if BESIDE.any(page, page + 1) {
+            // (Put there or opened by a fault since: whoever did clears the
+            // bit after this is set, or its own bit is found here.)
+            if BESIDE.any(page, page + 1) || LOOSE.any(page, page + 1) {
                 PUBLISHED.clear(page);
             }
         }
@@ -1708,7 +1817,7 @@ pub(crate) fn written_since_taken(at: usize, len: usize) -> bool {
     }
     let g = guards();
     (at / BLOCK..=(at + len - 1) / BLOCK)
-        .all(|b| !g.clean.contains(b) && !g.absent.contains(b) && !g.protected.contains(b))
+        .all(|b| LOOSE.any(b, b + 1) || !g.clean.contains(b) && !g.absent.contains(b) && !g.protected.contains(b))
 }
 
 /// For view memory: the pages of `[start, end)`'s blocks written since
@@ -1746,7 +1855,11 @@ fn guard_parts(start: usize, end: usize) -> Option<Vec<(usize, u16)>> {
     // takes the block out of the set, and it is looked at as any other.
     let unsure: Vec<usize> = {
         let g = guards_timed();
-        if g.clean.range(first..last).count() == last - first && !BESIDE.any(first, last) {
+        let clean = (first / 64..last.div_ceil(64)).all(|word| {
+            let these = in_word(word * 64, first, last);
+            g.clean.word(word) & these == these
+        });
+        if clean && !BESIDE.any(first, last) && !LOOSE.any(first, last) {
             // Nothing written, mapped or new since the range was last taken.
             #[cfg(feature = "diagnostics")]
             tally(3, 1);
@@ -1783,7 +1896,7 @@ fn guard_parts(start: usize, end: usize) -> Option<Vec<(usize, u16)>> {
     // clean.
     let mut written = Vec::new();
     for word in first / 64..last.div_ceil(64) {
-        let known = g.clean.word(word) & !BESIDE.word(word) | g.absent.word(word);
+        let known = g.clean.word(word) & !BESIDE.word(word) & !LOOSE.word(word) | g.absent.word(word);
         written.extend(BitsOf(!known & in_word(word * 64, first, last)).map(|bit| word * 64 + bit));
     }
     let mut parts = vec![WHOLE; written.len()];
@@ -1803,6 +1916,13 @@ fn guard_parts(start: usize, end: usize) -> Option<Vec<(usize, u16)>> {
         let beside = BESIDE.take(block);
         if beside {
             put_count(block).store(0, std::sync::atomic::Ordering::Relaxed);
+        }
+        if loose(&mut g, block) && g.protected.contains(block) {
+            // A fault is opening it right now: guarded at the next asking.
+            if let Some((from, to)) = run.take() {
+                protect(&mut g, from, to);
+            }
+            continue;
         }
         if g.protected.contains(block) {
             // Read-only by way of another view of its page, or not clean
@@ -1945,6 +2065,13 @@ fn cover(g: &mut Guards, from: usize, to: usize) -> bool {
         #[cfg(feature = "diagnostics")]
         ALIASES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         g.aliased.insert(block);
+        ALIASED.set(block);
+        if loose(g, block) {
+            // Opened by a fault since it was guarded.
+            all = false;
+            g.clean.remove(block);
+            continue;
+        }
         let mut covered = true;
         for other in others {
             covered &= protect_alias(g, other / BLOCK);
@@ -1966,6 +2093,11 @@ fn cover(g: &mut Guards, from: usize, to: usize) -> bool {
 fn protect_alias(g: &mut Guards, block: usize) -> bool {
     use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE, VirtualProtect};
     g.aliased.insert(block);
+    ALIASED.set(block);
+    if loose(g, block) && g.protected.contains(block) {
+        // A fault is opening it.
+        return false;
+    }
     if g.protected.contains(block) {
         // With parts open, a write through those would not be seen here.
         if g.parted.contains_key(&block) {
@@ -2102,6 +2234,7 @@ fn open(g: &mut Guards, start: usize, end: usize) -> usize {
         let one = open_one_view();
         for block in aliased {
             g.aliased.remove(block);
+            ALIASED.clear(block);
             for other in crate::inplace::pages_of(block * BLOCK) {
                 let other = other / BLOCK;
                 if one {
@@ -2114,6 +2247,7 @@ fn open(g: &mut Guards, start: usize, end: usize) -> usize {
                     continue;
                 }
                 g.aliased.remove(other);
+                ALIASED.clear(other);
                 if !(first..last).contains(&other) && g.protected.contains(other) {
                     blocks.push(other);
                 }
@@ -2818,6 +2952,7 @@ fn title_memory_changed(at: usize, len: usize) -> std::sync::MutexGuard<'static,
     let aliased: Vec<usize> = g.aliased.range(range).collect();
     for block in aliased {
         g.aliased.remove(block);
+        ALIASED.clear(block);
     }
     g
 }
@@ -2879,6 +3014,15 @@ pub(crate) fn install() {
             if !PROTECTED.any(block, block + 1) && writable(at) {
                 #[cfg(feature = "diagnostics")]
                 crate::faultbook::note(crate::faultbook::What::Open, block, 0, 0);
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
+            if open_loose(block) {
+                #[cfg(feature = "diagnostics")]
+                {
+                    crate::copystat::add(crate::copystat::C::GuardFaults, 1);
+                    crate::faultbook::note(crate::faultbook::What::Fault, block, 1 << 32, 0);
+                    crate::faultbook::note(crate::faultbook::What::Site, r.ExceptionAddress as usize, block, 0);
+                }
                 return EXCEPTION_CONTINUE_EXECUTION;
             }
             #[cfg(feature = "diagnostics")]
@@ -3884,6 +4028,43 @@ mod tests {
         unsafe {
             UnmapViewOfFile(windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS { Value: view as *mut _ })
         };
+    }
+
+    /// A write fault opens a guarded block while another thread holds the
+    /// guards' lock, and the next asking tells it as written.
+    #[test]
+    fn a_write_fault_opens_its_block_with_the_lock_held_elsewhere() {
+        use windows_sys::Win32::System::Memory::{CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, UnmapViewOfFile};
+        // SAFETY: a pagefile section of a block, mapped read-write.
+        let view = unsafe {
+            let section =
+                CreateFileMappingW(-1isize as _, std::ptr::null(), PAGE_READWRITE, 0, BLOCK as u32, std::ptr::null());
+            assert!(!section.is_null());
+            MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, BLOCK)
+        };
+        let at = view.Value as usize;
+        assert_ne!(at, 0);
+        assert!(guard(at, at + BLOCK).is_some());
+        assert!(!writable(at), "guarded");
+        let held = guards();
+        let (sent, came) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            // SAFETY: inside the view; the handler opens it.
+            unsafe { ((at + 8) as *mut u8).write_volatile(1) };
+            sent.send(()).unwrap();
+        });
+        let done = came.recv_timeout(std::time::Duration::from_secs(10)).is_ok();
+        let noted = held.protected.contains(at / BLOCK);
+        drop(held);
+        writer.join().unwrap();
+        assert!(done, "the write waited for the lock");
+        assert!(noted, "noted guarded until a holder of the lock looks");
+        assert!(writable(at));
+        assert_eq!(guard(at, at + BLOCK), Some(vec![at / PAGE]));
+        assert!(!LOOSE.any(at / BLOCK, at / BLOCK + 1));
+        title_memory_unmapping(at, BLOCK);
+        // SAFETY: our view.
+        unsafe { UnmapViewOfFile(view) };
     }
 
     /// Blocks next to each other but of separate allocations (one call over
