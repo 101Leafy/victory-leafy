@@ -9609,6 +9609,9 @@ struct Presenter {
     ahead: Vec<(HostList, u64)>,
     hwnd: HWND,
     meter: Meter,
+    /// Puts a present's two planes together ([`crate::compose`]); made at
+    /// the first present of two.
+    composer: Option<crate::compose::Composer>,
     #[cfg(feature = "diagnostics")]
     panel: panel::Panel,
     #[cfg(feature = "diagnostics")]
@@ -9998,11 +10001,40 @@ impl Host {
     /// as frame `frame` (saved if captures are on). `None` if nothing was
     /// shown; else, in diagnostics builds, whether the frame was black.
     pub(crate) fn present(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
+        self.present_planes(texture, state, None, frame)
+    }
+
+    /// [`Host::present`] with a second plane, `overlay` in its own host
+    /// state (which it stays in), put over `texture` ([`crate::compose`]).
+    /// Planes the composer cannot read, or no composer: `texture` alone.
+    pub(crate) fn present_planes(
+        &self,
+        texture: &ID3D12Resource,
+        state: u32,
+        overlay: Option<(&ID3D12Resource, u32)>,
+        frame: u64,
+    ) -> Option<bool> {
+        static NO_COMPOSER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };
-        let Some(format) = swap_format(desc.Format) else {
-            tracing::warn!(format = desc.Format.0, "cannot present this format");
-            return None;
+        let planes = overlay.filter(|_| !NO_COMPOSER.load(Ordering::Relaxed)).and_then(|(over, over_state)| {
+            // SAFETY: a live resource.
+            let over_desc = unsafe { over.GetDesc() };
+            Some((
+                over,
+                D3D12_RESOURCE_STATES(over_state as i32),
+                crate::compose::view(&desc)?,
+                crate::compose::view(&over_desc)?,
+            ))
+        });
+        let format = if planes.is_some() {
+            DXGI_FORMAT_R8G8B8A8_UNORM
+        } else {
+            let Some(format) = swap_format(desc.Format) else {
+                tracing::warn!(format = desc.Format.0, "cannot present this format");
+                return None;
+            };
+            format
         };
         let (width, height) = (desc.Width as u32, desc.Height);
         let mut presenter = self.presenter.lock().unwrap_or_else(|e| e.into_inner());
@@ -10016,6 +10048,20 @@ impl Host {
             };
         }
         let p = presenter.as_mut()?;
+        if planes.is_some() && p.composer.is_none() {
+            match crate::compose::Composer::new(self, format) {
+                Ok(composer) => {
+                    tracing::info!(frame, width, height, "presents of two planes are put together");
+                    p.composer = Some(composer);
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "no composer for two planes; the first is shown alone");
+                    NO_COMPOSER.store(true, Ordering::Relaxed);
+                    drop(presenter);
+                    return self.present_planes(texture, state, None, frame);
+                }
+            }
+        }
         if (p.width, p.height, p.format) != (width, height, format) {
             // Presents sent ahead hold back buffers until they have run.
             settle_now(WHY_SYNC);
@@ -10073,35 +10119,85 @@ impl Host {
             };
             copy.reset();
             let list = &copy.list;
-            list.ResourceBarrier(&[
-                transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE),
-                transition(
-                    &back,
-                    D3D12_RESOURCE_STATE_PRESENT,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                ),
-            ]);
-            list.CopyResource(&back, texture);
+            let composed = match (planes, p.composer.as_mut()) {
+                (Some((over, over_state, base_view, over_view)), Some(composer)) => {
+                    const READ: D3D12_RESOURCE_STATES = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+                    copy.keep(texture);
+                    copy.keep(over);
+                    let moves = |to_read: bool, back_from: D3D12_RESOURCE_STATES, back_to: D3D12_RESOURCE_STATES| {
+                        let mut moves = Vec::with_capacity(3);
+                        for (plane, at) in [(texture, state), (over, over_state)] {
+                            if at != READ {
+                                moves.push(if to_read { transition(plane, at, READ) } else { transition(plane, READ, at) });
+                            }
+                        }
+                        moves.push(transition(&back, back_from, back_to));
+                        moves
+                    };
+                    list.ResourceBarrier(&moves(true, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET));
+                    let views = slot.map_or(0, |i| i + 1);
+                    match composer.record(self, views, list, [(texture, base_view), (over, over_view)], &back, (width, height)) {
+                        Ok(()) => {
+                            list.ResourceBarrier(&moves(false, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_DEST));
+                            true
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "two planes not put together; the first is shown alone");
+                            list.ResourceBarrier(&moves(false, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT));
+                            false
+                        }
+                    }
+                }
+                _ => false,
+            };
+            if !composed {
+                list.ResourceBarrier(&[
+                    transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                    transition(
+                        &back,
+                        D3D12_RESOURCE_STATE_PRESENT,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                    ),
+                ]);
+                list.CopyResource(&back, texture);
+            }
+            // (A frame put together is read from the back buffer.)
             #[cfg(feature = "diagnostics")]
             let capture = crate::capture::wanted(frame)
-                .then(|| crate::capture::read_back(&self.device, list, texture))
+                .then(|| {
+                    if !composed {
+                        return crate::capture::read_back(&self.device, list, texture);
+                    }
+                    list.ResourceBarrier(&[transition(&back, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                    let read = crate::capture::read_back(&self.device, list, &back);
+                    list.ResourceBarrier(&[transition(&back, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST)]);
+                    read
+                })
                 .flatten();
             #[cfg(feature = "diagnostics")]
-            let probe = if slot.is_some() { None } else { crate::capture::probe(&self.device, list, texture) };
+            let probe = if slot.is_some() || composed { None } else { crate::capture::probe(&self.device, list, texture) };
             #[cfg(feature = "diagnostics")]
-            let watched = crate::popwatch::take(&self.device, list, texture);
+            let watched = if composed { None } else { crate::popwatch::take(&self.device, list, texture) };
             #[cfg(feature = "diagnostics")]
             p.panel.draw(self, copy, &back, (width, height), format);
             #[cfg(not(feature = "diagnostics"))]
             let _ = frame;
-            list.ResourceBarrier(&[
-                transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state),
-                transition(
+            if composed {
+                list.ResourceBarrier(&[transition(
                     &back,
                     D3D12_RESOURCE_STATE_COPY_DEST,
                     D3D12_RESOURCE_STATE_PRESENT,
-                ),
-            ]);
+                )]);
+            } else {
+                list.ResourceBarrier(&[
+                    transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state),
+                    transition(
+                        &back,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                        D3D12_RESOURCE_STATE_PRESENT,
+                    ),
+                ]);
+            }
             copy.close();
             let flown = match slot {
                 Some(i) => {
@@ -10193,6 +10289,7 @@ impl Host {
                 ahead: Vec::new(),
                 hwnd,
                 meter: Meter::new(),
+                composer: None,
                 #[cfg(feature = "diagnostics")]
                 panel: panel::Panel::new(),
                 #[cfg(feature = "diagnostics")]
