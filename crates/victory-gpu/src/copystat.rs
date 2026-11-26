@@ -355,7 +355,7 @@ pub(crate) enum C {
     SubmitLockDoneNs,
     SubmitLockSettleNs,
 }
-const COUNTERS: usize = 192;
+const COUNTERS: usize = 256;
 
 /// The counters' names, in the order of [`C`], for the frame recorder's columns.
 pub(crate) const NAMES: [&str; 191] = [

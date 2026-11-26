@@ -2662,6 +2662,10 @@ struct Line {
     in_hand: Vec<(usize, crate::queue::Written, usize)>,
     /// With [`card_steps`]: what the flights being landed write.
     landing: Vec<card_steps::Writer>,
+    /// With [`relay`]: things of the line landed so far, and how many the
+    /// landing under way took ([`settle_unlocked`]).
+    landed_items: u64,
+    taking: u64,
 }
 
 // SAFETY: D3D12 objects (free-threaded) and host lists nothing records
@@ -2678,6 +2682,8 @@ static LINE: Mutex<Line> = Mutex::new(Line {
     landed: Vec::new(),
     in_hand: Vec::new(),
     landing: Vec::new(),
+    landed_items: 0,
+    taking: 0,
 });
 /// Told when a flight joins [`LINE`] or it is poked.
 static LINE_MOVED: std::sync::Condvar = std::sync::Condvar::new();
@@ -3195,10 +3201,30 @@ pub(crate) fn settle_now(why: usize) {
     let Some(host) = host() else {
         return;
     };
+    if relay() && settle_unlocked() {
+        let mark = {
+            let line = line();
+            line.landed_items + line.taking + line.line.len() as u64
+        };
+        relay_wait(why, |line| line.landed_items >= mark);
+        return;
+    }
     let mut submitted = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
     let held = std::time::Instant::now();
     host.settle(&mut submitted, why);
     crate::copystat::lap(crate::copystat::C::SubmitLockSettleNs, held);
+}
+
+/// `VICTORY_SETTLE_UNLOCKED=1` (off by default), with [`relay`]: a
+/// [`settle_now`] waits until what was in the line when it was called has
+/// landed, without the submission lock, so the submitting thread goes on
+/// meanwhile. Under the lock it waited for the line to empty, and for the
+/// submissions of other threads that held the lock first; the title cannot
+/// count on those being done anyway, as nothing orders them before the
+/// present or fence wait that settles.
+fn settle_unlocked() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SETTLE_UNLOCKED").is_some_and(|v| v == "1"))
 }
 
 /// [`settle_now`] at a present, and for a fence the title blocks on.
@@ -3416,6 +3442,7 @@ fn relay_worker() {
                 }
                 line.settling = true;
                 let items: Vec<Late> = line.line.drain(..n).collect();
+                line.taking = n as u64;
                 line.in_hand = items
                     .iter()
                     .filter_map(|l| match l {
@@ -4928,9 +4955,12 @@ impl Host {
                 landed: kept,
                 in_hand,
                 landing,
+                landed_items,
+                taking,
                 ..
             } = &mut *line;
             kept.extend(landed);
+            *landed_items += std::mem::take(taking);
             in_hand.clear();
             landing.clear();
             // What is still in the air, from the flights that are.
