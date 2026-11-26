@@ -573,20 +573,28 @@ fn entry_name(path: &std::path::Path) -> String {
 const MAGIC: &[u8; 4] = b"VSH1";
 const REFUSED: &[u8; 4] = b"VSR1";
 
-/// A refusal's entry: [`REFUSED`], the reason's length (u32) and the reason.
-/// Builds from before refusals were kept do not read it and translate
-/// again.
+/// The translator's source and what it is built from (`build.rs`), in each
+/// refusal. A refusal can come from a translator bug, and a fix to it may
+/// leave every translation the same: then [`Check`] finds the output
+/// unchanged and goes on keying by `emit::VERSION`, so the key alone would
+/// keep serving the refusal.
+const MADE_BY: &str = env!("VICTORY_TRANSLATOR");
+
+/// A refusal's entry: [`REFUSED`], [`MADE_BY`], the reason's length (u32)
+/// and the reason. Builds from before refusals were kept do not read it and
+/// translate again.
 fn refusal(reason: &str) -> Vec<u8> {
-    [REFUSED.as_slice(), &(reason.len() as u32).to_le_bytes(), reason.as_bytes()].concat()
+    [REFUSED.as_slice(), MADE_BY.as_bytes(), &(reason.len() as u32).to_le_bytes(), reason.as_bytes()].concat()
 }
 
 /// An entry read back: a translation, a refusal's reason, or `None` when it
-/// is damaged.
+/// is damaged or a refusal by another translator source, which is
+/// translated again.
 fn decode_entry(bytes: &[u8]) -> Option<Result<HostShader, String>> {
     let Some(rest) = bytes.strip_prefix(REFUSED) else {
         return decode(bytes).map(Ok);
     };
-    let (len, reason) = rest.split_first_chunk::<4>()?;
+    let (len, reason) = rest.strip_prefix(MADE_BY.as_bytes())?.split_first_chunk::<4>()?;
     if reason.is_empty() || reason.len() != u32::from_le_bytes(*len) as usize {
         return None;
     }
@@ -1065,8 +1073,29 @@ mod tests {
         assert_eq!(decode(b"VSH0"), None);
         assert_eq!(decode_entry(&bytes), Some(Ok(shader())));
         assert_eq!(decode_entry(&refusal("why")), Some(Err("why".to_owned())));
-        assert_eq!(decode_entry(b"VSR1\x04\0\0\0cut"), None);
-        assert_eq!(decode_entry(b"VSR1\x01\0\0\0\xff"), None);
-        assert_eq!(decode_entry(b"VSR1\0\0\0\0"), None);
+        let refused = |rest: &[u8]| [REFUSED.as_slice(), MADE_BY.as_bytes(), rest].concat();
+        assert_eq!(decode_entry(&refused(b"\x03\0\0\0why")), Some(Err("why".to_owned())));
+        assert_eq!(decode_entry(&refused(b"\x04\0\0\0cut")), None);
+        assert_eq!(decode_entry(&refused(b"\x01\0\0\0\xff")), None);
+        assert_eq!(decode_entry(&refused(b"\0\0\0\0")), None);
+        assert_eq!(decode_entry(b"VSR1\x03\0\0\0why"), None);
+    }
+
+    /// A refusal by another translator source is translated again, even
+    /// where the key is the same (a fix that changed no translation).
+    #[test]
+    fn a_refusal_by_another_translator_is_tried_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(dir.path()).unwrap();
+        let refuse = |_: &[u8]| Err::<HostShader, _>(ShaderError::Unsupported { offset: 4, what: "test opcode" });
+        assert!(cached(&cache, &[7; 32], b"a container", refuse).is_err());
+        for e in walk(dir.path()) {
+            let mut bytes = std::fs::read(&e).unwrap();
+            assert!(bytes.starts_with(REFUSED));
+            bytes[REFUSED.len()] ^= 1;
+            assert_eq!(decode_entry(&bytes), None);
+            std::fs::write(e, bytes).unwrap();
+        }
+        assert_eq!(cached(&cache, &[7; 32], b"a container", |_: &[u8]| Ok(shader())), Ok(shader()));
     }
 }
