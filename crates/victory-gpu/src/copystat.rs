@@ -362,11 +362,20 @@ pub(crate) enum C {
     /// already, and their slots.
     FreshRevived,
     FreshRevivedSlots,
+    /// The most dynamic descriptor slots held at once in the frame, and the
+    /// most wanted: held when an ask was refused, plus the slots of the
+    /// frame's refused asks so far ([`most`], not sums).
+    DynamicHeldMost,
+    DynamicWantedMost,
+    /// Slots of refused asks, and refused asks with fewer slots free than
+    /// asked (the rest of `DynamicFull` met a longest free run too short).
+    DynamicRefusedSlots,
+    DynamicShortOfFree,
 }
 const COUNTERS: usize = 256;
 
 /// The counters' names, in the order of [`C`], for the frame recorder's columns.
-pub(crate) const NAMES: [&str; 195] = [
+pub(crate) const NAMES: [&str; 199] = [
     "Submissions", "Copies", "CopyBytes", "Refreshes", "RefreshBytes", "Skipped", "SkippedBytes", "Runs",
     "RunUs", "Queries", "QueryUs", "MoveUs", "Unmapped", "Watches", "WatchUs", "Checked", "Unchanged",
     "Fallbacks", "GuardFaults", "TexWatched", "TexHashed", "TexChanged", "TexHot", "Frames", "RecordCalls",
@@ -404,6 +413,7 @@ pub(crate) const NAMES: [&str; 195] = [
     "SubmitLockDoneNs", "SubmitLockSettleNs",
     "ReadBackPoolNs", "ReadBacksMadeNs",
     "FreshRevived", "FreshRevivedSlots",
+    "DynamicHeldMost", "DynamicWantedMost", "DynamicRefusedSlots", "DynamicShortOfFree",
 ];
 /// One of some sets of counters, each in lines of the processor's memory of
 /// its own: a set for all threads had them wait for each other's lines at
@@ -433,6 +443,12 @@ fn bank() -> usize {
 
 pub(crate) fn add(c: C, n: u64) {
     COUNT[bank()].0[c as usize].fetch_add(n, Relaxed);
+}
+
+/// `c` becomes `n` if `n` is more: a high mark for the frame, kept in the
+/// first set only so the sum of the sets is the mark.
+pub(crate) fn most(c: C, n: u64) {
+    COUNT[0].0[c as usize].fetch_max(n, Relaxed);
 }
 
 /// The counter, all sets together, as it is now (it goes back to 0 with
@@ -719,7 +735,7 @@ mod command_tests {
     #[test]
     fn every_counter_is_named() {
         use super::{C, COUNTERS, NAMES};
-        assert_eq!(C::FreshRevivedSlots as usize + 1, NAMES.len());
+        assert_eq!(C::DynamicShortOfFree as usize + 1, NAMES.len());
         assert_eq!(NAMES[C::Frames as usize], "Frames");
         assert!(NAMES.len() <= COUNTERS);
     }
