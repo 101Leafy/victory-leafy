@@ -450,6 +450,20 @@ fn quiet_slow_limit() -> usize {
     })
 }
 
+/// Graphics pipelines are made before compute ones, and compute ones never
+/// hold every worker (upstream #3025). In the world some 180 compute
+/// pipelines take the driver 3.7 s each on average (up to 24 s); taken in
+/// order of first use they held all workers for minutes while the scene's
+/// graphics pipelines, made in milliseconds, waited behind them and their
+/// draws were dropped (a 360 s run: ~870 queued, 500 to 1,000 draws a frame
+/// dropped; with graphics first, 7 queued after three minutes and ~370
+/// dropped). `VICTORY_PIPELINE_GRAPHICS_FIRST=0`: one list for both, as
+/// before.
+fn graphics_first() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_GRAPHICS_FIRST").is_none_or(|v| v != "0"))
+}
+
 struct Queue {
     /// Requested passes over the screen: before all others, and the only ones
     /// [`SCREEN_WORKERS`] take.
@@ -460,6 +474,14 @@ struct Queue {
     slow: VecDeque<Arc<Pending>>,
     slow_now: usize,
     requested: VecDeque<Arc<Pending>>,
+    /// Compute ones, after the graphics ones of the same list
+    /// ([`graphics_first`]).
+    requested_compute: VecDeque<Arc<Pending>>,
+    early_compute: VecDeque<Arc<Pending>>,
+    /// Compute pipelines being made, and how many may be: all workers but
+    /// one, so one is always free for graphics.
+    compute_now: usize,
+    compute_cap: usize,
     /// When a pipeline last went into a list other than the slow one.
     others_at: Option<Instant>,
 }
@@ -472,6 +494,10 @@ impl Queue {
             slow: VecDeque::new(),
             slow_now: 0,
             requested: VecDeque::new(),
+            requested_compute: VecDeque::new(),
+            early_compute: VecDeque::new(),
+            compute_now: 0,
+            compute_cap: usize::MAX,
             others_at: None,
         }
     }
@@ -497,12 +523,17 @@ impl Queue {
         if priority == REQUESTED || !slow {
             self.others_at = Some(Instant::now());
         }
+        let compute = p.graphics.is_none() && graphics_first();
         if priority == REQUESTED && p.screen && screens_first() {
             self.screen.push_back(p.clone());
+        } else if priority == REQUESTED && compute {
+            self.requested_compute.push_back(p.clone());
         } else if priority == REQUESTED {
             self.requested.push_back(p.clone());
         } else if slow {
             self.slow.push_back(p.clone());
+        } else if compute {
+            self.early_compute.push_back(p.clone());
         } else {
             self.early.push_back(p.clone());
         }
@@ -514,17 +545,28 @@ impl Queue {
         let unclaimed = |list: &mut VecDeque<Arc<Pending>>| {
             std::iter::from_fn(|| list.pop_front()).find(|p| p.queue_state.load(Ordering::Relaxed) == EARLY)
         };
+        let compute_free = self.compute_now < self.compute_cap;
         let mut p = self.screen.pop_front();
         let mut from = TAKEN_SCREEN;
         if p.is_none() && !screens_only {
             p = self.requested.pop_front();
             from = TAKEN_REQUESTED;
+            if p.is_none() && compute_free {
+                p = self.requested_compute.pop_front();
+            }
             if p.is_none() {
                 p = unclaimed(&mut self.early);
                 from = TAKEN_EARLY;
             }
+            if p.is_none() && compute_free {
+                p = unclaimed(&mut self.early_compute);
+            }
             if p.is_none() && self.slow_now < slow_limit {
                 p = unclaimed(&mut self.slow);
+                // A compute one waits its turn while compute holds all it may.
+                if let Some(q) = p.take_if(|q| q.graphics.is_none() && !compute_free) {
+                    self.slow.push_front(q);
+                }
                 from = TAKEN_SLOW;
                 if let Some(p) = &p {
                     p.was_slow.store(true, Ordering::Relaxed);
@@ -533,6 +575,9 @@ impl Queue {
             }
         }
         let p = p?;
+        if p.graphics.is_none() {
+            self.compute_now += 1;
+        }
         p.taken_from.store(from, Ordering::Relaxed);
         p.queue_state.store(MAKING, Ordering::Relaxed);
         Some(p)
@@ -606,6 +651,10 @@ fn workers() -> bool {
             std::thread::available_parallelism().map_or(2, |n| n.get()),
         );
         tracing::info!(workers, "pipeline workers");
+        if graphics_first() {
+            // With one worker only, compute has to take it, else none is made.
+            QUEUE.lock().unwrap_or_else(|e| e.into_inner()).compute_cap = workers.max(2) - 1;
+        }
         let screens = if screens_first() { SCREEN_WORKERS } else { 0 };
         for i in 0..workers + screens {
             let screens_only = i >= workers;
@@ -629,7 +678,10 @@ fn workers() -> bool {
                     loop {
                         let p = next(screens_only);
                         BUSY.fetch_add(1, Ordering::Relaxed);
-                        p.make();
+                        {
+                            let _slot = ComputeSlot(p.graphics.is_none());
+                            p.make();
+                        }
                         BUSY.fetch_sub(1, Ordering::Relaxed);
                         if p.was_slow.load(Ordering::Relaxed) {
                             let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
@@ -664,6 +716,21 @@ fn workers() -> bool {
     })
 }
 
+/// A compute pipeline's place in [`Queue::compute_now`], given back once it
+/// is made, also when the driver's compiler panics (it would be kept for
+/// good otherwise).
+struct ComputeSlot(bool);
+
+impl Drop for ComputeSlot {
+    fn drop(&mut self) {
+        if self.0 {
+            let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+            queue.compute_now -= 1;
+            AVAILABLE.notify_all();
+        }
+    }
+}
+
 /// Workers making a pipeline now.
 static BUSY: AtomicU64 = AtomicU64::new(0);
 
@@ -671,7 +738,12 @@ static BUSY: AtomicU64 = AtomicU64::new(0);
 fn queues() -> super::spent::Queues {
     let queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
     super::spent::Queues {
-        lists: [queue.screen.len(), queue.requested.len(), queue.early.len(), queue.slow.len()],
+        lists: [
+            queue.screen.len(),
+            queue.requested.len() + queue.requested_compute.len(),
+            queue.early.len() + queue.early_compute.len(),
+            queue.slow.len(),
+        ],
         busy: BUSY.load(Ordering::Relaxed) as usize,
     }
 }
@@ -821,6 +893,32 @@ mod tests {
         queue.others_at = Instant::now().checked_sub(QUIET);
         assert_eq!(queue.slow_cap(), quiet_slow_limit());
         assert!(quiet_slow_limit() >= slow_limit());
+    }
+
+    /// Graphics pipelines go before compute ones of the same list, and
+    /// compute never takes the last worker (upstream #3025).
+    #[test]
+    fn graphics_go_first_and_compute_leaves_a_worker() {
+        let compute = || Arc::new(Pending::new(Vec::new(), None));
+        let graphics = || Arc::new(Pending::new(Vec::new(), Some(Box::default())));
+        let (asked_c, asked_g, early_c, early_g, long_c) = (compute(), graphics(), compute(), graphics(), compute());
+        let mut queue = Queue::new();
+        queue.compute_cap = 1;
+        assert_eq!(queue.push_as(&early_c, EARLY, false), Some(true));
+        assert_eq!(queue.push_as(&long_c, EARLY, true), Some(true));
+        assert_eq!(queue.push_as(&early_g, EARLY, false), Some(true));
+        assert_eq!(queue.push_as(&asked_c, REQUESTED, false), Some(true));
+        assert_eq!(queue.push_as(&asked_g, REQUESTED, false), Some(true));
+        assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &asked_g));
+        assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &asked_c));
+        // One compute is being made: the others wait, graphics do not.
+        assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &early_g));
+        assert!(queue.pop(false, 1).is_none());
+        assert_eq!(queue.slow.len(), 1, "the slow compute one is left for later");
+        queue.compute_now -= 1;
+        assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &early_c));
+        queue.compute_now -= 1;
+        assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &long_c));
     }
 
     /// Passes over the screen go before all others, and workers of their own
