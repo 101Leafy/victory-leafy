@@ -3510,6 +3510,9 @@ enum Step {
     /// Work that writes host memory only, and the title memory it reads
     /// (from, to; empty for none).
     Host(Box<dyn Fn() + Send>, (usize, usize)),
+    /// As `Host`, for work that reads what the texture checks before it
+    /// found: they are run first.
+    Checked(Box<dyn Fn() + Send>),
     /// Shaders write a range (address, bytes) of a buffer's host copy.
     GpuWrite(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
     /// Brings a texture's staging buffer up to date: once per submission,
@@ -4395,7 +4398,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                         return Some(WHY_READ);
                     }
                 },
-                Step::Refresh(..) | Step::GpuWrite(..) | Step::Host(..) => {}
+                Step::Refresh(..) | Step::GpuWrite(..) | Step::Host(..) | Step::Checked(_) => {}
             }
         }
     }
@@ -9686,6 +9689,13 @@ impl HostList {
         self.deferred().copies.push(Step::Host(Box::new(work), (0, 0)));
     }
 
+    /// As [`HostList::defer_host`], for work that reads what an earlier
+    /// [`HostList::defer_texture`] check found (with wide checks they wait
+    /// for the batch's flush otherwise).
+    pub(crate) fn defer_host_checked(&self, work: impl Fn() + Send + 'static) {
+        self.deferred().copies.push(Step::Checked(Box::new(work)));
+    }
+
     /// As [`HostList::defer_host`], for work that reads `len` bytes of title
     /// memory at `from`.
     pub(crate) fn defer_host_read(&self, from: usize, len: usize, work: impl Fn() + Send + 'static) {
@@ -9795,8 +9805,11 @@ impl HostList {
                     batch.add(shadow, *address, *len);
                     continue;
                 }
-                Step::Run(work) | Step::Host(work, _) => {
+                Step::Run(work) | Step::Host(work, _) | Step::Checked(work) => {
                     batch.fill();
+                    if matches!(step, Step::Checked(_)) && !batch.due.is_empty() {
+                        batch.refresh_textures();
+                    }
                     #[cfg(feature = "diagnostics")]
                     let started = std::time::Instant::now();
                     if matches!(step, Step::Run(_)) {
