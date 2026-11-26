@@ -266,6 +266,23 @@ impl Module {
             .collect()
     }
 
+    /// Integer-constant arguments of every written call to `name`.
+    #[cfg(test)]
+    pub fn written_call_int_args(&self, name: &str) -> Vec<Vec<Option<i64>>> {
+        let live = self.live();
+        self.blocks
+            .iter()
+            .flat_map(|b| &b.body)
+            .filter(|&&i| live[i as usize])
+            .filter_map(|&i| match &self.insts[i as usize].op {
+                Op::Call(f, args) if self.funcs[*f as usize].name == name => {
+                    Some(args.iter().map(|&a| self.int_value(a)).collect())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
     fn ty(&mut self, def: TypeDef) -> Ty {
         if let Some(&t) = self.type_ids.get(&def) {
             return Ty(t);
