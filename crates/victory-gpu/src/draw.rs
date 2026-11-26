@@ -4170,10 +4170,12 @@ impl State {
                             | DXGI_FORMAT_D32_FLOAT
                             | DXGI_FORMAT_R32G8X24_TYPELESS
                             | DXGI_FORMAT_D32_FLOAT_S8X24_UINT
-                    ) && seen.Width >= of.Width
-                        && seen.Height >= of.Height
-                        && seen.Width <= of.Width * 4
+                    ) && seen.Width.abs_diff(of.Width * 2) <= 1
+                        && u64::from(seen.Height).abs_diff(u64::from(of.Height) * 2) <= 1
                 };
+                // The picture's depth: twice the rays' image each way (run
+                // final-4: a looser match took another depth texture, which the
+                // size check then refused, "another image").
                 let found = usual_depth(MISS_DEPTH).filter(|(seen, _)| fits(seen)).or_else(|| {
                     scan(ResourceType::Srv, &|d| depth_like(d) && fits(d))
                 });
