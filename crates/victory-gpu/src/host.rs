@@ -1031,6 +1031,18 @@ pub(crate) fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
 
 #[cfg(test)]
 mod tests {
+    /// Card stamps scale to the title's 100 MHz without overflow (a
+    /// saturating multiply gave every one the same value).
+    #[test]
+    fn timestamps_scale_to_the_title_clock() {
+        assert_eq!(super::title_ticks(26_509_312, 1_000_000_000), 2_650_931);
+        assert_eq!(super::title_ticks(254_637, 10_000_000), 2_546_370);
+        // A card clock three hours on at 1 GHz.
+        assert_eq!(super::title_ticks(10_800_000_000_000, 1_000_000_000), 1_080_000_000_000);
+        // A zero frequency, which a queue without timestamps reports.
+        assert_eq!(super::title_ticks(1_000_000_000, 0), 100_000_000_000_000_000);
+    }
+
     /// A list of ours is found by its name, with the debug layer's note or not.
     #[cfg(feature = "diagnostics")]
     #[test]
@@ -2482,6 +2494,11 @@ struct Deferred {
     back_wanted: Vec<crate::texback::Target>,
     /// Those copies, whose texels go to title memory once the list has run.
     texture_backs: Vec<crate::texback::Back>,
+    /// Resolved timestamps, which go to title memory in the title's clock
+    /// once the list has run: the read-back buffer, where they are in it
+    /// when it is a chunk mapped for good (0: map it, from its start), the
+    /// title memory, how many.
+    stamps: Vec<(ID3D12Resource, usize, usize, usize)>,
     /// Whether the indirect-work budget is zeroed for this recording (a
     /// step on the CPU, or in the list for the card's copy).
     budget_zeroed: bool,
@@ -4112,6 +4129,53 @@ fn read_backs(list: &HostList) {
             }
         }
     }
+    if !list.deferred().stamps.is_empty() {
+        land_stamps(&list.deferred().stamps);
+    }
+}
+
+/// Resolved host timestamps into title memory. The card's clock counts from
+/// its own start, the title's ([`crate::queue::gpu_clock`]) from ours: each
+/// stamp goes back by how long before the card's clock now it was taken.
+fn land_stamps(stamps: &[(ID3D12Resource, usize, usize, usize)]) {
+    let Some(host) = host() else {
+        return;
+    };
+    let (mut card, mut pc) = (0, 0);
+    // SAFETY: plain queries of our queue.
+    let frequency = unsafe {
+        if host.queue.GetClockCalibration(&mut card, &mut pc).is_err() {
+            return;
+        }
+        host.queue.GetTimestampFrequency().unwrap_or(0)
+    };
+    let now = crate::queue::gpu_clock();
+    for (buffer, mapped, at, count) in stamps {
+        let mut data = *mapped as *mut std::ffi::c_void;
+        // SAFETY: a read-back buffer of ours (or a chunk of one, mapped for
+        // good) the list that has run resolved `count` stamps into; the
+        // title's destination holds them (checked when it was recorded).
+        unsafe {
+            if (*mapped != 0 || buffer.Map(0, None, Some(&mut data)).is_ok()) && !data.is_null() {
+                for i in 0..*count {
+                    let taken = data.cast::<u64>().add(i).read_unaligned();
+                    let ticks = now.saturating_sub(title_ticks(card.saturating_sub(taken), frequency)).max(1);
+                    (*at as *mut u64).add(i).write_unaligned(ticks);
+                }
+                if *mapped == 0 {
+                    buffer.Unmap(0, None);
+                }
+            }
+        }
+    }
+}
+
+/// `at` ticks of a clock of `host_hz` in the title's, [`crate::queue::TIMESTAMP_FREQUENCY`].
+/// The product is taken in u128: a card's clock counts from its start, and
+/// at 1 GHz its count times 100 MHz passes u64::MAX in about three minutes.
+fn title_ticks(at: u64, host_hz: u64) -> u64 {
+    let title_hz = u128::from(crate::queue::TIMESTAMP_FREQUENCY);
+    (u128::from(at) * title_hz / u128::from(host_hz.max(1))) as u64
 }
 
 /// After the card ran what declared `back`: what shaders wrote there goes
@@ -7142,6 +7206,13 @@ impl HostList {
         Some((chunk.buffer.clone(), at, (chunk.mapped + at as usize) as *const u8))
     }
 
+    /// Timestamps resolved into `buffer` (at `mapped` when it is a chunk
+    /// mapped for good, else null and from its start): once the list has
+    /// run, `count` of them go to `dst` in the title's clock.
+    pub(crate) fn defer_stamps(&self, buffer: ID3D12Resource, mapped: *const u8, dst: *mut u8, count: usize) {
+        self.deferred().stamps.push((buffer, mapped as usize, dst as usize, count));
+    }
+
     /// Stores `what` (`bytes` of it) at `dst` once the list has run.
     pub(crate) fn defer_write(&self, dst: *mut u8, what: crate::queue::Written, bytes: usize) {
         self.deferred().writes.push((dst as usize, what, bytes));
@@ -8802,6 +8873,24 @@ impl Host {
     /// given memory ahead of the list that uploads them).
     pub(crate) fn queue(&self) -> &ID3D12CommandQueue {
         &self.queue
+    }
+
+    /// A host query heap of `count` queries for a console heap of `kind`
+    /// (the heap types match: 0 occlusion, 1 timestamp, 2 pipeline
+    /// statistics); none for other kinds.
+    pub(crate) fn query_heap(&self, kind: u32, count: u32) -> Option<ID3D12QueryHeap> {
+        let kind = match kind {
+            0 => D3D12_QUERY_HEAP_TYPE_OCCLUSION,
+            1 => D3D12_QUERY_HEAP_TYPE_TIMESTAMP,
+            2 => D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS,
+            _ => return None,
+        };
+        let mut heap: Option<ID3D12QueryHeap> = None;
+        // SAFETY: plain object creation.
+        unsafe { self.device.CreateQueryHeap(&D3D12_QUERY_HEAP_DESC { Type: kind, Count: count.max(1), NodeMask: 0 }, &mut heap) }.ok()?;
+        let heap = heap?;
+        name(&heap, || format!("query heap {} x{count}", kind.0));
+        Some(heap)
     }
 
     /// A buffer in the upload heap, mapped for writing.
