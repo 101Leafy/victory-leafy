@@ -987,6 +987,23 @@ fn create() -> windows::core::Result<Host> {
             );
             tracing::info!(ok = set.is_ok(), "the host's background shader work is switched off (VICTORY_D3D12_BACKGROUND=0)");
         }
+        // `VICTORY_DRIVER_CACHE=0`: the driver's own shader cache (and the
+        // runtime's, for a driver without one) is not used by this run, so a
+        // run with an empty `VICTORY_LIBRARY_DIR` makes its pipelines cold
+        // without a VERSION bump. Needs Windows developer mode. Switched off
+        // for this process only, never cleared.
+        if std::env::var_os("VICTORY_DRIVER_CACHE").is_some_and(|v| v == "0") {
+            let off = device.cast::<ID3D12Device9>().and_then(|device9| {
+                device9.ShaderCacheControl(
+                    D3D12_SHADER_CACHE_KIND_FLAG_IMPLICIT_DRIVER_MANAGED | D3D12_SHADER_CACHE_KIND_FLAG_IMPLICIT_D3D_CACHE_FOR_DRIVER,
+                    D3D12_SHADER_CACHE_CONTROL_FLAG_DISABLE,
+                )
+            });
+            match off {
+                Ok(()) => tracing::info!("the driver's shader cache is off for this run (VICTORY_DRIVER_CACHE=0)"),
+                Err(e) => tracing::warn!(error = %e, "the driver's shader cache could not be switched off"),
+            }
+        }
         // the widest wave the GPU runs: 32 (NVIDIA) gets console wave64 compute programs whose
         // cross-lane code stays in 32-lane halves translated for waves of 32
         let mut o1 = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
