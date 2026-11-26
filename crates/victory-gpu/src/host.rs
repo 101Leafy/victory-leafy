@@ -524,6 +524,19 @@ fn bury_lag() -> u64 {
     *LAG.get_or_init(|| std::env::var("VICTORY_BURY_LAG").ok().and_then(|v| v.parse().ok()).unwrap_or(64))
 }
 
+/// Whether a flight's lists give their dynamic descriptor slots back when
+/// it lands, as a submission that is waited for does
+/// ([`crate::list::tables_done`]), and not when the lists are reset
+/// [`bury_lag`] landings later (`VICTORY_TABLES_AT_LANDING=0`: then). Held
+/// for 64 landings, the binocular zoom ran the slots out with 4,200 to
+/// 4,600 asks a frame refused and a third of its draws gone (codec_d,
+/// pareto-residency f4b48ad76). The card has read the slots by then; the
+/// objects they name still wait for the bury.
+pub(crate) fn tables_at_landing() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_TABLES_AT_LANDING").map_or(true, |v| v.trim() != "0"))
+}
+
 /// Drops what waited for submissions up to `finished` ([`bury_lag`]). The
 /// numbers come in order, but for threads that overtake each other: one of
 /// those is dropped a little later than it could be.
@@ -5556,7 +5569,7 @@ impl Host {
         let mut telling = std::time::Instant::now();
         for item in items {
             telling = match item {
-                Late::Run(flight) => {
+                Late::Run(mut flight) => {
                     last = flight.number;
                     for &i in &flight.order {
                         read_backs(flight.lists[i].host());
@@ -5566,6 +5579,11 @@ impl Host {
                     }
                     if let Some(own) = flight.own {
                         own.landed();
+                    }
+                    if tables_at_landing() {
+                        for list in &mut flight.lists {
+                            list.release_tables();
+                        }
                     }
                     landed.push((flight.lists, flight.order));
                     crate::land::spent(crate::land::stat::READ_BACKS, telling)
@@ -6041,13 +6059,18 @@ impl Host {
             let mut landed = Vec::new();
             for item in items {
                 match item {
-                    Late::Run(flight) => {
+                    Late::Run(mut flight) => {
                         last = flight.number;
                         for &i in &flight.order {
                             read_backs(flight.lists[i].host());
                         }
                         if let Some(card) = flight.card {
                             self.card_done(card);
+                        }
+                        if tables_at_landing() {
+                            for list in &mut flight.lists {
+                                list.release_tables();
+                            }
                         }
                         landed.push((flight.lists, flight.order));
                     }
