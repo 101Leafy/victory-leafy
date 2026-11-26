@@ -987,6 +987,23 @@ impl CopyLaps {
     }
 }
 
+/// Brings a copy source texture up to date: from the texture it was placed
+/// over in another format when the host wrote that one
+/// (`crate::texture::alias`), else from title memory when the title writes
+/// it. Either can leave the source in the copy destination state, so the
+/// caller sets the source state after this. After upstream #3170.
+#[cfg(windows)]
+fn sync_copy_source(
+    list: &crate::host::HostList,
+    src: This,
+    texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+) {
+    let aliased = crate::resource::alias_of(src).is_some_and(|source| crate::texture::alias(list, src, source));
+    if !aliased && crate::texture::title_written(texture) {
+        crate::texture::upload(list, src, texture);
+    }
+}
+
 extern "system" fn copy_resource(this: This, dst: This, src: This) {
     #[cfg(windows)]
     {
@@ -1012,10 +1029,9 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             // triippywhale 6e502b3b.
             let same = windows::core::Interface::as_raw(to) == windows::core::Interface::as_raw(from);
             // A source the title fills itself is uploaded first (upstream
-            // PR #671): a copy read whatever the host texture held.
-            if crate::texture::title_written(from) {
-                crate::texture::upload(list, src, from);
-            }
+            // PR #671): a copy read whatever the host texture held. One
+            // placed over a texture the host writes gets that one's texels.
+            sync_copy_source(list, src, from);
             // Depth textures shaders also write: what they wrote, first.
             list.twin_use(dst, false, true);
             list.twin_use(src, false, false);
@@ -1325,9 +1341,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         // The source: what the title wrote itself, first; then to the
         // first buffer.
         list.twin_use(src, false, false);
-        if crate::texture::title_written(from) {
-            crate::texture::upload(list, src, from);
-        }
+        sync_copy_source(list, src, from);
         ensure_state(list, src, COPY_SOURCE);
         barrier(l, &a, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
         let texels = CopyLocation { resource: raw(from), kind: 0, footprint: crate::resource::PlacedFootprint::ZERO };
@@ -1531,9 +1545,7 @@ extern "system" fn copy_texture_region(
                 && dst.kind != FOOTPRINT
                 && src.footprint.offset as u32 == dst.footprint.offset as u32;
             list.twin_use(src.resource, false, false);
-            if crate::texture::title_written(texture) {
-                crate::texture::upload(list, src.resource, texture);
-            }
+            sync_copy_source(list, src.resource, texture);
             if !same {
                 ensure_state(list, src.resource, COPY_SOURCE);
             }
@@ -1682,9 +1694,7 @@ fn read_back(
     // As a texture source of any copy: what shaders wrote to a depth twin
     // and what the title wrote itself first, then the state.
     list.twin_use(src.resource, false, false);
-    if crate::texture::title_written(texture) {
-        crate::texture::upload(list, src.resource, texture);
-    }
+    sync_copy_source(list, src.resource, texture);
     ensure_state(list, src.resource, COPY_SOURCE);
     let mut from = src;
     from.resource = texture.as_raw().cast_const().cast();
