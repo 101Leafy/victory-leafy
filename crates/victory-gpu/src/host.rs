@@ -8544,6 +8544,26 @@ impl Meter {
         tracing::debug!(target: "victory_gpu::frame", token = crate::frame::current(), "present");
         #[cfg(feature = "diagnostics")]
         crate::copystat::presented();
+        // Launch time as the player sees it: from the process's creation,
+        // which is before anything of ours runs.
+        static FIRST: std::sync::Once = std::sync::Once::new();
+        FIRST.call_once(|| {
+            use windows_sys::Win32::Foundation::FILETIME;
+            use windows_sys::Win32::System::SystemInformation::GetSystemTimeAsFileTime;
+            use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
+            let zero = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+            let (mut created, mut exited, mut kernel, mut user, mut now) = (zero, zero, zero, zero, zero);
+            // SAFETY: our own process and valid out pointers.
+            let ok = unsafe {
+                GetSystemTimeAsFileTime(&mut now);
+                GetProcessTimes(GetCurrentProcess(), &mut created, &mut exited, &mut kernel, &mut user)
+            } != 0;
+            let ticks = |t: FILETIME| (u64::from(t.dwHighDateTime) << 32) | u64::from(t.dwLowDateTime);
+            if ok {
+                let ms = ticks(now).saturating_sub(ticks(created)) / 10_000;
+                tracing::info!(ms, "first frame presented");
+            }
+        });
         self.frames += 1;
         #[cfg(feature = "diagnostics")]
         {
