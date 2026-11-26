@@ -10096,7 +10096,8 @@ impl<'a> Lower<'a> {
             let f = self.half_fsrc(inst, 0)?;
             return self.write_f(inst, f, guard);
         }
-        let float_result = |l: &mut Self, mut f: V| -> Result<(), Why> {
+        // `nan`: lanes that take RDNA2's 0xfe00 instead (unless clamped, which makes NaN 0).
+        let float_result = |l: &mut Self, mut f: V, nan: Option<V>| -> Result<(), Why> {
             match v.omod {
                 0 => {}
                 k => {
@@ -10117,11 +10118,19 @@ impl<'a> Lower<'a> {
             } else {
                 l.s.op(l.cur, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f])
             };
+            // After the conversion: a NaN's bits through it are the host's (0x7fff on NVIDIA).
+            let h = match nan {
+                Some(n) if !v.clamp => {
+                    let k = l.s.m.i32(0xFE00);
+                    l.s.m.select(l.cur, n, k, h)
+                }
+                _ => h,
+            };
             l.write_half(inst, h, guard)
         };
         if name == "v_cvt_f16_f32" {
             let f = self.fsrc(inst, 0)?;
-            return float_result(self, f);
+            return float_result(self, f, None);
         }
         if float2.contains(&name) {
             let (a, b) = (self.half_fsrc(inst, 0)?, self.half_fsrc(inst, 1)?);
@@ -10133,7 +10142,7 @@ impl<'a> Lower<'a> {
                 "v_max_f16" => self.max_min(true, a, b),
                 _ => self.max_min(false, a, b),
             };
-            return float_result(self, r);
+            return float_result(self, r, None);
         }
         if float3.contains(&name) {
             let (a, b) = (self.half_fsrc(inst, 0)?, self.half_fsrc(inst, 1)?);
@@ -10180,9 +10189,10 @@ impl<'a> Lower<'a> {
                 "v_div_fixup_f16" => self.div_fixup(a, b, acc),
                 _ => self.med3(a, b, acc),
             };
-            return float_result(self, r);
+            return float_result(self, r, None);
         }
         if float1.contains(&name) {
+            let mut nan = None;
             let r = match name {
                 "v_cvt_f16_u16" | "v_cvt_f16_i16" => {
                     let mut x = self.half_src(inst, 0)?;
@@ -10221,19 +10231,17 @@ impl<'a> Lower<'a> {
                         // Any f16 in (-2^-11, 0) has fract >= 1 - 2^-12; clamp to 0x3bff (1 - 2^-11).
                         22 => self.fract(a, 1.0 - 1.0 / 4096.0, 1.0 - 1.0 / 2048.0),
                         // RDNA2 gives 0xfe00 for negative nonzero inputs,
-                        // including -infinity. The host chooses the NaN bits.
+                        // including -infinity.
                         23 => {
-                            let log = self.unary(op, a);
                             let zero = self.s.m.f32(0);
-                            let negative = self.s.m.cmp(c, pred::OLT, a, zero);
-                            let nan = self.s.m.f32(0xFFC0_0000);
-                            self.s.m.select(c, negative, nan, log)
+                            nan = Some(self.s.m.cmp(c, pred::OLT, a, zero));
+                            self.unary(op, a)
                         }
                         _ => self.unary(op, a),
                     }
                 }
             };
-            return float_result(self, r);
+            return float_result(self, r, nan);
         }
         if matches!(name, "v_cvt_u16_f16" | "v_cvt_i16_f16") {
             if v.clamp || v.omod != 0 {
