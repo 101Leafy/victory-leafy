@@ -151,17 +151,14 @@ fn fallback(keys: &[KeyState]) -> PadState {
     }
 }
 
-/// Two pads as one: buttons of both, and of each axis and trigger the one
-/// pushed further.
 /// The debug overlay (Alt+Z, `victory_gpu::overlay`) shows the pad the
 /// title reads on `values[target]` (the first connected pad, with the
 /// keyboard and mouse when `[controls]` is on, else the keyboard's
-/// stand-in); while it shows, the title reads neutral pads (still
-/// connected).
-fn overlay(values: &mut [Option<PadState>], target: usize) {
+/// stand-in). The title keeps its input while it shows.
+fn overlay(values: &[Option<PadState>], target: usize) {
     #[cfg(windows)]
     {
-        use victory_gpu::overlay::{Pad, captured, show_pad};
+        use victory_gpu::overlay::{Pad, show_pad};
         let read = values[target].or_else(|| values.iter().flatten().next().copied());
         show_pad(read.map(|read| Pad {
             buttons: read.buttons,
@@ -169,25 +166,13 @@ fn overlay(values: &mut [Option<PadState>], target: usize) {
             left: [read.left_x, read.left_y],
             right: [read.right_x, read.right_y],
         }));
-        if captured() {
-            values
-                .iter_mut()
-                .flatten()
-                .for_each(|p| *p = PadState::default());
-        }
     }
     #[cfg(not(windows))]
     let _ = (values, target);
 }
 
-/// Whether the debug overlay shows: the title then reads no keys.
-fn overlay_shows() -> bool {
-    #[cfg(windows)]
-    return victory_gpu::overlay::captured();
-    #[cfg(not(windows))]
-    false
-}
-
+/// Two pads as one: buttons of both, and of each axis and trigger the one
+/// pushed further.
 fn merged(a: PadState, b: PadState) -> PadState {
     let further = |x: f32, y: f32| if y.abs() > x.abs() { y } else { x };
     PadState {
@@ -591,7 +576,6 @@ impl State {
         self.host_pads = pads;
         self.keys.clone_from(&keys);
         self.publish(devices, now, None, &mut events);
-        let keys = if overlay_shows() { Vec::new() } else { keys };
         self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
         events
     }
@@ -629,7 +613,7 @@ impl State {
             None if base.is_none() => values[FALLBACK] = Some(fallback(&self.keys)),
             None => {}
         }
-        overlay(&mut values, target);
+        overlay(&values, target);
         for (index, value) in values.into_iter().enumerate() {
             self.update(devices, index, value.map(Value::Pad), now, events);
         }

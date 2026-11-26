@@ -6,9 +6,8 @@
 //! frames and the 1% low), the presenter's last second (draws per frame,
 //! time preparing submissions and waiting for the GPU), the process's CPU
 //! use and memory, video memory against its budget, and the controller as
-//! the title last read it. Keys 1-4, while it shows, leave kinds of GPU
-//! work out ([`skip`]), to see what draws what. While it shows the title
-//! gets no keyboard or controller input ([`captured`]).
+//! the title last read it. The title keeps its keyboard and controller
+//! input while it shows.
 //!
 //! The panel is drawn on the CPU into upload memory in the back buffer's
 //! format, and copied into its top left corner after the frame, before the
@@ -31,32 +30,9 @@ use crate::host::Host;
 
 static VISIBLE: AtomicBool = AtomicBool::new(false);
 
-/// Whether the overlay shows: the title gets no input meanwhile.
-pub fn captured() -> bool {
+/// Whether the overlay shows.
+pub fn shown() -> bool {
     VISIBLE.load(Relaxed)
-}
-
-/// Kinds of GPU work the toggles can leave out.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Work {
-    Compute = 0,
-    Mesh = 1,
-    Vertex = 2,
-    Indirect = 3,
-}
-
-static SKIPPED: [AtomicBool; 4] = [const { AtomicBool::new(false) }; 4];
-const WORK: [&str; 4] = [
-    "COMPUTE DISPATCHES",
-    "MESH DRAWS",
-    "VERTEX DRAWS",
-    "INDIRECT EXECUTION",
-];
-
-/// Whether the toggles leave `work` out (one relaxed load).
-#[inline]
-pub(crate) fn skip(work: Work) -> bool {
-    SKIPPED[work as usize].load(Relaxed)
 }
 
 /// A controller as the title reads it: GameInput's buttons, triggers and
@@ -215,7 +191,7 @@ pub(crate) fn time_lists(
     queue: &ID3D12CommandQueue,
     group: &[Option<ID3D12CommandList>],
 ) -> Option<Vec<Option<ID3D12CommandList>>> {
-    if !captured() {
+    if !shown() {
         return None;
     }
     let mut slot = TIMER.lock().unwrap_or_else(|e| e.into_inner());
@@ -273,7 +249,7 @@ fn epoch() -> Instant {
 /// The title reads its input (GameInput's current reading): the first read
 /// after a present starts the input-to-present time of the next frame.
 pub fn note_input_read() {
-    if captured() {
+    if shown() {
         let at = (Instant::now() - epoch()).as_nanos().max(1) as u64;
         let _ = FIRST_READ.compare_exchange(0, at, Relaxed, Relaxed);
     }
@@ -299,9 +275,9 @@ fn scale_for(height: u32) -> f32 {
 /// The presenter's overlay state.
 pub(crate) struct Overlay {
     enabled: bool,
-    /// Keys down at the last frame: Alt+Z, then 1-4 (only without the
-    /// key thread, [`watch_keys`]).
-    down: u8,
+    /// Alt+Z was down at the last frame (only without the key thread,
+    /// [`watch_keys`]).
+    down: bool,
     last: Option<Instant>,
     times: VecDeque<f32>,
     /// Per frame: GPU busy time and input-to-present time, ms (`None`:
@@ -328,7 +304,7 @@ impl Default for Overlay {
         }
         Overlay {
             enabled: switch.as_deref().is_none_or(|v| v != "0"),
-            down: 0,
+            down: false,
             last: None,
             times: VecDeque::with_capacity(HISTORY),
             gpu: VecDeque::with_capacity(HISTORY),
@@ -350,8 +326,6 @@ const POLL: Duration = Duration::from_millis(15);
 
 /// The window whose keys the overlay takes, as a number (0: none yet).
 static WINDOW: AtomicUsize = AtomicUsize::new(0);
-/// A key changed what the panel shows since it was last drawn.
-static CHANGED: AtomicBool = AtomicBool::new(false);
 /// The key thread runs.
 static KEY_THREAD: AtomicBool = AtomicBool::new(false);
 
@@ -364,7 +338,7 @@ fn watch_keys(hwnd: HWND) -> bool {
         let spawned = std::thread::Builder::new()
             .name("victory overlay keys".into())
             .spawn(|| {
-                let mut down = 0;
+                let mut down = false;
                 loop {
                     down = poll_keys(down, HWND(WINDOW.load(Relaxed) as *mut _));
                     std::thread::sleep(POLL);
@@ -378,44 +352,26 @@ fn watch_keys(hwnd: HWND) -> bool {
     KEY_THREAD.load(Relaxed)
 }
 
-/// Alt+Z shows and hides the panel; 1-4 toggle work while it shows. Only
-/// while `hwnd` has focus, when a key goes down: `before` is what was down
-/// at the last look, and the keys down now are returned for the next.
-fn poll_keys(before: u8, hwnd: HWND) -> u8 {
+/// Alt+Z shows and hides the panel, only while `hwnd` has focus, when it
+/// goes down: `before` is whether it was down at the last look, and
+/// whether it is down now is returned for the next.
+fn poll_keys(before: bool, hwnd: HWND) -> bool {
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
     // SAFETY: a plain query.
     let focused = !hwnd.is_invalid() && unsafe { GetForegroundWindow() } == hwnd;
     // SAFETY: a plain query.
-    let down = keys_down(|vk| focused && unsafe { GetAsyncKeyState(vk) } < 0);
-    toggle(down & !before);
-    down
-}
-
-/// The overlay's keys held, one bit each: Alt+Z, then 1-4.
-fn keys_down(held: impl Fn(i32) -> bool) -> u8 {
-    const ALT: i32 = 0x12;
-    let mut down = u8::from(held(ALT) && held(i32::from(b'Z')));
-    for (k, key) in (b'1'..=b'4').enumerate() {
-        down |= u8::from(held(i32::from(key))) << (k + 1);
-    }
-    down
-}
-
-/// Acts on the keys that went down (bits as [`keys_down`]).
-fn toggle(pressed: u8) {
-    if pressed & 1 != 0 {
+    let down = alt_z_down(|vk| focused && unsafe { GetAsyncKeyState(vk) } < 0);
+    if down && !before {
         let shown = !VISIBLE.fetch_xor(true, Relaxed);
         tracing::info!(shown, "overlay");
     }
-    if captured() {
-        for (k, skipped) in SKIPPED.iter().enumerate() {
-            if pressed >> (k + 1) & 1 != 0 {
-                let off = !skipped.fetch_xor(true, Relaxed);
-                tracing::warn!(work = WORK[k], left_out = off, "overlay toggle");
-                CHANGED.store(true, Relaxed);
-            }
-        }
-    }
+    down
+}
+
+/// Whether Alt+Z is held.
+fn alt_z_down(held: impl Fn(i32) -> bool) -> bool {
+    const ALT: i32 = 0x12;
+    held(ALT) && held(i32::from(b'Z'))
 }
 
 /// What is sampled once a second.
@@ -459,7 +415,7 @@ impl Overlay {
                 self.times.pop_front();
             }
             self.times.push_back((now - last).as_secs_f32() * 1000.0);
-            let gpu = (captured() && gpu_ns > 0).then(|| gpu_ns as f32 / 1e6);
+            let gpu = (shown() && gpu_ns > 0).then(|| gpu_ns as f32 / 1e6);
             push(&mut self.gpu, gpu);
             let latency = (read > 0).then(|| {
                 let at = epoch() + Duration::from_nanos(read);
@@ -470,10 +426,7 @@ impl Overlay {
         if !watch_keys(hwnd) {
             self.down = poll_keys(self.down, hwnd);
         }
-        if CHANGED.swap(false, Relaxed) {
-            self.drawn = None;
-        }
-        if !captured() {
+        if !shown() {
             self.drawn = None;
             return state;
         }
@@ -650,7 +603,6 @@ impl Overlay {
     fn panel(&self, scale: f32, system: &System) -> Image {
         let second = *SECOND.lock().unwrap_or_else(|e| e.into_inner());
         let pad = *PAD.lock().unwrap_or_else(|e| e.into_inner());
-        let skipped = std::array::from_fn(|k| SKIPPED[k].load(Relaxed));
         let fonts = Fonts::new();
         draw_panel(
             &fonts,
@@ -663,7 +615,6 @@ impl Overlay {
                 second,
                 system: *system,
                 pad,
-                skipped,
             },
         )
     }
@@ -678,7 +629,6 @@ struct Facts<'a> {
     second: Second,
     system: System,
     pad: Option<Pad>,
-    skipped: [bool; 4],
 }
 
 /// Mean frame time, its rate, and the rate of the slowest 1% of frames.
@@ -1315,45 +1265,6 @@ fn draw_panel(fonts: &Fonts, scale: f32, f: &Facts) -> Image {
     };
     y += p.px(8.0);
 
-    // Toggles.
-    y = p.header(left, y, inner, "DRAW TOGGLES (KEYS 1-4)");
-    const NAMES: [&str; 4] = [
-        "Compute dispatches",
-        "Mesh draws",
-        "Vertex draws",
-        "Indirect execution",
-    ];
-    for (k, name) in NAMES.iter().enumerate() {
-        let on = !f.skipped[k];
-        let b = p.px(12.0);
-        let top = y + p.px(3.0);
-        p.image
-            .outline(left, top, b, b, if on { colour::GOOD } else { colour::BAD });
-        if on {
-            p.image.rect(
-                left + p.px(3.0),
-                top + p.px(3.0),
-                b - 2 * p.px(3.0),
-                b - 2 * p.px(3.0),
-                colour::GOOD,
-            );
-        }
-        p.text(
-            left + b + p.px(8.0),
-            y,
-            &format!("{}  {name}", k + 1),
-            (14.0, false),
-            colour::VALUE,
-            Align::Left,
-        );
-        let (state, c) = if on {
-            ("drawn", colour::GOOD)
-        } else {
-            ("LEFT OUT", colour::BAD)
-        };
-        p.text(right, y, state, (14.0, !on), c, Align::Right);
-        y += p.px(19.0);
-    }
     y += pad;
 
     // Cut to size and frame it.
@@ -1736,15 +1647,14 @@ fn glyph(c: char) -> [u8; 7] {
 mod tests {
     use super::*;
 
-    /// Alt+Z is bit 0 only with Alt held; 1-4 are bits 1-4 alone.
+    /// Alt+Z only with Alt held.
     #[test]
-    fn keys_map_to_their_bits() {
-        let with = |keys: &'static [u8]| keys_down(move |vk| keys.contains(&(vk as u8)));
-        assert_eq!(with(b"Z"), 0);
-        assert_eq!(with(&[0x12, b'Z']), 1);
-        assert_eq!(with(b"1"), 0b10);
-        assert_eq!(with(b"4"), 0b1_0000);
-        assert_eq!(with(&[0x12, b'Z', b'2', b'3']), 0b1101);
+    fn alt_z_needs_alt() {
+        let with = |keys: &'static [u8]| alt_z_down(move |vk| keys.contains(&(vk as u8)));
+        assert!(!with(b"Z"));
+        assert!(!with(&[0x12]));
+        assert!(with(&[0x12, b'Z']));
+        assert!(with(&[0x12, b'Z', b'1']));
     }
 
     /// The key thread starts once and stays pointed at the latest window;
@@ -1758,7 +1668,7 @@ mod tests {
     }
 
     /// Sample facts: a minute of history, frame times around 30 fps with
-    /// some slow ones, a pad with A and RB held, compute left out.
+    /// some slow ones, and a pad with A and RB held.
     fn sample_facts<'a>(
         times: &'a VecDeque<f32>,
         history: &'a VecDeque<[Option<f32>; 3]>,
@@ -1787,7 +1697,6 @@ mod tests {
                 left: [0.0, 0.98],
                 right: [-0.25, 0.0],
             }),
-            skipped: [true, false, false, false],
         }
     }
 

@@ -9077,7 +9077,7 @@ impl Host {
             let read_now = false;
             // The overlay rewrites its upload buffer between presents, so
             // while it shows each present is waited for.
-            let read_now = read_now || crate::overlay::captured();
+            let read_now = read_now || crate::overlay::shown();
             let slot = if late_free_present() && !read_now {
                 let finished = FINISHED.load(Ordering::Acquire);
                 p.ahead.iter().position(|(_, flown)| *flown <= finished).or_else(|| {
