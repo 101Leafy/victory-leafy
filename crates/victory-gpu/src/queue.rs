@@ -47,15 +47,15 @@ const _: () = assert!(std::mem::offset_of!(Queue, kind) == 0x10);
 /// One thing a waiting queue holds back.
 #[cfg(windows)]
 enum Held {
-    /// The queue waits for the fence (its address) to reach the value.
-    Wait(usize, u64),
+    /// The queue waits for the fence to reach the value.
+    Wait(crate::fence::Kept, u64),
     /// A list of the next submission waits for a memory value.
     Value(crate::list::ValueWait),
     /// A submission: the lists' host sides, taken from the title's lists
     /// (which it may reset meanwhile), and the order they run in.
     Run(Vec<crate::list::Detached>, Vec<usize>),
     /// A signal of the queue's, due after what it holds before it.
-    Signal(usize, u64),
+    Signal(crate::fence::Kept, u64),
 }
 
 /// The queues that hold something (their addresses).
@@ -332,8 +332,8 @@ pub(crate) fn release_held(all: bool) {
             loop {
                 match held.first() {
                     None => break,
-                    Some(&Held::Wait(fence, value))
-                        if !all && crate::fence::completed(fence as This) < value =>
+                    Some(Held::Wait(fence, value))
+                        if !all && crate::fence::completed(fence.this()) < *value =>
                     {
                         break;
                     }
@@ -415,8 +415,8 @@ pub(crate) fn release_held(all: bool) {
                     // Behind what was sent to the card and not waited
                     // for, if anything was.
                     Held::Signal(fence, value) => {
-                        if !crate::host::late_signal(fence, value) {
-                            crate::fence::set(fence as This, value);
+                        if !crate::host::late_signal(fence.at(), value) {
+                            crate::fence::set(fence.this(), value);
                         }
                     }
                 }
@@ -681,7 +681,7 @@ extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
     }
     // A queue that waits signals after what it holds.
     #[cfg(windows)]
-    if hold(this, || Held::Signal(fence as usize, value)) {
+    if hold(this, || Held::Signal(crate::fence::Kept::new(fence), value)) {
         return S_OK;
     }
     // Behind the submissions sent to the card and not waited for: the
@@ -723,9 +723,10 @@ extern "system" fn wait(this: This, fence: This, value: u64) -> HRESULT {
         }
         let behind = {
             let mut held = lock(&queue(this).held);
-            let behind = !held.is_empty() || now < value;
+            // Read again under the lock: a signal may have got it there.
+            let behind = !held.is_empty() || crate::fence::completed(fence) < value;
             if behind && waits() {
-                held.push(Held::Wait(fence as usize, value));
+                held.push(Held::Wait(crate::fence::Kept::new(fence), value));
             }
             behind
         };
@@ -1237,6 +1238,37 @@ mod tests {
             slot::<extern "system" fn(This) -> u64>(fence, 0x40)(fence),
             7
         );
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(q, 0x10)(q), 0);
+    }
+
+    /// D3D12's Wait keeps the fence until the wait is met: the title may
+    /// release it right after the call, and the held wait still reads it.
+    #[cfg(windows)]
+    #[test]
+    fn a_held_wait_keeps_its_fence() {
+        if behind::on() || !waits() {
+            return;
+        }
+        let null = std::ptr::null();
+        let desc = QueueDesc {
+            kind: 0,
+            priority: 0,
+            flags: 0,
+            nodes: 0,
+        };
+        let mut q = null;
+        assert_eq!(create(null, &desc, &QUEUE_IIDS[0], &mut q), S_OK);
+        let mut fence = null;
+        assert_eq!(crate::fence::create(null, 0, 0, &crate::fence::FENCE_IIDS[0], &mut fence), S_OK);
+        let wait = slot::<extern "system" fn(This, This, u64) -> HRESULT>(q, signal_slot(q) + 8);
+        assert_eq!(wait(q, fence, 1), S_OK);
+        assert!(matches!(lock(&queue(q).held).first(), Some(Held::Wait(..))));
+        let release = slot::<extern "system" fn(This) -> u32>(fence, 0x10);
+        assert_eq!(release(fence), 1, "the held wait keeps a reference");
+        assert_eq!(crate::fence::completed(fence), 0);
+        // Met: the wait goes, and with it the last reference.
+        assert_eq!(slot::<extern "system" fn(This, u64) -> HRESULT>(fence, 0x50)(fence, 1), S_OK);
+        assert!(lock(&queue(q).held).is_empty());
         assert_eq!(slot::<extern "system" fn(This) -> u32>(q, 0x10)(q), 0);
     }
 
