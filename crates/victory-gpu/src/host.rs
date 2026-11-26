@@ -3196,7 +3196,9 @@ pub(crate) fn settle_now(why: usize) {
         return;
     };
     let mut submitted = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+    let held = std::time::Instant::now();
     host.settle(&mut submitted, why);
+    crate::copystat::lap(crate::copystat::C::SubmitLockSettleNs, held);
 }
 
 /// [`settle_now`] at a present, and for a fence the title blocks on.
@@ -3282,7 +3284,9 @@ fn late_helper() {
             if line().target != target {
                 continue;
             }
+            let held = std::time::Instant::now();
             host.settle(&mut submitted, WHY_CARD_DONE);
+            crate::copystat::lap(crate::copystat::C::SubmitLockDoneNs, held);
         }
         land();
         crate::queue::release_held(false);
