@@ -67,6 +67,36 @@ pub(super) fn folder() -> Option<PathBuf> {
     DIR.get().cloned()
 }
 
+/// The folder of the library's file itself: `VICTORY_LIBRARY_DIR`, so that
+/// runs with different cache folders share one library and pay for each
+/// driver compile once (each folder made the same 1,300 slow pipelines
+/// again, about 14 minutes). The early and slow lists stay per folder.
+/// Two runs that both save keep the last one's library: the host cannot
+/// list or merge another library's pipelines.
+fn library_dir() -> Option<PathBuf> {
+    static SHARED: OnceLock<Option<PathBuf>> = OnceLock::new();
+    let shared = SHARED.get_or_init(|| std::env::var_os("VICTORY_LIBRARY_DIR").filter(|v| !v.is_empty()).map(PathBuf::from));
+    shared.clone().or_else(folder)
+}
+
+/// The lock a run holds on [`LOCK_FILE`] in `dir` while it writes the
+/// library's file there, so that two runs sharing it do not write one
+/// temporary file at once. Tried for `wait`; `None` if another run still
+/// holds it.
+fn writer(dir: &std::path::Path, wait: std::time::Duration) -> Option<std::fs::File> {
+    let file = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(dir.join(LOCK_FILE)).ok()?;
+    let began = std::time::Instant::now();
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Some(file),
+            Err(std::fs::TryLockError::WouldBlock) if began.elapsed() < wait => {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(_) => return None,
+        }
+    }
+}
+
 /// Host pipelines created, loaded from the library, and title pipelines
 /// started at creation, since the start.
 pub(crate) static MADE: AtomicU64 = AtomicU64::new(0);
@@ -207,11 +237,14 @@ enum Blob {
 
 impl Blob {
     /// The library file in `dir`: a library a save left beside it
-    /// ([`NEXT_FILE`]) takes its place first.
+    /// ([`NEXT_FILE`]) takes its place first, unless another run is saving.
     fn of(dir: &std::path::Path) -> Blob {
         let path = dir.join(LIBRARY_FILE);
         let next = dir.join(NEXT_FILE);
-        if next.exists() && std::fs::rename(&next, &path).is_err() {
+        if next.exists()
+            && let Some(_lock) = writer(dir, std::time::Duration::ZERO)
+            && std::fs::rename(&next, &path).is_err()
+        {
             tracing::warn!("the host pipeline library saved last could not take the old one's place");
         }
         if mapped()
@@ -438,6 +471,8 @@ const LIBRARY_FILE: &str = "host-pipelines.bin";
 /// had it mapped (a system that refuses to replace a mapped file): the next
 /// start renames it over the library first ([`Blob::of`]).
 const NEXT_FILE: &str = "host-pipelines.next";
+/// Held locked by the run writing the library ([`writer`]).
+const LOCK_FILE: &str = "host-pipelines.lock";
 const EARLY_FILE: &str = "early-pipelines.txt";
 /// Title pipelines listed for an early start, at most.
 const EARLY_MAX: usize = 100_000;
@@ -447,7 +482,7 @@ fn library() -> Option<&'static Library> {
     LIBRARY
         .get_or_init(|| {
             let device = crate::host::host()?.device.cast::<ID3D12Device1>().ok()?;
-            let blob = DIR.get().map_or(Blob::None, |d| Blob::of(d));
+            let blob = library_dir().map_or(Blob::None, |d| Blob::of(&d));
             let library = open(&device, blob);
             if library.is_none() {
                 tracing::warn!("no host pipeline library: pipelines are not kept");
@@ -522,7 +557,13 @@ pub(crate) fn pipeline(
     let wide = HSTRING::from(name);
     let Some(library) = library() else {
         MADE.fetch_add(1, Ordering::Relaxed);
-        return create();
+        let began = std::time::Instant::now();
+        let pso = create();
+        super::spent::add(|p| {
+            p.create += began.elapsed();
+            p.made += 1;
+        });
+        return pso;
     };
     let began = std::time::Instant::now();
     let loaded = {
@@ -531,12 +572,15 @@ pub(crate) fn pipeline(
         let _call = call("load", name);
         load(&library.library, PCWSTR(wide.as_ptr()))
     };
+    let load_took = began.elapsed();
+    super::spent::add(|p| p.load += load_took);
     // The load read the library's file (see `trim`).
     LOADED_AT.store(crate::host::now_ms(), Ordering::Relaxed);
     TRIMMED.store(false, Ordering::Relaxed);
     let refused = match loaded {
         Ok(pso) => {
             LOADED.fetch_add(1, Ordering::Relaxed);
+            super::spent::add(|p| p.loaded += 1);
             crate::host::trail(|| {
                 let label = LABEL.with(|l| l.borrow().clone());
                 format!("pipeline library: loaded {label} in {:.1} ms", began.elapsed().as_secs_f64() * 1e3)
@@ -548,9 +592,18 @@ pub(crate) fn pipeline(
     // Compiled outside any lock: compiles take up to seconds.
     let pso = {
         let _call = call("make", name);
-        create()?
+        let creating = std::time::Instant::now();
+        let pso = create();
+        super::spent::add(|p| {
+            p.create += creating.elapsed();
+            p.made += 1;
+        });
+        pso?
     };
     MADE.fetch_add(1, Ordering::Relaxed);
+    if !MADE_NAMES.lock().unwrap_or_else(|e| e.into_inner()).insert(name.to_owned()) {
+        MADE_AGAIN.fetch_add(1, Ordering::Relaxed);
+    }
     crate::host::trail(|| {
         let label = LABEL.with(|l| l.borrow().clone());
         format!(
@@ -558,15 +611,58 @@ pub(crate) fn pipeline(
             began.elapsed().as_secs_f64() * 1e3
         )
     });
+    let waiting = std::time::Instant::now();
     let _all = one_call();
-    let _stores = library.saving.read().unwrap_or_else(|e| e.into_inner());
-    let _call = call("store", name);
+    // A save holds the library for the whole serialise (seconds for some
+    // 400 MB): the pipeline is stored after it instead of the worker
+    // waiting that long.
+    let stores = match library.saving.try_read() {
+        Ok(stores) => stores,
+        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            LATER.lock().unwrap_or_else(|e| e.into_inner()).push(Later(wide, pso.clone()));
+            STORED_LATER.fetch_add(1, Ordering::Relaxed);
+            return Ok(pso);
+        }
+    };
+    let storing = std::time::Instant::now();
+    store(library, &wide, &pso);
+    store_later(library);
+    drop(stores);
+    super::spent::add(|p| {
+        p.store_wait += storing - waiting;
+        p.store += storing.elapsed();
+    });
+    Ok(pso)
+}
+
+/// Pipelines made while a save held the library, for the next store.
+struct Later(HSTRING, ID3D12PipelineState);
+// SAFETY: D3D12 objects are free-threaded.
+unsafe impl Send for Later {}
+static LATER: Mutex<Vec<Later>> = Mutex::new(Vec::new());
+static STORED_LATER: AtomicU64 = AtomicU64::new(0);
+
+/// Names of the pipelines the driver compiled in this run, and how many it
+/// compiled again under a name it had compiled before.
+static MADE_NAMES: std::sync::LazyLock<Mutex<HashSet<String>>> = std::sync::LazyLock::new(Default::default);
+static MADE_AGAIN: AtomicU64 = AtomicU64::new(0);
+
+fn store(library: &Library, name: &HSTRING, pso: &ID3D12PipelineState) {
+    let _call = call("store", &name.to_string());
     // SAFETY: a live pipeline; a name already stored (a description that
     // differs) is refused, which leaves the library as it was.
-    if unsafe { library.library.StorePipeline(PCWSTR(wide.as_ptr()), &pso) }.is_ok() {
+    if unsafe { library.library.StorePipeline(PCWSTR(name.as_ptr()), pso) }.is_ok() {
         library.added.fetch_add(1, Ordering::Relaxed);
     }
-    Ok(pso)
+}
+
+/// Stores the pipelines a save held up; the caller holds `saving` to read.
+fn store_later(library: &Library) {
+    let later = std::mem::take(&mut *LATER.lock().unwrap_or_else(|e| e.into_inner()));
+    for Later(name, pso) in &later {
+        store(library, name, pso);
+    }
 }
 
 /// Writes the library and the early list if pipelines were added since the
@@ -582,16 +678,25 @@ pub(crate) fn save(now: bool) {
         }
         *last = Some(std::time::Instant::now());
     }
-    if let Err(e) = std::fs::create_dir_all(dir) {
+    let shared = library_dir().unwrap_or_else(|| dir.clone());
+    if let Err(e) = std::fs::create_dir_all(dir).and_then(|()| std::fs::create_dir_all(&shared)) {
         tracing::warn!(error = %e, "host pipeline library not saved");
         return;
     }
-    let tmp = dir.join(LIBRARY_FILE).with_extension("tmp");
+    let tmp = shared.join(LIBRARY_FILE).with_extension("tmp");
+    {
+        let _stores = library.saving.read().unwrap_or_else(|e| e.into_inner());
+        store_later(library);
+    }
+    let began = std::time::Instant::now();
+    let mut held = std::time::Duration::ZERO;
     // The bytes of the library written to `tmp`; 0 when no pipeline was
     // added: the library on disk is then what it was, and only the early
     // list is written (a title pipeline first drawn with wrote all 1,352 MB
-    // of the library again: run 60's second save).
-    let bytes = {
+    // of the library again: run 60's second save). Also 0 while another run
+    // writes the shared library: the pipelines stay counted as added, for
+    // the next save. A save at the end waits for that run; others do not.
+    let (bytes, _lock) = {
         let _all = one_call();
         // No store between asking the size and writing; loads go on.
         let _alone = library.saving.write().unwrap_or_else(|e| e.into_inner());
@@ -599,8 +704,13 @@ pub(crate) fn save(now: bool) {
         if !USED_CHANGED.swap(false, Ordering::Relaxed) && added == 0 {
             return;
         }
-        if added == 0 {
-            0
+        let wait = std::time::Duration::from_secs(if now { 30 } else { 0 });
+        let lock = if added == 0 { None } else { writer(&shared, wait) };
+        if added > 0 && lock.is_none() {
+            tracing::warn!("host pipeline library not saved this time: another run is saving it");
+        }
+        if lock.is_none() {
+            (0, None)
         } else {
             // SAFETY: a plain query.
             let size = unsafe { library.library.GetSerializedSize() };
@@ -612,16 +722,17 @@ pub(crate) fn save(now: bool) {
             }
             library.added.store(0, Ordering::Relaxed);
             SAVED.store(size as u64, Ordering::Relaxed);
-            size
+            held = began.elapsed();
+            (size, lock)
         }
     };
     // Through `used`: a process that asked for none yet (`victory shaders`)
     // must not write the earlier runs' list over with nothing.
     let used: Vec<String> = used().iter().flatten().cloned().collect();
-    let library_written = if bytes > 0 { replace_library(dir, &tmp) } else { Ok(()) };
+    let library_written = if bytes > 0 { replace_library(&shared, &tmp) } else { Ok(()) };
     if bytes > 0 && library_written.is_ok() {
         // In place unless the system refused and the new one waits beside it.
-        let in_place = !dir.join(NEXT_FILE).exists();
+        let in_place = !shared.join(NEXT_FILE).exists();
         if in_place && VIEW[0].load(Ordering::Relaxed) != 0 {
             REPLACED[1].store(crate::host::now_ms(), Ordering::Relaxed);
             REPLACED[0].fetch_add(1, Ordering::Relaxed);
@@ -642,8 +753,12 @@ pub(crate) fn save(now: bool) {
             bytes,
             early = used.len(),
             made = MADE.load(Ordering::Relaxed),
+            made_again = MADE_AGAIN.load(Ordering::Relaxed),
             loaded = LOADED.load(Ordering::Relaxed),
             started_early = EARLY.load(Ordering::Relaxed),
+            held_ms = held.as_millis() as u64,
+            ms = began.elapsed().as_millis() as u64,
+            stored_later = STORED_LATER.load(Ordering::Relaxed),
             "host pipeline library saved"
         ),
         Err(e) => tracing::warn!(error = %e, "host pipeline library not saved"),
