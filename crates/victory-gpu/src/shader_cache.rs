@@ -12,7 +12,7 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, mpsc};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, mpsc};
 
 use victory_pipeline::{Cache, Converter};
 use victory_shader::emit::{HostShader, StaticSampler, UserData};
@@ -278,6 +278,61 @@ pub fn precompile(container: &[u8]) -> Result<bool, String> {
     Ok(MISSES.load(Ordering::Relaxed) == misses)
 }
 
+/// Translations the pipeline workers run at once: the host's processors
+/// less the title's (an Xbox Series title has 7 cores, 14 threads), at
+/// least one. In play-i 744 shaders that did not translate took 2,761,450
+/// ms of worker time, and from 200 s on the title got too little of the
+/// processor. The title's own threads never wait here: a draw that asks
+/// for a shader first translates it at once.
+/// `VICTORY_TRANSLATE_JOBS=n`: n at once.
+const TITLE_THREADS: usize = 14;
+
+struct Turns {
+    limit: usize,
+    busy: Mutex<usize>,
+    free: Condvar,
+}
+
+struct Turn<'a>(&'a Turns);
+
+impl Turns {
+    fn new(limit: usize) -> Self {
+        Self { limit: limit.max(1), busy: Mutex::new(0), free: Condvar::new() }
+    }
+
+    fn take(&self) -> Turn<'_> {
+        let mut busy = self.busy.lock().unwrap_or_else(|e| e.into_inner());
+        while *busy >= self.limit {
+            busy = self.free.wait(busy).unwrap_or_else(|e| e.into_inner());
+        }
+        *busy += 1;
+        Turn(self)
+    }
+}
+
+impl Drop for Turn<'_> {
+    fn drop(&mut self) {
+        *self.0.busy.lock().unwrap_or_else(|e| e.into_inner()) -= 1;
+        self.0.free.notify_one();
+    }
+}
+
+/// A turn to translate when this is a pipeline worker (`pipeline::make`).
+fn worker_turn() -> Option<Turn<'static>> {
+    static TURNS: OnceLock<Turns> = OnceLock::new();
+    if !std::thread::current().name().is_some_and(|n| n.starts_with("victory-pipelines-")) {
+        return None;
+    }
+    let turns = TURNS.get_or_init(|| {
+        let asked = std::env::var("VICTORY_TRANSLATE_JOBS").ok().and_then(|v| v.trim().parse().ok());
+        let processors = std::thread::available_parallelism().map_or(2, |n| n.get());
+        let limit = asked.unwrap_or(processors.saturating_sub(TITLE_THREADS));
+        tracing::info!(limit = limit.max(1), "translations at once on the pipeline workers");
+        Turns::new(limit)
+    });
+    Some(turns.take())
+}
+
 /// The translation of a console shader container, from the cache when
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
@@ -291,6 +346,7 @@ pub(crate) fn host_shader_finite(container: &[u8], mask: u8) -> Result<HostShade
     let hash = blake3::hash(container).to_hex();
     let (wide, own) = (wave_wide(&hash), firstlane_own(&hash));
     let translate = move |c: &[u8]| {
+        let _turn = worker_turn();
         let plain = || {
             victory_shader::emit::with_wave_wide(wide, || {
                 victory_shader::emit::with_firstlane_own(own, || victory_shader::emit::translate(c))
@@ -748,6 +804,28 @@ mod tests {
         };
         assert_eq!(cached(&cache, &[7; 32], b"a container", translate), Ok(shader()));
         assert_eq!(runs.load(Ordering::Relaxed), 1);
+    }
+
+    /// No more than the limit translate at once, and every one gets a turn.
+    #[test]
+    fn turns_hold_the_limit() {
+        let turns = &Turns::new(3);
+        let (now, most) = (&AtomicU32::new(0), &AtomicU32::new(0));
+        std::thread::scope(|s| {
+            for _ in 0..12 {
+                s.spawn(move || {
+                    for _ in 0..20 {
+                        let _turn = turns.take();
+                        most.fetch_max(now.fetch_add(1, Ordering::SeqCst) + 1, Ordering::SeqCst);
+                        std::thread::yield_now();
+                        now.fetch_sub(1, Ordering::SeqCst);
+                    }
+                });
+            }
+        });
+        assert!((1..=3).contains(&most.load(Ordering::SeqCst)));
+        assert_eq!(*turns.busy.lock().unwrap(), 0);
+        assert_eq!(Turns::new(0).limit, 1);
     }
 
     fn walk(dir: &std::path::Path) -> Vec<PathBuf> {
