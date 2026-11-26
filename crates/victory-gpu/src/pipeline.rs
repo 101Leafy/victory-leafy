@@ -567,7 +567,10 @@ pub(crate) fn note_drop(this: This) {
         let p = pipeline(this);
         skipped_shader(p)
             .map(|hash| format!("skipped shader {hash}"))
-            .or_else(|| make::missing(&p.host))
+            .or_else(|| match &p.loose {
+                Some(loose) => loose.missing(),
+                None => make::missing(&p.host),
+            })
     };
     if let Some(why) = why {
         note_why(why);
@@ -631,10 +634,12 @@ fn hand_out_loose(
     tracing::trace!(?shaders, "pipeline state");
     #[cfg(windows)]
     let host = Arc::new(make::Pending::new(shaders.clone(), graphics));
+    // A loose pipeline's own is never made: its host pipelines go by targets.
     #[cfg(windows)]
-    known::note(host.key(), &shaders, host.graphics.as_deref());
-    #[cfg(windows)]
-    make::early(&host);
+    if loose.is_none() {
+        known::note(host.key(), &shaders, host.graphics.as_deref());
+        make::early(&host);
+    }
     #[cfg(windows)]
     let builder = of_builder(&shaders);
     #[cfg(windows)]
