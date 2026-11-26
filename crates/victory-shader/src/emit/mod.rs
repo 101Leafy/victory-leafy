@@ -532,6 +532,45 @@ pub(super) fn firstlane_own_here() -> bool {
     FIRSTLANE_OWN_HERE.get()
 }
 
+thread_local! {
+    /// [`with_finite_targets`]'s render targets, for this thread's translations.
+    static FINITE_HERE: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
+
+/// Runs `f` (a translation) with the float colour exports to the render
+/// targets in `mask` (bit n: `SV_Target<n>`) held to +-65024 and a NaN as 0,
+/// as `VICTORY_COLOR_FINITE=1` holds them for every target. For the targets
+/// [`finite_targets`] picks: 16-bit and 11/10-bit float, where the console
+/// clamps and the host writes an infinity.
+pub fn with_finite_targets<R>(mask: u8, f: impl FnOnce() -> R) -> R {
+    let before = FINITE_HERE.replace(mask);
+    let out = f();
+    FINITE_HERE.set(before);
+    out
+}
+
+/// The render targets [`with_finite_targets`] asked for on this thread.
+pub(super) fn finite_here() -> u8 {
+    FINITE_HERE.get()
+}
+
+/// The render targets among `formats` (DXGI formats, target n at n) with too
+/// little range for a float export: 16-bit and 11/10-bit float.
+pub fn finite_targets(formats: &[u32]) -> u8 {
+    const NARROW: [u32; 4] = [
+        10, // R16G16B16A16_FLOAT
+        26, // R11G11B10_FLOAT
+        34, // R16G16_FLOAT
+        54, // R16_FLOAT
+    ];
+    formats
+        .iter()
+        .take(8)
+        .enumerate()
+        .filter(|(_, f)| NARROW.contains(f))
+        .fold(0, |m, (i, _)| m | 1 << i)
+}
+
 /// Emits a program whose earlier stages already ran.
 pub fn emit(
     c: &Container,
@@ -2186,8 +2225,15 @@ mod tests {
         }
     }
 
+    #[test]
+    fn narrow_float_targets_are_picked() {
+        assert_eq!(finite_targets(&[10, 2, 26, 28, 34, 41, 54]), 0b101_0101);
+        assert_eq!(finite_targets(&[2, 2, 2, 2, 2, 2, 2, 2, 10]), 0);
+    }
+
     /// A pixel program exporting 1e6, a NaN, -1e6 and 1: as they are, and with
-    /// `VICTORY_COLOR_FINITE` held to 65024, 0, -65024 and 1.
+    /// `VICTORY_COLOR_FINITE` or its target in `with_finite_targets` held to
+    /// 65024, 0, -65024 and 1.
     #[test]
     #[cfg(windows)]
     fn color_exports_are_held_finite_when_asked_to() {
@@ -2245,18 +2291,25 @@ mod tests {
         let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
         let io = io::raise(&p, &native).unwrap();
         let ms = triangle_mesh_to(TRIANGLE, 1.3).unwrap();
-        for finite in [false, true] {
-            let was = super::lower::TEST_COLOR_FINITE.replace(Some(finite));
-            let ps = emit(&c, &native, &p, &st, &io, &res);
+        // (all targets, none, target 0 alone, target 1 alone)
+        let mut made: Vec<(bool, Vec<u8>)> = Vec::new();
+        for (all, mask, finite) in [(true, 0, true), (false, 0, false), (false, 1, true), (false, 2, false)] {
+            let was = super::lower::TEST_COLOR_FINITE.replace(Some(all));
+            let ps = with_finite_targets(mask, || emit(&c, &native, &p, &st, &io, &res));
             super::lower::TEST_COLOR_FINITE.set(was);
             let ps = ps.unwrap();
+            // A held target gives the same shader whichever way it is asked for.
+            for (f, other) in &made {
+                assert_eq!(*f == finite, *other == ps.dxil, "mask {mask:#x}");
+            }
+            made.push((finite, ps.dxil.clone()));
             if let Some(path) = super::validator::Validator::default_path() {
                 let mut v = super::validator::Validator::load(Some(&path)).unwrap();
                 v.validate(&mut ps.dxil.clone()).unwrap();
             }
             let Ok(host) = Host::new(false) else {
                 eprintln!("no hardware device; not run");
-                return;
+                continue;
             };
             let root = host
                 .root_signature_for(&[
@@ -2266,7 +2319,7 @@ mod tests {
                 .unwrap();
             let Ok(pso) = host.mesh_pipeline_with(&root, &ms.dxil, &ps.dxil) else {
                 eprintln!("no mesh pipeline; not run");
-                return;
+                continue;
             };
             let texels = host
                 .draw(
