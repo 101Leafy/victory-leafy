@@ -9125,15 +9125,11 @@ impl Meter {
 
 impl Host {
     /// Shows `texture`, which is in `state` (a host state) and stays in it,
-    /// as frame `frame` (saved if captures are on). `None` if nothing was
-    /// shown; else, in diagnostics builds, whether the frame was black.
-    pub(crate) fn present(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
-        self.present_planes(texture, state, None, frame)
-    }
-
-    /// [`Host::present`] with a second plane, `overlay` in its own host
-    /// state (which it stays in), put over `texture` ([`crate::compose`]).
+    /// as frame `frame` (saved if captures are on), with `overlay`, in its
+    /// own host state (which it stays in), put over it ([`crate::compose`]).
     /// Planes the composer cannot read, or no composer: `texture` alone.
+    /// `None` if nothing was shown; else, in diagnostics builds, whether the
+    /// frame was black.
     pub(crate) fn present_planes(
         &self,
         texture: &ID3D12Resource,
