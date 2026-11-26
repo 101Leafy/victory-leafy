@@ -4536,18 +4536,36 @@ impl State {
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
                         let size = crate::descriptor::host::constant_view_bytes(size);
-                        // Renderer port 5: title memory in place is the
+                        // Renderer port 5: title memory in place (and, with
+                        // `VICTORY_PORT_CBV_COPIES=1`, host copies too) is the
                         // card's to read where it is; nothing is copied.
-                        if size != 0 && address != 0 && crate::port_cbv::in_place_on() {
-                            match crate::shadow::find(address, u64::from(size)).filter(|s| s.in_place()) {
-                                Some(shadow) => {
+                        let in_place = crate::port_cbv::in_place_on();
+                        let copies = crate::port_cbv::copies_on();
+                        if size != 0 && address != 0 && (in_place || copies) {
+                            let shadow = crate::shadow::find(address, u64::from(size));
+                            let choice = crate::port_cbv::table_use(
+                                in_place,
+                                copies,
+                                shadow.is_some(),
+                                shadow.as_ref().is_some_and(|s| s.in_place()),
+                            );
+                            match (choice, shadow) {
+                                (crate::port_cbv::TableUse::InPlace, Some(shadow)) => {
                                     if host.constant_raw_at(index, &shadow.buffer, shadow.gpu(address), size) {
                                         crate::port_cbv::in_place(size);
                                         continue;
                                     }
                                     crate::port_cbv::copied(false);
                                 }
-                                None => crate::port_cbv::copied(true),
+                                (crate::port_cbv::TableUse::HostCopy, Some(shadow)) => {
+                                    if host.constant_raw_at(index, &shadow.buffer, shadow.gpu(address), size) {
+                                        shadow.refresh(list, address, u64::from(size));
+                                        crate::port_cbv::in_copy(size);
+                                        continue;
+                                    }
+                                    crate::port_cbv::copied(false);
+                                }
+                                _ => crate::port_cbv::copied(true),
                             }
                         }
                         if size == 0 || address == 0 {
