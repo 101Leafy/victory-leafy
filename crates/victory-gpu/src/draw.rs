@@ -2655,9 +2655,13 @@ impl State {
                 && !baking
                 && crate::descriptor::host::show_after()
                 && heap.handle(index).is_some_and(|handle| !host.texture_slot_made_from(index, handle));
+            #[cfg(feature = "diagnostics")]
+            let mirroring = std::time::Instant::now();
             let view = heap.handle(index).and_then(|handle| {
                 if shows_other || late { crate::descriptor::view(handle) } else { host.mirror(index, handle, true) }
             });
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::lap(crate::copystat::C::HeapTexMirrorNs, mirroring);
             let at_once = || {
                 if late && let Some(handle) = heap.handle(index) {
                     let _ = host.mirror(index, handle, true);
@@ -2672,7 +2676,11 @@ impl State {
                     continue;
                 }
             };
+            #[cfg(feature = "diagnostics")]
+            let started = std::time::Instant::now();
             let texture = crate::resource::host_resource(resource);
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::lap(crate::copystat::C::HeapTexHostNs, started);
             let title_fills = texture.is_some_and(crate::texture::title_written);
             if !title_fills {
                 at_once();
@@ -2711,7 +2719,11 @@ impl State {
                 let memory = if again.is_none() && heap_recheck() { crate::texture::title_span(resource, first) } else { None };
                 match memory {
                     Some((at, len)) => {
+                        #[cfg(feature = "diagnostics")]
+                        let started = std::time::Instant::now();
                         let print = crate::texture::fingerprint(at, len);
+                        #[cfg(feature = "diagnostics")]
+                        crate::copystat::lap(crate::copystat::C::HeapTexPrintNs, started);
                         host.texture_slot_recheck(index, write, frame + again_in, (at, len), print, 0, frame);
                     }
                     None => host.texture_slot_done(index, write, again),
@@ -2826,7 +2838,11 @@ impl State {
             match memory {
                 // Whole and uploaded: looked at again (see above).
                 Some((at, len)) => {
+                    #[cfg(feature = "diagnostics")]
+                    let started = std::time::Instant::now();
                     let print = crate::texture::fingerprint(at, len);
+                    #[cfg(feature = "diagnostics")]
+                    crate::copystat::lap(crate::copystat::C::HeapTexPrintNs, started);
                     host.texture_slot_recheck(index, write, frame + again_in, (at, len), print, 0, frame);
                 }
                 None => host.texture_slot_done(index, write, again),
