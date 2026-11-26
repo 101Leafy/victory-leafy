@@ -186,11 +186,13 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     }
     if p.made.get().is_none() {
         start(p, REQUESTED);
-        if p.graphics.is_none() && compute_waits() {
+        let frame = crate::frame::current();
+        if p.graphics.is_none() && compute_waits() && compute_wait_left(frame) {
             // Made here, or waited for while a worker makes it.
+            let began = Instant::now();
             p.make();
+            compute_waited(frame, began.elapsed());
         } else {
-            let frame = crate::frame::current();
             wait(p, frame);
             if p.made.get().is_none() {
                 dropped(p, frame);
@@ -218,6 +220,52 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
 fn compute_waits() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_COMPUTE_WAIT").is_none_or(|v| v != "0"))
+}
+
+/// What a frame may spend making compute pipelines for its dispatches
+/// (`VICTORY_PIPELINE_COMPUTE_WAIT_MS`, 5 s; 0: no cap). A cold library can
+/// meet dozens of new compute programs in one frame, and the title's
+/// watchdog fires at 30 s. Once a frame has spent it, its dispatches wait
+/// within the frame's budget as draws do; the one pipeline being made when
+/// the cap runs out still finishes.
+fn compute_wait_cap() -> Duration {
+    static CAP: OnceLock<Duration> = OnceLock::new();
+    *CAP.get_or_init(|| {
+        let millis = std::env::var("VICTORY_PIPELINE_COMPUTE_WAIT_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(5_000);
+        Duration::from_millis(millis)
+    })
+}
+
+/// Frame and time spent in it making compute pipelines for dispatches.
+static COMPUTE_SPENT: Mutex<(u64, Duration)> = Mutex::new((u64::MAX, Duration::ZERO));
+
+fn compute_wait_left(frame: u64) -> bool {
+    let cap = compute_wait_cap();
+    if cap.is_zero() {
+        return true;
+    }
+    let mut spent = COMPUTE_SPENT.lock().unwrap_or_else(|e| e.into_inner());
+    if spent.0 != frame {
+        *spent = (frame, Duration::ZERO);
+    }
+    spent.1 < cap
+}
+
+fn compute_waited(frame: u64, took: Duration) {
+    let cap = compute_wait_cap();
+    let mut spent = COMPUTE_SPENT.lock().unwrap_or_else(|e| e.into_inner());
+    if spent.0 != frame {
+        *spent = (frame, Duration::ZERO);
+    }
+    let before = spent.1;
+    spent.1 += took;
+    if !cap.is_zero() && before < cap && spent.1 >= cap {
+        tracing::info!(
+            frame,
+            ms = spent.1.as_millis() as u64,
+            "a frame spent its compute wait: its other dispatches wait within the frame's budget (VICTORY_PIPELINE_COMPUTE_WAIT_MS)"
+        );
+    }
 }
 
 /// The pipelines a frame's draws were dropped for, logged when the next
@@ -1059,6 +1107,21 @@ mod tests {
         assert_eq!(quiet_limit(Some("0"), 24, 6), 6);
         assert_eq!(quiet_limit(Some("all"), 24, 6), 24);
         assert_eq!(quiet_limit(Some("all"), 1, 1), 1);
+    }
+
+    #[test]
+    fn a_frame_stops_making_compute_pipelines_at_its_cap() {
+        let cap = compute_wait_cap();
+        if cap.is_zero() {
+            return;
+        }
+        let frame = u64::MAX - 7;
+        assert!(compute_wait_left(frame));
+        compute_waited(frame, cap / 2);
+        assert!(compute_wait_left(frame));
+        compute_waited(frame, cap);
+        assert!(!compute_wait_left(frame));
+        assert!(compute_wait_left(frame + 1));
     }
 
     #[test]
