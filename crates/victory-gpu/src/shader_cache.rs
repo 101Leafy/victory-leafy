@@ -1132,7 +1132,10 @@ mod tests {
         let cache = Cache::open(dir.path()).unwrap();
         let refuse = |_: &[u8]| Err::<HostShader, _>(ShaderError::Unsupported { offset: 4, what: "test opcode" });
         assert!(cached(&cache, &[7; 32], b"a container", refuse).is_err());
-        for e in walk(dir.path()) {
+        // Entries sit in folders; the root holds the cache's own marker.
+        let entries: Vec<_> = walk(dir.path()).into_iter().filter(|e| e.parent() != Some(dir.path())).collect();
+        assert_eq!(entries.len(), 1);
+        for e in entries {
             let mut bytes = std::fs::read(&e).unwrap();
             assert!(bytes.starts_with(REFUSED));
             bytes[REFUSED.len()] ^= 1;
