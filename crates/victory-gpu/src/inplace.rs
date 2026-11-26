@@ -1145,9 +1145,14 @@ fn census_of(spans: &[(u64, u64, bool)]) -> Vec<String> {
         bytes >> 20,
         big >> 20
     ));
+    // VICTORY_SECTION_MB cuts an allocation into many equal sections: a line for each size.
+    let mut groups = std::collections::BTreeMap::new();
     for &(_, bytes, committed) in &v.sections {
+        *groups.entry((bytes, committed)).or_insert(0usize) += 1;
+    }
+    for ((bytes, committed), count) in groups {
         lines.push(format!(
-            "census, a section of {} MB, {}",
+            "census, {count} section(s) of {} MB, {}",
             bytes >> 20,
             if committed { "committed: it can be opened as one heap" } else { "reserved: refused as a heap until it is made with SEC_COMMIT" }
         ));
