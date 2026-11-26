@@ -649,6 +649,24 @@ fn scene_wide(c: &Container, native: &NativeProgram) -> bool {
         )
 }
 
+/// The two programs the pair meetings were made for ([`lower::with_pair_meetings`]), widened
+/// only where the meetings are asked for ([`lower::wave_wide_on`]: `VICTORY_WAVE_WIDE=1`, or a
+/// test's switch): the triangle clip's heap defragmentation (`vfx_triangleClip:CS_DefragHeap_
+/// ComputeRelocations`, groups of 128), which holds two console waves that walk the heap each
+/// its own way, so their host waves meet per console wave ([`widen`]); and the underwater
+/// volumetric light (`water_shading:CS_TransmissionVolumetricsSubmerged`, groups of 64),
+/// widened like its tiled siblings (29 branches). (The clip's `CS_CollectTriangles_Meshlets`,
+/// groups of 1024, does not fit that way: its own LDS is the host group's whole 32 KiB.)
+fn pair_wide(c: &Container, native: &NativeProgram) -> bool {
+    let threads = match native.io {
+        crate::native::StageIo::Cs(cs) => cs.threads.iter().product::<u32>(),
+        _ => return false,
+    };
+    lower::wave_wide_on()
+        && (threads == 64 && c.digest == [0xf1, 0xf1, 0x61, 0xe4, 0x7e, 0xef, 0xa3, 0x64, 0x69, 0x18, 0x39, 0xfd, 0x72, 0x06, 0xcc, 0xf6]
+            || threads == 128 && c.digest == [0x50, 0xcf, 0x28, 0x32, 0x8b, 0x58, 0x05, 0x3d, 0xa8, 0x9a, 0x8d, 0xa0, 0x1a, 0xa1, 0x23, 0xc6])
+}
+
 /// Runs `f` (a translation on this thread) with the wave-wide form on when `on`
 /// ([`wave_wide_only`]).
 pub fn with_wave_wide<T>(on: bool, f: impl FnOnce() -> T) -> T {
@@ -886,7 +904,7 @@ fn emit_forms(
         let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1") || WIDE_HERE.get() || scene_wide(c, native);
         if !splits.is_empty() && (!halves || wide_on) {
             let why = std::env::var_os("VICTORY_WAVE_WHY").is_some();
-            match widen(c, native, p, &splits, why, false) {
+            match widen(c, native, p, &splits, why, false, wide_on) {
                 Ok((shader, wave)) if !(halves && wave == Some(64)) => {
                     if why {
                         eprintln!("SCALAR-SPLITS {} branches taken wave-wide", splits.len());
@@ -971,7 +989,7 @@ fn emit_forms(
         // lost the card in a submission of two programs that had just moved to it
         // (`ptfx_CS_lightAtlas_Sprite` and `_Trail`). The 32-lane programs' form below, which
         // has no barrier, stays on.
-        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1") || WIDE_HERE.get() || scene_wide(c, native);
+        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1") || WIDE_HERE.get() || scene_wide(c, native) || pair_wide(c, native);
         // A single guest wave can iterate an active-lane loop until both host
         // halves have finished. The precise latch and convergence conditions
         // for the driver compute route are checked by widen().
@@ -1034,7 +1052,7 @@ fn emit_forms(
                         Some(p),
                     ];
                     if let Some(base) = bases.into_iter().flatten().next() {
-                        let again = widen(c, native, base, &[], why, driver_loop && !wide_on);
+                        let again = widen(c, native, base, &[], why, driver_loop && !wide_on, wide_on);
                         report("wave-wide branches", &again);
                         if done(&again) {
                             return again;
@@ -1098,7 +1116,7 @@ fn emit_forms(
                 && what == lower::LANE_MASK
                 && std::env::var_os("VICTORY_WAVE_WIDE").is_none_or(|v| v != "0") =>
         {
-            let again = widen(c, native, p, &[], std::env::var_os("VICTORY_WAVE_WHY").is_some(), false);
+            let again = widen(c, native, p, &[], std::env::var_os("VICTORY_WAVE_WHY").is_some(), false, false);
             match again {
                 Ok(_) => again,
                 Err(_) => {
@@ -1185,9 +1203,13 @@ fn split_choices(
 /// branches around its cross-lane code taken wave-wide ([`structure::structure_wide`]): the
 /// lowering names the blocks where the two host waves must meet and could not
 /// (`lower::take_needs`), the branches whose regions hold them are widened, and so on until
-/// it translates or a branch cannot be widened. Only where a thread group is one console
-/// wave: with several, the waves of a group would decide differently and a barrier inside
-/// such a branch would wait for threads that never come.
+/// it translates or a branch cannot be widened. Where a thread group is several console
+/// waves, those decide differently and a group barrier inside such a branch would wait for
+/// threads that never come: a wave-wide decision is then the whole group's
+/// (`Lower::wave_wide`). With `groups` and the meetings asked for ([`lower::wave_wide_on`]:
+/// `VICTORY_WAVE_WIDE=1`, or a test's switch), the host waves of each console wave meet on
+/// their own there instead ([`lower::with_pair_meetings`]; whole console waves only), and
+/// each console wave decides its own way, as on the console.
 fn widen(
     c: &Container,
     native: &NativeProgram,
@@ -1195,6 +1217,7 @@ fn widen(
     seed: &[usize],
     why: bool,
     active_loop_only: bool,
+    groups: bool,
 ) -> Result<(HostShader, Option<u32>), ShaderError> {
     const NOT: ShaderError = ShaderError::Unsupported {
         offset: 0,
@@ -1209,6 +1232,14 @@ fn widen(
         crate::native::StageIo::Cs(_) => {}
         _ => return Err(NOT),
     }
+    // (several console waves to a group, each two host waves, whose host waves meet per
+    // console wave: only where asked for, `VICTORY_WAVE_WIDE=1` or a test's switch; every
+    // other program keeps the whole group's decisions, `Lower::wave_wide`)
+    let pairs = groups
+        && lower::wave_wide_on()
+        && native.wave64
+        && lower::host_max_wave() == 32
+        && matches!(native.io, crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() > 64 && cs.threads.iter().product::<u32>() % 64 == 0);
     let mut wide: std::collections::HashSet<usize> = seed.iter().copied().collect();
     loop {
         let st = structure::structure_wide(p, &wide)?;
@@ -1222,7 +1253,11 @@ fn widen(
         let io = io::raise(p, native)?;
         let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
         lower::take_needs();
-        let r = emit_program(c, native, p, &st, &io, &res);
+        let r = if pairs {
+            lower::with_pair_meetings(|| emit_program(c, native, p, &st, &io, &res))
+        } else {
+            emit_program(c, native, p, &st, &io, &res)
+        };
         let needs = lower::take_needs();
         // (or translated for 64-lane waves still: shared memory read and written where not
         // every lane runs, whose blocks the lowering names too)
@@ -1235,7 +1270,8 @@ fn widen(
             }
             return r;
         }
-        let Some((around, unsafe_loop)) = lower::branches_around(&st, &needs) else {
+        let around = || lower::branches_around(&st, &needs);
+        let Some((around, unsafe_loop)) = (if pairs { lower::with_pair_meetings(around) } else { around() }) else {
             // Not followed (an indirect exit): emitting the program as it stands could put a
             // barrier where one of the two host waves never comes.
             return Err(ShaderError::Unsupported {
