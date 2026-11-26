@@ -354,11 +354,15 @@ pub(crate) enum C {
     /// `settle_now` (a present, a fence, descriptor slots run out).
     SubmitLockDoneNs,
     SubmitLockSettleNs,
+    /// Read-back buffers: the wait for the pool's lock, and the making of
+    /// the ones the pool had none idle for.
+    ReadBackPoolNs,
+    ReadBacksMadeNs,
 }
 const COUNTERS: usize = 256;
 
 /// The counters' names, in the order of [`C`], for the frame recorder's columns.
-pub(crate) const NAMES: [&str; 191] = [
+pub(crate) const NAMES: [&str; 193] = [
     "Submissions", "Copies", "CopyBytes", "Refreshes", "RefreshBytes", "Skipped", "SkippedBytes", "Runs",
     "RunUs", "Queries", "QueryUs", "MoveUs", "Unmapped", "Watches", "WatchUs", "Checked", "Unchanged",
     "Fallbacks", "GuardFaults", "TexWatched", "TexHashed", "TexChanged", "TexHot", "Frames", "RecordCalls",
@@ -394,6 +398,7 @@ pub(crate) const NAMES: [&str; 191] = [
     "HeapTexUploadNs",
     "SettleTablesNs", "SettleResultsNs", "SettleListsNs",
     "SubmitLockDoneNs", "SubmitLockSettleNs",
+    "ReadBackPoolNs", "ReadBacksMadeNs",
 ];
 /// One of some sets of counters, each in lines of the processor's memory of
 /// its own: a set for all threads had them wait for each other's lines at
