@@ -252,6 +252,20 @@ pub(crate) enum C {
     CopyTexRecordNs,
     CopyTexCalls,
     CopyTexSlow,
+    /// Watch: write faults in the descriptor heaps' guarded blocks that
+    /// opened one 4 KiB part, ones that opened the whole block because
+    /// enough parts were open or because the block has other views, and,
+    /// as guards made them read-only again, the blocks with parts open and
+    /// those parts (`VICTORY_GUARD_PARTS`).
+    GuardPartFaults,
+    GuardPartWhole,
+    GuardPartAliased,
+    GuardPartBlocks,
+    GuardPartParts,
+    /// Draws: fresh tables built and their slots, asks another list made at
+    /// the same table this frame (slots, those holding constant views), asks
+    /// made from the same records at another table, build time, and asks
+    /// served from another list's table (`VICTORY_SHARED_TABLES`).
     FreshMade,
     FreshMadeSlots,
     FreshAgainSlots,
@@ -265,7 +279,7 @@ pub(crate) enum C {
 const COUNTERS: usize = 160;
 
 /// The counters' names, in the order of [`C`], for the frame recorder's columns.
-pub(crate) const NAMES: [&str; 144] = [
+pub(crate) const NAMES: [&str; 149] = [
     "Submissions", "Copies", "CopyBytes", "Refreshes", "RefreshBytes", "Skipped", "SkippedBytes", "Runs",
     "RunUs", "Queries", "QueryUs", "MoveUs", "Unmapped", "Watches", "WatchUs", "Checked", "Unchanged",
     "Fallbacks", "GuardFaults", "TexWatched", "TexHashed", "TexChanged", "TexHot", "Frames", "RecordCalls",
@@ -287,8 +301,10 @@ pub(crate) const NAMES: [&str; 144] = [
     "CloseBudgetNs", "CloseComingNs", "CloseQueryNs", "CloseDriverNs", "ReadBacksMade", "ReadBacksReused",
     "RefusedNoSlots", "RefusedNoHeap", "RefusedNotHeld", "RefusedNoIndex", "RefusedKind", "RefusedRootTable",
     "CopyTexBackNs", "CopyTexSourceNs", "CopyTexFirstNs", "CopyTexLevelsNs", "CopyTexRecordNs", "CopyTexCalls",
-    "CopyTexSlow", "FreshMade", "FreshMadeSlots", "FreshAgainSlots", "FreshAgainCbvSlots", "FreshSame",
-    "FreshSameSlots", "FreshNs", "FreshShared", "FreshSharedSlots",
+    "CopyTexSlow",
+    "GuardPartFaults", "GuardPartWhole", "GuardPartAliased", "GuardPartBlocks", "GuardPartParts",
+    "FreshMade", "FreshMadeSlots", "FreshAgainSlots", "FreshAgainCbvSlots", "FreshSame", "FreshSameSlots",
+    "FreshNs", "FreshShared", "FreshSharedSlots",
 ];
 /// One of some sets of counters, each in lines of the processor's memory of
 /// its own: a set for all threads had them wait for each other's lines at
