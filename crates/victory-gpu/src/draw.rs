@@ -520,6 +520,10 @@ fn mesh_kept(pipeline: usize) -> bool {
 /// Draws recorded on the host GPU since the last frame line.
 static DRAWN: AtomicU64 = AtomicU64::new(0);
 
+/// Mesh dispatches of more than 65,535 groups, cut to that, since the start.
+#[cfg(feature = "diagnostics")]
+pub(crate) static MESH_CUT: AtomicU64 = AtomicU64::new(0);
+
 /// Draws run on the host so far.
 pub(crate) fn drawn() -> u64 {
     DRAWN.load(Ordering::Relaxed)
@@ -3393,6 +3397,8 @@ impl State {
                     // undefined there.)
                     if x > 65_535 {
                         once!(x, "a mesh dispatch of more groups than the host takes: cut");
+                        #[cfg(feature = "diagnostics")]
+                        MESH_CUT.fetch_add(1, Ordering::Relaxed);
                     }
                     // SAFETY: an open list with everything set.
                     unsafe { l6.DispatchMesh(x.min(65_535), 1, 1) };
