@@ -20,7 +20,10 @@
 //!   (+0x204/+0x208), then the title's own else-path (screen size set,
 //!   +0xd8c3a0 if the height changed). Everything that reads the settings
 //!   after it (the device parameters +0x1e0fb30, the render size +0x7b4e10)
-//!   sees the same size.
+//!   sees the same size. Below 4K the back buffers leave most of the pool
+//!   they are placed in (+0x247ad10, 64 MB) unused, and the title's check
+//!   that no more than 2 MB is left (+0x247af2b) breaks into the debugger:
+//!   that check is skipped with any `VICTORY_OUTPUT`.
 //! - **Render scale.** The upscaler the title picks (+0x7e93f0: 6, its own,
 //!   except on Series S with a flag, 7, AMD FidelityFX) gives the render
 //!   size from the output size (+0x7e92f0 → the upscaler's +0x50 method):
@@ -111,6 +114,14 @@ pub const OUTPUT: Site = Site {
         0x39, 0xfd, 0x74, 0x07, 0xb1, 0x01, // cmp ebp, edi ; je ; mov cl, 1
         0xe8, 0x38, 0x8e, 0xb4, 0xfe, // call +0xd8c3a0
     ],
+};
+
+/// The back buffer pool's check, +0x247af2b: `jbe` over an `int3` when no
+/// more than 2 MB of the pool is left.
+pub const POOL_LEFT: Site = Site {
+    at: 0x247af2b,
+    what: "back buffer pool's leftover check",
+    bytes: &[0x76, 0x01, 0xcc],
 };
 
 /// The title's own upscaler, its method +0x28f1e70: `mov dword [rcx+90h],
@@ -262,6 +273,7 @@ pub unsafe fn apply_asked(base: usize, size: usize) {
     let mut asked: Vec<(&Site, Vec<u8>, String)> = Vec::new();
     if let Some((w, h)) = asked_output() {
         asked.push((&OUTPUT, output_code(w, h), format!("{w}x{h}")));
+        asked.push((&POOL_LEFT, vec![0xeb, 0x01], "skipped".into()));
     }
     if let Some(s) = asked_render_scale() {
         asked.push((&OWN_SCALE, own_scale_code(s), format!("{s}")));
@@ -359,6 +371,7 @@ mod tests {
         let changed: Vec<usize> = (0..ffx.len()).filter(|&i| ffx[i] != FFX_SCALE.bytes[i]).collect();
         assert!(changed.iter().all(|&i| (0x2c..0x30).contains(&i) || (0x36..0x3a).contains(&i) || (0x64..0x68).contains(&i)));
         assert_eq!(picker_code(7), [0xb8, 7, 0, 0, 0, 0xc3]);
+        assert_eq!(POOL_LEFT.at + 2 + POOL_LEFT.bytes[1] as usize, POOL_LEFT.at + 3, "jbe lands past the int3");
     }
 
     #[cfg(windows)]
