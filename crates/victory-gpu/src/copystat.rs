@@ -343,11 +343,17 @@ pub(crate) enum C {
     HeapTexMappedNs,
     HeapTexSameNs,
     HeapTexUploadNs,
+    /// Settles for lists in the air, by cause: dynamic descriptor slots run
+    /// out (`settle_for_tables`), the card compare result area full
+    /// (`card_results_low`), and too many lists out (`late_most`).
+    SettleTablesNs,
+    SettleResultsNs,
+    SettleListsNs,
 }
 const COUNTERS: usize = 192;
 
 /// The counters' names, in the order of [`C`], for the frame recorder's columns.
-pub(crate) const NAMES: [&str; 186] = [
+pub(crate) const NAMES: [&str; 189] = [
     "Submissions", "Copies", "CopyBytes", "Refreshes", "RefreshBytes", "Skipped", "SkippedBytes", "Runs",
     "RunUs", "Queries", "QueryUs", "MoveUs", "Unmapped", "Watches", "WatchUs", "Checked", "Unchanged",
     "Fallbacks", "GuardFaults", "TexWatched", "TexHashed", "TexChanged", "TexHot", "Frames", "RecordCalls",
@@ -381,6 +387,7 @@ pub(crate) const NAMES: [&str; 186] = [
     "HeapTexRoomNs", "HeapTexRemappedNs", "HeapTexShortNs", "HeapTexRemadeNs", "HeapTexFlipNs", "HeapTexWaitingNs",
     "HeapTexDueNs", "HeapTexLoopNs", "HeapTexLooks", "HeapTexCheckNs", "HeapTexMappedNs", "HeapTexSameNs",
     "HeapTexUploadNs",
+    "SettleTablesNs", "SettleResultsNs", "SettleListsNs",
 ];
 /// One of some sets of counters, each in lines of the processor's memory of
 /// its own: a set for all threads had them wait for each other's lines at
