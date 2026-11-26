@@ -3218,7 +3218,12 @@ impl Shadow {
     /// the frame line's counts.
     fn compared(&self, from: usize, to: usize) {
         #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::BackCompared, (to - from) as u64);
+        {
+            crate::copystat::add(crate::copystat::C::BackCompared, (to - from) as u64);
+            if crate::copystat::again(3, (self.start as usize, from, to)) {
+                crate::copystat::add(crate::copystat::C::BackAgainBytes, (to - from) as u64);
+            }
+        }
         let (bytes, ranges) = if self.window { (2, 5) } else { (3, 6) };
         BACK_CLASS[bytes].fetch_add((to - from) as u64, Ordering::Relaxed);
         BACK_CLASS[ranges].fetch_add(1, Ordering::Relaxed);

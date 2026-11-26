@@ -146,11 +146,40 @@ pub(crate) enum C {
     /// Tables made afresh in a list that another list of the same frame
     /// had made already from the same records.
     FreshAgain,
+    /// Refreshes of a copy that went as far as `Shadow::update`, those of
+    /// them that copied nothing, and their microseconds; refreshes of a copy
+    /// and range refreshed before in the same frame, and their bytes.
+    RefreshUpdates,
+    RefreshEmpty,
+    RefreshEmptyUs,
+    RefreshAgain,
+    RefreshAgainBytes,
+    /// Kernel askings about title memory it refused (not write-watched), and
+    /// their microseconds; of those, ranges refused before in the same frame;
+    /// askings not made because the range was refused before in the frame
+    /// (`VICTORY_REFUSED_ONCE`); askings that went through for a range asked
+    /// before in the same frame, and their bytes.
+    AskRefused,
+    AskRefusedUs,
+    AskRefusedAgain,
+    AskSkipped,
+    AskAgain,
+    AskAgainBytes,
+    /// Blocks made read-only that had been made read-only before in the same
+    /// frame (opened by a write in between).
+    GuardAgain,
+    /// Bytes of copies compared after a submission that were compared after
+    /// another submission of the same frame.
+    BackAgainBytes,
+    /// Bytes a submission's pending refresh of a copy took in between the
+    /// ranges asked for, when a range was added apart from the one before:
+    /// the range that covers both is refreshed, not the two.
+    RefreshGapBytes,
 }
 const COUNTERS: usize = 96;
 
 /// The counters' names, in the order of [`C`], for the frame recorder's columns.
-pub(crate) const NAMES: [&str; 79] = [
+pub(crate) const NAMES: [&str; 93] = [
     "Submissions", "Copies", "CopyBytes", "Refreshes", "RefreshBytes", "Skipped", "SkippedBytes", "Runs",
     "RunUs", "Queries", "QueryUs", "MoveUs", "Unmapped", "Watches", "WatchUs", "Checked", "Unchanged",
     "Fallbacks", "GuardFaults", "TexWatched", "TexHashed", "TexChanged", "TexHot", "Frames", "RecordCalls",
@@ -163,6 +192,10 @@ pub(crate) const NAMES: [&str; 79] = [
     "NothingBackUs", "WaitsForGroups", "WaitsForBuffers", "IndirectBounded", "HeapLooked",
     "HeapLookedWritten", "HeapSameAgain", "HeapSelfMarks", "DynamicSlots", "DynamicSteps", "DynamicFull",
     "FreshAgain",
+    "RefreshUpdates",
+    "RefreshEmpty", "RefreshEmptyUs", "RefreshAgain", "RefreshAgainBytes", "AskRefused", "AskRefusedUs",
+    "AskRefusedAgain", "AskSkipped", "AskAgain", "AskAgainBytes", "GuardAgain", "BackAgainBytes",
+    "RefreshGapBytes",
 ];
 /// One of some sets of counters, each in lines of the processor's memory of
 /// its own: a set for all threads had them wait for each other's lines at
@@ -473,7 +506,7 @@ mod command_tests {
     #[test]
     fn every_counter_is_named() {
         use super::{C, COUNTERS, NAMES};
-        assert_eq!(C::IndirectBounded as usize + 1, NAMES.len());
+        assert_eq!(C::RefreshGapBytes as usize + 1, NAMES.len());
         assert_eq!(NAMES[C::Frames as usize], "Frames");
         assert!(NAMES.len() <= COUNTERS);
     }
@@ -1457,4 +1490,24 @@ pub(crate) fn log(frames: f64) {
             us as f64 / 1e3 / frames
         );
     }
+}
+
+/// What was worked on this frame, by kind (0 refreshes, 1 kernel askings, 2
+/// refused askings, 3 compares after submissions, 4 blocks made read-only):
+/// the frame and the keys.
+#[cfg(feature = "diagnostics")]
+static SEEN: Mutex<(u64, [Option<std::collections::HashSet<(usize, usize, usize)>>; 5])> =
+    Mutex::new((0, [None, None, None, None, None]));
+
+/// Whether work of `kind` on `key` was done before in this frame (and notes
+/// it done): for the counters of work done twice.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn again(kind: usize, key: (usize, usize, usize)) -> bool {
+    let frame = crate::frame::current();
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if seen.0 != frame {
+        seen.0 = frame;
+        seen.1.iter_mut().flatten().for_each(|keys| keys.clear());
+    }
+    !seen.1[kind].get_or_insert_with(Default::default).insert(key)
 }

@@ -248,6 +248,11 @@ thread_local! {
 fn kernel_written(first: usize, last: usize) -> Option<Vec<(usize, u16)>> {
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
+    if refused_before(first, last) {
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::AskSkipped, 1);
+        return None;
+    }
     FOUND.with(|found| {
         let mut found = found.borrow_mut();
         let mut count = (last - first) * PAGE / KERNEL_PAGE;
@@ -272,8 +277,20 @@ fn kernel_written(first: usize, last: usize) -> Option<Vec<(usize, u16)>> {
         {
             tally(10, u64::from(failed));
             tally(11, started.elapsed().as_nanos() as u64);
+            use crate::copystat::{C, add, again};
+            if failed {
+                add(C::AskRefused, 1);
+                add(C::AskRefusedUs, started.elapsed().as_micros() as u64);
+                if again(2, (first, last, 0)) {
+                    add(C::AskRefusedAgain, 1);
+                }
+            } else if again(1, (first, last, 0)) {
+                add(C::AskAgain, 1);
+                add(C::AskAgainBytes, ((last - first) * PAGE) as u64);
+            }
         }
         if failed {
+            refused(first, last);
             return None;
         }
         #[cfg(feature = "diagnostics")]
@@ -296,6 +313,56 @@ fn kernel_written(first: usize, last: usize) -> Option<Vec<(usize, u16)>> {
         }
         Some(pages)
     })
+}
+
+/// Whether a range the kernel refused to answer for (memory that is not
+/// write-watched: the title's views, its other heaps) is not asked about
+/// again in the same frame (`VICTORY_REFUSED_ONCE=0`: asked every time, as
+/// before).
+///
+/// Of 460 kernel askings a frame some 210 were refused (play-prof, gameplay):
+/// the submission's one asking asked every view range its lists refresh, the
+/// refresh that followed asked the same range again before it went to the
+/// guards, and the next submission did both once more. A refusal stands for
+/// as long as the memory stays as it is mapped, and the title maps and
+/// unmaps its views between frames, not in the middle of one; a range the
+/// title made write-watched in the frame is then guarded, or copied whole,
+/// until the next frame asks again.
+fn refused_once() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_REFUSED_ONCE").is_none_or(|v| v != "0"))
+}
+
+/// Ranges (first page, past the last) the kernel refused this frame, and the
+/// frame.
+static REFUSED: Mutex<(u64, Option<std::collections::HashSet<(usize, usize)>>)> = Mutex::new((0, None));
+
+/// Whether the kernel refused to answer for `[first, last)` before in this
+/// frame ([`refused_once`]).
+fn refused_before(first: usize, last: usize) -> bool {
+    if !refused_once() {
+        return false;
+    }
+    let frame = crate::frame::current();
+    let mut refused = REFUSED.lock().unwrap_or_else(|e| e.into_inner());
+    if refused.0 != frame {
+        *refused = (frame, None);
+        return false;
+    }
+    refused.1.as_ref().is_some_and(|ranges| ranges.contains(&(first, last)))
+}
+
+/// The kernel refused to answer for `[first, last)`.
+fn refused(first: usize, last: usize) {
+    if !refused_once() {
+        return;
+    }
+    let frame = crate::frame::current();
+    let mut refused = REFUSED.lock().unwrap_or_else(|e| e.into_inner());
+    if refused.0 != frame {
+        *refused = (frame, None);
+    }
+    refused.1.get_or_insert_with(Default::default).insert((first, last));
 }
 
 /// Ranges of one submission closer than this are asked about together:
@@ -1794,7 +1861,11 @@ fn is_view(start: usize, end: usize) -> bool {
 /// `VICTORY_VIEW_GUARD=0` leaves the other views as they are, as before.
 fn protect(g: &mut Guards, from: usize, to: usize) {
     #[cfg(feature = "diagnostics")]
-    crate::faultbook::note(crate::faultbook::What::Taken, from, to, 0);
+    {
+        crate::faultbook::note(crate::faultbook::What::Taken, from, to, 0);
+        let again = (from..to).filter(|&block| crate::copystat::again(4, (block, 0, 0))).count();
+        crate::copystat::add(crate::copystat::C::GuardAgain, again as u64);
+    }
     protect_here(g, from, to);
     cover(g, from, to);
 }
