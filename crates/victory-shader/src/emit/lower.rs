@@ -15,7 +15,7 @@ use super::shader::{Shader, flags};
 use crate::ShaderError;
 use crate::gfx10::{Dpp, Fields, NULL, Operand};
 use crate::io::{Barycentric, Export, Input, Interp, Io, Target};
-use crate::ir::{EXEC, Exit, Inst, Program, Reg, Value};
+use crate::ir::{EXEC, Exit, Inst, Program, Reg, VCC, Value};
 use crate::native::{HwStage, NativeProgram, ResourceType, RootType, StageIo, Usage, UsedResource};
 use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source};
 use crate::structure::{Atom, Bool, LaneExit, Structured};
@@ -455,6 +455,12 @@ struct Lower<'a> {
     cur_ir: usize,
     /// Whole-wave sections by block and start index.
     sections: HashMap<usize, HashMap<usize, super::wave::Section>>,
+    /// The run of guarded VALU work being lowered in every lane
+    /// ([`Self::guarded_run`]): block, first and end index.
+    spec: Option<(usize, usize, usize)>,
+    /// With [`super::guard_runs`]: per value, the last instruction of its own
+    /// block that reads it, none where a phi or another block reads it.
+    last_read: HashMap<Value, Option<usize>>,
     /// Values written in a section that code outside it reads.
     section_out: HashSet<Value>,
     /// The program's constant table (the code from the first byte read
@@ -1553,6 +1559,10 @@ pub(super) fn sets_pops_packer(i: &Inst) -> bool {
         && matches!(i.fields, Fields::Sop { imm: Some(imm), .. } if imm & 0x3F == 25)
 }
 
+/// The shortest run [`Lower::guarded_runs`] takes (one instruction is a
+/// select either way).
+const RUN_MIN: usize = 2;
+
 fn unsupported(offset: usize, what: Why) -> Stop {
     Stop::Fail(ShaderError::Unsupported { offset, what })
 }
@@ -1987,6 +1997,8 @@ impl<'a> Lower<'a> {
                 .collect(),
             cur_ir: 0,
             sections: HashMap::new(),
+            spec: None,
+            last_read: HashMap::new(),
             section_out: HashSet::new(),
             code_table: None,
             #[cfg(test)]
@@ -2776,6 +2788,9 @@ impl<'a> Lower<'a> {
             ));
         }
         self.find_sections();
+        if super::guard_runs() && self.twin.is_none() {
+            self.last_read = self.last_reads();
+        }
         self.inputs()?;
         if self.twin.is_some() {
             // (the upper lanes' inputs: their own thread ids)
@@ -2808,8 +2823,14 @@ impl<'a> Lower<'a> {
                 self.lds_meeting();
             }
             self.lds_last = None;
+            let runs = self.guarded_runs(b);
             let mut i = 0;
             while i < p.blocks[b].insts.len() {
+                if let Some(&end) = runs.get(&i) {
+                    self.guarded_run(b, i, end)?;
+                    i = end;
+                    continue;
+                }
                 if self.twin.is_some() {
                     self.paired_inst(b, i)?;
                 } else {
@@ -5175,10 +5196,152 @@ impl<'a> Lower<'a> {
     }
 
     fn guard(&mut self, b: usize, i: usize) -> Result<Option<V>, Why> {
+        if self.spec.is_some_and(|(sb, start, end)| sb == b && (start..end).contains(&i)) {
+            return Ok(None);
+        }
         match self.x.st.guards[b][i] {
             None => Ok(None),
             Some(g) => Ok(Some(self.boolean(g, self.cur)?)),
         }
+    }
+
+    /// Whether instruction `i` of block `b` may join a run lowered in every
+    /// lane ([`Self::guarded_runs`]): plain VALU work that reads no other
+    /// lane (no DPP, lane reads or writes, lane counts), no EXEC, no lane
+    /// mask but a `v_cndmask` selector, and writes VGPRs only.
+    fn runs_alone(&self, b: usize, i: usize) -> bool {
+        let inst = &self.x.p.blocks[b].insts[i];
+        let Fields::Valu(v) = &inst.fields else {
+            return false;
+        };
+        let name = inst.name();
+        if v.dpp.is_some()
+            || name.starts_with("v_cmp")
+            || name.starts_with("v_interp")
+            || name.starts_with("v_mbcnt")
+            || name.starts_with("v_movrel")
+            || name.contains("lane")
+            || self.x.res.waterfall.compares.contains(&(b, i))
+            || !inst.writes.iter().all(|w| matches!(w.0, Reg::V(_)))
+        {
+            return false;
+        }
+        let selector = if !name.starts_with("v_cndmask") {
+            None
+        } else {
+            match v.src.get(2) {
+                Some(&Operand::Scalar { code, .. }) => Some(code),
+                None => Some(VCC),
+                _ => None,
+            }
+        };
+        inst.reads.iter().all(|&(r, x)| match r {
+            Reg::S(c) if c == EXEC || c == EXEC + 1 => false,
+            Reg::S(c) if self.x.st.masks.contains_key(&x) || self.x.st.highs.contains_key(&x) => {
+                selector.is_some_and(|s| c == s || c == s + 1)
+            }
+            _ => true,
+        })
+    }
+
+    /// Runs of block `b`: VALU instructions in a row under one lane guard
+    /// that [`Self::runs_alone`] takes, by first index (the end each).
+    fn guarded_runs(&self, b: usize) -> HashMap<usize, usize> {
+        let mut runs = HashMap::new();
+        if self.last_read.is_empty() || self.twin.is_some() || self.x.p.blocks[b].exit == Exit::Indirect {
+            return runs;
+        }
+        let guards = &self.x.st.guards[b];
+        let section = |k: usize| self.sections.get(&b).is_some_and(|s| s.contains_key(&k));
+        let mut i = 0;
+        while i < guards.len() {
+            let Some(g) = guards[i] else {
+                i += 1;
+                continue;
+            };
+            let mut end = i;
+            while end < guards.len() && guards[end] == Some(g) && !section(end) && self.runs_alone(b, end) {
+                end += 1;
+            }
+            if end - i >= RUN_MIN {
+                runs.insert(i, end);
+            }
+            i = end.max(i + 1);
+        }
+        runs
+    }
+
+    /// Lowers a run from [`Self::guarded_runs`] in every lane. No other lane
+    /// and nothing outside the run reads what it computes in between, so
+    /// only the values it leaves take the guard: one select per register
+    /// where each write had one. The lanes outside it keep what the
+    /// registers held before the run.
+    fn guarded_run(&mut self, b: usize, start: usize, end: usize) -> Result<(), Stop> {
+        let p = self.x.p;
+        let offset = p.blocks[b].insts[start].machine.offset;
+        let g = self.guard(b, start).map_err(|w| unsupported(offset, w))?.expect("a guarded run");
+        self.spec = Some((b, start, end));
+        let r = (start..end).try_for_each(|i| self.inst(b, i));
+        self.spec = None;
+        r?;
+        let mut before: HashMap<Reg, Option<Value>> = HashMap::new();
+        for inst in &p.blocks[b].insts[start..end] {
+            for &(reg, w) in &inst.writes {
+                let old = *before.entry(reg).or_insert_with(|| inst.read(reg));
+                if self.last_read.get(&w).is_some_and(|k| k.is_some_and(|k| k < end))
+                    || matches!(self.vals.get(&w), None | Some(Val::Missing(_)))
+                {
+                    continue;
+                }
+                match self.floats.get(&w).copied() {
+                    Some(f) if super::guard_float() => {
+                        let o = match old.map(|o| self.float_of(o)) {
+                            Some(Ok(o)) => o,
+                            _ => self.s.m.f32(0),
+                        };
+                        let f = self.s.m.select(self.cur, g, f, o);
+                        self.s.m.tag(f, Tag::Guard);
+                        let x = self.as_int(f);
+                        self.vals.insert(w, Val::I32(x));
+                        self.floats.insert(w, f);
+                    }
+                    _ => {
+                        self.floats.remove(&w);
+                        let x = self.i32_of(w).map_err(|why| unsupported(offset, why))?;
+                        let o = match old.map(|o| self.i32_of(o)) {
+                            Some(Ok(o)) => o,
+                            _ => self.s.m.i32(0),
+                        };
+                        let x = self.s.m.select(self.cur, g, x, o);
+                        self.s.m.tag(x, Tag::Guard);
+                        self.vals.insert(w, Val::I32(x));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// See [`Self::last_read`].
+    fn last_reads(&self) -> HashMap<Value, Option<usize>> {
+        let mut last: HashMap<Value, Option<usize>> = HashMap::new();
+        for (b, block) in self.x.p.blocks.iter().enumerate() {
+            for phi in &block.phis {
+                for &a in &phi.args {
+                    last.insert(a, None);
+                }
+            }
+            for (i, inst) in block.insts.iter().enumerate() {
+                for &(_, v) in &inst.reads {
+                    if self.def_block.get(&v) != Some(&b) {
+                        last.insert(v, None);
+                    } else {
+                        last.entry(v).and_modify(|k| *k = k.map(|k| k.max(i))).or_insert(Some(i));
+                    }
+                }
+            }
+        }
+        last
     }
 
     // ---- results ----
@@ -5285,6 +5448,22 @@ impl<'a> Lower<'a> {
         let Some(Operand::Vector { reg, .. }) = v.dst else {
             return Err("a float result outside a VGPR");
         };
+        if let Some(g) = guard
+            && super::guard_float()
+            && Self::sdwa_dst(inst).is_none()
+            && let Some(new) = inst.write(Reg::V(reg))
+        {
+            let old = match inst.read(Reg::V(reg)).map(|o| self.float_of(o)) {
+                Some(Ok(o)) => o,
+                _ => self.s.m.f32(0),
+            };
+            let f = self.s.m.select(self.cur, g, f, old);
+            self.s.m.tag(f, Tag::Guard);
+            let x = self.as_int(f);
+            self.vals.insert(new, Val::I32(x));
+            self.floats.insert(new, f);
+            return Ok(());
+        }
         let x = self.as_int(f);
         self.write(inst, Reg::V(reg), x, guard);
         if guard.is_none()
