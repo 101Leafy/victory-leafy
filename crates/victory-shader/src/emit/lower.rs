@@ -1244,11 +1244,12 @@ pub(super) fn with_local_waves<R>(f: impl FnOnce() -> R) -> R {
 }
 
 /// `VICTORY_F16_NEAREST=1`: the results of 16-bit float operations (`v_add_f16`,
-/// `v_mul_f16`, `v_cvt_f16_f32` ...) are rounded to nearest as the console rounds them
-/// ([`Lower::f16_nearest`]) instead of as the host's `f32tof16` does (toward zero on NVIDIA:
-/// the last place of a result that is not exact is then one lower than the console's).
-/// Off by default: it is exact but untried in a game run, and adds instructions to every
-/// such operation. The wave sum of 16-bit floats ([`Lower::half_sum`]) is always exact.
+/// `v_mul_f16`, `v_cvt_f16_f32` ..., `v_pk_*_f16`, `v_fma_mix*_f16`) and d16 float loads are
+/// rounded to nearest as the console rounds them ([`Lower::to_half`]) instead of as the
+/// host's `f32tof16` does (toward zero on NVIDIA: the last place of a result that is not
+/// exact is then one lower than the console's). Off by default: it is exact but untried in
+/// a game run, and adds 23 instructions to every such result. 16-bit interpolants keep the
+/// host's conversion. The wave sum of 16-bit floats ([`Lower::half_sum`]) is always exact.
 fn f16_nearest_on() -> bool {
     #[cfg(test)]
     if let Some(on) = TEST_F16_NEAREST.get() {
@@ -4352,6 +4353,11 @@ impl<'a> Lower<'a> {
     /// conversion, one step back toward zero where it rounded away (which
     /// also turns an overflow to infinity into the largest finite half).
     fn f16_toward_zero(&mut self, f: V) -> V {
+        self.f16_toward_zero_and_size(f).0
+    }
+
+    /// [`Self::f16_toward_zero`] and `|f|`, which [`Self::f16_nearest`] needs as well.
+    fn f16_toward_zero_and_size(&mut self, f: V) -> (V, V) {
         let c = self.cur;
         let i32t = self.s.t.i32;
         let h = self
@@ -4365,7 +4371,7 @@ impl<'a> Lower<'a> {
         let away = self.s.m.cmp(c, pred::OGT, ba, fa);
         let one = self.s.m.i32(1);
         let stepped = self.s.m.bin(c, Bin::Sub, h, one);
-        self.s.m.select(c, away, stepped, h)
+        (self.s.m.select(c, away, stepped, h), fa)
     }
 
     /// `f` as an f16 in the low bits, rounded to nearest, ties to even, as the console's
@@ -4379,7 +4385,7 @@ impl<'a> Lower<'a> {
     fn f16_nearest(&mut self, f: V) -> V {
         let c = self.cur;
         let f32t = self.s.t.f32;
-        let lo = self.f16_toward_zero(f);
+        let (lo, fa) = self.f16_toward_zero_and_size(f);
         let (one, zero) = (self.s.m.i32(1), self.s.m.i32(0));
         let hi = self.s.m.bin(c, Bin::Add, lo, one);
         let size = |l: &mut Self, h: V| {
@@ -4392,7 +4398,6 @@ impl<'a> Lower<'a> {
         let top = self.s.m.cmp(c, pred::EQ, m, infinity);
         let bound = self.s.m.f32(65536.0f32.to_bits());
         let above = self.s.m.select(c, top, bound, above);
-        let fa = self.unary(6, f);
         // (both differences are exact: the three values lie within one half's step)
         let under = self.s.m.bin(c, Bin::Sub, fa, below);
         let over = self.s.m.bin(c, Bin::Sub, above, fa);
@@ -4404,6 +4409,20 @@ impl<'a> Lower<'a> {
         let tie = self.s.m.bin(c, Bin::And, tie, odd);
         let up = self.s.m.bin(c, Bin::Or, nearer, tie);
         self.s.m.select(c, up, hi, lo)
+    }
+
+    /// `f` as an f16 in the low bits for a 16-bit float result: [`Self::f16_nearest`] with
+    /// `VICTORY_F16_NEAREST=1` ([`f16_nearest_on`], 24 instructions), else the host's
+    /// conversion (one). (A fused result such as `v_fma_mix*`'s is an f32 already rounded
+    /// once, so a tie there may round the other way from the console's single rounding.)
+    fn to_half(&mut self, f: V) -> V {
+        if f16_nearest_on() {
+            self.f16_nearest(f)
+        } else {
+            let i32t = self.s.t.i32;
+            self.s
+                .op(self.cur, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f])
+        }
     }
 
     /// `(a >> off[4:0]) & ((1 << width) - 1)`, sign-extended from the field's
@@ -7998,9 +8017,8 @@ impl<'a> Lower<'a> {
                 let m = self.s.m.i32(0xFFFF);
                 self.s.m.bin(c, Bin::And, x, m)
             } else {
-                let (f, i32t) = (self.as_float(x), self.s.t.i32);
-                self.s
-                    .op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f])
+                let f = self.as_float(x);
+                self.to_half(f)
             });
         }
         let mut out = Vec::new();
@@ -9516,9 +9534,7 @@ impl<'a> Lower<'a> {
                     Some(Err(FIRST_HALF)) | None => self.s.m.i32(0),
                     Some(Err(why)) => return Err(why),
                 };
-                let h = self
-                    .s
-                    .op(c, "legacyF32ToF16", Attr::ReadNone, self.s.t.i32, 130, &[r]);
+                let h = self.to_half(r);
                 let (keep, h) = if name == "v_fma_mixhi_f16" {
                     let k16 = self.s.m.i32(16);
                     (0xFFFF, self.s.m.bin(c, Bin::Shl, h, k16))
@@ -10112,12 +10128,8 @@ impl<'a> Lower<'a> {
             // The console rounds to nearest; the host's conversion may round toward zero
             // (NVIDIA's does), one step of the last place lower where the two differ.
             // shortcut: the host's conversion unless `VICTORY_F16_NEAREST=1`
-            // ([`f16_nearest_on`]), which costs a dozen instructions per result.
-            let h = if f16_nearest_on() {
-                l.f16_nearest(f)
-            } else {
-                l.s.op(l.cur, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f])
-            };
+            // ([`f16_nearest_on`]), which costs 24 instructions per result instead of one.
+            let h = l.to_half(f);
             // After the conversion: a NaN's bits through it are the host's (0x7fff on NVIDIA).
             let h = match nan {
                 Some(n) if !v.clamp => {
@@ -10512,7 +10524,7 @@ impl<'a> Lower<'a> {
             return Err("modifiers on a packed integer operation");
         }
         let c = self.cur;
-        let (i32t, f32t) = (self.s.t.i32, self.s.t.f32);
+        let f32t = self.s.t.f32;
         let mut halves = Vec::new();
         for high in [false, true] {
             let mut xs = Vec::new();
@@ -10548,8 +10560,7 @@ impl<'a> Lower<'a> {
                 if v.clamp {
                     f = self.unary(7, f);
                 }
-                self.s
-                    .op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f])
+                self.to_half(f)
             } else {
                 let k16 = self.s.m.i32(16);
                 let sext = |l: &mut Self, x: V| {
@@ -12346,11 +12357,9 @@ impl<'a> Lower<'a> {
                 None => self.s.m.extract(c, r, ch),
             };
             xs.push(if *d16 {
-                // shortcut: d16 results are taken as floats (rounded to
-                // nearest even); integer formats would keep 16 bits.
-                let i32t = self.s.t.i32;
-                self.s
-                    .op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[x])
+                // shortcut: d16 results are taken as floats ([`Self::to_half`]);
+                // integer formats would keep 16 bits.
+                self.to_half(x)
             } else {
                 self.as_int(x)
             });
@@ -12913,14 +12922,11 @@ impl<'a> Lower<'a> {
             // 16 bits of an integer view's (see the stores above).
             let integer = if typed { self.integer_view(src)? } else { None };
             let k16 = self.s.m.i32(16);
-            let i32t = self.s.t.i32;
             for k in 0..count.div_ceil(2) {
                 let mut x = None;
                 for ch in (2 * k..(2 * k + 2).min(count)).rev() {
                     let f = self.s.m.extract(c, r, ch);
-                    let mut h = self
-                        .s
-                        .op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f]);
+                    let mut h = self.to_half(f);
                     if let Some((int, _)) = integer {
                         let bits = self.as_int(f);
                         let low = self.s.m.i32(0xFFFF);
