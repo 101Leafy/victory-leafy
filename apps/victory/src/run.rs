@@ -208,8 +208,9 @@ pub fn run(
         let done = unsafe { victory_loader::frame_rate::apply_longest_step(image.base(), size, step) };
         println!("simulation: longest step {} s: {done:?}", step.0);
     }
-    // The output size and render scale (VICTORY_OUTPUT, VICTORY_RENDER_SCALE,
-    // VICTORY_UPSCALER; each off without it).
+    // The output size and render scale (VICTORY_OUTPUT, VICTORY_RENDER_SCALE;
+    // each off without it), and the upscaler picker made to return the
+    // title's own, never FidelityFX.
     #[cfg(windows)]
     if execute {
         let size = image.info().size_of_image as usize;
@@ -399,8 +400,7 @@ fn absent_title_dlls(
     absent
 }
 
-/// Title DLLs the title loads itself (`LoadLibrary`) that nothing imports,
-/// e.g. The title's upscaler behind its FidelityFX loader.
+/// Title DLLs the title loads itself (`LoadLibrary`) that nothing imports.
 #[cfg(windows)]
 struct LateDlls {
     host: victory_hle::HostPolicy,
