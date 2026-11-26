@@ -1768,8 +1768,17 @@ impl HostHeap {
         #[cfg(not(feature = "diagnostics"))]
         let _ = steps;
         let Some(first) = found else {
+            // Asks longer than the longest free run fail without a search
+            // until slots come back (`release`). Shorter ones
+            // used to search the whole ring and fail as well: 37 ms a frame
+            // in play-e with thousands refused.
             if enough {
-                self.too_long.fetch_min(n as u32, std::sync::atomic::Ordering::Relaxed);
+                let (most, looked) = taken.longest();
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::DynamicSteps, looked);
+                #[cfg(not(feature = "diagnostics"))]
+                let _ = looked;
+                self.too_long.fetch_min(most.min(n - 1) as u32 + 1, std::sync::atomic::Ordering::Relaxed);
             }
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!(n, "no free dynamic descriptor slots: a table is not made"));
