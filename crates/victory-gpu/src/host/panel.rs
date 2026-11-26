@@ -7,6 +7,10 @@
 //! box out of a buffer in the card's memory. Copied onto the swap chain's
 //! buffer, behind the title's picture: saved frames and the frame recorder
 //! see the title's own.
+//!
+//! Nothing on it says whose PC it is: numbers, the card's name with the
+//! user and computer names taken out, and whether frame lines are written
+//! (`VICTORY_FRAMES`, [`super::frames`]).
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -27,7 +31,7 @@ const GLYPH: (u32, u32) = (5, 7);
 const CELL: (u32, u32) = (6, 9);
 /// Characters in a line, lines, and the box's rim in dots.
 const COLUMNS: u32 = 40;
-const LINES: u32 = 9;
+const LINES: u32 = 11;
 const RIM: u32 = 3;
 
 /// The texts are put into one of these in turn: the card reads the others,
@@ -172,7 +176,7 @@ fn painted(lines: &[String], scale: u32, colours: [&[u8]; 2], pitch: usize) -> V
 #[derive(Clone, Copy, Default)]
 struct Counters([u64; COUNTERS]);
 
-const COUNTERS: usize = 11;
+const COUNTERS: usize = 13;
 
 impl Counters {
     fn now() -> Counters {
@@ -191,6 +195,8 @@ impl Counters {
             crate::draw::dropped_now(),
             peek(C::RecordNs),
             crate::draw::drawn(),
+            get(&crate::draw::HEAP_BUFFER_PASSES),
+            get(&crate::draw::HEAP_BUFFER_MICROS),
         ])
     }
 
@@ -221,8 +227,30 @@ fn text(c: &[f64; COUNTERS], ms: f64, worst: f64, cost: f64, host: &Host) -> Vec
         format!("MB UP {:.0}  TEXTURES {:.0}  BACK {:.0}", c[7] / 1e6, c[4] / 1e6, c[6] / 1e6),
         format!("RAM {:.1} GB  IN MEMORY {:.1}", gb(private), gb(working)),
         format!("VRAM {:.1}/{:.1} GB  SHARED {:.1}", gb(used), gb(budget), gb(shared)),
-        format!("THIS PANEL {:.0} US A FRAME", cost),
+        format!("HEAP PASSES {:.1}  HEAP {:.2} MS", c[11], c[12] / 1e3),
+        format!("THIS PANEL {:.0} US A FRAME  {}", cost, recording()),
+        card(host),
     ]
+}
+
+fn recording() -> String {
+    match std::env::var_os("VICTORY_FRAMES").filter(|v| v != "0") {
+        Some(_) => format!("REC {}", super::frames::ROWS.load(Ordering::Relaxed)),
+        None => "REC OFF".to_owned(),
+    }
+}
+
+/// The card's name in the characters the box has, read once.
+fn card(host: &Host) -> String {
+    static CARD: OnceLock<String> = OnceLock::new();
+    CARD.get_or_init(|| shown_name(&super::frames::card(host))).clone()
+}
+
+fn shown_name(name: &str) -> String {
+    let name = name.replace("(R)", "").replace("(TM)", "").to_uppercase();
+    let kept: String = name.chars().filter(|c| c.is_ascii_alphanumeric() || " ./-".contains(*c)).collect();
+    let line = format!("GPU {}", kept.split_whitespace().collect::<Vec<_>>().join(" "));
+    line.chars().take(COLUMNS as usize).collect()
 }
 
 /// The buffers of a box that size and format.
@@ -461,6 +489,13 @@ mod tests {
             // Nothing past a line's end.
             assert_eq!(at((RIM + CELL.0 * 2 + 2) * scale, (RIM + CELL.1) * scale), colours[0]);
         }
+    }
+
+    #[test]
+    fn card_names_fit_the_box() {
+        assert_eq!(shown_name("NVIDIA GeForce RTX 4080"), "GPU NVIDIA GEFORCE RTX 4080");
+        assert_eq!(shown_name("Intel(R) Arc(TM) A770 Graphics"), "GPU INTEL ARC A770 GRAPHICS");
+        assert!(shown_name(&"x".repeat(80)).len() == COLUMNS as usize);
     }
 
     #[test]

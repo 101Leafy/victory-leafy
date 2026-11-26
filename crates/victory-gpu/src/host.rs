@@ -3628,6 +3628,8 @@ mod card_steps;
 pub(crate) mod indirects;
 #[cfg(feature = "diagnostics")]
 mod panel;
+#[cfg(feature = "diagnostics")]
+mod frames;
 mod place;
 mod send;
 pub(crate) use send::{goes_as_words, words_under};
@@ -8482,6 +8484,8 @@ struct Presenter {
     meter: Meter,
     #[cfg(feature = "diagnostics")]
     panel: panel::Panel,
+    #[cfg(feature = "diagnostics")]
+    frames: frames::Frames,
 }
 
 /// The frame rate, shown in the window's caption every second and logged
@@ -8933,11 +8937,21 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             crate::replay::record::present(texture, state);
             let mut showing = crate::timeline::span("the host's Present");
+            #[cfg(feature = "diagnostics")]
+            let presenting = std::time::Instant::now();
             let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
             showing.next("the frame meter");
             #[cfg(feature = "diagnostics")]
-            p.panel.frame(p.meter.line_due());
+            let line = p.meter.line_due();
+            #[cfg(feature = "diagnostics")]
+            p.frames.frame(self, presenting.elapsed());
+            #[cfg(feature = "diagnostics")]
+            p.panel.frame(line);
             p.meter.frame(p.hwnd);
+            #[cfg(feature = "diagnostics")]
+            if line {
+                p.frames.after();
+            }
             showing.end();
             #[cfg(feature = "diagnostics")]
             return Some(probe.is_some_and(|b| crate::capture::black(&b)));
@@ -8991,6 +9005,8 @@ impl Host {
                 meter: Meter::new(),
                 #[cfg(feature = "diagnostics")]
                 panel: panel::Panel::new(),
+                #[cfg(feature = "diagnostics")]
+                frames: frames::Frames::new(self),
             })
         }
     }
