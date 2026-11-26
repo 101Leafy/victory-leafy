@@ -1399,7 +1399,7 @@ mod tests {
                     nodes: 0,
                 },
                 #[cfg(windows)]
-                held: std::sync::Mutex::new(Vec::new()),
+                held: Default::default(),
             };
             let q: This = std::ptr::from_ref(&object).cast();
             let suspend = slot::<extern "system" fn(This, u32) -> HRESULT>(q, at);
