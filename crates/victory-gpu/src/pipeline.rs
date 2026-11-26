@@ -100,25 +100,32 @@ pub(crate) fn kept() -> [u64; 7] {
     ]
 }
 
-/// The shared container for `bytes`.
+/// The shared container for `bytes`. A new one is built outside the lock
+/// (the copy and the compute role scan), so other creations do not wait on
+/// it; of two built at once, the first in keeps its place.
 fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
     let full = blake3::hash(bytes);
+    let key = *full.as_bytes();
+    if let Some(known) = SHADERS.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|s| s.get(&key)) {
+        return known.clone();
+    }
+    let built = Arc::new(Shader {
+        stage,
+        hash: full.to_hex()[..16].to_owned(),
+        container: bytes.to_vec(),
+        #[cfg(windows)]
+        ambient: (stage == "compute").then(|| crate::ambient::role(bytes)).flatten(),
+        #[cfg(windows)]
+        translated: OnceLock::new(),
+    });
     let mut shaders = SHADERS.lock().unwrap_or_else(|e| e.into_inner());
     shaders
         .get_or_insert_with(HashMap::new)
-        .entry(*full.as_bytes())
+        .entry(key)
         .or_insert_with(|| {
             KEPT[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             KEPT[1].fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
-            Arc::new(Shader {
-                stage,
-                hash: full.to_hex()[..16].to_owned(),
-                container: bytes.to_vec(),
-                #[cfg(windows)]
-                ambient: (stage == "compute").then(|| crate::ambient::role(bytes)).flatten(),
-                #[cfg(windows)]
-                translated: OnceLock::new(),
-            })
+            built
         })
         .clone()
 }
@@ -828,6 +835,18 @@ mod tests {
             .iter()
             .map(|s| (s.stage, s.container.clone()))
             .collect()
+    }
+
+    /// The same bytes give the same container, kept and counted once.
+    #[test]
+    fn same_bytes_share_one_container() {
+        let bytes: Vec<u8> = (0..4096u32).map(|i| (i * 31 + 7) as u8).collect();
+        let first = shader("pixel", &bytes);
+        let kept = KEPT[0].load(std::sync::atomic::Ordering::Relaxed);
+        let again = shader("pixel", &bytes);
+        assert!(Arc::ptr_eq(&first, &again));
+        assert_eq!(first.hash, blake3::hash(&bytes).to_hex()[..16]);
+        assert!(KEPT[0].load(std::sync::atomic::Ordering::Relaxed) >= kept);
     }
 
     /// A compute pipeline the structure builder creates (its bytecode in
