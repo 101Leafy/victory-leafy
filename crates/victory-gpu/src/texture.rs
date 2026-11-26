@@ -1723,7 +1723,7 @@ impl Staging {
             // Read through the copy, which stands unmapped pages: memory of
             // big pools is too slow to ask page by page.
             let read = with_read(size, |read| {
-                if !exact && since != 0 && !self.on_demand && let Some(bytes) = self.detile_written(read, &written, since) {
+                if since != 0 && !self.on_demand && let Some(bytes) = self.detile_written(read, &written, since) {
                     return bytes;
                 }
                 crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
