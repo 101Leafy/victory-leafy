@@ -59,13 +59,16 @@ pub fn run(
         victory_hle::modules::d3d12x::start_host();
     }
     let cfg = victory_core::Config::load()?;
+    victory_hle::modules::controls::configure(cfg.controls.as_ref())
+        .map_err(anyhow::Error::msg)?;
     let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
-    let prepared = victory_loader::prepare(&original)?;
+    let mut prepared = victory_loader::prepare(&original)?;
     let hash = prepared.original_hash.to_hex();
     match victory_game::identify(&hash) {
         Some(build) => println!("build          {} ({hash})", build.label),
         None => println!("build          unknown ({hash})"),
     }
+    victory_loader::mods::apply_asked(&mut prepared);
 
     let images = cfg.cache_subdir("images")?;
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
@@ -207,6 +210,24 @@ pub fn run(
         // SAFETY: the image stays mapped and nothing of it has run yet.
         let done = unsafe { victory_loader::frame_rate::apply_longest_step(image.base(), size, step) };
         println!("simulation: longest step {} s: {done:?}", step.0);
+        if done == victory_loader::frame_rate::Patched::Done
+            && let Some(until) = victory_loader::frame_rate::asked_step_until_ms()
+        {
+            let base = image.base();
+            std::thread::spawn(move || {
+                use victory_loader::frame_rate::{game_ms, restore_longest_step};
+                // SAFETY: the image stays mapped for the life of the process.
+                while unsafe { game_ms(base, size) }.is_some_and(|ms| ms < until) {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                // SAFETY: as above; the load was changed to read step.1.
+                let done = unsafe { restore_longest_step(base, size, step.1) };
+                // SAFETY: as above.
+                let at = unsafe { game_ms(base, size) }.unwrap_or(0);
+                tracing::info!(game_ms = at, ?done, "simulation: longest step back to 1/15 s (VICTORY_LONGEST_STEP_UNTIL)");
+                eprintln!("VIctory: simulation: longest step back to 1/15 s at game {at} ms: {done:?}");
+            });
+        }
     }
     // The output size and render scale (VICTORY_OUTPUT, VICTORY_RENDER_SCALE;
     // each off without it), and the upscaler picker made to return the
@@ -216,6 +237,13 @@ pub fn run(
         let size = image.info().size_of_image as usize;
         // SAFETY: the image stays mapped and nothing of it has run yet.
         unsafe { victory_loader::resolution::apply_asked(image.base(), size) };
+    }
+    // The title's -skipToIIS switch (VICTORY_SKIP_TO_IIS=1, off without it).
+    #[cfg(windows)]
+    if execute {
+        let size = image.info().size_of_image as usize;
+        // SAFETY: the image stays mapped and nothing of it has run yet.
+        unsafe { victory_loader::scenes::apply_asked(image.base(), size) };
     }
     if !execute {
         println!("not executing (pass --execute to start the title)");
