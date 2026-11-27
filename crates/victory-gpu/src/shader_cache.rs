@@ -91,6 +91,7 @@ fn build(translator: &str) -> [u8; 32] {
             "VICTORY_WAVE_OWN_BITS",
             "VICTORY_WAVE_LOCAL",
             "VICTORY_F16_NEAREST",
+            "VICTORY_FILTER_3D",
             "VICTORY_HELPER_OWN",
             "VICTORY_FIRSTLANE_OWN",
             "VICTORY_FIRST_HALF",
