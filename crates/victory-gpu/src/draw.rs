@@ -5335,6 +5335,13 @@ mod thread_tests {
     }
 }
 
+/// Lock-free wrapper for immutable D3D12 command signatures.
+struct SyncSignature(ID3D12CommandSignature);
+
+// SAFETY: `ID3D12CommandSignature` is immutable and free-threaded in D3D12.
+unsafe impl Send for SyncSignature {}
+unsafe impl Sync for SyncSignature {}
+
 /// The host command signature for one argument of `kind` with records
 /// `stride` bytes apart, made once. With `constant` (a root signature, one
 /// of its root constant parameters, and a dword of it) each record first
@@ -5345,6 +5352,20 @@ fn host_signature(
     stride: u32,
     constant: Option<(&ID3D12RootSignature, u32, u32)>,
 ) -> Option<ID3D12CommandSignature> {
+    static FAST: [std::sync::OnceLock<Option<SyncSignature>>; 4] = [const { std::sync::OnceLock::new() }; 4];
+    let fast_slot = match (kind, stride, constant.is_none()) {
+        (0, 16, true) => Some(0),  // Draw
+        (1, 20, true) => Some(1),  // DrawIndexed
+        (2, 12, true) => Some(2),  // Dispatch
+        (10, 12, true) => Some(3), // DispatchMesh
+        _ => None,
+    };
+    if let Some(slot) = fast_slot {
+        return FAST[slot]
+            .get_or_init(|| make_host_signature(kind, stride, None).map(SyncSignature))
+            .as_ref()
+            .map(|s| s.0.clone());
+    }
     type Key = (u32, u32, Option<(usize, u32, u32)>);
     // The root signatures are kept, so their addresses are not reused.
     static MADE: std::sync::Mutex<Vec<(Key, Option<ID3D12RootSignature>, ID3D12CommandSignature)>> =
@@ -5354,6 +5375,16 @@ fn host_signature(
     if let Some((.., s)) = made.iter().find(|(k, ..)| *k == key) {
         return Some(s.clone());
     }
+    let signature = make_host_signature(kind, stride, constant)?;
+    made.push((key, constant.map(|(root, ..)| root.clone()), signature.clone()));
+    Some(signature)
+}
+
+fn make_host_signature(
+    kind: u32,
+    stride: u32,
+    constant: Option<(&ID3D12RootSignature, u32, u32)>,
+) -> Option<ID3D12CommandSignature> {
     let mut arguments = Vec::with_capacity(2);
     if let Some((_, param, word)) = constant {
         arguments.push(D3D12_INDIRECT_ARGUMENT_DESC {
@@ -5390,9 +5421,7 @@ fn host_signature(
         once!(error = %e, kind, stride, "host command signature refused");
         return None;
     }
-    let signature = signature?;
-    made.push((key, constant.map(|(root, ..)| root.clone()), signature.clone()));
-    Some(signature)
+    signature
 }
 
 /// Gets what a shader reads or writes through a view ready: buffer data
