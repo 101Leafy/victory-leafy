@@ -818,6 +818,41 @@ macro_rules! once {
     }};
 }
 
+/// 64 KiB of zeros on the card, for a root constant buffer or shader view
+/// with nothing to read: the title left it unset, or its memory is not
+/// found. A root left as it was is undefined (a page fault on NVIDIA). Kept
+/// for the life of the process; never a root UAV (AnyXboxX#458).
+fn zero_root() -> Option<u64> {
+    static GPU: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *GPU.get_or_init(|| {
+        const BYTES: u64 = 64 << 10;
+        let (buffer, data) = crate::host::host()?.upload_buffer(BYTES)?;
+        // SAFETY: the buffer is mapped for its whole size and never freed.
+        unsafe {
+            data.write_bytes(0, BYTES as usize);
+            let gpu = buffer.GetGPUVirtualAddress();
+            std::mem::forget(buffer);
+            Some(gpu)
+        }
+    })
+}
+
+/// Counts a root bound to [`zero_root`]; how many were in a frame is logged
+/// at the first one of a later frame.
+fn zeroed_root() {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
+    static COUNT: AtomicU64 = AtomicU64::new(0);
+    let frame = crate::frame::current();
+    if FRAME.swap(frame, Relaxed) != frame {
+        let n = COUNT.swap(0, Relaxed);
+        if n > 0 {
+            tracing::info!("{n} root params bound to zeros");
+        }
+    }
+    COUNT.fetch_add(1, Relaxed);
+}
+
 fn set(roots: &mut Vec<Root>, slot: u32, root: Root) {
     let slot = slot as usize;
     if roots.len() <= slot {
@@ -1948,13 +1983,27 @@ impl State {
                         }
                         continue;
                     }
+                    // SAFETY: an open list; `gpu` is in live memory.
+                    let bind = |gpu: u64| unsafe {
+                        match (compute, srv) {
+                            (false, false) => l.SetGraphicsRootConstantBufferView(param, gpu),
+                            (false, true) => l.SetGraphicsRootShaderResourceView(param, gpu),
+                            (true, false) => l.SetComputeRootConstantBufferView(param, gpu),
+                            (true, true) => l.SetComputeRootShaderResourceView(param, gpu),
+                        }
+                    };
                     let tabled = srv && crate::pipeline::host::bounded_root_srvs();
                     let Some(&Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
                     else {
                         once!(slot, "a shader reads a root view the title did not set");
                         // A table left unset is undefined: a null view.
-                        if tabled && !self.root_srv_table(list, None, param, compute, false) {
-                            return refuse(Refused::RootTable);
+                        if tabled {
+                            if !self.root_srv_table(list, None, param, compute, false) {
+                                return refuse(Refused::RootTable);
+                            }
+                        } else if let Some(gpu) = zero_root() {
+                            zeroed_root();
+                            bind(gpu);
                         }
                         continue;
                     };
@@ -1970,27 +2019,27 @@ impl State {
                         }
                         continue;
                     }
-                    let Some(mut gpu) = root_view(list, address, srv) else {
-                        continue;
-                    };
-                    if biased {
-                        gpu -= u64::from(self.host_word(
-                            compute,
-                            victory_shader::emit::USER_VIEW_BIAS,
-                            slot,
-                            0,
-                            None,
-                        ));
-                    }
-                    // SAFETY: an open list; the address is in live memory.
-                    unsafe {
-                        match (compute, srv) {
-                            (false, false) => l.SetGraphicsRootConstantBufferView(param, gpu),
-                            (false, true) => l.SetGraphicsRootShaderResourceView(param, gpu),
-                            (true, false) => l.SetComputeRootConstantBufferView(param, gpu),
-                            (true, true) => l.SetComputeRootShaderResourceView(param, gpu),
+                    let gpu = match root_view(list, address, srv) {
+                        Some(gpu) if biased => {
+                            gpu - u64::from(self.host_word(
+                                compute,
+                                victory_shader::emit::USER_VIEW_BIAS,
+                                slot,
+                                0,
+                                None,
+                            ))
                         }
-                    }
+                        Some(gpu) => gpu,
+                        // Zeros, not the bytes before them.
+                        None => {
+                            let Some(gpu) = zero_root() else {
+                                continue;
+                            };
+                            zeroed_root();
+                            gpu
+                        }
+                    };
+                    bind(gpu);
                 }
             }
             for &(slot, param) in &stage.root_uavs {
@@ -5771,6 +5820,18 @@ fn staging_budget_per_frame(vram_budget: Option<u64>) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    /// The zeros a root with nothing to read is bound to are one buffer,
+    /// placed where a root constant buffer may start.
+    #[test]
+    fn a_root_with_nothing_to_read_reads_one_zero_buffer() {
+        if crate::host::host().is_none() {
+            return; // no host GPU
+        }
+        let gpu = super::zero_root().unwrap();
+        assert_eq!(gpu % 256, 0);
+        assert_eq!(super::zero_root(), Some(gpu));
+    }
+
     use super::{SharedTables, settle_due, staging_budget_per_frame};
 
     /// A dropped host heap's kept ranges go with it; another heap's stay
