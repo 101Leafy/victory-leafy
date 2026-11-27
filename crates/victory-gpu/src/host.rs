@@ -970,7 +970,12 @@ fn host_adapter() -> Option<IDXGIAdapter> {
         if let Ok(wanted) = std::env::var("VICTORY_ADAPTER") {
             let mut index = 0;
             while let Ok(a) = factory.EnumAdapters1(index) {
+                // `EnumAdapters1` lists the software adapter too; it stays
+                // behind `VICTORY_D3D12_WARP`, whose path checks that DXGI
+                // names it as software, so a name that matches it here is not
+                // taken.
                 if let Ok(desc) = a.GetDesc1()
+                    && desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0
                     && names_adapter(&adapter_name(&desc), &wanted)
                 {
                     let name = adapter_name(&desc);
@@ -1078,7 +1083,12 @@ fn create() -> windows::core::Result<Host> {
             let driver = std::time::Instant::now();
             match adapter {
                 Some(adapter) => D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?,
-                None => D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?,
+                None => {
+                    // The one thing this patch exists to stop: a device made
+                    // on whichever adapter DXGI defaults to, unannounced.
+                    tracing::warn!("no adapter enumerated; the device is made on the default one");
+                    D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?
+                }
             }
             tracing::info!(ms = driver.elapsed().as_millis() as u64, "D3D12CreateDevice done");
             // Whether a GPU hang ends the run or freezes the PC (#1054).
