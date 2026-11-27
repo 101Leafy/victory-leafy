@@ -1900,16 +1900,20 @@ impl State {
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
         if self.host_heaps != self.heaps {
-            let heaps: Vec<Option<ID3D12DescriptorHeap>> = self
+            let mut heaps: [Option<ID3D12DescriptorHeap>; 2] = [None, None];
+            let mut n_heaps = 0;
+            for heap in self
                 .heaps
                 .iter()
                 .filter(|&&h| h != 0)
                 .filter_map(|&h| crate::descriptor::heap(h as This).host())
-                .map(|h| Some(h.heap.clone()))
-                .collect();
-            heaps.iter().flatten().for_each(|h| list.keep(h));
+            {
+                list.keep(&heap.heap);
+                heaps[n_heaps] = Some(heap.heap.clone());
+                n_heaps += 1;
+            }
             // SAFETY: an open list and shader-visible heaps.
-            unsafe { l.SetDescriptorHeaps(&heaps) };
+            unsafe { l.SetDescriptorHeaps(&heaps[..n_heaps]) };
             self.host_heaps = self.heaps;
             self.host_roots = [0; 2];
         }
