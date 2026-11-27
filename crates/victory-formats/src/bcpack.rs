@@ -1811,6 +1811,19 @@ mod tests {
 
     /// Decode throughput on synthetic streams (no game data):
     /// `cargo test --release -p victory-formats bcpack_throughput -- --ignored --nocapture`.
+    ///
+    /// Seven timed passes a case, and the median of them with the spread
+    /// beside it. One timed pass on a machine that is also doing something
+    /// else is not a measurement: the runs taken for PR 20 on an i9-13900K
+    /// swung wider than the two sides of that change differed, and the line
+    /// said nothing about it. A difference smaller than the spread printed
+    /// here is not a difference, and the line says so, since the number is
+    /// what gets pasted into a report.
+    ///
+    /// The rates are only comparable between runs of the same profile: an
+    /// unoptimized build decodes 20 to 30 times slower (2,058 ns a block
+    /// against 53 in a release build on an i9-13900K, PR 22), so the line
+    /// names the profile it ran in.
     #[test]
     #[ignore = "benchmark"]
     fn bcpack_throughput() {
@@ -1820,6 +1833,7 @@ mod tests {
             (4, &BC4_LANES, 1, 8),
             (7, &[3, 3, 7, 7, 7, 7, 7, 6, 6, 4, 5, 7, 7, 7, 7, 4], 2, 16),
         ];
+        let (runs, passes) = (40, 7);
         for (bc, widths, per, block) in cases {
             // One fragment per lane holds at most 65792 bytes.
             let blocks = 1 << 14;
@@ -1827,16 +1841,25 @@ mod tests {
             let src = stream(&t, widths, per, &records);
             let mut dst = vec![0u8; blocks * block];
             decode(bc, &src, &mut dst, &t).unwrap();
-            let runs = 40;
-            let started = std::time::Instant::now();
-            for _ in 0..runs {
-                decode(bc, std::hint::black_box(&src), &mut dst, &t).unwrap();
+            let mut rates = vec![0.0f64; passes];
+            for rate in &mut rates {
+                let started = std::time::Instant::now();
+                for _ in 0..runs {
+                    decode(bc, std::hint::black_box(&src), &mut dst, &t).unwrap();
+                }
+                let secs = started.elapsed().as_secs_f64() / f64::from(runs);
+                *rate = (blocks * block) as f64 / secs / 1e6;
             }
-            let secs = started.elapsed().as_secs_f64() / f64::from(runs);
+            rates.sort_by(f64::total_cmp);
+            let median = rates[passes / 2];
+            let (low, high) = (rates[0], rates[passes - 1]);
+            let profile = if cfg!(debug_assertions) { "debug" } else { "release" };
             println!(
-                "BC{bc}: {blocks} blocks, {:.1} MB out/s, {:.1} ns/block",
-                (blocks * block) as f64 / secs / 1e6,
-                secs * 1e9 / blocks as f64
+                "BC{bc}: {blocks} blocks, {median:.1} MB out/s median of {passes} passes \
+                 (min {low:.1}, max {high:.1}, spread {:.0} %), {:.1} ns/block, {profile} \
+                 (a difference under the spread is not a difference)",
+                (high - low) / median * 100.0,
+                block as f64 * 1e3 / median
             );
         }
     }
