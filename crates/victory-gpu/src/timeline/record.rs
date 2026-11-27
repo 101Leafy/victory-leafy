@@ -3,7 +3,7 @@
 //! can be done anywhere, the handler of write faults included.
 
 use std::cell::Cell;
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 /// What an event is.
@@ -449,6 +449,9 @@ struct Asked {
     /// Seconds after which a recording begins, for each.
     after: Vec<f64>,
     frames: u64,
+    /// Seconds without a present after which what was recorded is written
+    /// all the same (0: never).
+    stall: f64,
     started: std::time::Instant,
 }
 
@@ -485,6 +488,7 @@ fn asked() -> Option<&'static Asked> {
                 file: file.into(),
                 after,
                 frames: frames.clamp(1, 60),
+                stall: number("VICTORY_TIMELINE_STALL").unwrap_or(10.0).max(0.0),
                 started: std::time::Instant::now(),
             })
         })
@@ -507,19 +511,24 @@ struct Stage {
     before: Option<super::report::Threads>,
 }
 
+static STAGE: Mutex<Stage> = Mutex::new(Stage {
+    ready: false,
+    began: false,
+    frames: 0,
+    made: 0,
+    writing: false,
+    before: None,
+});
+
+/// When the last present came back ([`ticks`]).
+static LAST_PRESENT: AtomicU64 = AtomicU64::new(0);
+
 /// The title's present came back.
 pub(crate) fn presented() {
     let Some(asked) = asked() else {
         return;
     };
-    static STAGE: Mutex<Stage> = Mutex::new(Stage {
-        ready: false,
-        began: false,
-        frames: 0,
-        made: 0,
-        writing: false,
-        before: None,
-    });
+    LAST_PRESENT.store(ticks(), Ordering::Relaxed);
     let mut stage = STAGE.lock().unwrap_or_else(|e| e.into_inner());
     let Some(&after) = asked.after.get(stage.made) else {
         return;
@@ -543,6 +552,9 @@ pub(crate) fn presented() {
         if std::thread::Builder::new().name("victory-sample".into()).spawn(sample).is_err() {
             tracing::warn!("the timeline is without samples of the title's threads");
         }
+        if asked.stall > 0.0 && std::thread::Builder::new().name("victory-stall".into()).spawn(watch).is_err() {
+            tracing::warn!("a hang will not write the timeline");
+        }
         frame();
         return;
     }
@@ -551,15 +563,46 @@ pub(crate) fn presented() {
     if stage.frames < asked.frames {
         return;
     }
+    write(asked, stage, after, "");
+}
+
+/// While a recording goes on: if no present comes for `VICTORY_TIMELINE_STALL`
+/// seconds, what was recorded so far is written (a hang would never write it).
+fn watch() {
+    let Some(asked) = asked() else {
+        return;
+    };
+    let most = (asked.stall * frequency() as f64) as u64;
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        let stage = STAGE.lock().unwrap_or_else(|e| e.into_inner());
+        if !stage.began || stage.writing {
+            return;
+        }
+        let waited = ticks().saturating_sub(LAST_PRESENT.load(Ordering::Relaxed));
+        if waited < most {
+            continue;
+        }
+        let Some(&after) = asked.after.get(stage.made) else {
+            return;
+        };
+        tracing::warn!(seconds = asked.stall, frames = stage.frames, "no present: the timeline is written as it stands");
+        write(asked, stage, after, "stall.");
+        return;
+    }
+}
+
+/// The recording ends and is written, on a thread of its own; `mark` goes
+/// ahead of the file's extension.
+fn write(asked: &Asked, mut stage: std::sync::MutexGuard<'_, Stage>, after: f64, mark: &str) {
     stage.writing = true;
     let before = stage.before.take().unwrap_or_default();
+    let kind = asked.file.extension().map_or("json".into(), |e| e.to_string_lossy().into_owned());
     // Several recordings: a file each.
-    let file = match asked.after.len() {
-        1 => asked.file.clone(),
-        _ => {
-            let end = asked.file.extension().map_or("json".into(), |e| e.to_string_lossy().into_owned());
-            asked.file.with_extension(format!("{after:.0}.{end}"))
-        }
+    let file = match (asked.after.len(), mark) {
+        (1, "") => asked.file.clone(),
+        (1, _) => asked.file.with_extension(format!("{mark}{kind}")),
+        _ => asked.file.with_extension(format!("{after:.0}.{mark}{kind}")),
     };
     drop(stage);
     let write = move || {
