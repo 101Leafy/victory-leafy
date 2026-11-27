@@ -362,6 +362,15 @@ fn batches() -> u8 {
     })
 }
 
+/// Whether a dispatch run in pieces (`crate::indirect::SPLIT`) is clamped
+/// in a batch like any other single record (`VICTORY_SPLIT_BATCH=1`; off by
+/// default). Gameplay has about 880 clamp passes a frame, most of them for
+/// these, each with two full waits.
+fn split_batch() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SPLIT_BATCH").is_some_and(|v| v == "1"))
+}
+
 /// Whether a full wait (a title barrier on buffers, a pipeline sync or
 /// barrier group, the wait that opens a batch of clamps) is left out when
 /// nothing that writes was recorded in the list since the last one
@@ -4942,7 +4951,7 @@ impl State {
             self.batch = None;
         }
         // A draw after dispatches waits for them.
-        if kind != DISPATCH {
+        if kind != DISPATCH && kind != crate::indirect::SPLIT {
             self.synced();
         }
         let (id, offset) = (args.id(), args.offset(arguments));
@@ -5104,9 +5113,9 @@ impl State {
             return true;
         }
         // One record without a count: clamped in a batch (`batches`).
-        let batch = if batches() > 0 && max == 1 && count.is_none() && split.is_none() {
+        let batch = if batches() > 0 && max == 1 && count.is_none() && (split.is_none() || split_batch()) {
             args.refresh(list, arguments, len);
-            self.batched(list, &args, arguments, kind)
+            self.batched(list, &args, arguments, if split.is_some() { crate::indirect::SPLIT } else { kind })
         } else {
             None
         };
@@ -5249,7 +5258,7 @@ impl State {
                     &bounded,
                     at,
                     Some(&bounded),
-                    u64::from(max) * u64::from(crate::indirect::PIECES * 16),
+                    at + u64::from(max) * u64::from(crate::indirect::PIECES * 16),
                 ),
                 None => list.list.ExecuteIndirect(
                     &signature,
