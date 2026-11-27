@@ -440,11 +440,13 @@ pub(crate) enum C {
     CardLateMoved,
     CardLateMovedBytes,
     CardLateRefused,
+    /// Full waits with nothing written since the last one (`crate::draw::State::wait_needed`).
+    WaitsQuiet,
 }
 const COUNTERS: usize = 256;
 
 /// The counters' names, in the order of [`C`], for the frame recorder's columns.
-pub(crate) const NAMES: [&str; 233] = [
+pub(crate) const NAMES: [&str; 234] = [
     "Submissions", "Copies", "CopyBytes", "Refreshes", "RefreshBytes", "Skipped", "SkippedBytes", "Runs",
     "RunUs", "Queries", "QueryUs", "MoveUs", "Unmapped", "Watches", "WatchUs", "Checked", "Unchanged",
     "Fallbacks", "GuardFaults", "TexWatched", "TexHashed", "TexChanged", "TexHot", "Frames", "RecordCalls",
@@ -495,6 +497,7 @@ pub(crate) const NAMES: [&str; 233] = [
     "CbvViews", "CbvAligned", "CbvBytes", "CbvAlignedBytes",
     "CbvTables", "CbvTablesAligned", "CbvTablesAlignedSlots", "CbvAgainAlignedSlots",
     "CardLateMoved", "CardLateMovedBytes", "CardLateRefused",
+    "WaitsQuiet",
 ];
 /// One of some sets of counters, each in lines of the processor's memory of
 /// its own: a set for all threads had them wait for each other's lines at
@@ -873,7 +876,7 @@ mod command_tests {
     #[test]
     fn every_counter_is_named() {
         use super::{C, COUNTERS, NAMES};
-        assert_eq!(C::CardLateRefused as usize + 1, NAMES.len());
+        assert_eq!(C::WaitsQuiet as usize + 1, NAMES.len());
         assert_eq!(NAMES[C::Frames as usize], "Frames");
         assert!(NAMES.len() <= COUNTERS);
     }
@@ -1940,10 +1943,11 @@ pub(crate) fn log(frames: f64) {
     tracing::info!(
         "  waits for every earlier shader write, per frame: {:.0} for the title's barrier groups, {:.0} \
          for its barriers on buffers; {:.0} indirect commands bounded (a dispatch of ours between two \
-         such waits each); barrier experiment {}",
+         such waits each); {:.0} of all these after nothing that writes; barrier experiment {}",
         c[C::WaitsForGroups as usize],
         c[C::WaitsForBuffers as usize],
         c[C::IndirectBounded as usize],
+        c[C::WaitsQuiet as usize],
         barrier_test()
     );
     barrier_next();

@@ -259,8 +259,8 @@ impl Table {
 
 /// Records the pass over the table at `jobs` (a host address) into `dst`,
 /// which is in state `before` and left in `INDIRECT_ARGUMENT`: after every
-/// earlier shader write (the title's argument passes), before what reads
-/// the clamped records.
+/// earlier shader write (the title's argument passes) if `wait`, before
+/// what reads the clamped records.
 pub(super) fn record(
     c: &Clamp,
     l: &ID3D12GraphicsCommandList,
@@ -268,6 +268,7 @@ pub(super) fn record(
     budget: u64,
     sources: [u64; SOURCES],
     jobs: u64,
+    wait: bool,
 ) {
     let after = transition(
         dst,
@@ -277,10 +278,12 @@ pub(super) fn record(
     // SAFETY: an open list; our root signature and pipeline; live buffers:
     // the sources and the table are read in the common state (promoted).
     unsafe {
-        l.ResourceBarrier(&[
-            uav_barrier(),
-            transition(dst, before, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
-        ]);
+        let moved = transition(dst, before, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        if wait {
+            l.ResourceBarrier(&[uav_barrier(), moved]);
+        } else {
+            l.ResourceBarrier(&[moved]);
+        }
         l.SetComputeRootSignature(&c.root);
         l.SetPipelineState(&c.pso);
         for (i, source) in sources.into_iter().enumerate() {
