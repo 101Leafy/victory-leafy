@@ -47,7 +47,15 @@ pub(crate) fn room(memory: Option<[u64; 4]>) {
 
 fn spares(memory: Option<[u64; 4]>, keep: bool) -> usize {
     match memory {
-        Some([budget, used, ..]) if keep && u128::from(used) * 100 < u128::from(budget) * 85 => SPARE_KEPT,
+        Some([budget, used, ..]) if keep && u128::from(used) * 100 < u128::from(budget) * 85 => {
+            // Empty blocks wait for the next turn, but never more of them
+            // than there is room left for: sixty-four are 4 GiB, which is
+            // half the budget of an 8 GiB card kept empty for a later use
+            // while the title's own textures are refused. Two always stay,
+            // as before, so a card that is full still has the small ones.
+            let fits = budget.saturating_sub(used) / BLOCK;
+            (SPARE_KEPT as u64).min(fits.max(SPARE as u64)) as usize
+        }
         _ => SPARE,
     }
 }
@@ -608,10 +616,17 @@ mod tests {
 
     #[test]
     fn empty_blocks_stay_while_the_card_has_room() {
-        assert_eq!(spares(Some([100, 84, 0, 0]), true), SPARE_KEPT);
-        assert_eq!(spares(Some([100, 85, 0, 0]), true), SPARE);
-        assert_eq!(spares(Some([100, 10, 0, 0]), false), SPARE);
+        const GIB: u64 = 1 << 30;
+        // 24 GiB with 20 in use: room for the full set, as measured.
+        assert_eq!(spares(Some([24 * GIB, 20 * GIB, 0, 0]), true), SPARE_KEPT);
+        // The same card at 85 % of its budget: the few.
+        assert_eq!(spares(Some([1000, 850, 0, 0]), true), SPARE);
+        assert_eq!(spares(Some([1000, 10, 0, 0]), false), SPARE);
         assert_eq!(spares(None, true), SPARE);
+        // An 8 GiB card with 6 in use holds the 2 GiB it has room for, not 4.
+        assert_eq!(spares(Some([8 * GIB, 6 * GIB, 0, 0]), true), 32);
+        // Full: never fewer than the two it always had.
+        assert_eq!(spares(Some([8 * GIB, 8 * GIB, 0, 0]), true), SPARE);
     }
 
     #[test]
