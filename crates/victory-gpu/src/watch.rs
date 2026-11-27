@@ -709,6 +709,40 @@ const AHEAD_GAP: usize = (8 << 20) / PAGE;
 /// The most one asking covers (its answer needs 8 bytes per 4 KiB page).
 const AHEAD_MAX: usize = (1 << 30) / PAGE;
 
+/// [`AHEAD_GAP`], or `VICTORY_AHEAD_GAP_MB` MiB.
+fn ahead_gap() -> usize {
+    static GAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *GAP.get_or_init(|| {
+        std::env::var("VICTORY_AHEAD_GAP_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .map_or(AHEAD_GAP, |mb| (mb << 20) / PAGE)
+    })
+}
+
+/// Whether [`ask_ahead`] keeps each asking inside one reservation
+/// (`VICTORY_ASK_SPLIT=1`; off by default). A run across two reservations is
+/// refused, and [`ask_run`] then asks it again by halves: in Leafy's
+/// gameplay frames (leafy-0314) 105 of 227 askings a frame were refused.
+/// With the switch a run that is refused anyway lies in one reservation that
+/// is not write-watched: it is not halved, and the reservation is not asked
+/// about again in the frame. Its ranges are left to [`writes`], as a lone
+/// range is.
+fn ask_split() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ASK_SPLIT").is_some_and(|v| v == "1"))
+}
+
+/// The reservation `page` lies in: its allocation base, in pages.
+fn reservation(page: usize) -> usize {
+    use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
+    // SAFETY: plain data filled in by the query.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out pointer of the right size.
+    let n = unsafe { VirtualQuery((page * PAGE) as *const _, &mut info, size_of_val(&info)) };
+    if n == 0 { usize::MAX } else { info.AllocationBase as usize / PAGE }
+}
+
 /// Asks the kernel about many ranges `(start, end)` at once, before the
 /// [`writes`] of each: ranges close together are one asking, and `writes`
 /// then answers from the journal until [`ask_ahead_done`]. The world's
@@ -732,6 +766,8 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
     if journal().kept {
         return;
     }
+    let split = ask_split();
+    let homes: Vec<usize> = if split { pieces.iter().map(|p| reservation(p.0)).collect() } else { Vec::new() };
     let _all = Asking::hold_all();
     let (mut asked, mut written) = (Vec::new(), Vec::new());
     let mut i = 0;
@@ -740,13 +776,26 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
         let mut last = pieces[i].1;
         let mut k = i + 1;
         while k < pieces.len()
-            && pieces[k].0 <= last + AHEAD_GAP
+            && pieces[k].0 <= last + ahead_gap()
             && last.max(pieces[k].1) - first <= AHEAD_MAX
+            && (!split || homes[k] == homes[i])
         {
             last = last.max(pieces[k].1);
             k += 1;
         }
-        ask_run(&pieces[i..k], &mut asked, &mut written);
+        if !split {
+            ask_run(&pieces[i..k], &mut asked, &mut written);
+        } else if k - i >= 2 && !refused_before(homes[i], homes[i]) {
+            // (A reservation refused is noted as the range (base, base),
+            // which no asking has.)
+            match kernel_written(first, last) {
+                Some(pages) => {
+                    written.extend(pages);
+                    asked.push((first, last));
+                }
+                None => refused(homes[i], homes[i]),
+            }
+        }
         i = k;
     }
     note_hot(&written);
@@ -4212,6 +4261,25 @@ mod tests {
         );
         // SAFETY: our allocation.
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn reservation_is_the_allocation_base() {
+        // SAFETY: two fresh reservations, the first committed in part, freed at the end.
+        let (a, b) = unsafe {
+            let a = VirtualAlloc(std::ptr::null(), 8 * PAGE, MEM_RESERVE | MEM_WRITE_WATCH, PAGE_READWRITE) as usize;
+            VirtualAlloc((a + 2 * PAGE) as _, PAGE, MEM_COMMIT, PAGE_READWRITE);
+            (a, VirtualAlloc(std::ptr::null(), PAGE, MEM_RESERVE, PAGE_READWRITE) as usize)
+        };
+        assert!(a != 0 && b != 0);
+        assert_eq!(reservation(a / PAGE + 2), a / PAGE);
+        assert_eq!(reservation(a / PAGE + 7), a / PAGE);
+        assert_eq!(reservation(b / PAGE), b / PAGE);
+        // SAFETY: our reservations.
+        unsafe {
+            VirtualFree(a as *mut _, 0, MEM_RELEASE);
+            VirtualFree(b as *mut _, 0, MEM_RELEASE);
+        }
     }
 
     /// Our write into title memory after the asking that found it has ended is in the journal: the
