@@ -18,6 +18,7 @@ use std::sync::mpsc::{Sender, channel};
 use std::time::{Duration, Instant};
 
 use super::Host;
+use super::spans;
 
 /// Frames written so far, for the panel.
 pub(super) static ROWS: AtomicU64 = AtomicU64::new(0);
@@ -69,7 +70,28 @@ const COUNTERS: &[(&str, fn() -> u64)] = &[
 ];
 
 /// Read as they are, not as growth: memory in bytes.
-const GAUGES: [&str; 5] = ["private", "working", "vram_used", "vram_budget", "vram_shared"];
+const GAUGES: [&str; 9] = [
+    "private",
+    "working",
+    "vram_used",
+    "vram_budget",
+    "vram_shared",
+    // The card's own clock, as `spans::line` leaves it each second: submissions
+    // a frame, the card working, the card idle between submissions, and the
+    // longest one. `VICTORY_CARD_SPANS=1` measures them; without it they stay 0,
+    // which says "not measured" rather than "nothing found". They are what
+    // separates a card that is working all of the frame from one that is starved
+    // between the pieces it is handed.
+    //
+    // Submissions are written in HUNDREDTHS (`spans::LAST[0]` is
+    // `count / frames * 100`, so that a frame of the second does not round to
+    // none): 5 800 is 58 submissions a frame. The column says so in its name,
+    // because a scale nobody can see is a number read a hundred times too big.
+    "card_span_submissions_x100",
+    "card_span_busy_us",
+    "card_span_between_us",
+    "card_span_longest_us",
+];
 
 fn get(a: &AtomicU64) -> u64 {
     a.load(Ordering::Relaxed)
@@ -249,13 +271,27 @@ impl Frames {
         }
         let counters = counters();
         let mut row = Vec::with_capacity(4 + GAUGES.len() + counters.len());
+        // The five memory gauges as the second handed them (`self.gauges`,
+        // read once a second for the reason above) and the card's own four
+        // from the last line the stamps drew: one extend of thirteen, so the
+        // row carries exactly as many values as the header names.
+        let [private, working, used, budget, shared] = self.gauges;
+        let [submissions, busy, between, longest] = spans::last();
         row.extend([
             self.frame,
             (now - self.began).as_micros() as u64,
             (now - self.last).as_micros() as u64,
             present.as_micros() as u64,
+            private,
+            working,
+            used,
+            budget,
+            shared,
+            submissions,
+            busy,
+            between,
+            longest,
         ]);
-        row.extend(self.gauges);
         row.extend(grown(&counters, &self.before));
         self.before = counters;
         self.last = now;
