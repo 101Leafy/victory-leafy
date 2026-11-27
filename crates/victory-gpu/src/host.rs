@@ -6486,6 +6486,9 @@ impl Host {
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
         let was_working = working(true);
         submitting(1, runs.len());
+        // With [`heap_sync_first`]: the heaps' records begun now, beside the
+        // planning of steps done on the card and the look at flights.
+        let first_heaps = (late && heap_sync_first()).then(crate::descriptor::begin_sync_heaps);
         #[cfg(feature = "diagnostics")]
         let ahead = Split::begin();
         #[cfg(feature = "diagnostics")]
@@ -6499,11 +6502,13 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         ahead.part(12);
         stage.next("submit: waiting for flights it reads from");
+        let mut waited_for_flights = false;
         if !late {
             self.settle(&mut submitted, WHY_SYNC);
         } else if own.is_none()
             && let Some(why) = late_blocked(runs)
         {
+            waited_for_flights = true;
             if relay_exact() && why == WHY_READ {
                 // Only until the flights that may write what is read have
                 // landed: their copy-back's end, not the card's other work.
@@ -6520,10 +6525,25 @@ impl Host {
         // command lists that index those slots are submitted.
         // Renderer port #7 (from renderer patch #4): the round asked for when
         // the title submitted it, if that is known (`crate::port_journal`).
+        // With [`heap_sync_first`] the round begun first is taken, or after a
+        // wait for flights, whose landings wrote title memory, another is
+        // begun, as the first saw them; the first is not waited for.
         let heaps_on = crate::port_journal::on();
-        let heaps_synced = match crate::port_journal::needed() {
-            0 => crate::descriptor::begin_sync_heaps(),
-            mark => crate::descriptor::begin_sync_heaps_after(mark),
+        let heaps_synced = match (first_heaps, waited_for_flights) {
+            (Some(first), false) => {
+                HEAP_SYNC_FIRST[0].fetch_add(1, Ordering::Relaxed);
+                first
+            }
+            (first, _) => {
+                if let Some(first) = first {
+                    HEAP_SYNC_FIRST[1].fetch_add(1, Ordering::Relaxed);
+                    std::mem::forget(first);
+                }
+                match crate::port_journal::needed() {
+                    0 => crate::descriptor::begin_sync_heaps(),
+                    mark => crate::descriptor::begin_sync_heaps_after(mark),
+                }
+            }
         };
         // That list runs first, and is one of the submission's from here on.
         let with: Vec<&HostList>;
@@ -8618,6 +8638,31 @@ static SPLIT: [std::sync::atomic::AtomicU64; 16] = [const { std::sync::atomic::A
 #[cfg(feature = "diagnostics")]
 static FLUSHES: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
+/// Whether a submission sent ahead begins the round of the heaps' records
+/// (`crate::descriptor::begin_sync_heaps`) as soon as it holds the
+/// submission lock, before the steps done on the card are planned and
+/// flights are looked at (`VICTORY_HEAP_SYNC_FIRST=1`; off by default: after
+/// them, as before). With `VICTORY_PORT_JOURNAL=1` it does nothing: the
+/// journal asks for the round at the title's submit, earlier still.
+///
+/// From trustno1-coder's fork: there the submitting thread waited for those
+/// rounds at the end of its preparing, 2.7-5.8 ms a frame, while the
+/// planning ahead of the round's start took 2-4 ms a frame. What changes:
+/// the round reads the heaps' pages earlier, by that planning's time. A
+/// record the title writes for this submission after submitting it (which
+/// the console's card could miss as well) is left to the next round; a
+/// submission that waited for flights to land begins another round after
+/// the wait, as the round begun here saw what they landed.
+fn heap_sync_first() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_HEAP_SYNC_FIRST") && !crate::port_journal::on())
+}
+
+/// Since the last frame line, with [`heap_sync_first`]: submissions whose
+/// round of the heaps' records was begun first, and those that began
+/// another after a wait for flights.
+static HEAP_SYNC_FIRST: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
 /// Counts into [`SPLIT`].
 #[cfg(feature = "diagnostics")]
 struct Split(std::cell::Cell<std::time::Instant>);
@@ -10245,6 +10290,13 @@ impl Meter {
         );
         crate::shadow::exact_line(frames);
         crate::descriptor::sync_line(frames);
+        if heap_sync_first() {
+            let [first, again] = [0, 1].map(|i| HEAP_SYNC_FIRST[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            tracing::info!(
+                "the heaps' records begun as a submission took the lock, per frame (VICTORY_HEAP_SYNC_FIRST=1): {first:.1}, and \
+                 {again:.1} begun again after a wait for flights"
+            );
+        }
         late_line(frames);
         crate::queue::behind_line(frames);
         card_clock_line(frames, ms);
