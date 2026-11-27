@@ -178,6 +178,31 @@ fn recheck_soon() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_RECHECK_SOON").is_none_or(|v| v != "0"))
 }
 
+/// Whether the first pass before a bake in a frame also looks at every
+/// texture uploaded whole whose next look again ([`RECHECK_FRAMES`]) is
+/// further off than the pass takes slots from (`VICTORY_BAKE_LOOK_ALL=0`:
+/// no, as before). A texture the title fills after an early look found its
+/// memory as uploaded waits 40 to 3,600 frames for the next one, and a
+/// bake in between bakes what the first upload held: with the title's
+/// streaming threads at their own lower priority (no
+/// `VICTORY_TITLE_PRIORITIES=0`), the face layers of the women in the
+/// interview room were baked black and speckled for the whole scene.
+/// Such a look leaves the slot's own next look where it was; a texture
+/// found changed is uploaded before the bake. The latest uploads first, and
+/// [`BAKE_LOOK_AT_MOST`] of them: a look reads 48 KiB, and a scene keeps
+/// thousands of slots waiting.
+fn bake_look_all() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BAKE_LOOK_ALL").is_none_or(|v| v != "0"))
+}
+
+/// Since the start: textures [`bake_look_all`] looked at that were as
+/// uploaded, and that had changed.
+pub(crate) static BAKE_LOOKS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+
+/// The most textures [`bake_look_all`] looks at before a bake (48 MiB read).
+const BAKE_LOOK_AT_MOST: usize = 1024;
+
 /// Frames ahead the pass before a bake takes slots from that are due only
 /// then ([`bake_exact`]): those of notices (1 and 2), and the first looks
 /// again ([`RECHECK_FRAMES`]), these at the frame's first bake alone (a
@@ -2437,6 +2462,8 @@ impl State {
                 queued_at_the_last_pass = slots,
                 due_at_the_last_pass = due,
                 uploaded_so_far = HEAP_TEXTURES.load(Ordering::Relaxed),
+                looked_at_early_as_uploaded = BAKE_LOOKS[0].load(Ordering::Relaxed),
+                looked_at_early_changed = BAKE_LOOKS[1].load(Ordering::Relaxed),
                 "a draw of the title's decoration bake: textures picked by index are uploaded first (VICTORY_BAKE_TEXTURES_MS=0: not)"
             );
         }
@@ -2639,12 +2666,22 @@ impl State {
         let (mut due, census) = host.texture_slots_due(frame, if baking { 1 << 16 } else { 4096 });
         // (Those that are due later after all that are due.)
         let on_time = due.len();
+        let mut looked_early = std::collections::HashSet::new();
         if baking {
-            let known: std::collections::HashSet<u32> = due.iter().map(|&(index, _)| index).collect();
+            let mut known: std::collections::HashSet<u32> = due.iter().map(|&(index, _)| index).collect();
             static AHEAD: AtomicU64 = AtomicU64::new(u64::MAX);
             let again = AHEAD.swap(frame, Ordering::Relaxed) == frame;
-            let (ahead, _) = host.texture_slots_due(frame + BAKE_AHEAD[usize::from(again)], 1 << 16);
-            due.extend(ahead.into_iter().filter(|(index, _)| !known.contains(index)));
+            let by = frame + BAKE_AHEAD[usize::from(again)];
+            let (ahead, _) = host.texture_slots_due(by, 1 << 16);
+            due.extend(ahead.into_iter().filter(|&(index, _)| known.insert(index)));
+            if !again && bake_look_all() {
+                for (index, write) in host.texture_slots_rechecking(by).into_iter().take(BAKE_LOOK_AT_MOST) {
+                    if known.insert(index) {
+                        looked_early.insert(index);
+                        due.push((index, write));
+                    }
+                }
+            }
         }
         HEAP_TEXTURES_WAITING.store(census[0], Ordering::Relaxed);
         for (count, now) in HEAP_TEXTURES_QUEUE.iter().zip(census) {
@@ -2741,6 +2778,13 @@ impl State {
                 let unchanged = crate::texture::fingerprint(at, len) == print;
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::lap(crate::copystat::C::HeapTexCheckNs, started);
+                if unchanged && looked_early.contains(&index) {
+                    BAKE_LOOKS[0].fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+                if looked_early.contains(&index) {
+                    BAKE_LOOKS[1].fetch_add(1, Ordering::Relaxed);
+                }
                 if unchanged {
                     HEAP_TEXTURES_RECHECKED[0].fetch_add(1, Ordering::Relaxed);
                     match RECHECK_FRAMES.get(usize::from(looks) + 1) {

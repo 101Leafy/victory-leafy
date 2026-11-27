@@ -1402,6 +1402,20 @@ impl TextureQueue {
         self.slots.get(&index).map(|w| w.checked).filter(|c| c.2 != 0)
     }
 
+    /// The slots uploaded whole and waiting for a look again
+    /// ([`TextureQueue::recheck`]) that is not due by frame `by`, each
+    /// with its write number, the latest upload first.
+    fn rechecking(&self, by: u64) -> Vec<(u32, u64)> {
+        let mut later: Vec<(u64, u32, u64)> = self
+            .slots
+            .iter()
+            .filter(|(_, w)| w.checked.2 != 0 && w.due > by)
+            .map(|(&index, w)| (w.checked.4, index, w.write))
+            .collect();
+        later.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        later.into_iter().map(|(_, index, write)| (index, write)).collect()
+    }
+
     /// The memory slot `index`'s texture lies in was mapped, unmapped or
     /// written in `frame`: the slot is looked at from frame `due` as one
     /// written now, whatever was known of it (a pass at work on it does
@@ -2210,6 +2224,11 @@ impl HostHeap {
     /// See [`TextureQueue::checked`].
     pub(crate) fn texture_slot_checked(&self, index: u32) -> Option<(u64, u64, u64, u8, u64)> {
         self.textures.lock().unwrap_or_else(|e| e.into_inner()).checked(index)
+    }
+
+    /// See [`TextureQueue::rechecking`].
+    pub(crate) fn texture_slots_rechecking(&self, by: u64) -> Vec<(u32, u64)> {
+        self.textures.lock().unwrap_or_else(|e| e.into_inner()).rechecking(by)
     }
 
     /// Nothing to upload at title slot `index` now (its memory is not
@@ -5935,6 +5954,32 @@ mod tests {
         q.written(98, 14, 16, false);
         assert!(!q.due(15, 100).iter().any(|d| d.0 == 98));
         assert!(q.due(16, 100).iter().any(|d| d.0 == 98));
+    }
+
+    /// A bake asks for the slots uploaded whole whose next look is not due
+    /// yet: those waiting for such a look alone, not due by the frame
+    /// asked, the latest upload first; and a slot the title wrote again
+    /// is no longer one of them.
+    #[test]
+    fn a_bake_finds_the_slots_waiting_for_a_later_look() {
+        let mut q = TextureQueue::default();
+        for i in 0..5u32 {
+            q.written(30 + i, 1, 0, false);
+        }
+        let write = |q: &TextureQueue, index: u32| q.due(u64::MAX, 100).iter().find(|d| d.0 == index).unwrap().1;
+        // 30 uploaded at frame 10, next look at 400; 31 at 20, look at 60;
+        // 32 at 15, look at 24; 33 uploaded in part; 34 never.
+        let (w30, w31, w32, w33) = (write(&q, 30), write(&q, 31), write(&q, 32), write(&q, 33));
+        q.recheck(30, w30, 400, (0x1000, 0x10000), 7, 3, 10);
+        q.recheck(31, w31, 60, (0x20000, 0x10000), 9, 2, 20);
+        q.recheck(32, w32, 24, (0x40000, 0x10000), 5, 1, 15);
+        q.partly(33, w33, 30, 4096);
+        assert_eq!(q.rechecking(30), [(31, w31), (30, w30)]);
+        assert_eq!(q.rechecking(100), [(30, w30)]);
+        assert_eq!(q.rechecking(0), [(31, w31), (32, w32), (30, w30)]);
+        // What the queue knew of slot 31 is dropped with its new write.
+        q.written(31, 40, 0, false);
+        assert_eq!(q.rechecking(30), [(30, w30)]);
     }
 
     /// Slots held back for lack of room on the card are not handed out
