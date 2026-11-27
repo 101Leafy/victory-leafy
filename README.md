@@ -215,6 +215,11 @@ described in a comment where it is read.
 
 On top of what the forks above bring:
 
+- **Renderer port 1** (`VICTORY_PORT_CONSTANTS=1`, off by default): the title's
+  185 MB reservation of 32-bit graphics memory is opened once through a view of
+  ours and used where the title writes it, so that heap's ~17 MB a frame of
+  uploads, the fetch-back and compare passes over it and ~6,000 constant-buffer
+  fills a frame are gone (from Belobug's renderer ports, 86dc109 and 4b82f6c).
 - **NVIDIA**: the wave64 pull requests merged together, and float colour exports
   held to what the console's colour block allows, with a NaN written as 0
   (`VICTORY_COLOR_FINITE`).
