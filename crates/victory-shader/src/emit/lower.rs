@@ -6,8 +6,9 @@
 //! emitter cannot express is `Missing` with a reason, and only fails the
 //! program when something with an effect (an export, a branch) needs it.
 
-use std::cell::OnceCell;
+use std::cell::{Cell, OnceCell};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::thread::LocalKey;
 
 use super::UserData;
 use super::bitcode::{Attr, Bin, Cast, Rmw, Tag, Term, V, pred};
@@ -1200,10 +1201,26 @@ thread_local! {
 // console's 32-lane programs that share LDS within a wave), the fences only keeping its
 // compiler from moving one thread's accesses past each other.
 pub(super) fn with_paired_lanes<R>(f: impl FnOnce() -> R) -> R {
-    let was = PAIRED.replace(true);
-    let r = f();
-    PAIRED.set(was);
-    r
+    with_lowering_mode(&PAIRED, f)
+}
+
+/// Restore the previous mode even when a worker catches a panic and
+/// translates another shader on the same thread.
+fn with_lowering_mode<R>(mode: &'static LocalKey<Cell<bool>>, f: impl FnOnce() -> R) -> R {
+    struct Restore {
+        mode: &'static LocalKey<Cell<bool>>,
+        previous: bool,
+    }
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            self.mode.set(self.previous);
+        }
+    }
+    let _restore = Restore {
+        mode,
+        previous: mode.replace(true),
+    };
+    f()
 }
 
 /// As [`with_local_waves`], with every other use of a lane mask as a number
@@ -1214,10 +1231,7 @@ pub(super) fn with_paired_lanes<R>(f: impl FnOnce() -> R) -> R {
 /// thread group gets per-half results. The last resort for programs that
 /// do not translate otherwise.
 pub(super) fn with_local_waves_any<R>(f: impl FnOnce() -> R) -> R {
-    let was = LOCAL_ANY.replace(true);
-    let r = with_local_waves(f);
-    LOCAL_ANY.set(was);
-    r
+    with_lowering_mode(&LOCAL_ANY, || with_local_waves(f))
 }
 
 /// Runs `f` with console wave64 programs on 32-lane hosts lowered with each
@@ -1237,10 +1251,7 @@ pub(super) fn with_local_waves_any<R>(f: impl FnOnce() -> R) -> R {
 /// say, with one wave per thread group) gets its half's result. It is used
 /// only for programs that do not translate otherwise.
 pub(super) fn with_local_waves<R>(f: impl FnOnce() -> R) -> R {
-    let was = LOCAL_WAVES.replace(true);
-    let r = f();
-    LOCAL_WAVES.set(was);
-    r
+    with_lowering_mode(&LOCAL_WAVES, f)
 }
 
 /// `VICTORY_F16_NEAREST=1`: the results of 16-bit float operations (`v_add_f16`,
@@ -1342,10 +1353,7 @@ thread_local! {
 /// pair they start: the translation of a program refused with
 /// [`FIRST_HALF`] (`VICTORY_FIRST_HALF=0`: refused again, as before).
 pub(super) fn with_first_half_pairs<R>(translate: impl FnOnce() -> R) -> R {
-    let before = FIRST_HALF_PAIRS.replace(true);
-    let result = translate();
-    FIRST_HALF_PAIRS.set(before);
-    result
+    with_lowering_mode(&FIRST_HALF_PAIRS, translate)
 }
 
 pub(super) fn host_max_wave() -> u32 {
@@ -1353,7 +1361,24 @@ pub(super) fn host_max_wave() -> u32 {
     if let Some(lanes) = TEST_HOST_WAVE.get() {
         return lanes;
     }
-    HOST_MAX_WAVE.load(std::sync::atomic::Ordering::Relaxed)
+    match HOST_MAX_WAVE.load(std::sync::atomic::Ordering::Relaxed) {
+        #[cfg(test)]
+        0 => test_host_wave(),
+        lanes => lanes,
+    }
+}
+
+/// `VICTORY_TEST_HOST_WAVE=32`: tests translate as for a host whose waves are at most 32
+/// lanes (NVIDIA, Intel), the width `victory-gpu` passes there, instead of with no host
+/// width (which lowers as a 64-lane host does). An RDNA card runs waves of 32 too, so it
+/// runs the GPU tests in the form those hosts get. A test that sets its own width keeps it.
+#[cfg(test)]
+fn test_host_wave() -> u32 {
+    static WAVE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *WAVE.get_or_init(|| {
+        let wave = std::env::var("VICTORY_TEST_HOST_WAVE").ok();
+        wave.and_then(|v| v.trim().parse().ok()).unwrap_or(0)
+    })
 }
 
 #[cfg(test)]
@@ -1685,19 +1710,18 @@ impl<'a> Lower<'a> {
             let one_wave = group <= wave;
             // A host whose waves are at most 32 lanes (NVIDIA) refuses `WaveSize(64)`. A console
             // wave64 program whose cross-lane code stays inside 32-lane halves – DPP rows,
-            // `ds_swizzle`, `v_permlane16` / `v_permlanex16`, which the ISA confines there – runs
-            // exactly in waves of 32: the thread relabelling makes each host wave one half of a
-            // console wave (lanes 32k..32k+31). Not when it crosses halves (`v_mbcnt`,
-            // `v_readlane`, `v_writelane`, `ds_(b)permute`, masks as numbers or lane-constant
-            // masks), nor when LDS may be shared within the console wave without barriers (a
-            // group over 32 threads with LDS): those still need 64-lane waves.
+            // `ds_swizzle`, `v_permlane16` / `v_permlanex16`, `ds_bpermute`, which the ISA
+            // confines there – runs exactly in waves of 32: the thread relabelling makes each host
+            // wave one half of a console wave (lanes 32k..32k+31). Not when it crosses halves
+            // (`v_mbcnt`, `v_readlane`, `v_writelane`, `ds_permute`, masks as numbers or
+            // lane-constant masks), nor when LDS may be shared within the console wave without
+            // barriers (a group over 32 threads with LDS): those still need 64-lane waves.
             if wave == 64 && host_max_wave() == 32 && (console_lanes || one_wave && s.lds_dwords > 0) {
                 let crosses = insts().any(|i| {
                     let n = i.name();
                     n.starts_with("v_mbcnt")
                         || matches!(n, "v_readlane_b32" | "v_writelane_b32")
                         || n.starts_with("ds_permute")
-                        || n.starts_with("ds_bpermute")
                         || reads_mask_as_data(x.st, i)
                 }) || lane_constant_masks(x.st)
                     || !x.st.wide.is_empty();
@@ -1758,8 +1782,8 @@ impl<'a> Lower<'a> {
                             "v_readlane"
                         } else if n == "v_writelane_b32" {
                             "v_writelane"
-                        } else if n.starts_with("ds_permute") || n.starts_with("ds_bpermute") {
-                            "ds_(b)permute"
+                        } else if n.starts_with("ds_permute") {
+                            "ds_permute"
                         } else if reads_mask_as_data(x.st, i) {
                             "mask as data"
                         } else {
@@ -2250,13 +2274,26 @@ impl<'a> Lower<'a> {
                     dword(self, at)?
                 }
                 Some((width, signed)) => {
-                    // shortcut: the field is taken not to cross a dword.
+                    // A half at byte 3 straddles: its high byte is byte 0 of
+                    // the next dword.
                     let (not3, three) = (self.s.m.i32(!3), self.s.m.i32(3));
                     let at = self.s.m.bin(c, Bin::And, off, not3);
                     let w = dword(self, at)?;
                     let byte = self.s.m.bin(c, Bin::And, off, three);
                     let sh = self.s.m.bin(c, Bin::Shl, byte, three);
-                    let x = self.s.m.bin(c, Bin::LShr, w, sh);
+                    let mut x = self.s.m.bin(c, Bin::LShr, w, sh);
+                    if width == 16 {
+                        // Reads this dword again when the half does not
+                        // straddle, so nothing is read that was not before.
+                        let is3 = self.s.m.cmp(c, pred::EQ, byte, three);
+                        let [four, eight, zero] = [4, 8, 0].map(|k| self.s.m.i32(k));
+                        let next = self.s.m.bin(c, Bin::Add, at, four);
+                        let next = self.s.m.select(c, is3, next, at);
+                        let hi = dword(self, next)?;
+                        let hi = self.s.m.bin(c, Bin::Shl, hi, eight);
+                        let hi = self.s.m.select(c, is3, hi, zero);
+                        x = self.s.m.bin(c, Bin::Or, x, hi);
+                    }
                     let left = self.s.m.i32(32 - width);
                     let x = self.s.m.bin(c, Bin::Shl, x, left);
                     self.s
@@ -3295,8 +3332,23 @@ impl<'a> Lower<'a> {
             return Val::Missing("pull-model barycentrics");
         }
         // One element per interpolation mode (the console's own, if its
-        // signature declares one): DXIL allows two.
+        // signature declares one). DXIL allows two, one perspective and
+        // one linear: a second perspective (or linear) mode is refused,
+        // since its weights differ from the first's where the modes'
+        // sample points do (centroid weights stay inside the triangle,
+        // center ones need not), so reusing the declared element would
+        // be a silent wrong value.
         let bary = |e: &SigElement| e.kind == 28;
+        let clash = self.s.inputs.iter().any(|e| {
+            bary(e) && e.usage != 0 && e.interp != mode && linear(e.interp) == linear(mode)
+        });
+        if clash {
+            return Val::Missing(if linear(mode) {
+                "barycentrics of two linear modes (SV_Barycentrics allows one)"
+            } else {
+                "barycentrics of two perspective modes (SV_Barycentrics allows one)"
+            });
+        }
         let id = match self
             .s
             .inputs
@@ -6070,28 +6122,30 @@ impl<'a> Lower<'a> {
         }
         if name == "ds_bpermute_b32" {
             // Backward permute: no LDS is touched. Each lane takes the data
-            // register of the lane its address names, (address + offset) / 4
-            // within the wave; a source lane outside EXEC gives 0. (
-            // the title's checkerboard shadow-mask generators read their
-            // neighbours' samples with it; without them every shadowed light
-            // was multiplied by an empty mask.)
+            // register of the lane its address names, (address + offset) / 4,
+            // within its own 32-lane half: GFX10 permutes the two halves of a
+            // wave of 64 on their own (LLVM's `supportsWaveWideBPermute`, Mesa
+            // ACO's `emit_bpermute`). So lane l reads lane (l & 32) | that & 31,
+            // in the same host wave on hosts of 32 lanes too. A source lane
+            // outside EXEC gives 0. (The title's checkerboard shadow-mask
+            // generators read their neighbours' samples with it; without them
+            // every shadowed light was multiplied by an empty mask.)
             // shortcut: a source lane that is not at this instruction on the
             // host (it left through a branch, not a guard) is read as the
             // host gives it; the console reads 0.
             self.cross_lane(false)?;
-            if self.exchange.as_ref().is_some_and(|e| !e.1) {
-                // a console wave of 64 run as two host waves: the lane named
-                // may be in the other one
-                return Err("a lane permute across two host waves");
-            }
             let at = self.vgprs(inst, addr.as_ref().ok_or("a permute address")?, 1)?[0];
             let x = self.vgprs(inst, data.first().ok_or("a permute source")?, 1)?[0];
             let o = self.s.m.i32(offset);
             let at = self.s.m.bin(c, Bin::Add, at, o);
             let two = self.s.m.i32(2);
             let src = self.s.m.bin(c, Bin::LShr, at, two);
-            let last = self.s.m.i32(self.wave() - 1);
-            let src = self.s.m.bin(c, Bin::And, src, last);
+            let k31 = self.s.m.i32(31);
+            let src = self.s.m.bin(c, Bin::And, src, k31);
+            let lane = self.lane_index();
+            let k32 = self.s.m.i32(32);
+            let half = self.s.m.bin(c, Bin::And, lane, k32);
+            let src = self.s.m.bin(c, Bin::Or, src, half);
             let x = match guard {
                 Some(g) => {
                     let z = self.s.m.i32(0);
@@ -6633,10 +6687,10 @@ impl<'a> Lower<'a> {
         }
     }
 
-    /// The paired form: an instruction that reads other lanes of the console wave, any of its
-    /// 64: `v_readlane_b32` and `v_readfirstlane_b32` (scalar results, the same in both lanes of
-    /// the thread) and `ds_bpermute_b32`. Lane n and lane n + 32 are the lower and the upper
-    /// lane of host lane n.
+    /// The paired form: an instruction that reads other lanes of the console wave:
+    /// `v_readlane_b32` and `v_readfirstlane_b32`, any of its 64 (scalar results, the same in
+    /// both lanes of the thread), and `ds_bpermute_b32`, within the lane's own half. Lane n and
+    /// lane n + 32 are the lower and the upper lane of host lane n.
     fn paired_cross(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
         self.cross_lane(false)?;
         let c = self.cur;
@@ -6669,8 +6723,9 @@ impl<'a> Lower<'a> {
                 self.write_i(inst, r, None)?;
             }
             _ => {
-                // `ds_bpermute_b32`: each lane reads the lane its address names, which gives
-                // its data, or 0 outside EXEC
+                // `ds_bpermute_b32`: each lane reads the lane its address names in its own
+                // half (the lower lanes the lower values, the upper lanes the upper ones),
+                // which gives its data, or 0 outside EXEC
                 let Fields::Ds {
                     dst: Some(Operand::Vector { reg, .. }),
                     addr: Some(addr),
@@ -6697,7 +6752,9 @@ impl<'a> Lower<'a> {
                     };
                     Ok((from, x, guard))
                 })?;
-                let read = [pick(self, x_lo, x_hi, from_lo), pick(self, x_lo, x_hi, from_hi)];
+                let from_lo = self.s.m.bin(c, Bin::And, from_lo, k31);
+                let from_hi = self.s.m.bin(c, Bin::And, from_hi, k31);
+                let read = [self.read_lane(x_lo, from_lo), self.read_lane(x_hi, from_hi)];
                 let guards = [g_lo, g_hi];
                 let reg = *reg;
                 self.both(|l| {
@@ -13647,6 +13704,11 @@ impl<'a> Lower<'a> {
     }
 }
 
+/// Whether DXIL interpolation mode `mode` is a linear (noperspective) one.
+fn linear(mode: u8) -> bool {
+    matches!(mode, 4 | 5 | 7)
+}
+
 /// The DXIL interpolation mode of a kind of barycentrics (none for the
 /// pull model).
 fn interp_mode(kind: Barycentric) -> Option<u8> {
@@ -13828,6 +13890,43 @@ mod tests {
         assert!(!lowered(1 << 4).early_depth);
         // A program that exports depth keeps it.
         assert!(!lowered(1 << 12 | 1 << 4 | 1).early_depth);
+    }
+
+    #[test]
+    fn scoped_lowering_modes_restore_after_a_panic() {
+        use super::{
+            FIRST_HALF_PAIRS, LOCAL_ANY, LOCAL_WAVES, PAIRED, with_first_half_pairs,
+            with_local_waves, with_local_waves_any, with_paired_lanes,
+        };
+
+        let modes = || (LOCAL_WAVES.get(), LOCAL_ANY.get(), FIRST_HALF_PAIRS.get());
+        assert_eq!(modes(), (false, false, false));
+        assert!(!PAIRED.get());
+
+        with_local_waves(|| {
+            with_local_waves_any(|| {
+                with_first_half_pairs(|| assert_eq!(modes(), (true, true, true)));
+                assert_eq!(modes(), (true, true, false));
+            });
+            assert_eq!(modes(), (true, false, false));
+        });
+        assert_eq!(modes(), (false, false, false));
+
+        let failure = std::panic::catch_unwind(|| {
+            with_paired_lanes(|| {
+                with_local_waves_any(|| {
+                    with_first_half_pairs(|| {
+                        assert_eq!(modes(), (true, true, true));
+                        assert!(PAIRED.get());
+                        panic!("synthetic lowering panic");
+                    });
+                });
+            });
+        })
+        .expect_err("the lowering panic should be caught");
+        assert_eq!(failure.downcast_ref::<&str>(), Some(&"synthetic lowering panic"));
+        assert_eq!(modes(), (false, false, false));
+        assert!(!PAIRED.get());
     }
 
     #[test]
