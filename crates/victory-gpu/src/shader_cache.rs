@@ -86,6 +86,7 @@ fn build(translator: &str) -> [u8; 32] {
         // executable had cached with the switch unset.
         for name in [
             "VICTORY_WAVE_WIDE",
+            "VICTORY_SCALAR_SPLITS",
             "VICTORY_WAVE_DEEP_SKIPS",
             "VICTORY_WAVE_OWN_BITS",
             "VICTORY_WAVE_LOCAL",
@@ -99,6 +100,7 @@ fn build(translator: &str) -> [u8; 32] {
             "VICTORY_BVH_BOUNDS",
             "VICTORY_WAVE_PAIRS",
             "VICTORY_LAUNCHED_EXEC",
+            "VICTORY_MESH_LAUNCH",
             "VICTORY_GUARD_FLOAT",
             "VICTORY_GUARD_RUNS",
         ] {

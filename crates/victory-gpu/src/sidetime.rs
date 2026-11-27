@@ -1,8 +1,10 @@
 //! The card's time in the sends the main lists' stamps leave out
 //! (`VICTORY_SIDE_STAMPS=1`, diagnostics builds): the list that sends host
 //! copies up to the card's memory and hashes them, the compare behind a
-//! submission's lists, and the fetch of what differed. Each list gets a
-//! pair of timestamps; the frame line adds them up by kind.
+//! submission's lists, the fetch of what differed, and the list of steps
+//! done on the card (`VICTORY_CARD_STEPS`). Each list gets a pair of
+//! timestamps (the first list two, sends and hashes); the frame line adds
+//! them up by kind.
 
 use std::collections::VecDeque;
 use std::sync::{Mutex, OnceLock};
@@ -12,7 +14,12 @@ use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
 pub(crate) const SYNC: usize = 0;
 pub(crate) const CHECK: usize = 1;
 pub(crate) const FETCH: usize = 2;
-const NAMES: [&str; 3] = ["sends and hashes", "compares", "fetches"];
+pub(crate) const HASH: usize = 3;
+pub(crate) const STEPS: usize = 4;
+const KINDS: usize = 5;
+const NAMES: [&str; KINDS] = ["sends", "compares", "fetches", "hashes", "steps on the card"];
+/// The order on the frame line.
+const ORDER: [usize; KINDS] = [SYNC, HASH, CHECK, FETCH, STEPS];
 
 /// Pairs of stamps in the ring.
 const PAIRS: u32 = 4096;
@@ -21,8 +28,8 @@ struct Ring {
     next: u32,
     /// Pairs given out and not read yet, with their kind.
     out: VecDeque<(u32, usize)>,
-    ticks: [u64; 3],
-    lists: [u64; 3],
+    ticks: [u64; KINDS],
+    lists: [u64; KINDS],
     /// Pairs the ring came round to before they were read.
     lost: u64,
 }
@@ -89,7 +96,7 @@ fn stamps(device: &ID3D12Device, queue: &ID3D12CommandQueue) -> Option<&'static 
                     back,
                     data: data as usize,
                     hz,
-                    ring: Mutex::new(Ring { next: 0, out: VecDeque::new(), ticks: [0; 3], lists: [0; 3], lost: 0 }),
+                    ring: Mutex::new(Ring { next: 0, out: VecDeque::new(), ticks: [0; KINDS], lists: [0; KINDS], lost: 0 }),
                 })
             }
         })
@@ -167,10 +174,10 @@ pub(crate) fn line(frames: f64) -> Option<String> {
     let ticks = std::mem::take(&mut ring.ticks);
     let lists = std::mem::take(&mut ring.lists);
     let mut text = String::new();
-    for kind in 0..3 {
+    for (i, kind) in ORDER.into_iter().enumerate() {
         text += &format!(
             "{}{} {:.1} ms ({:.1} lists)",
-            if kind == 0 { "" } else { ", " },
+            if i == 0 { "" } else { ", " },
             NAMES[kind],
             ticks[kind] as f64 / s.hz * 1000.0 / frames,
             lists[kind] as f64 / frames

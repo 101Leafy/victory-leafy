@@ -79,6 +79,9 @@ pub(crate) struct Shadow {
     /// outside buffers nothing asked for in a while, and nothing holds, is
     /// let go ([`let_go_idle`]).
     used: AtomicU64,
+    /// Of a window, the frames after the one it was made in that asked for
+    /// it ([`card_late`]).
+    frames: std::sync::atomic::AtomicU32,
     /// The lowest and highest title address asked for in the copy (a
     /// window is 4 MiB whatever was asked: measured for the memory line).
     asked: [AtomicU64; 2],
@@ -179,8 +182,13 @@ pub(crate) fn cards() -> bool {
 /// Default `(min_mb, max_mb)` for [`card_limits`] chosen from the adapter's
 /// local VRAM budget (`DXGI_QUERY_VIDEO_MEMORY_INFO.Budget`), in bytes.
 ///
-/// - Unknown (`None`, e.g. WARP) or `<= 12 GiB` (8–12 GB cards, whose WDDM
-///   budget is below 12 GiB): `(16, 512)` MiB, matching the 12 GB baseline.
+/// - Unknown (`None`, e.g. WARP) or `<= 9 GiB` (8 GB cards): `(16, 512)` MiB.
+/// - `> 9 GiB` and `<= 12 GiB` (12 GB cards, whose WDDM budget is about
+///   10–11.5 GiB): `(1, 1024)` MiB. On a 12 GB card with the 16 MiB floor
+///   nearly every title buffer stayed in PC memory and the CPU compared
+///   ~275 MB of their copies a frame for shader writes; with these values
+///   26 MB, preparing 87 -> 51 ms, copy-back 43 -> 20 ms, median FPS in
+///   scenes of more than 1,500 draws 4.9 -> 8.8, VRAM at 7.9 of 10.5 GB.
 /// - `> 12 GiB` and `< 20 GiB` (16 GB cards, whose WDDM budget is typically
 ///   ~13.5–15.2 GiB): `(1, 2048)` MiB. It was `(4, 2048)`: on the RTX 5080
 ///   (budget 15,209 MB) the play run of 2026-11-26 made 57 copies in the
@@ -199,10 +207,13 @@ fn default_card_limits_mb(local_vram_budget: Option<u64>) -> (u64, u64) {
         return (16, 512);
     };
     let budget_mb = budget_bytes >> 20;
+    const NINE_GIB_MB: u64 = 9 * 1024;
     const TWELVE_GIB_MB: u64 = 12 * 1024;
     const TWENTY_GIB_MB: u64 = 20 * 1024;
-    if budget_mb <= TWELVE_GIB_MB {
+    if budget_mb <= NINE_GIB_MB {
         (16, 512)
+    } else if budget_mb <= TWELVE_GIB_MB {
+        (1, 1024)
     } else if budget_mb < TWENTY_GIB_MB {
         (1, 2048)
     } else {
@@ -230,7 +241,7 @@ fn resolve_card_limits(
 /// shaders write takes its size twice), both in bytes:
 /// `VICTORY_CARD_BUFFERS_MIN_MB` and `VICTORY_CARD_BUFFERS_MB`.
 /// Defaults scale with the adapter's local VRAM budget (16 MiB / 512 MiB on
-/// `<= 12 GiB` budgets, 1 MiB / 2048 MiB on 16 GB cards, 1 MiB / up to 8192 MiB
+/// `<= 9 GiB` budgets, 1 MiB / 1024 MiB on 12 GB cards, 1 MiB / 2048 MiB on 16 GB cards, 1 MiB / up to 8192 MiB
 /// on `>= 20 GiB` budgets), and explicit env vars always override.
 fn card_limits() -> (u64, u64) {
     static LIMITS: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
@@ -488,7 +499,10 @@ fn card_room_for(size: u64) -> Option<ID3D12Resource> {
 }
 
 /// The most bytes of windows outside buffers whose copies go to the card's
-/// memory (`VICTORY_CARD_WINDOWS_MB`; 0, the default, none).
+/// memory (`VICTORY_CARD_WINDOWS_MB`; 1024 by default, 0 for none).
+///
+/// 1024 by default since the 2026-11-26 A/B on play 88de7c54d: p95 312 ms
+/// in the heavy section against 382-414 for the base and cb64 arms.
 ///
 /// Windows are two thirds of the PC memory the card shares (run 104: 861
 /// windows, 3,552 MB of 5,400), and every draw that takes vertices, indices
@@ -508,7 +522,7 @@ fn card_room_for(size: u64) -> Option<ID3D12Resource> {
 fn window_card_most() -> u64 {
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *MOST.get_or_init(|| {
-        std::env::var("VICTORY_CARD_WINDOWS_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0) << 20
+        std::env::var("VICTORY_CARD_WINDOWS_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(1024) << 20
     })
 }
 
@@ -600,10 +614,14 @@ fn window_room_for(size: u64) -> Option<ID3D12Resource> {
     if let Some([budget, used, ..]) = host.video_memory()
         && used + size > budget / 10 * 8
     {
+        WINDOW_ROOM_REFUSED[0].fetch_add(1, Ordering::Relaxed);
+        WINDOW_ROOM_REFUSED[1].fetch_add(size, Ordering::Relaxed);
         return None;
     }
     if WINDOW_CARD_BYTES.fetch_add(size, Ordering::Relaxed) + size > most {
         WINDOW_CARD_BYTES.fetch_sub(size, Ordering::Relaxed);
+        WINDOW_ROOM_REFUSED[0].fetch_add(1, Ordering::Relaxed);
+        WINDOW_ROOM_REFUSED[1].fetch_add(size, Ordering::Relaxed);
         return None;
     }
     let buffer = host.uav_buffer(size);
@@ -611,6 +629,147 @@ fn window_room_for(size: u64) -> Option<ID3D12Resource> {
         WINDOW_CARD_BYTES.fetch_sub(size, Ordering::Relaxed);
     }
     buffer
+}
+
+/// Windows get their side in the card's own memory ([`window_room_for`])
+/// only once asked for in this many frames after the one they were made in,
+/// those asked for in the most frames first (`VICTORY_CARD_WINDOWS_LATE`;
+/// "1" is 2 frames, another number that many; unset or 0, when made, as
+/// before). Made with the window, the room went to whichever came first:
+/// 7.5 GB of windows in wbar-a2 against 3 GB of room in dh-cw3, many of
+/// them read in one frame only.
+fn card_late() -> u32 {
+    static FRAMES: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *FRAMES.get_or_init(|| {
+        match std::env::var("VICTORY_CARD_WINDOWS_LATE").ok().and_then(|v| v.trim().parse::<u32>().ok()) {
+            Some(1) => 2,
+            Some(frames) => frames,
+            None => 0,
+        }
+    })
+}
+
+/// Most windows [`card_late_windows`] moves at one submission: each is a
+/// buffer made on the card, and its window copied again and sent up whole.
+const LATE_AT_ONCE: usize = 8;
+
+/// Gives the windows due ([`card_late`]) their side on the card. The window
+/// becomes a new copy whose CPU's side is the old copy's buffer, with the
+/// same bytes: slots made earlier still show that buffer, and as the new
+/// copy is brought up to date there they read what they read before, over
+/// the bus. Slots made after, root views and the copy's own refreshes take
+/// the new copy and its card side.
+///
+/// Only windows that only the table holds (no list, no pass), that were
+/// asked for in the last frame, that shaders never wrote, and with no side
+/// of their own. The buffers are made with no lock held; a window handed
+/// out in the meantime stays as it is. Called by [`let_go_idle`].
+fn card_late_windows() {
+    let late = card_late();
+    if late == 0 || !cards() || WINDOW_CARD_BYTES.load(Ordering::Relaxed) >= window_card_most() {
+        return;
+    }
+    let frame = crate::host::moment() >> 32;
+    let mut due: Vec<((u64, u64), Arc<Shadow>)> = {
+        let map = LOOSE.read().unwrap_or_else(|e| e.into_inner());
+        map.iter()
+            .filter(|(_, s)| {
+                s.window
+                    && s.card.is_none()
+                    && s.place.is_none()
+                    && !s.mapped
+                    && !s.written.load(Ordering::Relaxed)
+                    && s.frames.load(Ordering::Relaxed) >= late
+                    && frame.saturating_sub(s.used.load(Ordering::Relaxed) >> 32) <= 1
+                    && Arc::strong_count(s) == 1
+            })
+            .map(|(key, s)| (*key, s.clone()))
+            .collect()
+    };
+    if due.is_empty() {
+        return;
+    }
+    due.sort_unstable_by_key(|(_, s)| std::cmp::Reverse(s.frames.load(Ordering::Relaxed)));
+    due.truncate(LATE_AT_ONCE);
+    let mut made = Vec::new();
+    for (key, old) in due {
+        let Some(on_card) = window_room_for(old.len) else {
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::CardLateRefused, 1);
+            break;
+        };
+        let (start, len) = (old.start, old.len);
+        crate::host::name(&on_card, || format!("title memory {start:#x}+{len:#x} on the card"));
+        // SAFETY: a live buffer.
+        let gpu = unsafe { on_card.GetGPUVirtualAddress() };
+        let mut shadow = Shadow::new(on_card, old.data, gpu, start, len);
+        shadow.window = true;
+        shadow.card = Some(Card {
+            staging: old.buffer.clone(),
+            before: Mutex::default(),
+            dirty: Mutex::default(),
+            sent: Mutex::default(),
+            touched: Default::default(),
+            me: Default::default(),
+            changed_at: Default::default(),
+            size: len,
+        });
+        for (to, from) in [
+            (&shadow.used, &old.used),
+            (&shadow.asked[0], &old.asked[0]),
+            (&shadow.asked[1], &old.asked[1]),
+            (&shadow.unsized_asks, &old.unsized_asks),
+        ] {
+            to.store(from.load(Ordering::Relaxed), Ordering::Relaxed);
+        }
+        shadow.frames.store(old.frames.load(Ordering::Relaxed), Ordering::Relaxed);
+        made.push((key, old, Arc::new(shadow)));
+    }
+    let mut moved = Vec::new();
+    let mut unused = Vec::new();
+    {
+        let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
+        for (key, old, shadow) in made {
+            // Ours and the table's: nothing took it since.
+            if map.get(&key).is_some_and(|s| Arc::ptr_eq(s, &old)) && Arc::strong_count(&old) == 2 {
+                note_carded(&shadow);
+                map.insert(key, shadow);
+                moved.push(old);
+            } else {
+                unused.push(shadow);
+            }
+        }
+    }
+    drop(unused);
+    for old in moved {
+        #[cfg(feature = "diagnostics")]
+        {
+            crate::copystat::add(crate::copystat::C::CardLateMoved, 1);
+            crate::copystat::add(crate::copystat::C::CardLateMovedBytes, old.len);
+        }
+        crate::host::retire(old);
+    }
+}
+
+/// Windows turned away from the card's memory since the start, by its budget
+/// or by [`window_card_most`]: copies and bytes.
+static WINDOW_ROOM_REFUSED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// How long a window with a side in the card's memory may be held by no list
+/// and no slot before it is let go, in milliseconds
+/// (`VICTORY_CARD_WINDOWS_IDLE_MS`; 0, the default: as other windows, five
+/// minutes while the PC has RAM free).
+///
+/// Windows get card room in the order draws first ask for them, until a fifth
+/// of the card's budget is left. At the boat in gpt-b1 (CARD_WINDOWS_MB=3072)
+/// 1,666 MB of windows were on the card, 1,538 MB of them with nothing sent
+/// for 10 s, and every window made after that was read over the bus. One idle
+/// this long gives its room back to the next window made.
+fn card_windows_idle_ms() -> u64 {
+    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MS.get_or_init(|| {
+        std::env::var("VICTORY_CARD_WINDOWS_IDLE_MS").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0)
+    })
 }
 
 /// What went up, by send: its number, and the offsets, in order and joined
@@ -831,6 +990,31 @@ pub(crate) fn card_sides_census() -> [u64; 10] {
             }
         }
     }
+    out
+}
+
+/// For the memory line: the windows outside buffers by where shaders read
+/// them and whether they are idle (no draw asked for them for 10 s, and no
+/// list or slot holds them). Copies and bytes, four times: on the card and in
+/// use, on the card and idle, in the PC's memory and in use, there and idle.
+/// Then the windows turned away from the card since the start.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn windows_by_use() -> [u64; 10] {
+    let mut out = [0u64; 10];
+    {
+        let loose = LOOSE.read().unwrap_or_else(|e| e.into_inner());
+        let mut seen = std::collections::HashSet::new();
+        for s in loose.values().filter(|s| seen.insert(Arc::as_ptr(s) as usize)) {
+            let idle = crate::host::long_ago(s.used.load(Ordering::Relaxed), 10_000, 4)
+                && Arc::strong_count(s) == 1
+                && crate::host::references(&s.buffer) == 1;
+            let at = (if s.card.is_some() || s.mapped { 0 } else { 4 }) + if idle { 2 } else { 0 };
+            out[at] += 1;
+            out[at + 1] += s.len;
+        }
+    }
+    out[8] = WINDOW_ROOM_REFUSED[0].load(Ordering::Relaxed);
+    out[9] = WINDOW_ROOM_REFUSED[1].load(Ordering::Relaxed);
     out
 }
 
@@ -1180,15 +1364,39 @@ impl Flights {
 /// read, could undo that write. (The merge of a waited-for submission
 /// stores every byte of a differing stretch back into the copy.)
 fn merge_piece(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
-    let mut differs = 0u8;
-    for ((n, h), t) in now.iter().zip(held.iter_mut()).zip(title.iter_mut()) {
+    let mut differs = 0u64;
+    let (n_chunks, n_tail) = now.as_chunks::<DIFF_CHUNK>();
+    let (h_chunks, h_tail) = held.as_chunks_mut::<DIFF_CHUNK>();
+    let (t_chunks, t_tail) = title.as_chunks_mut::<DIFF_CHUNK>();
+    for ((nc, hc), tc) in n_chunks.iter().zip(h_chunks.iter_mut()).zip(t_chunks.iter_mut()) {
+        if nc == hc {
+            continue;
+        }
+        let (nw, _) = nc.as_chunks::<8>();
+        let (hw, _) = hc.as_chunks_mut::<8>();
+        let (tw, _) = tc.as_chunks_mut::<8>();
+        for ((n8, h8), t8) in nw.iter().zip(hw.iter_mut()).zip(tw.iter_mut()) {
+            let n = u64::from_ne_bytes(*n8);
+            let h = u64::from_ne_bytes(*h8);
+            let t = u64::from_ne_bytes(*t8);
+            let x = n ^ h;
+            let non_zero = (x | ((x & 0x7f7f_7f7f_7f7f_7f7f) + 0x7f7f_7f7f_7f7f_7f7f)) & 0x8080_8080_8080_8080;
+            let wrote = (non_zero >> 7) * 0xff;
+            let merged = (t & !wrote) | (n & wrote);
+            differs |= merged ^ t;
+            *t8 = merged.to_ne_bytes();
+            *h8 = ((h & !wrote) | (n & wrote)).to_ne_bytes();
+        }
+    }
+    let mut tail_differs = 0u8;
+    for ((n, h), t) in n_tail.iter().zip(h_tail.iter_mut()).zip(t_tail.iter_mut()) {
         let wrote = if *n != *h { 0xffu8 } else { 0 };
         let merged = (*t & !wrote) | (*n & wrote);
-        differs |= merged ^ *t;
+        tail_differs |= merged ^ *t;
         *t = merged;
         *h = (*h & !wrote) | (*n & wrote);
     }
-    differs != 0
+    differs != 0 || tail_differs != 0
 }
 
 /// `[from, to)` without the ranges of `skip`, in order.
@@ -1212,6 +1420,104 @@ fn outside(from: usize, to: usize, mut skip: Vec<(usize, usize)>) -> Vec<(usize,
         out.push((at, to));
     }
     out
+}
+
+/// Original subtraction, retained for small batches and degenerate spans.
+fn snapshot_parts_pairwise(
+    range: (usize, usize),
+    pending: &[(usize, usize)],
+    inside: impl Fn((usize, usize)) -> (usize, usize),
+) -> Vec<(usize, usize)> {
+    let mut parts = vec![range];
+    for &span in pending {
+        let (a, e) = inside(span);
+        let mut rest = Vec::with_capacity(parts.len() + 1);
+        for (from, to) in parts {
+            if e <= from || a >= to {
+                rest.push((from, to));
+                continue;
+            }
+            if from < a {
+                rest.push((from, a));
+            }
+            if e < to {
+                rest.push((e, to));
+            }
+        }
+        parts = rest;
+        if parts.is_empty() {
+            break;
+        }
+    }
+    parts
+}
+
+/// Compute the uncovered snapshot intervals without repeatedly rebuilding
+/// the remaining ranges. Keep the exact old boundaries for empty spans,
+/// which can split an interval despite containing no bytes.
+fn snapshot_parts(
+    range: (usize, usize),
+    pending: &[(usize, usize)],
+    inside: impl Fn((usize, usize)) -> (usize, usize),
+) -> Vec<(usize, usize)> {
+    let (from, to) = range;
+    if pending.len() < 32 || from >= to {
+        return snapshot_parts_pairwise(range, pending, inside);
+    }
+    let mut skip = Vec::new();
+    for &span in pending {
+        let (a, b) = inside(span);
+        if b <= from || a >= to {
+            continue;
+        }
+        if a >= b {
+            return snapshot_parts_pairwise(range, pending, inside);
+        }
+        if a <= from && b >= to {
+            return Vec::new();
+        }
+        skip.push((a, b));
+    }
+    outside(from, to, skip)
+}
+
+#[cfg(test)]
+mod snapshot_sweep_tests {
+    use super::{snapshot_parts, snapshot_parts_pairwise};
+
+    #[test]
+    fn snapshot_sweep_matches_pairwise() {
+        let mut seed = 123456789u32;
+        let mut next = || {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            (seed >> 8) as usize
+        };
+        for count in [0, 1, 31, 32, 33, 128, 1024, 2800] {
+            for _ in 0..32 {
+                let pending: Vec<_> = (0..count).map(|_| {
+                    let a = next() % 32768;
+                    (a, a + 1 + next() % 256)
+                }).collect();
+                let inside = |(a, b): (usize, usize)| (a.clamp(32, 32700), b.clamp(32, 32700));
+                let a = next() % 16000;
+                let b = a + 1 + next() % 16000;
+                let range = inside((a, b));
+                assert_eq!(snapshot_parts(range, &pending, inside),
+                    snapshot_parts_pairwise(range, &pending, inside));
+            }
+        }
+        let identity = |r| r;
+        let mut pending: Vec<_> = (0..2800).map(|i| (i * 8 + 2, i * 8 + 4)).collect();
+        for range in [(0, 22400), (8, 16), (9, 9), (50000, 60000)] {
+            assert_eq!(snapshot_parts(range, &pending, identity),
+                snapshot_parts_pairwise(range, &pending, identity));
+        }
+        pending.push((5, 5));
+        assert_eq!(snapshot_parts((0, 22400), &pending, identity),
+            snapshot_parts_pairwise((0, 22400), &pending, identity));
+        pending.push((0, 22400));
+        assert!(snapshot_parts((0, 22400), &pending, identity).is_empty());
+    }
 }
 
 #[cfg(test)]
@@ -1562,6 +1868,29 @@ mod difference_tests {
                     assert_eq!(last_difference(a, &b), last, "{len} {at} {other}");
                 }
             }
+        }
+    }
+
+    #[test]
+    fn merge_piece_matches_byte_by_byte() {
+        for len in [0, 1, 7, 8, 9, 63, 64, 65, 130] {
+            let now: Vec<u8> = (0..len).map(|i| (i * 13 + 5) as u8).collect();
+            let mut held_ref: Vec<u8> = (0..len).map(|i| (i * 7 + 3) as u8).collect();
+            let mut title_ref: Vec<u8> = (0..len).map(|i| (i * 11 + 1) as u8).collect();
+            let mut held_fast = held_ref.clone();
+            let mut title_fast = title_ref.clone();
+            let mut differs_ref = 0u8;
+            for ((n, h), t) in now.iter().zip(held_ref.iter_mut()).zip(title_ref.iter_mut()) {
+                let wrote = if *n != *h { 0xffu8 } else { 0 };
+                let merged = (*t & !wrote) | (*n & wrote);
+                differs_ref |= merged ^ *t;
+                *t = merged;
+                *h = (*h & !wrote) | (*n & wrote);
+            }
+            let got = super::merge_piece(&now, &mut held_fast, &mut title_fast);
+            assert_eq!(got, differs_ref != 0, "{len}");
+            assert_eq!(held_fast, held_ref, "{len}");
+            assert_eq!(title_fast, title_ref, "{len}");
         }
     }
 
@@ -3144,17 +3473,23 @@ pub(crate) fn let_go_idle() {
             return;
         }
         let idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
+        let card_ms = card_windows_idle_ms();
         let idle: Vec<(u64, u64)> = map
             .iter()
             .filter(|(_, s)| {
+                let ms = if card_ms > 0 && s.card.is_some() { idle_ms.min(card_ms) } else { idle_ms };
                 Arc::strong_count(s) == 1
-                    && crate::host::long_ago(s.used.load(Ordering::Relaxed), idle_ms, IDLE_FRAMES)
+                    && crate::host::long_ago(s.used.load(Ordering::Relaxed), ms, IDLE_FRAMES)
                     && crate::host::references(&s.buffer) == 1
+                    // Slots made before a window went to the card late
+                    // show its CPU's side ([`card_late_windows`]).
+                    && s.card.as_ref().is_none_or(|c| crate::host::references(&c.staging) == 1)
             })
             .map(|(key, _)| *key)
             .collect();
         idle.into_iter().filter_map(|key| map.remove(&key)).collect()
     };
+    card_late_windows();
     if !gone.is_empty() {
         let (went, bytes) = (gone.len(), gone.iter().map(|s| s.len).sum::<u64>());
         crate::host::trail(|| {
@@ -3241,7 +3576,7 @@ fn same_bytes() {
         };
         BUFFERS.read().unwrap_or_else(|e| e.into_inner()).values().filter_map(|e| e.shadow.as_ref()).for_each(&mut take);
         LOOSE.read().unwrap_or_else(|e| e.into_inner()).values().for_each(&mut take);
-        EXACT.lock().unwrap_or_else(|e| e.into_inner()).1.values().for_each(|(s, _)| take(s));
+        EXACT.read().unwrap_or_else(|e| e.into_inner()).values().for_each(|(s, _)| take(s));
     }
     copies.retain(|s| s.place.is_none());
     let mapped = copies.iter().filter(|s| s.mapped).count();
@@ -3440,6 +3775,7 @@ impl Shadow {
             merging: RwLock::default(),
             kept: Mutex::default(),
             used: AtomicU64::new(crate::host::moment()),
+            frames: Default::default(),
             asked: [AtomicU64::new(u64::MAX), AtomicU64::new(0)],
             unsized_asks: AtomicU64::new(0),
             written: Default::default(),
@@ -3518,24 +3854,7 @@ impl Shadow {
         // The parts no declared range holds yet: their bytes are taken now,
         // just after the range's refresh (a part declared earlier has not
         // been refreshed since, and keeps the bytes taken then).
-        let mut parts = vec![self.inside(address, len)];
-        for &(a, e) in pending.iter() {
-            let (a, e) = self.inside(a, e - a);
-            let mut rest = Vec::with_capacity(parts.len() + 1);
-            for (from, to) in parts {
-                if e <= from || a >= to {
-                    rest.push((from, to));
-                    continue;
-                }
-                if from < a {
-                    rest.push((from, a));
-                }
-                if e < to {
-                    rest.push((e, to));
-                }
-            }
-            parts = rest;
-        }
+        let parts = snapshot_parts(self.inside(address, len), &pending, |(a, e)| self.inside(a, e - a));
         pending.push(range);
         let taken: usize = parts.iter().map(|&(from, to)| to.saturating_sub(from)).sum();
         BACK_CLASS[usize::from(!self.window)].fetch_add(taken as u64, Ordering::Relaxed);
@@ -5770,18 +6089,120 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
     Some(shadow)
 }
 
+/// The most an ask without a length (a root view) is given past its 4 MiB
+/// cell, in bytes: `VICTORY_ROOT_WINDOW_MB` (32; 4 = the cell alone, as
+/// before), in whole cells.
+fn root_window_most() -> u64 {
+    static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| {
+        let mb = std::env::var("VICTORY_ROOT_WINDOW_MB").ok().and_then(|v| v.trim().parse::<u64>().ok());
+        (mb.unwrap_or(32).clamp(4, 256) << 20) / WINDOW * WINDOW
+    })
+}
+
+/// The window of an ask without a length at `[address, end)`: its 4 MiB
+/// cell, and on past it while the title's memory stays committed, up to
+/// [`root_window_most`].
+///
+/// A root view has no size, and the shader reads on from its address
+/// through the copy it was given. Held to its cell, a view into a big
+/// allocation outside any buffer object (a 12 MB vertex pool, say) read
+/// past the end of its 4 MiB window into whatever the host had placed
+/// after it: in the intro (DRED, RX 7900 XT) the card faulted 0xbfd000
+/// bytes into the window of title 0xcae400000, at memory freed texture
+/// staging had held, and the device was removed. The memory the title
+/// committed around the view is what it can be reading.
+fn root_window(address: u64, end: u64) -> (u64, u64) {
+    let (cell, len) = window_of(address, end, WINDOW);
+    let most = root_window_most();
+    if most <= len {
+        return (cell, len);
+    }
+    root_extent(cell, len, recent_reach(cell + len, cell + most), most)
+}
+
+/// How long a [`committed_reach`] answer is used again, in milliseconds
+/// (`VICTORY_ROOT_REACH_MS`, 1000; 0: asked every time).
+///
+/// Every ask without a length asked Windows anew, from the threads that
+/// translate list calls, while the title maps and unmaps its pages: 680
+/// queries in 8 frames of driving took 362 ms of those threads (65 us to
+/// 5.7 ms each; 330,000 regions in the address space). What the title
+/// commits around a root view changes far less often than it is asked.
+fn root_reach_ms() -> u64 {
+    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MS.get_or_init(|| std::env::var("VICTORY_ROOT_REACH_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(1000))
+}
+
+/// [`committed_reach`], answered from what was found for the same range in
+/// the last [`root_reach_ms`].
+fn recent_reach(from: u64, limit: u64) -> u64 {
+    type Found = std::collections::HashMap<(u64, u64), (u64, std::time::Instant)>;
+    static FOUND: std::sync::LazyLock<std::sync::RwLock<Found>> = std::sync::LazyLock::new(Default::default);
+    let ms = root_reach_ms();
+    if ms == 0 {
+        return committed_reach(from, limit);
+    }
+    let fresh = std::time::Duration::from_millis(ms);
+    if let Some(&(reach, at)) = FOUND.read().unwrap_or_else(|e| e.into_inner()).get(&(from, limit))
+        && at.elapsed() < fresh
+    {
+        return reach;
+    }
+    let reach = committed_reach(from, limit);
+    let mut found = FOUND.write().unwrap_or_else(|e| e.into_inner());
+    if found.len() >= 4096 {
+        found.retain(|_, (_, at)| at.elapsed() < fresh);
+    }
+    found.insert((from, limit), (reach, std::time::Instant::now()));
+    reach
+}
+
+/// The window from `cell` of at least `len` bytes that reaches `reach`,
+/// rounded up to whole cells and held to `most` bytes.
+fn root_extent(cell: u64, len: u64, reach: u64, most: u64) -> (u64, u64) {
+    let end = reach.next_multiple_of(WINDOW).min(cell + most).max(cell + len);
+    (cell, end - cell)
+}
+
+/// Where the title's committed memory that runs on from `from` ends, looked
+/// at no further than `limit` (`from` itself if `from` is not committed).
+fn committed_reach(from: u64, limit: u64) -> u64 {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    let mut at = from;
+    while at < limit {
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a query of our own address space into `info`.
+        let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+        if n == 0 || info.State != MEM_COMMIT || info.RegionSize == 0 {
+            break;
+        }
+        at = info.BaseAddress as u64 + info.RegionSize as u64;
+    }
+    at.min(limit)
+}
+
 /// Copies of title memory outside buffers, by (start, length).
 static LOOSE: std::sync::RwLock<BTreeMap<(u64, u64), Arc<Shadow>>> = std::sync::RwLock::new(BTreeMap::new());
 
 fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Shadow>> {
     let (cell, _) = window_of(address, end, WINDOW);
-    let named = window_of(address, end, if unsized_ask { WINDOW } else { window() });
+    let named = if unsized_ask && !tails() {
+        root_window(address, end)
+    } else {
+        window_of(address, end, if unsized_ask { WINDOW } else { window() })
+    };
     // Under the lock, with the handing out: see `let_go_idle`.
     let note = |shadow: &Shadow| {
         // (Read first: the lines are shared by all recording threads.)
         let now = crate::host::moment();
-        if shadow.used.load(Ordering::Relaxed) != now {
+        let was = shadow.used.load(Ordering::Relaxed);
+        if was != now {
             shadow.used.store(now, Ordering::Relaxed);
+            if was >> 32 != now >> 32 {
+                shadow.frames.fetch_add(1, Ordering::Relaxed);
+            }
         }
         if shadow.asked[0].load(Ordering::Relaxed) > address {
             shadow.asked[0].fetch_min(address, Ordering::Relaxed);
@@ -5794,14 +6215,28 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         }
     };
     // The window is there already (nearly always): readers share the lock.
-    if !(unsized_ask && tails()) && !(any && fine() && !unsized_ask) {
+    // With tails or a finer grid the window to take is chosen among those
+    // there; that choice is made under the shared lock too (it was made
+    // only under the write lock, which every list thread then queued for:
+    // 16.5% of their time in profile belobug-9), and the write lock is
+    // taken only to make a window.
+    {
         let map = LOOSE.read().unwrap_or_else(|e| e.into_inner());
-        if let Some(shadow) = map.get(&named) {
+        let key = if unsized_ask && tails() {
+            let there = map.range((cell, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
+            longest_tail(there, address, end)
+        } else if any && fine() && !unsized_ask {
+            let there = map.range((cell, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
+            holder(there, address, end).or(Some(named))
+        } else {
+            Some(named)
+        };
+        if let Some(shadow) = key.and_then(|key| map.get(&key)) {
             note(shadow);
             return Some(shadow.clone());
         }
     }
-    let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
+    let map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
     let (start, len) = if unsized_ask && tails() {
         let there = map.range((cell, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
         longest_tail(there, address, end).unwrap_or_else(|| tail_of(address, end))
@@ -5827,13 +6262,25 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         note(shadow);
         return Some(shadow.clone());
     }
+    // The window is made without the lock (driver calls: every reader
+    // queued behind them, 15.6% of the list threads in profile belobug-10)
+    // and put in after, unless another thread put the same one in meanwhile.
+    drop(map);
+    let finish = |shadow: Arc<Shadow>| -> Option<Arc<Shadow>> {
+        let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
+        if let Some(theirs) = map.get(&(start, len)) {
+            note(theirs);
+            return Some(theirs.clone());
+        }
+        note(&shadow);
+        map.insert((start, len), shadow.clone());
+        Some(shadow)
+    };
     // In place, if asked for and the window's memory can be opened: the
     // window is the title's own memory, with nothing to copy.
     if let Some(placed) = crate::inplace::place_for(start, len, true) {
         let shadow = Arc::new(Shadow::placed(placed, start, len, true));
-        note(&shadow);
-        map.insert((start, len), shadow.clone());
-        return Some(shadow);
+        return finish(shadow);
     }
     // One buffer in the card's memory, filled by the CPU through the bus.
     if let Some((buffer, data)) = window_mapped_for(len) {
@@ -5844,15 +6291,15 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         shadow.window = true;
         shadow.mapped = true;
         let shadow = Arc::new(shadow);
-        note(&shadow);
-        map.insert((start, len), shadow.clone());
-        return Some(shadow);
+        return finish(shadow);
     }
     let (buffer, data) = host()?.shared_buffer(len)?;
     crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
     // With room for windows on the card (`window_card_most`): shaders get a
-    // buffer there, and the one just made is the CPU's side.
-    let (buffer, card) = match window_card_for(len) {
+    // buffer there, and the one just made is the CPU's side. With
+    // `card_late`, later.
+    let on_card = if card_late() > 0 && !windows_own() { None } else { window_card_for(len) };
+    let (buffer, card) = match on_card {
         Some(on_card) => {
             crate::host::name(&on_card, || format!("title memory {start:#x}+{len:#x} on the card"));
             let card = Card {
@@ -5881,15 +6328,19 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     shadow.card = card;
     let shadow = Arc::new(shadow);
     note_carded(&shadow);
-    note(&shadow);
-    map.insert((start, len), shadow.clone());
-    Some(shadow)
+    finish(shadow)
 }
 
 /// Copies of single buffer views' own bytes ([`exact`]), by (start,
 /// bytes), each with the asking that last took it; and the askings so far.
 #[allow(clippy::type_complexity)]
-static EXACT: Mutex<(u64, BTreeMap<(u64, u64), (Arc<Shadow>, u64)>)> = Mutex::new((0, BTreeMap::new()));
+static EXACT: RwLock<BTreeMap<(u64, u64), (Arc<Shadow>, AtomicU64)>> = RwLock::new(BTreeMap::new());
+
+/// The askings of [`exact`] so far (its clock for "not asked for lately").
+static EXACT_TICK: AtomicU64 = AtomicU64::new(0);
+
+/// The size of [`EXACT`]'s map at which its next sweep comes.
+static EXACT_SWEEP_AT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Since the last frame line: askings for such copies, and copies made.
 static EXACT_STATS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
@@ -5921,28 +6372,50 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
         return None;
     }
     EXACT_STATS[0].fetch_add(1, Ordering::Relaxed);
-    let mut guard = EXACT.lock().unwrap_or_else(|e| e.into_inner());
-    let (tick, map) = &mut *guard;
-    *tick += 1;
-    let now = *tick;
-    if let Some((shadow, used)) = map.get_mut(&(address, len)) {
-        *used = now;
+    let now = EXACT_TICK.fetch_add(1, Ordering::Relaxed) + 1;
+    // Found (nearly always): under the shared lock, so that list threads
+    // asking at once do not queue (6.7% of their time in profile belobug-10).
+    {
+        let map = EXACT.read().unwrap_or_else(|e| e.into_inner());
+        if let Some((shadow, used)) = map.get(&(address, len)) {
+            used.store(now, Ordering::Relaxed);
+            shadow.used.store(crate::host::moment(), Ordering::Relaxed);
+            return Some(shadow.clone());
+        }
+    }
+    let mut map = EXACT.write().unwrap_or_else(|e| e.into_inner());
+    if let Some((shadow, used)) = map.get(&(address, len)) {
+        used.store(now, Ordering::Relaxed);
         shadow.used.store(crate::host::moment(), Ordering::Relaxed);
         return Some(shadow.clone());
     }
-    if map.len() >= MANY {
+    // The sweep looks at every copy kept (two COM calls each) under the
+    // lock every list thread takes here: done on every miss, with ~2,700
+    // kept, it was a fifth of the list threads' time (profile belobug-6).
+    // Now only once the map has doubled since the last sweep.
+    if map.len() >= EXACT_SWEEP_AT.load(Ordering::Relaxed).max(MANY) {
         // Held by the map alone (no list), its buffer by the copy alone (no
         // slot shows it), and not asked for lately.
         map.retain(|_, (shadow, used)| {
-            Arc::strong_count(shadow) > 1 || crate::host::references(&shadow.buffer) > 1 || *used + LATELY > now
+            Arc::strong_count(shadow) > 1 || crate::host::references(&shadow.buffer) > 1 || used.load(Ordering::Relaxed) + LATELY > now
         });
+        EXACT_SWEEP_AT.store((map.len() * 2).max(MANY), Ordering::Relaxed);
     }
+    // The host buffer is made without the lock (a driver call), and the
+    // map asked again after: a thread that made the same copy meanwhile wins.
+    drop(map);
     let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(256))?;
     crate::host::name(&buffer, || format!("title view {address:#x}+{len:#x}"));
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
     let shadow = Arc::new(Shadow::new(buffer, data, gpu, address, len));
-    map.insert((address, len), (shadow.clone(), now));
+    let mut map = EXACT.write().unwrap_or_else(|e| e.into_inner());
+    if let Some((theirs, used)) = map.get(&(address, len)) {
+        used.store(now, Ordering::Relaxed);
+        theirs.used.store(crate::host::moment(), Ordering::Relaxed);
+        return Some(theirs.clone());
+    }
+    map.insert((address, len), (shadow.clone(), AtomicU64::new(now)));
     EXACT_STATS[1].fetch_add(1, Ordering::Relaxed);
     OWN_MADE.fetch_add(1, Ordering::Relaxed);
     Some(shadow)
@@ -5959,7 +6432,7 @@ pub(crate) fn exact_line(frames: f64) {
     if asked == 0 {
         return;
     }
-    let kept = EXACT.lock().unwrap_or_else(|e| e.into_inner()).1.len();
+    let kept = EXACT.read().unwrap_or_else(|e| e.into_inner()).len();
     tracing::info!(
         "buffer views off their copy's elements (they were refused and read zeros; VICTORY_VIEW_BYTES=0 refuses them again): \
          {:.1} asked for per frame, {:.1} copies of their own bytes made per frame, {kept} kept",
@@ -5980,11 +6453,16 @@ mod window_tests {
         const GIB: u64 = 1 << 30;
         const MIB: u64 = 1 << 20;
 
-        // Unknown (WARP / query failure) and <= 12 GiB keep the 12 GB baseline.
+        // Unknown (WARP / query failure) and <= 9 GiB (8 GB cards) keep the baseline.
         assert_eq!(default_card_limits_mb(None), (16, 512));
+        assert_eq!(default_card_limits_mb(Some(7 * GIB)), (16, 512));
         assert_eq!(default_card_limits_mb(Some(8 * GIB)), (16, 512));
-        assert_eq!(default_card_limits_mb(Some(11 * GIB)), (16, 512));
-        assert_eq!(default_card_limits_mb(Some(12 * GIB)), (16, 512));
+        assert_eq!(default_card_limits_mb(Some(9 * GIB)), (16, 512));
+
+        // 12 GB cards (> 9 GiB, <= 12 GiB): 1 MiB / 1024 MiB.
+        assert_eq!(default_card_limits_mb(Some(10 * GIB)), (1, 1024));
+        assert_eq!(default_card_limits_mb(Some(11 * GIB)), (1, 1024));
+        assert_eq!(default_card_limits_mb(Some(12 * GIB)), (1, 1024));
 
         // 16 GB tier (> 12 GiB, < 20 GiB), including WDDM budgets around 13.5–15 GiB.
         assert_eq!(default_card_limits_mb(Some(13 * GIB)), (1, 2048));
@@ -6124,6 +6602,75 @@ mod window_tests {
             assert!(start <= address && start + len >= end);
             assert!(start % g == 0 && len % g == 0);
         }
+    }
+
+    /// A root view's window reaches as far as the memory around it, in
+    /// whole cells, never less than its cell and never past the most.
+    #[test]
+    fn root_windows_reach_the_committed_memory() {
+        use super::root_extent;
+        let cell = 0xcae4_00000u64;
+        let most = 32 << 20;
+        assert_eq!(root_extent(cell, WINDOW, cell + WINDOW, most), (cell, WINDOW));
+        assert_eq!(root_extent(cell, WINDOW, cell + 0xbfd000 + 1, most), (cell, 12 << 20));
+        assert_eq!(root_extent(cell, WINDOW, cell + (12 << 20) + 1, most), (cell, 16 << 20));
+        assert_eq!(root_extent(cell, WINDOW, cell + (1 << 30), most), (cell, most));
+        assert_eq!(root_extent(cell, 2 * WINDOW, cell + WINDOW, most), (cell, 2 * WINDOW));
+    }
+
+    /// The reach of committed memory stops where the commitment does.
+    #[test]
+    fn committed_reach_stops_at_the_end_of_committed_memory() {
+        use super::committed_reach;
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        // SAFETY: a fresh reservation of our own, freed below.
+        let base = unsafe { VirtualAlloc(std::ptr::null(), 16 << 20, MEM_RESERVE, PAGE_READWRITE) } as u64;
+        assert_ne!(base, 0);
+        // SAFETY: inside the reservation just made.
+        let done = unsafe { VirtualAlloc(base as *const _, 12 << 20, MEM_COMMIT, PAGE_READWRITE) };
+        assert!(!done.is_null());
+        assert_eq!(committed_reach(base, base + (16 << 20)), base + (12 << 20));
+        assert_eq!(committed_reach(base, base + (8 << 20)), base + (8 << 20));
+        assert_eq!(committed_reach(base + (12 << 20), base + (16 << 20)), base + (12 << 20));
+        // SAFETY: our own reservation, nothing else uses it.
+        assert_ne!(unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) }, 0);
+    }
+
+    /// A 4 MiB cell of a fresh reservation, with `committed` bytes of it
+    /// committed from the cell on (the reservation stays; the test owns it).
+    fn committed_cell(committed: u64) -> u64 {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+        // SAFETY: a fresh reservation of our own; one cell of slack to align.
+        let base = unsafe { VirtualAlloc(std::ptr::null(), (40 << 20) as usize, MEM_RESERVE, PAGE_READWRITE) } as u64;
+        assert_ne!(base, 0);
+        let cell = base.next_multiple_of(WINDOW);
+        // SAFETY: inside the reservation just made.
+        let done = unsafe { VirtualAlloc(cell as *const _, committed as usize, MEM_COMMIT, PAGE_READWRITE) };
+        assert!(!done.is_null());
+        cell
+    }
+
+    /// A root view into 12 MiB of committed memory is given a window over
+    /// all of it, not its 4 MiB cell alone (`VICTORY_ROOT_WINDOW_MB=4`: the
+    /// cell, as before).
+    #[test]
+    fn a_root_view_window_covers_the_memory_committed_after_its_cell() {
+        let cell = committed_cell(12 << 20);
+        assert_eq!(super::root_window(cell + 0x100, cell + 0x104), (cell, 12 << 20), "the root view's window is its cell alone");
+    }
+
+    /// What was found committed around a root view is used again within
+    /// `VICTORY_ROOT_REACH_MS` (=0: asked anew every time).
+    #[test]
+    fn a_root_view_reach_is_used_again_within_its_time() {
+        use windows_sys::Win32::System::Memory::{MEM_DECOMMIT, VirtualFree};
+        let cell = committed_cell(12 << 20);
+        assert_eq!(super::root_window(cell, cell + 4), (cell, 12 << 20));
+        // SAFETY: the upper 8 MiB of our own commitment, nothing reads it.
+        assert_ne!(unsafe { VirtualFree((cell + WINDOW) as *mut _, (8 << 20) as usize, MEM_DECOMMIT) }, 0);
+        assert_eq!(super::root_window(cell, cell + 4), (cell, 12 << 20), "the reach was asked of Windows again");
     }
 }
 
