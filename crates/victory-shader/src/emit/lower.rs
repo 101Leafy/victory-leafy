@@ -447,6 +447,12 @@ struct Lower<'a> {
     clane: Option<V>,
     /// The first exchange dword of this thread's console wave ([`Self::exchange_pair`]).
     pair: Option<V>,
+    /// `VICTORY_EXCHANGE_FLIP=1`, where LDS has room: each console wave has two pairs of exchange
+    /// dwords and the exchanges of one block take turns with them, so the barrier after an
+    /// exchange's reads is the next one's, or goes at the end of the block.
+    flip: bool,
+    /// With `flip`: the block and pair of the last exchange, whose reads no barrier closes yet.
+    flip_last: Option<(usize, bool)>,
     /// A console wave64 program in host waves of 32: the LDS dword counting the console threads
     /// handed to host waves (`wave_base`), and the base made in the entry block.
     halves: Option<u32>,
@@ -1346,6 +1352,11 @@ thread_local! {
     pub(super) static TEST_F16_NEAREST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
+/// `VICTORY_EXCHANGE_FLIP=1`: two pairs of exchange dwords a console wave ([`Lower::flip`]).
+fn exchange_flip() -> bool {
+    std::env::var_os("VICTORY_EXCHANGE_FLIP").is_some_and(|v| v == "1")
+}
+
 /// `VICTORY_WAVE_OWN_BITS=0`: a wave OR where not every lane runs is refused as before
 /// ([`super::own_bits`]).
 fn own_bits_on() -> bool {
@@ -1729,6 +1740,7 @@ impl<'a> Lower<'a> {
         let mut lds_meet: Option<(Vec<bool>, Vec<(bool, bool)>)> = None;
         // a console wave64 program in two host waves of 32 (`exchange`)
         let mut exchange: Option<(u32, bool, Vec<bool>)> = None;
+        let mut flip = false;
         // a console wave64 program in host waves of 32: the LDS dword of `wave_base`'s counter
         let mut halves: Option<u32> = None;
         // console lanes in a 2-D or 3-D group: the LDS dword of `wave_base`'s counter
@@ -1842,7 +1854,11 @@ impl<'a> Lower<'a> {
                                 }
                             }
                         }
-                        let exchange_dwords = if crosses { 2 * group.div_ceil(64) } else { 0 };
+                        let mut exchange_dwords = if crosses { 2 * group.div_ceil(64) } else { 0 };
+                        if crosses && exchange_flip() && s.lds_dwords + 2 * exchange_dwords <= MAX_LDS_DWORDS {
+                            exchange_dwords *= 2;
+                            flip = true;
+                        }
                         if lds_ok && s.lds_dwords.saturating_add(exchange_dwords) <= MAX_LDS_DWORDS {
                             wave = 32;
                             split_lds = s.lds_dwords > 0 && group > 32;
@@ -2103,6 +2119,8 @@ impl<'a> Lower<'a> {
             exchange,
             clane: None,
             pair: None,
+            flip,
+            flip_last: None,
             halves,
             wave_base: None,
             ticket,
@@ -3022,6 +3040,9 @@ impl<'a> Lower<'a> {
                 break;
             }
             self.fill_phis()?;
+        }
+        if let Some((b, _)) = self.flip_last.take() {
+            self.group_sync(b);
         }
         // A linked stage's signatures without what it leaves out; an input left out must not
         // have been read.
@@ -5086,6 +5107,7 @@ impl<'a> Lower<'a> {
         }
         // the pair of dwords of this thread's console wave: its half's, then both
         let pair = self.exchange_pair(slot);
+        let (pair, bank) = self.exchange_slots(at, pair);
         let cl = self.console_lane();
         let five = self.s.m.i32(5);
         let half = self.s.m.bin(at, Bin::LShr, cl, five);
@@ -5100,9 +5122,40 @@ impl<'a> Lower<'a> {
         let p1 = self.s.m.element(at, lds, k1);
         let lo = self.s.m.load(at, p0);
         let hi = self.s.m.load(at, p1);
-        // the slots are written again only after every thread read them
-        self.group_sync(at);
+        self.exchange_read(at, bank);
         (lo, hi)
+    }
+
+    /// The exchange dwords to write at `at`: `pair`, or under [`Self::flip`] the pair the last
+    /// exchange of this block did not use (and whether that is the second). The first exchange
+    /// of a block closes the last block's reads with a barrier at that block's end.
+    fn exchange_slots(&mut self, at: usize, pair: V) -> (V, bool) {
+        if !self.flip {
+            return (pair, false);
+        }
+        let bank = match self.flip_last.take() {
+            Some((b, k)) if b == at => !k,
+            Some((b, _)) => {
+                self.group_sync(b);
+                false
+            }
+            None => false,
+        };
+        if !bank {
+            return (pair, false);
+        }
+        let two = self.s.m.i32(2);
+        (self.s.m.bin(at, Bin::Add, pair, two), true)
+    }
+
+    /// After an exchange's reads at `at`: the slots are written again only after every thread
+    /// read them, by a barrier here or under [`Self::flip`] the next exchange's.
+    fn exchange_read(&mut self, at: usize, bank: bool) {
+        if self.flip {
+            self.flip_last = Some((at, bank));
+        } else {
+            self.group_sync(at);
+        }
     }
 
     /// The first of the two exchange dwords of this thread's console wave (made in the entry
@@ -5118,6 +5171,7 @@ impl<'a> Lower<'a> {
         let one = self.s.m.i32(1);
         let twice = self.s.m.bin(e, Bin::Shl, wave, one);
         let base = self.s.m.i32(slot);
+        let twice = if self.flip { self.s.m.bin(e, Bin::Shl, twice, one) } else { twice };
         let v = self.s.m.bin(e, Bin::Add, base, twice);
         self.pair = Some(v);
         v
@@ -9894,6 +9948,7 @@ impl<'a> Lower<'a> {
                     let cl = self.console_lane();
                     let is = self.s.m.cmp(self.cur, pred::EQ, cl, lane);
                     let k = self.exchange_pair(slot);
+                    let (k, bank) = self.exchange_slots(self.cur, k);
                     let at = self.begin_guarded(Some(is));
                     let lds = self.s.lds();
                     let ptr = self.s.m.element(self.cur, lds, k);
@@ -9903,7 +9958,7 @@ impl<'a> Lower<'a> {
                     self.group_sync(c2);
                     let ptr = self.s.m.element(c2, lds, k);
                     let r = self.s.m.load(c2, ptr);
-                    self.group_sync(c2);
+                    self.exchange_read(c2, bank);
                     return int(self, r);
                 }
                 let r = self.read_lane(a, lane);
