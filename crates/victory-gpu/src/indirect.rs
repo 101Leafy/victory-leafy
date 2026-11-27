@@ -3170,6 +3170,32 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
         assert_eq!((memory[0], memory[TABLE as usize / 4]), (JOBS, 0xffff_ffff));
     }
 
+    /// A split dispatch's job takes the places of its pieces and their
+    /// count: the jobs after it come after them, and one that does not fit
+    /// in what is left is not added.
+    #[test]
+    fn batch_tables_split() {
+        use batch::{JOBS, SLOT, SPLIT_SLOTS, TABLE, Table};
+        assert!(SPLIT_SLOTS * SLOT >= PIECES * 16 + 4);
+        let mut memory = vec![0u32; TABLE as usize / 4];
+        // SAFETY: the vector holds the table and outlives its use.
+        let mut t = unsafe { Table::new(memory.as_mut_ptr().cast(), 0, [7, 0, 0, 0]) };
+        assert_eq!(t.place(7, 0, 0), Some(0));
+        assert_eq!(t.place(7, 64, SPLIT), Some(u64::from(SLOT)));
+        assert_eq!(t.place(7, 128, 2), Some(u64::from((1 + SPLIT_SLOTS) * SLOT)));
+        assert_eq!(t.place(7, 64, SPLIT), Some(u64::from(SLOT)), "the same record");
+        assert_eq!((memory[10], memory[14]), (SLOT, SLOT + SPLIT_SLOTS * SLOT));
+        let mut used = 2 + SPLIT_SLOTS;
+        let mut i = 0;
+        while used + SPLIT_SLOTS <= JOBS {
+            assert_eq!(t.place(7, 1024 + 16 * i, SPLIT), Some(u64::from(used * SLOT)));
+            used += SPLIT_SLOTS;
+            i += 1;
+        }
+        assert_eq!(t.place(7, 1024 + 16 * i, SPLIT), None, "no room for the pieces");
+        assert_eq!(t.place(7, 1024 + 16 * i, 2), Some(u64::from(used * SLOT)));
+    }
+
     /// A batch clamps records exactly as the clamp of one execution does, of
     /// any kind, sensible or not; they are added to its table after the pass
     /// was recorded; it charges each as often as it is read.
@@ -3179,7 +3205,7 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
             return;
         };
         let pass = make_from(&warp.device, batch::SOURCE).expect("the batched clamp must compile on WARP");
-        let kinds = [0u32, 1, 2, 10];
+        let kinds = [0u32, 1, 2, SPLIT, 10];
         let values = [0u32, 1, 3, 100, 65_535, 65_536, 1 << 20, (1 << 23) - 1, 1 << 23, 1 << 24, (1 << 26) + 1, u32::MAX];
         // Every kind with many records, in two sources.
         let mut records: Vec<(u32, [u32; 5])> = Vec::new();
@@ -3211,9 +3237,10 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
             let offset = i as u64 * 32;
             let words = batch::words(*kind).unwrap();
             let stride = words * 4;
+            let bytes = scratch_bytes((*kind, stride, 1)) as u32;
             let read = |p: *mut u8| -> Vec<u32> {
                 // SAFETY: the mapping holds more.
-                (0..words as usize).map(|w| unsafe { p.cast::<u32>().add(w).read_volatile() }).collect()
+                (0..bytes as usize / 4).map(|w| unsafe { p.cast::<u32>().add(w).read_volatile() }).collect()
             };
             let mut seen = Vec::new();
             for batched in [false, true] {
@@ -3239,7 +3266,7 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
                 // SAFETY: an open list; the records are readable as arguments.
                 unsafe {
                     warp.list.ResourceBarrier(&[transition(&dst, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
-                    warp.list.CopyBufferRegion(&back, 0, &dst, 0, u64::from(stride));
+                    warp.list.CopyBufferRegion(&back, 0, &dst, 0, u64::from(bytes));
                     warp.list.ResourceBarrier(&[transition(&dst, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON)]);
                 }
                 warp.submit_and_wait();
