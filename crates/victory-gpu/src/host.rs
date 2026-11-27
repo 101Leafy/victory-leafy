@@ -228,6 +228,30 @@ pub(crate) fn not_resident() -> D3D12_HEAP_FLAGS {
     if wait_resident() { D3D12_HEAP_FLAG_CREATE_NOT_RESIDENT } else { D3D12_HEAP_FLAG_NONE }
 }
 
+/// How much new memory is made without zeros (`VICTORY_NOT_ZEROED`, default
+/// 0: all of it zeroed). 1: texture blocks and committed textures the title
+/// fills, whose every texel is uploaded before anything reads it. 2: render
+/// targets and depth buffers too, which the title clears before use. Never
+/// unordered-access textures or buffers. The system zeroes memory it hands
+/// to a process unless it was that process's own before; in Leafy's play
+/// run of 2026-11-27 making new memory resident took 2.4 s of the first
+/// world frame (29k calls, 23.9 s over the run).
+fn zero_level() -> u8 {
+    static LEVEL: OnceLock<u8> = OnceLock::new();
+    *LEVEL.get_or_init(|| std::env::var("VICTORY_NOT_ZEROED").ok().and_then(|v| v.parse().ok()).unwrap_or(0))
+}
+
+/// [`not_resident`], plus not zeroed for memory of `level` (see
+/// [`zero_level`]: 1 title-filled textures and their blocks, 2 targets and
+/// depth).
+pub(crate) fn fresh(level: u8) -> D3D12_HEAP_FLAGS {
+    if level != 0 && zero_level() >= level {
+        not_resident() | D3D12_HEAP_FLAG_CREATE_NOT_ZEROED
+    } else {
+        not_resident()
+    }
+}
+
 /// A queue of its own that new memory is waited for with ([`mapped`]).
 struct Aside {
     queue: ID3D12CommandQueue,

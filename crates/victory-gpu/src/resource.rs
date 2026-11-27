@@ -2688,12 +2688,20 @@ fn host_texture_as(
             )
         }
     } else {
+        // Never without zeros: unordered access (`VICTORY_NOT_ZEROED`).
+        let level = if fills(desc) {
+            1
+        } else if desc.flags & UNORDERED == 0 {
+            2
+        } else {
+            0
+        };
         // SAFETY: the description has the host layout (checked size, same
         // fields); the out pointer is ours.
         unsafe {
             host.device.CreateCommittedResource(
                 &heap,
-                crate::host::not_resident(),
+                crate::host::fresh(level),
                 (&raw const d).cast(),
                 D3D12_RESOURCE_STATES(
                     crate::host::legal_for(d.flags, crate::host::texture_state(state)) as i32,
