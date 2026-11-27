@@ -146,6 +146,27 @@ pub(super) fn forward_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_FORWARD_PLACED").is_none_or(|v| v != "0"))
 }
 
+/// Constants behind a copy at its place in the same list that writes them are
+/// copied on the card at the fill's place, out of the host copy, and the slot
+/// shows that copy (`VICTORY_FILL_IN_PLACE=1`, off until it wins an A/B). As a
+/// fill at submission it was done in front of the lists, ahead of the copy,
+/// so card_steps refused it and the submission waited for every flight: 111
+/// to 142 ms a frame in game 95-112 of capss-ahead and capss-old, over half
+/// the frame.
+pub(super) fn fill_in_place() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_FILL_IN_PLACE") {
+        return on;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FILL_IN_PLACE").is_some_and(|v| v == "1"))
+}
+
+/// Since the last frame-rate line ([`fill_in_place`]): fills done at their
+/// place, their bytes, and fills behind such a copy left to submission (no
+/// host copy that shaders write holds all they read).
+pub(super) static FILLS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
 /// A fill that takes its bytes from a copy at its place: each by its list's
 /// place in the submission and its own in the list; `at`, where in the copy
 /// the fill's bytes begin.
@@ -403,6 +424,7 @@ impl HostList {
         STATS[1].fetch_add(len as u64, Ordering::Relaxed);
         to.gpu_writes(self, dst as u64, len as u64);
         let mut deferred = self.deferred();
+        deferred.placed.push((dst, dst + len));
         deferred.copies.push(Step::Placed(Placed {
             dst,
             src,
@@ -422,16 +444,46 @@ impl HostList {
         if !on() {
             return None;
         }
+        let between = self.shaders_wrote(src, len, D3D12_RESOURCE_STATE_COPY_SOURCE)?;
+        STATS[3].fetch_add(1, Ordering::Relaxed);
+        Some(between)
+    }
+
+    /// For constants of `[src, src + len)` that a copy at its place earlier
+    /// in this list writes: a buffer that holds them at this place of the
+    /// list, and its card address. `None`: the fill is done as before.
+    pub(crate) fn place_constants(&self, src: usize, len: usize) -> Option<(ID3D12Resource, u64)> {
+        if !on() || !fill_in_place() {
+            return None;
+        }
+        if !self.deferred().placed.iter().any(|&(from, to)| from < src + len && src < to) {
+            return None;
+        }
+        let read = D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER | D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE;
+        let Some(between) = self.shaders_wrote(src, len, read) else {
+            FILLS[2].fetch_add(1, Ordering::Relaxed);
+            return None;
+        };
+        FILLS[0].fetch_add(1, Ordering::Relaxed);
+        FILLS[1].fetch_add(len as u64, Ordering::Relaxed);
+        // SAFETY: a live buffer.
+        let gpu = unsafe { between.GetGPUVirtualAddress() };
+        Some((between, gpu))
+    }
+
+    /// A buffer that holds what shaders wrote at `[src, src + len)` at this
+    /// place of the list, left in `state`. `None` where shaders do not write
+    /// it.
+    fn shaders_wrote(&self, src: usize, len: usize, state: D3D12_RESOURCE_STATES) -> Option<ID3D12Resource> {
         let host = host()?;
         let from = shaders_own(src, len)?;
         let between = self.between(host, len as u64)?;
         from.refresh(self, src as u64, len as u64);
-        STATS[3].fetch_add(1, Ordering::Relaxed);
         // SAFETY: an open list; live buffers, ranges inside them.
         unsafe {
             wait_for_all(host, &self.list);
             self.list.CopyBufferRegion(&between, 0, &from.buffer, from.offset(src as u64), len as u64);
-            self.list.ResourceBarrier(&[transition(&between, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+            self.list.ResourceBarrier(&[transition(&between, D3D12_RESOURCE_STATE_COPY_DEST, state)]);
             wait_for_all(host, &self.list);
         }
         Some(between)

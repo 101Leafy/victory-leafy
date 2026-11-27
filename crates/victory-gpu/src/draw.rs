@@ -4749,6 +4749,11 @@ impl State {
                             cbv[2] += u64::from(size);
                             cbv[3] += aligned * u64::from(size);
                         }
+                        if let Some((buffer, gpu)) = list.place_constants(address as usize, size as usize) {
+                            host.constant_at(index, &buffer, gpu, size);
+                            constants = true;
+                            continue;
+                        }
                         let Some((buffer, gpu, to)) = list.scratch_held(u64::from(size)) else {
                             host.make_null(index);
                             continue;

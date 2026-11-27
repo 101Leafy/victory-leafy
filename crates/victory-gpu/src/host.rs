@@ -3554,6 +3554,9 @@ struct Deferred {
     /// Scratch memory [`HostList::fill_scratch`] fills since the list last
     /// wrote title memory (source, bytes): its host address.
     filled: std::collections::HashMap<(usize, usize), u64, std::hash::BuildHasherDefault<AddressHash>>,
+    /// Where the list's copies at their place write (from, to), for the
+    /// fills behind them ([`HostList::place_constants`]).
+    placed: Vec<(usize, usize)>,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize, std::hash::BuildHasherDefault<AddressHash>>,
     /// Last GPU source copied into each aliased host texture in this list.
@@ -5235,6 +5238,15 @@ fn late_line(frames: f64) {
             t[5],
             t[6],
         );
+        if place::fill_in_place() {
+            let f: Vec<f64> = place::FILLS.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+            tracing::info!(
+                "constants behind a copy at its place in their list, per frame (VICTORY_FILL_IN_PLACE): {:.2} copied on the card at their place, {:.1} KB; {:.2} left to submission, no host copy of what shaders wrote holds them",
+                f[0],
+                f[1] / 1024.0,
+                f[2],
+            );
+        }
     }
     card_steps::log(frames);
     fetch_waits::log(frames);
