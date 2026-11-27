@@ -183,7 +183,8 @@ pub(super) fn forwards(written: &[(usize, usize)], runs: &[&HostList]) -> Vec<Fo
     if !on() || !forward_on() {
         return Vec::new();
     }
-    forwards_of(written, runs.iter().map(|list| list.deferred().copies.iter().map(Order::of)))
+    let lists: Vec<Vec<Order>> = runs.iter().map(|list| list.deferred().copies.iter().map(Order::of).collect()).collect();
+    forwards_of(written, lists)
 }
 
 /// What [`forwards`] looks at in a step.
