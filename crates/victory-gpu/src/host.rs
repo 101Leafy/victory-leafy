@@ -6490,6 +6490,29 @@ impl Host {
         let ahead = Split::begin();
         #[cfg(feature = "diagnostics")]
         SPLIT[11].fetch_add(called.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        // `VICTORY_ASK_FIRST`: the submission's one asking begun now, on a
+        // thread of its own, beside the planning and the look at flights
+        // below; it is waited for where it was made before.
+        let asked_first = (late && crate::watch::first() && !upcheck::on()).then(|| {
+            let mut spans: ByCopy<(usize, usize)> = ByCopy::default();
+            for list in runs {
+                for step in &list.deferred().copies {
+                    if let Step::Refresh(shadow, address, len) = step
+                        && shadow.asked_ahead()
+                    {
+                        let span = spans
+                            .entry(std::sync::Arc::as_ptr(shadow) as usize)
+                            .or_insert((*address, *address + *len));
+                        *span = (span.0.min(*address), span.1.max(*address + *len));
+                    }
+                }
+            }
+            crate::watch::ask_first(spans.into_values().collect())
+        });
+        // Whether flights were waited for, or settled for the sweep,
+        // meanwhile.
+        let mut waited_for_flights = false;
+        let mut settled_for_sweep = false;
         stage.next("submit: steps given to the card");
         // Flights in the air ([`late`]): a submission that is waited for
         // settles them first, one sent ahead only if preparing it reads
@@ -6504,6 +6527,7 @@ impl Host {
         } else if own.is_none()
             && let Some(why) = late_blocked(runs)
         {
+            waited_for_flights = true;
             if relay_exact() && why == WHY_READ {
                 // Only until the flights that may write what is read have
                 // landed: their copy-back's end, not the card's other work.
@@ -6552,6 +6576,7 @@ impl Host {
             // With the present sent ahead nothing else brings a moment
             // with nothing in the air: one is made for the sweep.
             self.settle(&mut submitted, WHY_SYNC);
+            settled_for_sweep = true;
             if upcheck::on() {
                 upcheck::at_rest(self);
             }
@@ -6600,7 +6625,24 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             SPLIT[8].fetch_add(split.so_far(), Ordering::Relaxed);
             stage.next("submit: asking the write watch");
-            crate::watch::ask_once(&ranges);
+            match asked_first {
+                // Begun beside the first steps: waited for here. Made again,
+                // whole, if flights were waited for or settled since (what
+                // they landed is title memory written); else only what it
+                // does not hold is asked: the ranges of the list of steps
+                // done on the card, which was made after it.
+                Some(first) => {
+                    first.wait();
+                    ASKED_FIRST[0].fetch_add(1, Ordering::Relaxed);
+                    if waited_for_flights || settled_for_sweep {
+                        ASKED_FIRST[1].fetch_add(1, Ordering::Relaxed);
+                        crate::watch::ask_once(&ranges);
+                    } else if crate::watch::ask_more(&ranges) {
+                        ASKED_FIRST[2].fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                None => crate::watch::ask_once(&ranges),
+            }
             #[cfg(feature = "diagnostics")]
             split.part(0);
             stage.next("submit: title bytes under flights' writes");
@@ -8613,6 +8655,12 @@ impl std::hash::Hasher for AddressHash {
 #[cfg(feature = "diagnostics")]
 static SPLIT: [std::sync::atomic::AtomicU64; 16] = [const { std::sync::atomic::AtomicU64::new(0) }; 16];
 
+/// Since the last frame line, with `VICTORY_ASK_FIRST` (`crate::watch::first`):
+/// submissions whose asking was begun beside their first steps; those that
+/// made it again after flights were waited for or settled; and those that
+/// asked for more where it was made before.
+static ASKED_FIRST: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
 /// Since the last frame-rate line: flushes of refreshes, their refreshes,
 /// those known to copy nothing, and those done on several threads.
 #[cfg(feature = "diagnostics")]
@@ -10257,6 +10305,14 @@ impl Meter {
         #[cfg(feature = "diagnostics")]
         spans::line(frames);
         crate::shadow::back_line(frames);
+        {
+            let [begun, made_again, more] = [0, 1, 2].map(|i| ASKED_FIRST[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            if begun > 0.0 {
+                tracing::info!(
+                    "the submissions' asking begun beside their first steps, per frame (VICTORY_ASK_FIRST=1): {begun:.1}, {made_again:.1}                      made again after flights were waited for, {more:.1} asked for more where it was made before"
+                );
+            }
+        }
         #[cfg(feature = "diagnostics")]
         split_line(frames);
         {
