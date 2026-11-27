@@ -73,8 +73,9 @@ pub(super) fn folder() -> Option<PathBuf> {
 /// driver compile once (each folder made the same 1,300 slow pipelines
 /// again, about 14 minutes). The early and slow lists stay per folder.
 /// Two runs that both save keep the last one's library: the host cannot
-/// list or merge another library's pipelines.
-fn library_dir() -> Option<PathBuf> {
+/// list or merge another library's pipelines. The list of static samplers
+/// the library was filled with goes beside it (`super::samplers`).
+pub(super) fn library_dir() -> Option<PathBuf> {
     static SHARED: OnceLock<Option<PathBuf>> = OnceLock::new();
     let shared = SHARED.get_or_init(|| std::env::var_os("VICTORY_LIBRARY_DIR").filter(|v| !v.is_empty()).map(PathBuf::from));
     shared.clone().or_else(folder)
@@ -525,7 +526,17 @@ fn library() -> Option<&'static Library> {
         .get_or_init(|| {
             let device = crate::host::host()?.device.cast::<ID3D12Device1>().ok()?;
             let library = match library_dir() {
-                Some(dir) => open_dir(&dir, keeps_other(), |blob| load(&device, blob)).or_else(|| empty(&device)),
+                Some(dir) => {
+                    // A library filled before static samplers were made in a
+                    // kept order (`super::samplers`) holds pipelines of any
+                    // order: a pipeline loaded from it may sample with other
+                    // samplers than its root signature names
+                    // (fxceless/victory-fork#1459). It is let go once.
+                    if super::samplers::on() && !super::samplers::listed_at_start(&dir) {
+                        unlisted(&dir);
+                    }
+                    open_dir(&dir, keeps_other(), |blob| load(&device, blob)).or_else(|| empty(&device))
+                }
                 None => open(&device, Blob::None),
             };
             if library.is_none() {
@@ -534,6 +545,23 @@ fn library() -> Option<&'static Library> {
             library
         })
         .as_ref()
+}
+
+/// Removes the library in `dir`, one a save left beside it, and another
+/// setup's: they were filled with no list of static samplers beside them.
+fn unlisted(dir: &std::path::Path) {
+    for name in [LIBRARY_FILE, NEXT_FILE, OTHER_FILE] {
+        let path = dir.join(name);
+        let Ok(meta) = std::fs::metadata(&path) else { continue };
+        match std::fs::remove_file(&path) {
+            Ok(()) => tracing::info!(
+                file = name,
+                mb = meta.len() >> 20,
+                "the host pipeline library of before the static samplers' kept order is let go: its pipelines are made again"
+            ),
+            Err(e) => tracing::warn!(error = %e, file = name, "an old host pipeline library could not be removed; it is used as it is"),
+        }
+    }
 }
 
 /// The library of the cache folder `dir`, made by `load` (which hands back
