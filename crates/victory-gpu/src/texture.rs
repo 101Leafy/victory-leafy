@@ -241,6 +241,20 @@ fn turn_every() -> u64 {
     })
 }
 
+/// Where in the `every` frames a texture's turn falls. By its 64 KB block
+/// alone, big textures at aligned addresses share one turn: in face-prio
+/// 26 MB were hashed on every frame 62 of 64 and about 0.5 MB on the
+/// others. `VICTORY_TEXTURE_TURN_SPREAD=1` mixes the page number instead,
+/// so the same bytes spread over all the frames.
+fn turn_phase(start: usize) -> u64 {
+    static SPREAD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *SPREAD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_TURN_SPREAD").is_some_and(|v| v == "1")) {
+        (start as u64 >> 12).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 40
+    } else {
+        (start >> 16) as u64
+    }
+}
+
 // SAFETY: the staging mapping is written only at submission, under
 // `last`'s lock; the title memory is only read.
 unsafe impl Send for Staging {}
@@ -1764,7 +1778,7 @@ impl Staging {
             last.asked = now;
             let frame = crate::frame::current();
             let every = if last.hot_until == 0 { turn_every() } else { 8 };
-            let turn = frame.wrapping_add((start >> 16) as u64).is_multiple_of(every);
+            let turn = frame.wrapping_add(turn_phase(start)).is_multiple_of(every);
             // A texture starts hot: one written that way from its first
             // frames on changes before the hash has ever caught it.
             if last.started == 0 {
