@@ -43,10 +43,14 @@ pub(super) struct Linked {
 /// rows and modes (ids count only what is kept). An input left out must be one the program
 /// never reads: a lowering that reads one fails.
 pub(super) fn with_linked<R>(linked: Linked, f: impl FnOnce() -> R) -> R {
-    let was = LINKED.replace(Some(linked));
-    let r = f();
-    LINKED.set(was);
-    r
+    struct Restore(Option<Linked>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            LINKED.set(self.0.take());
+        }
+    }
+    let _restore = Restore(LINKED.replace(Some(linked)));
+    f()
 }
 
 /// Per element of `inputs` and of `outputs` (the signatures as the console declares them),

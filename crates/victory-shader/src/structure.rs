@@ -433,10 +433,14 @@ thread_local! {
 /// instead of letting them leave at the start, so a console wave run as two host waves still
 /// has both halves to exchange with.
 pub fn with_launched_exec<R>(f: impl FnOnce() -> R) -> R {
-    let was = LAUNCHED.replace(true);
-    let r = f();
-    LAUNCHED.set(was);
-    r
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            LAUNCHED.set(self.0);
+        }
+    }
+    let _restore = Restore(LAUNCHED.replace(true));
+    f()
 }
 
 impl Structured {

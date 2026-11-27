@@ -611,10 +611,15 @@ pub fn wave_wide_only(hash: &str) -> bool {
 /// Runs `f` (a translation on this thread) with the wave-wide form on when `on`
 /// ([`wave_wide_only`]).
 pub fn with_wave_wide<T>(on: bool, f: impl FnOnce() -> T) -> T {
-    let before = WIDE_HERE.replace(on);
-    let r = f();
-    WIDE_HERE.set(before);
-    r
+    // restored on a panic too: a worker that catches it translates the next shader here
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            WIDE_HERE.set(self.0);
+        }
+    }
+    let _restore = Restore(WIDE_HERE.replace(on));
+    f()
 }
 
 
