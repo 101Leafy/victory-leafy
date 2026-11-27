@@ -785,12 +785,22 @@ fn set(roots: &mut Vec<Root>, slot: u32, root: Root) {
 type Picked = crate::heap_pass::Picked<std::sync::Arc<crate::shadow::Shadow>>;
 
 struct Ranges {
-    heaps: std::collections::HashMap<usize, Picked>,
+    /// By the host heap's id, not its address: a heap made later where a
+    /// dropped one was starts anew ([`forget_heap_ranges`]).
+    heaps: std::collections::HashMap<u64, Picked>,
     /// A round ahead made this frame's sweep (`Picked::plan`).
     swept: bool,
 }
 
 static RANGES: std::sync::Mutex<Option<Ranges>> = std::sync::Mutex::new(None);
+
+/// What the pass kept for host heap `id`, let go as the heap is dropped
+/// (its copies were held for the rest of the run).
+pub(crate) fn forget_heap_ranges(id: u64) {
+    let picked = RANGES.lock().unwrap_or_else(|e| e.into_inner()).as_mut().and_then(|r| r.heaps.remove(&id));
+    // Letting go of a host copy can free its buffer: not under the lock.
+    drop(picked);
+}
 /// A pass waits for [`RANGES`]: a round ahead stops at its next batch.
 static CLOSING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// The title heap of the last pass, for the rounds ahead (0: none yet).
@@ -879,7 +889,7 @@ fn heap_looks(
     }
     let ranges = ranges
         .heaps
-        .entry(std::ptr::from_ref(host) as usize)
+        .entry(host.id())
         .or_insert_with(|| Picked::new(crate::heap_pass::full_pass()));
     let changed = host.buffer_changes();
     #[cfg(feature = "diagnostics")]
@@ -1069,7 +1079,7 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
     #[cfg(feature = "diagnostics")]
     let looked = std::time::Instant::now();
     // Per host copy, the span its picked views cover.
-    let ranges = &ranges.heaps[&(std::ptr::from_ref(host) as usize)];
+    let ranges = &ranges.heaps[&host.id()];
     let views = ranges.views() as u32;
     let spans = ranges.spans();
     drop(kept);
@@ -5456,6 +5466,41 @@ fn staging_budget_per_frame(vram_budget: Option<u64>) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{SharedTables, settle_due, staging_budget_per_frame};
+
+    /// A dropped host heap's kept ranges go with it; another heap's stay
+    /// (#1276).
+    #[test]
+    fn a_dropped_heap_leaves_no_kept_ranges() {
+        use super::{Picked, RANGES, Ranges, forget_heap_ranges};
+        let has = |id: u64| {
+            RANGES.lock().unwrap().as_ref().is_some_and(|r| r.heaps.contains_key(&id))
+        };
+        let keep = |id: u64| {
+            RANGES
+                .lock()
+                .unwrap()
+                .get_or_insert_with(|| Ranges { heaps: Default::default(), swept: false })
+                .heaps
+                .insert(id, Picked::new(false));
+        };
+        let other = u64::MAX - 1;
+        keep(other);
+        match crate::descriptor::host::HostHeap::new(false, 4) {
+            Some(heap) => {
+                let id = heap.id();
+                keep(id);
+                drop(heap);
+                assert!(!has(id), "a dropped heap's ranges were kept");
+            }
+            None => {
+                keep(u64::MAX - 2);
+                forget_heap_ranges(u64::MAX - 2);
+                assert!(!has(u64::MAX - 2));
+            }
+        }
+        assert!(has(other));
+        forget_heap_ranges(other);
+    }
 
     #[test]
     fn staging_budget_scales_with_vram_budget() {
