@@ -12760,6 +12760,12 @@ impl Meter {
                     crate::descriptor::host::STALE[3].load(Ordering::Relaxed),
                     crate::descriptor::host::STALE[4].load(Ordering::Relaxed)
                 );
+                if !crate::descriptor::host::queue_host_textures() {
+                    tracing::info!(
+                        "records of textures the host writes left out of the queue (VICTORY_QUEUE_HOST_TEXTURES=0), since the start: {}",
+                        crate::descriptor::host::HOST_TEXTURES_LEFT_OUT.load(Ordering::Relaxed)
+                    );
+                }
             }
             if crate::resource::held_only() {
                 let [copies, bytes, grown, whole] = [0, 1, 2, 3].map(|i| crate::resource::HELD[i].load(Ordering::Relaxed));
