@@ -1565,6 +1565,56 @@ fn fills(desc: &ResourceDesc) -> bool {
     desc.dimension != BUFFER && desc.flags & TARGET_DEPTH_UNORDERED == 0
 }
 
+/// How long a render target or a depth target must go unused before the
+/// sweep may let its host copy go, when it may at all ([`sweeps_targets`]).
+/// Long on purpose: a target let go is not read from title memory (the host
+/// wrote it), so this time is the only thing standing between the sweep and
+/// a pass of the same second reading a cleared target.
+const TARGET_IDLE_MS: u64 = 30_000;
+
+/// Whether render targets and depth targets are candidates for the sweep:
+/// `VICTORY_TEXTURE_SWEEP_TARGETS=1`, off by default.
+///
+/// Their contents are the host's and not the title's ([`fills`]), so a copy
+/// let go and made again starts clear and a pass that reads one before
+/// writing it sees a blank target where the last frame's picture was. That is
+/// why they were never swept, and why this is an experiment to measure
+/// rather than a setting: on a card over its budget they are the only memory
+/// left to give back (an 8 GB run held 2,499 MB of them against a 1,780 MB
+/// reserve while 1,266 copies were made again, PR 26).
+#[cfg(windows)]
+fn sweeps_targets() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_TEXTURE_SWEEP_TARGETS").is_ok_and(|v| v != "0"))
+}
+
+/// The idle time after which the host copy of the texture described by `desc`
+/// may be let go, or `None` when the sweep does not consider it at all.
+///
+/// - a texture the title fills ([`fills`]): `idle_ms`, as it always was;
+/// - a render target or a depth target: at least [`TARGET_IDLE_MS`], and only
+///   with [`sweeps_targets`];
+/// - a texture shaders write as unordered access: never. Its contents are
+///   read through views no list bookkeeping reaches, so no idle time can say
+///   it is safe, whatever the switch says.
+#[cfg(windows)]
+fn swept_after(desc: &ResourceDesc, idle_ms: u64, targets: bool) -> Option<u64> {
+    const RENDER_TARGET: u32 = 0x1;
+    const DEPTH: u32 = 0x2;
+    const UNORDERED: u32 = 0x4;
+    if desc.dimension == BUFFER {
+        return None;
+    }
+    let flags = desc.flags & (RENDER_TARGET | DEPTH | UNORDERED);
+    if flags == 0 {
+        return Some(idle_ms);
+    }
+    if !targets || flags & UNORDERED != 0 {
+        return None;
+    }
+    Some(idle_ms.max(TARGET_IDLE_MS))
+}
+
 /// Whether the title fills texture `this` itself ([`fills`]).
 #[cfg(windows)]
 pub(crate) fn title_fills(this: This) -> bool {
@@ -2243,8 +2293,10 @@ pub(crate) fn let_go_idle() {
         _ => (crate::host::vram_idle_ms(memory), u64::MAX),
     };
     // For the trail (`crate::host::trail`): how many went, their bytes,
-    // and the first one.
+    // and the first one; and the same for the targets the switch adds.
     let (mut went, mut bytes, mut first) = (0u64, 0u64, None);
+    let (mut went_targets, mut bytes_targets) = (0u64, 0u64);
+    let targets = sweeps_targets();
     let all = textures();
     // With a limit, the longest idle first.
     let mut by_age: Vec<(u64, usize)> = Vec::new();
@@ -2253,7 +2305,10 @@ pub(crate) fn let_go_idle() {
             // SAFETY: as below.
             let r = unsafe { &*(at as *const Resource) };
             let used = r.host.used.load(Relaxed);
-            if used != 0 && fills(&r.desc) && crate::host::long_ago(used, idle_ms, IDLE_FRAMES) {
+            if used != 0
+                && let Some(after) = swept_after(&r.desc, idle_ms, targets)
+                && crate::host::long_ago(used, after, IDLE_FRAMES)
+            {
                 by_age.push((used & 0xffff_ffff, at));
             }
         }
@@ -2290,14 +2345,23 @@ pub(crate) fn let_go_idle() {
         let r = unsafe { &*(at as *const Resource) };
         // (Without its lock first: most were used lately or have none.)
         let used = r.host.used.load(Relaxed);
-        if used == 0 || !fills(&r.desc) || crate::texture::host_wrote(at) {
+        let Some(after) = swept_after(&r.desc, idle_ms, targets) else {
+            continue;
+        };
+        let target = !fills(&r.desc);
+        // A copy of a texture the title fills that the host also wrote
+        // into is not the title's own bytes any more. A target is written
+        // by the host by definition: `after` is what covers it.
+        if used == 0 || (!target && crate::texture::host_wrote(at)) {
             continue;
         }
-        let mut wait = idle_ms;
-        if !crate::host::long_ago(used, idle_ms, IDLE_FRAMES) {
+        let mut wait = after;
+        if !crate::host::long_ago(used, after, IDLE_FRAMES) {
             // Sooner when the title gave its memory up: only a slot or a
-            // list keeps such a copy of use.
-            if idle_ms <= UNMAPPED_MS
+            // list keeps such a copy of use. Never a target: its time is
+            // all that covers it.
+            if target
+                || idle_ms <= UNMAPPED_MS
                 || asked >= UNMAPPED_ASKED
                 || !unmapped_first()
                 || !r.host.placed.load(Relaxed)
@@ -2333,14 +2397,19 @@ pub(crate) fn let_go_idle() {
             r.host.gone.store(true, Relaxed);
             KINDS[2].fetch_add(1, Relaxed);
             KINDS[3].fetch_add(host.bytes, Relaxed);
-            if wait != idle_ms {
+            if wait != after {
                 UNMAPPED_GONE[0].fetch_add(1, Relaxed);
                 UNMAPPED_GONE[1].fetch_add(host.bytes, Relaxed);
             }
-            went += 1;
-            bytes += host.held_bytes();
-            if first.is_none() {
-                first = Some(at);
+            if target {
+                went_targets += 1;
+                bytes_targets += host.held_bytes();
+            } else {
+                went += 1;
+                bytes += host.held_bytes();
+                if first.is_none() {
+                    first = Some(at);
+                }
             }
             crate::host::retire(host);
         }
@@ -2354,6 +2423,15 @@ pub(crate) fn let_go_idle() {
                 "sweep: {went} host copies of textures the title fills let go ({} KiB), each held by its title texture alone (no list, no slot); the first: title texture {:#x}",
                 bytes >> 10,
                 first.unwrap_or(0)
+            )
+        });
+    }
+    if went_targets > 0 {
+        crate::host::trail(|| {
+            format!(
+                "sweep: {went_targets} host copies of render targets let go ({} KiB) after {} s of no use, each held by its title texture alone (no list, no slot): what they held went with them, so a pass that reads one before writing it sees a clear target (VICTORY_TEXTURE_SWEEP_TARGETS=1)",
+                bytes_targets >> 10,
+                TARGET_IDLE_MS / 1000
             )
         });
     }
@@ -3740,6 +3818,49 @@ mod tests {
 
     use super::*;
     use crate::object::slot;
+
+    /// What the sweep considers, with and without the targets switch: the
+    /// copies it always took, the render and depth targets it takes only
+    /// then and never sooner than [`TARGET_IDLE_MS`], the unordered-access
+    /// ones it never takes, and never a buffer.
+    #[test]
+    #[cfg(windows)]
+    fn the_sweep_takes_targets_only_with_the_switch_and_no_unordered_access() {
+        let desc = |dimension: u32, flags: u32| ResourceDesc {
+            dimension,
+            alignment: 0,
+            width: 64,
+            height: 64,
+            depth_or_array_size: 1,
+            mip_levels: 1,
+            format: 0,
+            sample_count: 1,
+            sample_quality: 0,
+            layout: 0,
+            flags,
+        };
+        // D3D12_RESOURCE_DIMENSION_TEXTURE2D and BUFFER.
+        let (texture, buffer) = (3, 1);
+        // D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, ALLOW_DEPTH_STENCIL,
+        // ALLOW_UNORDERED_ACCESS.
+        let (render, depth, unordered) = (0x1, 0x2, 0x4);
+        // A texture the title fills: as it always was, whatever the switch.
+        assert_eq!(swept_after(&desc(texture, 0), 5_000, false), Some(5_000));
+        assert_eq!(swept_after(&desc(texture, 0), 5_000, true), Some(5_000));
+        // A render or depth target: only with the switch, and never sooner
+        // than TARGET_IDLE_MS, even when everything else is kept for longer.
+        assert_eq!(swept_after(&desc(texture, render), 5_000, false), None);
+        assert_eq!(swept_after(&desc(texture, depth), 5_000, false), None);
+        assert_eq!(swept_after(&desc(texture, render), 5_000, true), Some(TARGET_IDLE_MS));
+        assert_eq!(swept_after(&desc(texture, depth), 1_500, true), Some(TARGET_IDLE_MS));
+        assert_eq!(swept_after(&desc(texture, render), 600_000, true), Some(600_000));
+        // Unordered access, alone or with a target flag: never.
+        assert_eq!(swept_after(&desc(texture, unordered), 600_000, true), None);
+        assert_eq!(swept_after(&desc(texture, render | unordered), 600_000, true), None);
+        assert_eq!(swept_after(&desc(texture, depth | unordered), 600_000, true), None);
+        // A buffer is not a texture and is never a candidate.
+        assert_eq!(swept_after(&desc(buffer, 0), 5_000, true), None);
+    }
 
     #[test]
     fn a8_unorm_is_not_in_the_r8_typeless_family() {
