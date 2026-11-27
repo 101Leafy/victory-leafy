@@ -1177,6 +1177,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
         return Some(known);
     }
     let mut guards_asked = false;
+    let mut loosely = false;
     // (View memory read-only by our hand: the kernel would refuse.)
     let refused = guarded && light() && PROTECTED.any(first, last);
     let pages = match if refused { None } else { kernel_written(first, last) } {
@@ -1188,7 +1189,9 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
             }
             #[cfg(feature = "diagnostics")]
             let guarding = std::time::Instant::now();
-            let written = guard_parts(first * PAGE, last * PAGE);
+            let told = if loose_ask() && light() { guard_parts_loose(first * PAGE, last * PAGE) } else { None };
+            loosely = told.is_some();
+            let written = told.or_else(|| guard_parts(first * PAGE, last * PAGE));
             #[cfg(feature = "diagnostics")]
             {
                 use crate::copystat::{C, add};
@@ -1230,7 +1233,8 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     // now on. (The range is still held: no other asking of any of it came
     // between.)
     if guards_asked && light() {
-        publish(&pages.iter().map(|p| p.0).collect::<Vec<_>>());
+        let blocks: Vec<usize> = pages.iter().map(|p| p.0).collect();
+        if loosely { publish_loose(&blocks) } else { publish(&blocks) }
     }
     Some(answer)
 }
@@ -1662,19 +1666,132 @@ fn loose(g: &mut Guards, block: usize) -> bool {
 /// Those were the faults left taking the lock, and the title's threads
 /// waited behind askings for it: 361 waits, 129 ms of all threads a frame
 /// in the intro (2026-11-27).
+///
+/// `VICTORY_LOOSE_PARTS=2`: those, and askings about heap blocks that only
+/// such faults opened ([`guard_parts_loose`]).
 fn loose_parts() -> bool {
+    loose_level() != 0
+}
+
+fn loose_ask() -> bool {
+    loose_level() == 2
+}
+
+fn loose_level() -> u8 {
     #[cfg(test)]
-    if tests::LOOSE_PARTS_HERE.get() {
-        return true;
+    if tests::LOOSE_PARTS_HERE.get() != 0 {
+        return tests::LOOSE_PARTS_HERE.get();
     }
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_LOOSE_PARTS").is_some_and(|v| v == "1"))
+    static LEVEL: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *LEVEL.get_or_init(|| match std::env::var("VICTORY_LOOSE_PARTS").as_deref() {
+        Ok("1") => 1,
+        Ok("2") => 2,
+        _ => 0,
+    })
 }
 
 /// The blocks a write fault opened a part of with no lock
 /// ([`open_part_loose`]) since an asking last took their bit: not clean,
-/// whatever the guards' notes say.
+/// whatever the guards' notes say. (With `VICTORY_LOOSE_PARTS=2`, so too
+/// those [`part_open`] opened a part of under the lock.)
 static LOOSE_PART: Bits = Bits::new();
+
+/// Diagnostics: heap askings answered with no lock, the blocks they told,
+/// and heap askings that went on to the lock; since the start.
+#[cfg(feature = "diagnostics")]
+pub(crate) static LOOSE_ASKS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// [`guard_parts`] with no lock, for a range of the descriptor heaps whose
+/// blocks are all guarded and known clean, but for parts that write faults
+/// opened ([`LOOSE_PART`]): those are made read-only again and told.
+/// `None`: ask under the lock.
+///
+/// Each block is held in [`OPENING`] from the look at its parts to the
+/// close, as by the lock's own asking; who opens a heap block, or lets go of
+/// its guard, holds it there too, or sets a bit looked at here first.
+fn guard_parts_loose(start: usize, end: usize) -> Option<Vec<(usize, u16)>> {
+    let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
+    let words = first / 64..last.div_ceil(64);
+    let heap = words.clone().all(|word| {
+        let these = in_word(word * 64, first, last);
+        FINE.word(word) & PROTECTED.word(word) & these == these
+    });
+    if !heap {
+        return None;
+    }
+    let known = words.clone().all(|word| {
+        let these = in_word(word * 64, first, last);
+        (ALIASED.word(word) | BESIDE.word(word) | LOOSE.word(word) | PENDING.word(word)) & these == 0
+            && (PUBLISHED.word(word) | LOOSE_PART.word(word)) & these == these
+    });
+    if !known {
+        #[cfg(feature = "diagnostics")]
+        LOOSE_ASKS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return None;
+    }
+    let mut told = Vec::new();
+    for word in words {
+        for block in BitsOf(LOOSE_PART.word(word) & in_word(word * 64, first, last)).map(|bit| word * 64 + bit) {
+            if !LOOSE_PART.take(block) {
+                continue;
+            }
+            if !OPENING.put(block) {
+                // A fault is opening a part: told whole, guarded at the next
+                // asking.
+                LOOSE_PART.set(block);
+                told.push((block, WHOLE));
+                continue;
+            }
+            if !PROTECTED.any(block, block + 1) {
+                // Let go of since the look: opened whole.
+                OPENING.clear(block);
+                told.push((block, WHOLE));
+                continue;
+            }
+            let open = PARTED.take(block);
+            // Read-only again before the caller reads the parts.
+            let closed = open == 0 || close(block);
+            if !closed {
+                PARTED.or(block, WHOLE);
+                LOOSE_PART.set(block);
+            }
+            OPENING.clear(block);
+            if !closed || open == 0 || BESIDE.any(block, block + 1) {
+                told.push((block, WHOLE));
+                continue;
+            }
+            #[cfg(feature = "diagnostics")]
+            if open != WHOLE {
+                use crate::copystat::{C, add};
+                add(C::GuardPartBlocks, 1);
+                add(C::GuardPartParts, u64::from(open.count_ones()));
+            }
+            told.push((block, open));
+        }
+    }
+    #[cfg(feature = "diagnostics")]
+    {
+        LOOSE_ASKS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        LOOSE_ASKS[1].fetch_add(told.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+    Some(told)
+}
+
+/// [`publish`] for an asking [`guard_parts_loose`] answered, with no lock.
+fn publish_loose(blocks: &[usize]) {
+    for &block in blocks {
+        let has = |bits: &Bits| bits.any(block, block + 1);
+        if !has(&PROTECTED) {
+            continue;
+        }
+        PUBLISHED.set(block);
+        // (Opened, put there or let go of since: whoever did sets its bit, or
+        // holds the block in `OPENING`, before it clears this one.)
+        if [&BESIDE, &LOOSE, &LOOSE_PART, &PENDING, &OPENING, &ALIASED].into_iter().any(has) || !has(&PROTECTED) {
+            PUBLISHED.clear(block);
+        }
+    }
+}
 
 /// Diagnostics: write faults that opened a part with no lock, and those that
 /// went on to the lock; since the start.
@@ -3444,6 +3561,10 @@ fn open(g: &mut Guards, start: usize, end: usize) -> usize {
 fn unguard(g: &mut Guards, blocks: &[usize]) {
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
+    let mut sorted = blocks.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    let held = hold_heap(&sorted);
     // All of them before the first can be written: a write through one is a
     // write of the others' bytes.
     for &block in blocks {
@@ -3452,19 +3573,35 @@ fn unguard(g: &mut Guards, blocks: &[usize]) {
         PARTED.take(block);
         PUBLISHED.clear(block);
     }
-    let mut sorted = blocks.to_vec();
-    sorted.sort_unstable();
-    sorted.dedup();
     for run in sorted.chunk_by(|a, b| a + 1 == *b) {
         if run.len() == 1 || !open_run(run[0], run[run.len() - 1] + 1) {
             run.iter().for_each(|&block| open_block(block));
         }
         run.iter().for_each(|&block| PROTECTED.clear(block));
     }
+    held.iter().for_each(|&block| OPENING.clear(block));
     #[cfg(feature = "diagnostics")]
     if !blocks.is_empty() {
         tally(8, started.elapsed().as_nanos() as u64);
     }
+}
+
+/// With `VICTORY_LOOSE_PARTS=2`, holds the heap blocks of `blocks` (no two
+/// the same) in [`OPENING`] for a guard let go of under the lock: no asking
+/// with no lock looks at them meanwhile. The caller lets go of those
+/// returned after `PROTECTED` is cleared.
+fn hold_heap(blocks: &[usize]) -> Vec<usize> {
+    if !loose_ask() {
+        return Vec::new();
+    }
+    let held: Vec<usize> = blocks.iter().copied().filter(|&block| FINE.any(block, block + 1)).collect();
+    for &block in &held {
+        // (Who holds one with no lock waits for nothing meanwhile.)
+        while !OPENING.put(block) {
+            std::thread::yield_now();
+        }
+    }
+    held
 }
 
 #[cfg(test)]
@@ -3566,6 +3703,18 @@ fn part_open(g: &mut Guards, at: usize) -> bool {
         return false;
     }
     let part = 1u16 << (at % BLOCK / KERNEL_PAGE);
+    // No asking with no lock between the look at the parts and the part
+    // opened (`guard_parts_loose`).
+    let held = loose_ask();
+    while held && !OPENING.put(block) {
+        std::thread::yield_now();
+    }
+    let done = |opened: bool| {
+        if held {
+            OPENING.clear(block);
+        }
+        opened
+    };
     let open = PARTED.get(block);
     // (A part opened with no lock may have been let be read-only again.)
     if open & part != 0 && !loose_parts() {
@@ -3574,26 +3723,29 @@ fn part_open(g: &mut Guards, at: usize) -> bool {
     if open & part == 0 && open.count_ones() >= most {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::GuardPartWhole, 1);
-        return false;
+        return done(false);
     }
     // Told as written before the part can be.
+    if held {
+        LOOSE_PART.set(block);
+    }
     g.clean.remove(block);
     PUBLISHED.clear(block);
     let page = at & !(KERNEL_PAGE - 1);
     let mut old = 0;
     // SAFETY: a block we made read-only; one kernel page of it.
     if unsafe { VirtualProtect(page as *const _, KERNEL_PAGE, PAGE_READWRITE, &mut old) } == 0 {
-        return false;
+        return done(false);
     }
     if !matches!(old, PAGE_READONLY | PAGE_READWRITE) {
         // SAFETY: as above.
         unsafe { VirtualProtect(page as *const _, KERNEL_PAGE, old, &mut old) };
-        return false;
+        return done(false);
     }
     PARTED.or(block, part);
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::GuardPartFaults, 1);
-    true
+    done(true)
 }
 
 /// Makes all of a guarded `block` read-only again, the parts [`part_open`]
@@ -4095,6 +4247,7 @@ pub fn title_memory_unmapping(at: usize, len: usize) {
         }
     }
     let blocks: Vec<usize> = g.protected.range(at / BLOCK..at.saturating_add(len).div_ceil(BLOCK)).collect();
+    let held = hold_heap(&blocks);
     for block in blocks {
         g.protected.remove(block);
         g.clean.remove(block);
@@ -4102,6 +4255,7 @@ pub fn title_memory_unmapping(at: usize, len: usize) {
         PUBLISHED.clear(block);
         PROTECTED.clear(block);
     }
+    held.iter().for_each(|&block| OPENING.clear(block));
 }
 
 /// The title is about to free or decommit memory of its own,
@@ -4484,23 +4638,31 @@ mod tests {
     /// block opens whole.
     #[test]
     fn heap_blocks_open_by_the_part() {
-        heap_parts(false);
+        heap_parts(0);
     }
 
     /// So too with the parts opened with no lock.
     #[test]
     fn heap_blocks_open_by_the_part_with_no_lock() {
-        LOOSE_PARTS_HERE.set(true);
-        heap_parts(true);
-        LOOSE_PARTS_HERE.set(false);
+        LOOSE_PARTS_HERE.set(1);
+        heap_parts(1);
+        LOOSE_PARTS_HERE.set(0);
+    }
+
+    /// And with the blocks asked about with no lock.
+    #[test]
+    fn heap_blocks_open_by_the_part_asked_with_no_lock() {
+        LOOSE_PARTS_HERE.set(2);
+        heap_parts(2);
+        LOOSE_PARTS_HERE.set(0);
     }
 
     thread_local! {
-        /// `VICTORY_LOOSE_PARTS=1` for this thread's faults and askings.
-        pub(super) static LOOSE_PARTS_HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// `VICTORY_LOOSE_PARTS` for this thread's faults and askings.
+        pub(super) static LOOSE_PARTS_HERE: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
     }
 
-    fn heap_parts(loose: bool) {
+    fn heap_parts(level: u8) {
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, UnmapViewOfFile,
         };
@@ -4520,20 +4682,38 @@ mod tests {
         assert_ne!(view, 0);
         let block = view / BLOCK;
         (block..block + 2).for_each(|b| FINE.set(b));
+        // As `writes` asks: with no lock first at level 2, the blocks told
+        // known by their bits after. Whether it was with no lock.
+        let ask = || {
+            let (start, end) = (view, view + 2 * BLOCK);
+            if level == 2 {
+                if let Some(told) = guard_parts_loose(start, end) {
+                    publish_loose(&told.iter().map(|t| t.0).collect::<Vec<_>>());
+                    return (Some(told), true);
+                }
+                let told = guard_parts(start, end);
+                publish(&told.iter().flatten().map(|t| t.0).collect::<Vec<_>>());
+                return (told, false);
+            }
+            (guard_parts(start, end), false)
+        };
         assert!(guard(view, view + 2 * BLOCK).is_some()); // now read-only
+        if level == 2 {
+            publish(&[block, block + 1]);
+        }
         // SAFETY: our view; a write to a guarded part faults into the handler.
         let poke = |part: usize| unsafe { ((view + part * KERNEL_PAGE + 8) as *mut u8).write_volatile(1) };
         poke(3);
         assert!(writable(view + 3 * KERNEL_PAGE));
         assert!(!writable(view + 4 * KERNEL_PAGE));
-        assert_eq!(LOOSE_PART.any(block, block + 1), loose);
+        assert_eq!(LOOSE_PART.any(block, block + 1), level != 0);
         poke(3);
-        assert_eq!(guard_parts(view, view + 2 * BLOCK), Some(vec![(block, 1 << 3)]));
+        assert_eq!(ask(), (Some(vec![(block, 1 << 3)]), level == 2));
         assert!(!writable(view + 3 * KERNEL_PAGE));
-        assert_eq!(guard_parts(view, view + 2 * BLOCK), Some(Vec::new()));
+        assert_eq!(ask(), (Some(Vec::new()), level == 2));
         (0..=part_faults() as usize).for_each(poke);
         assert!(writable(view + 15 * KERNEL_PAGE));
-        assert_eq!(guard_parts(view, view + 2 * BLOCK), Some(vec![(block, WHOLE)]));
+        assert_eq!(ask(), (Some(vec![(block, WHOLE)]), false));
         title_memory_unmapping(view, 2 * BLOCK);
         (block..block + 2).for_each(|b| FINE.clear(b));
         // SAFETY: our view.

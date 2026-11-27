@@ -1789,8 +1789,14 @@ pub(crate) fn log(frames: f64) {
     );
     let [loose, to_lock] = [0, 1].map(|n| crate::watch::LOOSE_PARTS[n].load(std::sync::atomic::Ordering::Relaxed));
     tracing::info!(
-        "write faults that opened a descriptor heap part with no lock (VICTORY_LOOSE_PARTS=1), since the start: \
+        "write faults that opened a descriptor heap part with no lock (VICTORY_LOOSE_PARTS=1 or 2), since the start: \
          {loose}; {to_lock} went on to the lock"
+    );
+    let [asks, told, to_lock] =
+        [0, 1, 2].map(|n| crate::watch::LOOSE_ASKS[n].load(std::sync::atomic::Ordering::Relaxed));
+    tracing::info!(
+        "descriptor heap askings answered with no lock (VICTORY_LOOSE_PARTS=2), since the start: {asks}, \
+         {told} blocks told in them; {to_lock} went on to the lock"
     );
     let [runs, blocks, reopened, failed] =
         [0, 1, 2, 3].map(|n| crate::watch::LATER[n].load(std::sync::atomic::Ordering::Relaxed));
