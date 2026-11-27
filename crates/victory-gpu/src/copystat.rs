@@ -409,11 +409,36 @@ pub(crate) enum C {
     /// settle (`draw.rs` `dynamic_slots`, `VICTORY_SETTLE_BACKOFF`).
     SettlesBare,
     SettlesHeld,
+    /// Tables kept from an earlier frame (`draw.rs` `SharedTables`,
+    /// `VICTORY_TABLE_CACHE`): found and used as they are, asked for and not
+    /// kept, found but made afresh as another host heap asked or texture
+    /// views were made again, or as a view's host copy or shadow changed,
+    /// and runs given back unused or for room.
+    TableCacheHit,
+    TableCacheHitSlots,
+    TableCacheMiss,
+    TableCacheStale,
+    TableCacheChanged,
+    TableCacheRetired,
+    TableCacheRetiredSlots,
+    /// Constant views of tables made afresh, and of them those whose address
+    /// is a multiple of 256 (a host constant view could read the title's
+    /// memory in place), with their bytes; tables holding constant views,
+    /// those whose constant views all are, and their slots; slots of tables
+    /// asked again this frame whose constant views all are.
+    CbvViews,
+    CbvAligned,
+    CbvBytes,
+    CbvAlignedBytes,
+    CbvTables,
+    CbvTablesAligned,
+    CbvTablesAlignedSlots,
+    CbvAgainAlignedSlots,
 }
 const COUNTERS: usize = 256;
 
 /// The counters' names, in the order of [`C`], for the frame recorder's columns.
-pub(crate) const NAMES: [&str; 215] = [
+pub(crate) const NAMES: [&str; 230] = [
     "Submissions", "Copies", "CopyBytes", "Refreshes", "RefreshBytes", "Skipped", "SkippedBytes", "Runs",
     "RunUs", "Queries", "QueryUs", "MoveUs", "Unmapped", "Watches", "WatchUs", "Checked", "Unchanged",
     "Fallbacks", "GuardFaults", "TexWatched", "TexHashed", "TexChanged", "TexHot", "Frames", "RecordCalls",
@@ -459,6 +484,10 @@ pub(crate) const NAMES: [&str; 215] = [
     "HeapTexMirrorNs", "HeapTexHostNs", "HeapTexPrintNs",
     "RootTailAsked", "RootTailCovered",
     "SettlesBare", "SettlesHeld",
+    "TableCacheHit", "TableCacheHitSlots", "TableCacheMiss", "TableCacheStale",
+    "TableCacheChanged", "TableCacheRetired", "TableCacheRetiredSlots",
+    "CbvViews", "CbvAligned", "CbvBytes", "CbvAlignedBytes",
+    "CbvTables", "CbvTablesAligned", "CbvTablesAlignedSlots", "CbvAgainAlignedSlots",
 ];
 /// One of some sets of counters, each in lines of the processor's memory of
 /// its own: a set for all threads had them wait for each other's lines at
@@ -837,7 +866,7 @@ mod command_tests {
     #[test]
     fn every_counter_is_named() {
         use super::{C, COUNTERS, NAMES};
-        assert_eq!(C::SettlesHeld as usize + 1, NAMES.len());
+        assert_eq!(C::CbvAgainAlignedSlots as usize + 1, NAMES.len());
         assert_eq!(NAMES[C::Frames as usize], "Frames");
         assert!(NAMES.len() <= COUNTERS);
     }
