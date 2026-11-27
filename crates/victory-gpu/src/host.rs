@@ -527,14 +527,15 @@ fn bury_lag() -> u64 {
 /// Whether a flight's lists give their dynamic descriptor slots back when
 /// it lands, as a submission that is waited for does
 /// ([`crate::list::tables_done`]), and not when the lists are reset
-/// [`bury_lag`] landings later (`VICTORY_TABLES_AT_LANDING=0`: then). Held
+/// [`bury_lag`] landings later (`VICTORY_TABLES_AT_LANDING=1`; off, then, as
+/// before). Held
 /// for 64 landings, the binocular zoom ran the slots out with 4,200 to
 /// 4,600 asks a frame refused and a third of its draws gone (codec_d,
 /// pareto-residency f4b48ad76). The card has read the slots by then; the
 /// objects they name still wait for the bury.
 pub(crate) fn tables_at_landing() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("VICTORY_TABLES_AT_LANDING").map_or(true, |v| v.trim() != "0"))
+    *ON.get_or_init(|| std::env::var("VICTORY_TABLES_AT_LANDING").is_ok_and(|v| v.trim() == "1"))
 }
 
 /// Drops what waited for submissions up to `finished` ([`bury_lag`]). The

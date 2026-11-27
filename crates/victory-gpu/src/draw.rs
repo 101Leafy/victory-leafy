@@ -175,6 +175,14 @@ fn fallback_heaps() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_FALLBACK_HEAPS").is_some_and(|v| v == "1"))
 }
 
+/// Whether the heap buffer pass runs for each heap of a frame and each list
+/// keeps every heap's stride table (`VICTORY_HEAP_PASS_EACH=1`, codec_d
+/// 18bdf7932; off, once a frame and once a list, as before).
+fn heap_pass_each() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_PASS_EACH").is_some_and(|v| v == "1"))
+}
+
 /// Whether a texture found changed with nothing to tell of it is looked at
 /// again in the next frame (`VICTORY_RECHECK_SOON=0`: after four, as
 /// before).
@@ -2243,8 +2251,10 @@ impl State {
         let gpu = host.strides_gpu()?;
         // One key per list and table (bit 0: no title address), so that a
         // list that runs such shaders with two heaps keeps both tables
-        // (codec_d 18bdf7932).
-        if !list.first_use(gpu as usize | 1) {
+        // (codec_d 18bdf7932); one per list without heap_pass_each().
+        const ONCE: usize = usize::MAX - 0x5e;
+        let each = heap_pass_each();
+        if !list.first_use(if each { gpu as usize | 1 } else { ONCE }) {
             return Some(gpu);
         }
         // The list may outlive the title's heap object, which owns the table.
@@ -2257,8 +2267,10 @@ impl State {
         // shortcut: what the title writes into such buffers between lists
         // of one frame is seen a frame late.
         // Per heap: a second heap of the frame had no pass (codec_d 18bdf7932).
+        static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
         let frame = crate::frame::current();
-        if host.buffer_frame.swap(frame, Ordering::Relaxed) == frame {
+        let last = if each { &host.buffer_frame } else { &FRAME };
+        if last.swap(frame, Ordering::Relaxed) == frame {
             return Some(gpu);
         }
         let started = std::time::Instant::now();
