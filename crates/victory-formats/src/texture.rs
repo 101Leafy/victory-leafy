@@ -1293,10 +1293,24 @@ mod tests {
             block: 4,
             ..desc(4096, 4096, 13, n, swizzle)
         };
+        let bc1024 = |n, swizzle| Desc {
+            block: 4,
+            ..desc(1024, 1024, 11, n, swizzle)
+        };
+        let bc256 = |n, swizzle| Desc {
+            block: 4,
+            ..desc(256, 256, 9, n, swizzle)
+        };
         let cases = [
             ("BC7 64KB_D", bc(16, Swizzle::SW_64KB_D), 0),
             ("BC7 64KB_S", bc(16, Swizzle::SW_64KB_S), 0),
             ("BC1 64KB_D", bc(8, Swizzle::SW_64KB_D), 0),
+            // GTA VI's packs: 89% of textures are 4 KB tiled, most 1024 or smaller.
+            ("BC1 4KB_S 1024", bc1024(8, Swizzle::SW_4KB_S), 0),
+            ("BC7 4KB_S 1024", bc1024(16, Swizzle::SW_4KB_S), 0),
+            ("BC1 4KB_D 1024", bc1024(8, Swizzle::SW_4KB_D), 0),
+            ("BC1 4KB_S 256", bc256(8, Swizzle::SW_4KB_S), 0),
+            ("BC7 64KB_S 1024", bc1024(16, Swizzle::SW_64KB_S), 0),
             (
                 "RGBA8 64KB_D",
                 desc(1920, 1080, 1, 4, Swizzle::SW_64KB_D),
@@ -1805,7 +1819,7 @@ mod tests {
             let needs: Vec<u64> = (0..9).map(|mip| l.bytes_from(mip)).collect();
             assert!(needs.windows(2).all(|w| w[0] >= w[1]), "{needs:?}");
             assert!(needs[3] * 4 < l.size, "{needs:?}");
-            let tiled: Vec<u8> = (0..l.size).map(|i| (i * 7 >> 3) as u8).collect();
+            let tiled: Vec<u8> = (0..l.size).map(|i| ((i * 7) >> 3) as u8).collect();
             for mip in 1..9 {
                 let m = l.mips[mip as usize];
                 let pitch = m.width as usize * 8;
@@ -2191,6 +2205,93 @@ mod tests {
                 },
             ] {
                 assert!(!Layout::new_for_model(&d, series_s).unwrap().addressable());
+            }
+        }
+    }
+
+    /// BC7 and BC1 surfaces with an odd count of element rows, detiled whole
+    /// and by row ranges that start and end on odd rows, against each
+    /// element read from its own address. Only the bytes of the range's
+    /// span are real; the rest of the tiled memory is garbage.
+    #[test]
+    fn bc_row_ranges_with_odd_edges_match_element_addresses() {
+        let mut seed = 0x2545_f491_u32;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        for swizzle in [Swizzle::SW_4KB_S, Swizzle::SW_4KB_D, Swizzle::SW_64KB_S, Swizzle::SW_64KB_D] {
+            for n in [8u32, 16] {
+                for (w, h) in [(1000, 700), (516, 1036), (260, 92)] {
+                    let d = Desc { block: 4, ..desc(w, h, 9, n, swizzle) };
+                    let l = Layout::new(&d).unwrap();
+                    let size = l.size as usize;
+                    let tiled: Vec<u8> = (0..size).map(|_| next() as u8).collect();
+                    let n = n as usize;
+                    for mip in 0..d.mips {
+                        let m = l.mips[mip as usize];
+                        let bytes = m.width as usize * n;
+                        let row = bytes + 7;
+                        let len = (m.height as usize - 1) * row + bytes;
+                        let mut expected = vec![0xcc; len];
+                        for y in 0..m.height {
+                            for x in 0..m.width {
+                                let at = l.offset(mip, x, y, 0).unwrap() as usize;
+                                expected[y as usize * row + x as usize * n..][..n].copy_from_slice(&tiled[at..][..n]);
+                            }
+                        }
+                        let mut whole = vec![0xcc; len];
+                        l.detile(&tiled, mip, 0, &mut whole, row, len).unwrap();
+                        assert!(whole == expected, "{d:?} mip {mip} whole");
+                        let h = m.height;
+                        let mut spans = vec![0..h, 1..h, 0..h - 1, 1..2, (h / 2 * 2).saturating_sub(1)..h];
+                        spans.push((h / 3) | 1..((2 * h / 3) | 1).min(h));
+                        for rows in spans.into_iter().filter(|r| r.start < r.end && r.end <= h) {
+                            let mut part = vec![0xcc; len];
+                            let mut sparse = vec![0x5a; size];
+                            for y in rows.clone() {
+                                for x in 0..m.width {
+                                    let at = l.offset(mip, x, y, 0).unwrap() as usize;
+                                    sparse[at..][..n].copy_from_slice(&tiled[at..][..n]);
+                                }
+                            }
+                            l.detile_rows(&sparse, mip, 0, &mut part, row, len, rows.clone()).unwrap();
+                            for y in 0..h {
+                                let r = y as usize * row..y as usize * row + bytes;
+                                if rows.contains(&y) {
+                                    assert_eq!(part[r.clone()], expected[r], "{d:?} mip {mip} rows {rows:?} row {y}");
+                                } else {
+                                    assert!(part[r].iter().all(|&b| b == 0xcc), "{d:?} mip {mip} rows {rows:?} wrote row {y}");
+                                }
+                            }
+
+                            // As the staging refresh does it: the rows the
+                            // written elements touch, and only the tiled
+                            // span those rows read.
+                            let mut ranges: Vec<(usize, usize)> = Vec::new();
+                            for y in rows.clone() {
+                                for x in 0..m.width {
+                                    let at = l.offset(mip, x, y, 0).unwrap() as usize;
+                                    ranges.push((at, at + n));
+                                }
+                            }
+                            ranges.sort_unstable();
+                            ranges.dedup();
+                            let (band, span) = l.touched_rows(mip, 0, &ranges).unwrap();
+                            assert!(band.start <= rows.start && rows.end <= band.end, "{d:?} mip {mip} rows {rows:?} band {band:?}");
+                            let mut spanned = vec![0x5a; size];
+                            spanned[span.clone()].copy_from_slice(&tiled[span]);
+                            let mut part = vec![0xcc; len];
+                            l.detile_rows(&spanned, mip, 0, &mut part, row, len, band.clone()).unwrap();
+                            for y in band.clone() {
+                                let r = y as usize * row..y as usize * row + bytes;
+                                assert_eq!(part[r.clone()], expected[r], "{d:?} mip {mip} band {band:?} row {y}");
+                            }
+                        }
+                    }
+                }
             }
         }
     }

@@ -71,7 +71,7 @@ fn suggested(desc: &ResourceDesc) -> Swizzle {
 /// result in the description's layout field.
 pub extern "system" fn XGSuggestSwizzleMode(
     desc: *const ResourceDesc,
-    _flags: u32,
+    flags: u32,
     out: *mut u32,
 ) -> HRESULT {
     // SAFETY: the title passes a description and room for the layout
@@ -79,6 +79,18 @@ pub extern "system" fn XGSuggestSwizzleMode(
     match unsafe { (desc.as_ref(), out.as_mut()) } {
         (Some(desc), Some(out)) => {
             *out = SWIZZLED | suggested(desc).0;
+            tracing::debug!(
+                width = desc.width,
+                height = desc.height,
+                depth_or_array = desc.depth_or_array,
+                mips = desc.mips,
+                format = desc.format,
+                dimension = desc.dimension,
+                flags = format_args!("{:#x}", desc.flags),
+                asked = format_args!("{flags:#x}"),
+                layout = format_args!("{:#x}", *out),
+                "suggested swizzle mode"
+            );
             S_OK
         }
         _ => E_INVALIDARG,

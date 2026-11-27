@@ -142,6 +142,9 @@ pub(crate) struct Translated {
     pub(crate) stores: bool,
     /// Whether it can store through raw addresses ([`stores_by_address`]).
     pub(crate) stores_by_address: bool,
+    /// Whether it can store anywhere a later command may read, textures
+    /// included ([`writes`]).
+    pub(crate) writes: bool,
     /// Whether it stores through a view it picks from the heap by an index,
     /// once asked (`crate::picked`).
     pub(crate) picks: std::sync::atomic::AtomicU8,
@@ -240,6 +243,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         _ => None,
     });
     let stores_by_address = programs.is_empty() || programs.iter().any(stores_by_address);
+    let writes = stores || programs.iter().any(writes);
     let used = programs
         .into_iter()
         .find(|p| {
@@ -256,6 +260,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         used,
         stores,
         stores_by_address,
+        writes,
         picks: Default::default(),
     })
 }
@@ -407,6 +412,20 @@ fn stores_by_address(program: &victory_shader::NativeProgram) -> bool {
     })
 }
 
+/// Whether a console program can store to a texture (an image store or
+/// atomic), or code that does not decode: with [`stores`], whether a later
+/// command may read what it wrote.
+#[cfg(windows)]
+fn writes(program: &victory_shader::NativeProgram) -> bool {
+    use victory_shader::gfx10::{Encoding, decode};
+    let Ok(code) = decode(&program.code) else {
+        return true;
+    };
+    code.iter().any(|i| {
+        i.encoding == Encoding::Mimg && i.name().is_none_or(|n| n.contains("store") || n.contains("atomic"))
+    })
+}
+
 #[repr(C)]
 struct Pipeline {
     object: Object,
@@ -481,6 +500,24 @@ pub(crate) fn draw_targets(this: This, handles: &[u64], depth: u64) {
     if let Some(loose) = &pipeline(this).loose {
         loose.choose(handles, depth);
     }
+}
+
+/// As [`host_pipeline`], for a draw into render target and depth views of
+/// the formats `bound`: if a bound view has another format than the title's
+/// pipeline declares for its slot (`host::formats_differ`), the host
+/// pipeline of the same shaders and state made for the bound formats
+/// (`make::for_formats`). A draw whose views are as declared pays one
+/// comparison of the nine words.
+#[cfg(windows)]
+pub(crate) fn host_pipeline_for<'a>(this: This, bound: &host::TargetFormats) -> Option<&'a host::HostPipeline> {
+    if this.is_null() {
+        return None;
+    }
+    let p = &pipeline(this).host;
+    if p.formats != *bound && host::formats_differ(&p.formats, bound) {
+        return make::for_formats(p, bound);
+    }
+    make::ready(p)
 }
 
 /// Host pipelines queued and not made yet.
@@ -560,6 +597,7 @@ pub(crate) fn note_drop(this: This) {
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn note_why(why: String) {
     crate::capture::op(0, || format!("DROPPED {why}"));
+    crate::host::panel::log_event(format!("DROP {why}"));
     let mut drops = DROPS.lock().unwrap_or_else(|e| e.into_inner());
     *drops.get_or_insert_with(HashMap::new).entry(why).or_default() += 1;
 }

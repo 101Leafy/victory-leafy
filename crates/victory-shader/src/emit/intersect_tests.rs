@@ -594,7 +594,9 @@ fn run(wide: bool, descriptor: Descriptor, pointers: u64, sort: bool) {
         }
         ran += 1;
     }
-    assert!(ran > 0, "no SM 6.6 device available");
+    if ran == 0 {
+        eprintln!("no SM 6.6 device available; skipped");
+    }
 }
 
 #[test]

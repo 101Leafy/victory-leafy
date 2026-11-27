@@ -21,6 +21,8 @@
 //! (every mip and array slice), depth and stencil planes are not.
 
 pub(crate) mod ahead;
+#[cfg(feature = "diagnostics")]
+pub(crate) mod audit;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, Weak};
@@ -80,10 +82,16 @@ pub(crate) struct Staging {
     uploaded: std::sync::atomic::AtomicBool,
     /// When a list last recorded a use of it (`crate::host::moment`).
     used: std::sync::atomic::AtomicU64,
-    /// The frame until which the next check may hash the texture again
-    /// ([`Last::due_until`]), for [`upload`], which runs on the recording
+    /// The frame until which lists copy the texture changed or not
+    /// ([`Last::copy_until`]), for [`upload`], which runs on the recording
     /// threads and does not take `last`.
     hot: std::sync::atomic::AtomicU64,
+    /// Copies lists recorded since the last refresh only because the
+    /// texture was hot, and how many times it was detiled so far: when the
+    /// refresh after them detiles nothing, each of them copied what the
+    /// host texture held already.
+    forced: std::sync::atomic::AtomicU32,
+    fills: std::sync::atomic::AtomicU32,
     /// How many bytes of the texture's memory were mapped when a list last
     /// recorded an upload of it ([`fill_unlocked`]; 0: not asked).
     expected: std::sync::atomic::AtomicU64,
@@ -154,6 +162,20 @@ fn count_hashed(size: usize, why: u8) {
 /// check after its last change, and a guarded texture once a frame from its
 /// first check.
 const HOT_FRAMES: u64 = 64;
+
+/// Every how many frames a partly mapped texture is read while the guards
+/// see no write to it (reading around unmapped pages is slow).
+const PARTIAL_EVERY: u64 = 30;
+
+/// Whether a partly mapped texture last read in frame `at` is read again in
+/// `frame`: once a frame while the guards see writes to it, else every
+/// [`PARTIAL_EVERY`]th frame. A texture streamed into pages mapped with
+/// another's bytes was read with those, and kept them for up to 30 frames
+/// after its own texels landed: blocks of noise on the shirt of a close-up
+/// (dc-d frame 2469, detile-audit-tell frame 2639).
+fn partial_due(at: Option<u64>, frame: u64, written: bool) -> bool {
+    at.is_none_or(|at| if written { frame != at } else { frame >= at + PARTIAL_EVERY })
+}
 /// How long after a change the next check still counts as "again".
 const VERIFY_FRAMES: u64 = 24;
 
@@ -189,6 +211,13 @@ impl Last {
         let verifying = if self.verify { self.changed_at + VERIFY_FRAMES + 1 } else { 0 };
         self.hot_until.max(verifying)
     }
+
+    /// The frame until which every list that samples the texture records
+    /// its copy, changed or not ([`hot_level`] 2). With `verifying`, also in
+    /// the frames after a single change ([`hot_copy`]).
+    fn copy_until(&self, verifying: bool) -> u64 {
+        if verifying { self.due_until() } else { self.hot_until }
+    }
 }
 
 /// How a guarded texture that changes behind the guard's back is followed
@@ -211,6 +240,20 @@ fn hot_level() -> u8 {
         Some(v) if v == "1" => 1,
         _ => 2,
     })
+}
+
+/// Whether a texture that changed once is copied by every list that samples
+/// it while its next checks verify the change (`VICTORY_TEXTURE_HOT_COPY=1`,
+/// as before), or only once it is hot (0): found changing again within
+/// [`VERIFY_FRAMES`], or behind the guard's back. Every texture that streams
+/// in changes once, and in the opening of the game many do in a frame;
+/// each was copied again by every list for 24 frames. With 0 a second
+/// change is copied by the next list after its check, a frame late at most,
+/// and makes the texture hot, so a video's frames are copied as before
+/// from then on.
+fn hot_copy() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_HOT_COPY").is_none_or(|v| v != "0"))
 }
 
 /// Whether a texture in its first frames, not changing, is hashed once a
@@ -239,6 +282,20 @@ fn turn_every() -> u64 {
         let set = std::env::var("VICTORY_TEXTURE_TURN").ok().and_then(|v| v.parse().ok());
         set.unwrap_or(if crate::watch::page_writes() & 1 != 0 { 64 } else { 8 }).max(1)
     })
+}
+
+/// Where in the `every` frames a texture's turn falls. By its 64 KB block
+/// alone, big textures at aligned addresses share one turn: in face-prio
+/// 26 MB were hashed on every frame 62 of 64 and about 0.5 MB on the
+/// others. `VICTORY_TEXTURE_TURN_SPREAD=1` mixes the page number instead,
+/// so the same bytes spread over all the frames.
+fn turn_phase(start: usize) -> u64 {
+    static SPREAD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *SPREAD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_TURN_SPREAD").is_some_and(|v| v == "1")) {
+        (start as u64 >> 12).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 40
+    } else {
+        (start >> 16) as u64
+    }
 }
 
 // SAFETY: the staging mapping is written only at submission, under
@@ -1179,7 +1236,17 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
         return;
     }
     #[cfg(feature = "diagnostics")]
-    crate::copystat::add(crate::copystat::C::TexUploads, 1);
+    {
+        use crate::copystat::{C, add};
+        let bytes = staging.copied_bytes();
+        add(C::TexUploads, 1);
+        add(C::TexUploadBytes, bytes);
+        if staging.uploaded.load(Relaxed) && !staging.dirty.load(Relaxed) {
+            add(C::TexForced, 1);
+            add(C::TexForcedBytes, bytes);
+            staging.forced.fetch_add(1, Relaxed);
+        }
+    }
     if no_wait() && fill_unlocked() {
         let there = match picking {
             Some(there) if there != u64::MAX => there,
@@ -1626,7 +1693,7 @@ impl Staging {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexHot, 1);
         }
-        self.hot.store(last.due_until(), std::sync::atomic::Ordering::Relaxed);
+        self.hot.store(last.copy_until(hot_copy()), std::sync::atomic::Ordering::Relaxed);
     }
 
     /// The hash found the memory as it was.
@@ -1635,7 +1702,7 @@ impl Staging {
             return;
         }
         last.unchanged(crate::frame::current(), hot_level() >= 2);
-        self.hot.store(last.due_until(), std::sync::atomic::Ordering::Relaxed);
+        self.hot.store(last.copy_until(hot_copy()), std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Forgets what the staging buffer was last filled from: the next
@@ -1647,6 +1714,13 @@ impl Staging {
     /// The title memory the texture is read from: address and bytes.
     pub(crate) fn memory(&self) -> (usize, usize) {
         (self.memory as usize, self.read)
+    }
+
+    /// The bytes an upload copies from the staging buffer.
+    #[cfg(feature = "diagnostics")]
+    fn copied_bytes(&self) -> u64 {
+        let parts = self.footprints.iter().zip(&self.rows);
+        parts.map(|(f, &rows)| u64::from(f.Footprint.RowPitch) * u64::from(rows) * u64::from(f.Footprint.Depth)).sum()
     }
 
     /// The title's level and the array slice of the staging buffer's part
@@ -1698,7 +1772,18 @@ impl Staging {
         }
         let started = std::time::Instant::now();
         let _texture = crate::timeline::span("a texture's refresh");
+        #[cfg(feature = "diagnostics")]
+        let (forced, fills) = (self.forced.swap(0, Relaxed), self.fills.load(Relaxed));
         let read = self.refresh_now();
+        // Of the copies recorded because the texture was hot, one takes what
+        // this refresh detiled, if it detiled; the others copy what the host
+        // texture holds already.
+        #[cfg(feature = "diagnostics")]
+        if forced > 0 {
+            let wasted = u64::from(forced - u32::from(self.fills.load(Relaxed) != fills));
+            crate::copystat::add(crate::copystat::C::TexForcedSame, wasted);
+            crate::copystat::add(crate::copystat::C::TexForcedSameBytes, wasted * self.copied_bytes());
+        }
         let preparing = &crate::host::PREPARING;
         preparing[2].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
         preparing[3].fetch_add(read as u64, Relaxed);
@@ -1729,7 +1814,11 @@ impl Staging {
             // Read through the copy, which stands unmapped pages: memory of
             // big pools is too slow to ask page by page.
             let read = with_read(size, |read| {
-                if since != 0 && !self.on_demand && let Some(bytes) = self.detile_written(read, &written, since) {
+                if since != 0
+                    && !self.on_demand
+                    && crate::toggled!("VICTORY_TEXTURE_ROWS")
+                    && let Some(bytes) = self.detile_written(read, &written, since)
+                {
                     return bytes;
                 }
                 crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
@@ -1753,6 +1842,8 @@ impl Staging {
         static GUARD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         // The guard saw no write: a change the hash finds came another way.
         let mut blind = false;
+        // The guard saw a write since the last check.
+        let mut seen = false;
         // Why an unwritten texture is hashed: 0 written or unguarded, 1 its
         // turn, 2 due, 3 in its first frames only.
         let mut why = 0;
@@ -1764,7 +1855,7 @@ impl Staging {
             last.asked = now;
             let frame = crate::frame::current();
             let every = if last.hot_until == 0 { turn_every() } else { 8 };
-            let turn = frame.wrapping_add((start >> 16) as u64).is_multiple_of(every);
+            let turn = frame.wrapping_add(turn_phase(start)).is_multiple_of(every);
             // A texture starts hot: one written that way from its first
             // frames on changes before the hash has ever caught it.
             if last.started == 0 {
@@ -1796,6 +1887,7 @@ impl Staging {
                 }
             }
             blind = unwritten;
+            seen = !unwritten;
         }
         // From here on the texture's memory may be read in place. Held until
         // that read is done: the runtime changes what title memory shows
@@ -1819,12 +1911,22 @@ impl Staging {
             // there, the usual state while it streams in. Read through the
             // copy, which stands unmapped pages (zeros), and upload what
             // is there; nothing at all mapped changes nothing.
-            // shortcut: read again at most every 30 frames (reading around
-            // unmapped pages is slow, and nothing tells us when pages
-            // arrive): a mip that streams in shows up to 30 frames late.
+            // shortcut: read again at most every 30 frames while the guards
+            // see no write ([`partial_due`]): a change they miss shows up
+            // to 30 frames late.
             let frame = crate::frame::current();
-            if last.partial.is_some_and(|at| frame < at + 30) {
+            if !partial_due(last.partial, frame, seen) {
+                if seen {
+                    // Read in the next frame: the write is not forgotten.
+                    last.asked = 0;
+                }
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::TexPartialSkipped, size as u64);
                 return 0;
+            }
+            #[cfg(feature = "diagnostics")]
+            if !partial_due(last.partial, frame, false) {
+                crate::copystat::add(crate::copystat::C::TexPartialWritten, size as u64);
             }
             last.partial = Some(frame);
             count_hashed(size, why);
@@ -1960,6 +2062,8 @@ impl Staging {
     /// written into mip 0 of a 4K texture re-read and detiled all 16 MiB of
     /// it). Returns the bytes read, or `None` if the layout cannot say which
     /// rows or a part was not detiled (then it is detiled whole).
+    /// `VICTORY_TEXTURE_ROWS=0`: every written texture is detiled whole, as
+    /// before.
     fn detile_written(&self, read: &mut [u8], written: &[(usize, u64)], since: u64) -> Option<usize> {
         let (start, size) = (self.memory as usize, self.read);
         let page = crate::watch::PAGE;
@@ -1992,6 +2096,9 @@ impl Staging {
             return Some(bytes);
         }
         self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.fills.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        #[cfg(feature = "diagnostics")]
+        let touched = bands.iter().map(|(rows, _)| rows.clone()).collect::<Vec<_>>();
         for (i, (band, _)) in bands.into_iter().enumerate() {
             if band.is_empty() {
                 continue;
@@ -2013,12 +2120,76 @@ impl Staging {
         }
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexRowsDetiled, bytes as u64);
+        #[cfg(feature = "diagnostics")]
+        self.check_rows(&touched);
         Some(bytes)
+    }
+
+    /// With `VICTORY_TEXTURE_ROWS_CHECK=1`: after a detile of written rows,
+    /// detiles the whole texture again into a scratch copy and logs each
+    /// part whose staging rows differ, inside the rows just detiled (the
+    /// title wrote between the two reads, or the rows were detiled wrong)
+    /// or outside them (a write the watch did not see). The first 16 such
+    /// textures are saved to the capture folder as `rows-<memory>.tiled`
+    /// and `rows-<memory>-<part>.staging` / `.whole`.
+    #[cfg(feature = "diagnostics")]
+    fn check_rows(&self, touched: &[std::ops::Range<u32>]) {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        static SAVED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if !*ON.get_or_init(|| crate::switch::on("VICTORY_TEXTURE_ROWS_CHECK")) {
+            return;
+        }
+        let mut tiled = vec![0; self.read];
+        crate::host::copy_mapped(tiled.as_mut_ptr(), self.memory, self.read, false);
+        let mut differed = false;
+        for (i, (footprint, &rows)) in self.footprints.iter().zip(&self.rows).enumerate() {
+            let (mip, slice) = self.part(i);
+            let f = footprint.Footprint;
+            let pitch = f.RowPitch as usize;
+            let len = (pitch * rows as usize * f.Depth as usize)
+                .min(self.bytes.saturating_sub(footprint.Offset) as usize);
+            // SAFETY: the part's piece of the mapped staging buffer.
+            let staged = unsafe { std::slice::from_raw_parts(self.data.add(footprint.Offset as usize), len) };
+            let mut whole = staged.to_vec();
+            if self.layout.detile(&tiled, mip, slice, &mut whole, pitch, pitch * rows as usize).is_err() {
+                continue;
+            }
+            let Some(first) = staged.iter().zip(&whole).position(|(a, b)| a != b) else {
+                continue;
+            };
+            let bytes = staged.iter().zip(&whole).filter(|(a, b)| a != b).count();
+            let row = first % (pitch * rows as usize).max(1) / pitch.max(1);
+            tracing::warn!(
+                memory = ?self.memory,
+                desc = ?self.layout.desc,
+                mip,
+                slice,
+                row,
+                detiled = ?touched[i],
+                bytes,
+                "texture rows check: staging differs from a whole detile"
+            );
+            if SAVED.load(std::sync::atomic::Ordering::Relaxed) < 16
+                && let Some(dir) = crate::capture::folder()
+            {
+                let name = format!("rows-{:x}-{i}", self.memory as usize);
+                let _ = std::fs::write(dir.join(format!("{name}.staging")), staged);
+                let _ = std::fs::write(dir.join(format!("{name}.whole")), &whole);
+                differed = true;
+            }
+        }
+        if differed
+            && SAVED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 16
+            && let Some(dir) = crate::capture::folder()
+        {
+            let _ = std::fs::write(dir.join(format!("rows-{:x}.tiled", self.memory as usize)), &tiled);
+        }
     }
 
     /// Detiles `tiled` (the texture's memory) into the staging buffer.
     fn detile(&self, tiled: &[u8]) {
         self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.fills.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // Levels on demand: which levels are the title's is judged here,
         // once, for what the staging buffer holds from now on. The step
         // that gives levels their memory goes by this answer.
@@ -2033,6 +2204,8 @@ impl Staging {
         } else {
             u32::MAX
         };
+        #[cfg(feature = "diagnostics")]
+        audit::read(self.memory as usize, tiled);
         #[cfg(feature = "diagnostics")]
         if tiled.iter().all(|&b| b == 0) {
             tracing::debug!(
@@ -2458,6 +2631,8 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
         uploaded: std::sync::atomic::AtomicBool::new(false),
         used: std::sync::atomic::AtomicU64::new(crate::host::moment()),
         hot: std::sync::atomic::AtomicU64::new(0),
+        forced: std::sync::atomic::AtomicU32::new(0),
+        fills: std::sync::atomic::AtomicU32::new(0),
         expected: std::sync::atomic::AtomicU64::new(0),
         on_demand,
         detiled: std::sync::atomic::AtomicU32::new(0),
@@ -2577,6 +2752,21 @@ mod remap_tests {
         assert!(!s.note(8, 40, 1_000, || 8));
         assert_eq!(s.settled(1_000, 200, 2_000, 64, 150), vec![5]);
         assert_eq!(s.settled(1_000, 200, 2_000, 64, 150), vec![8]);
+    }
+
+    /// A partly mapped texture read with the bytes its pages held before
+    /// its texels landed is read again the frame after the guards see the
+    /// write, not 30 frames later; with no write, every 30th frame.
+    #[test]
+    fn a_partly_mapped_texture_is_read_again_after_a_write() {
+        use super::partial_due;
+        assert!(partial_due(None, 100, false));
+        assert!(partial_due(None, 100, true));
+        assert!(!partial_due(Some(100), 100, true));
+        assert!(partial_due(Some(100), 101, true));
+        assert!(!partial_due(Some(100), 101, false));
+        assert!(!partial_due(Some(100), 129, false));
+        assert!(partial_due(Some(100), 130, false));
     }
 }
 
@@ -2999,6 +3189,19 @@ mod hot_texture_tests {
         assert_eq!(last.due_until(), (13 + HOT_FRAMES).max(13 + VERIFY_FRAMES + 1));
         last.unchanged(20, true);
         assert_eq!(last.due_until(), 13 + HOT_FRAMES);
+    }
+
+    /// `VICTORY_TEXTURE_HOT_COPY=0`: a texture that streamed in once is
+    /// copied only by the list after its check, a hot one by every list.
+    #[test]
+    fn copy_until_leaves_out_the_verifying_unless_asked() {
+        let mut last = Last::default();
+        last.changed(10);
+        assert_eq!(last.copy_until(false), 0);
+        assert_eq!(last.copy_until(true), 10 + VERIFY_FRAMES + 1);
+        last.changed(13);
+        assert!(last.copy_until(false) >= 13 + HOT_FRAMES);
+        assert!(last.copy_until(true) >= 13 + HOT_FRAMES);
     }
 
     /// A hot texture that stops changing falls back to the turns.
