@@ -67,6 +67,7 @@
 //! [`SWEEP`] frames.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 
 use victory_shader::emit::{MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY};
@@ -223,6 +224,8 @@ struct Stats {
     micros: u64,
     /// Looks put off while another asking held the range (VICTORY_MEMORY_NO_WAIT).
     put_off: u64,
+    /// Of `micros`, in the write watch's answer.
+    asked: u64,
 }
 
 // SAFETY: the mappings are of memory the struct owns; all access is under
@@ -230,6 +233,40 @@ struct Stats {
 unsafe impl Send for Memory {}
 
 static MEMORY: Mutex<Option<Memory>> = Mutex::new(None);
+
+/// Nanoseconds threads waited for [`MEMORY`] and held it, summed, since the
+/// last report.
+static WAITED: AtomicU64 = AtomicU64::new(0);
+static HELD: AtomicU64 = AtomicU64::new(0);
+
+/// [`MEMORY`] taken, timed.
+struct Taken(std::sync::MutexGuard<'static, Option<Memory>>, std::time::Instant);
+
+fn take() -> Taken {
+    let asked = std::time::Instant::now();
+    let guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
+    WAITED.fetch_add(asked.elapsed().as_nanos() as u64, Relaxed);
+    Taken(guard, std::time::Instant::now())
+}
+
+impl Drop for Taken {
+    fn drop(&mut self) {
+        HELD.fetch_add(self.1.elapsed().as_nanos() as u64, Relaxed);
+    }
+}
+
+impl std::ops::Deref for Taken {
+    type Target = Option<Memory>;
+    fn deref(&self) -> &Option<Memory> {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for Taken {
+    fn deref_mut(&mut self) -> &mut Option<Memory> {
+        &mut self.0
+    }
+}
 
 /// What a draw binds.
 pub(crate) struct Ready {
@@ -573,6 +610,7 @@ impl Memory {
         }
         let started = std::time::Instant::now();
         let answer = crate::watch::writes((first * PAGE) as usize, (end * PAGE) as usize, true);
+        self.stats.asked += started.elapsed().as_micros() as u64;
         for page in first..end {
             let Some(held) = self.pages.get_mut(&page) else {
                 continue;
@@ -836,7 +874,7 @@ impl Memory {
         tracing::info!(
             "title memory by address: {} pages ({} MB) in {} arenas, {} copies in all; per frame {:.0} dispatches that read, {:.0} that build, \
              {:.1} pages that had no copy, {:.1} pages turned down, {:.1} results brought back; {:.0} pages looked at, {:.1} KB changed, \
-             {:.1} packed structures ({} there), {:.2} ms, {:.1} looks put off; {} windows; since the last line {} KB of packed structures came and {} of them went, \
+             {:.1} packed structures ({} there), {:.2} ms ({:.2} ms asking the write watch), {:.1} looks put off; the mutex held {:.2} ms and waited for {:.2} ms over all threads; {} windows; since the last line {} KB of packed structures came and {} of them went, \
              and pages for constants {}, views written {}, others {}, upload memory {}, faults in all {}",
             self.pages.len(),
             (self.pages.len() as u64 * PAGE) >> 20,
@@ -852,7 +890,10 @@ impl Memory {
             s.packed as f64 / frames,
             self.packed.len(),
             s.micros as f64 / 1000.0 / frames,
+            s.asked as f64 / 1000.0 / frames,
             s.put_off as f64 / frames,
+            HELD.swap(0, Relaxed) as f64 / 1e6 / frames,
+            WAITED.swap(0, Relaxed) as f64 / 1e6 / frames,
             self.windows,
             s.packed_bytes >> 10,
             s.gone,
@@ -981,7 +1022,7 @@ pub(crate) fn ready(
     use_: Use,
     threads: Option<[u32; 3]>,
 ) -> Option<Ready> {
-    let mut guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
+    let mut guard = take();
     if guard.is_none() {
         *guard = Memory::new();
     }
@@ -1058,7 +1099,7 @@ pub(crate) fn ready(
                 m.bring(at / PAGE, (at + len - 1) / PAGE + 1);
             }
             list.defer_host(move || {
-                if let Some(m) = MEMORY.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+                if let Some(m) = take().as_mut() {
                     m.land(at);
                 }
             });
