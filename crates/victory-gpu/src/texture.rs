@@ -82,10 +82,16 @@ pub(crate) struct Staging {
     uploaded: std::sync::atomic::AtomicBool,
     /// When a list last recorded a use of it (`crate::host::moment`).
     used: std::sync::atomic::AtomicU64,
-    /// The frame until which the next check may hash the texture again
-    /// ([`Last::due_until`]), for [`upload`], which runs on the recording
+    /// The frame until which lists copy the texture changed or not
+    /// ([`Last::copy_until`]), for [`upload`], which runs on the recording
     /// threads and does not take `last`.
     hot: std::sync::atomic::AtomicU64,
+    /// Copies lists recorded since the last refresh only because the
+    /// texture was hot, and how many times it was detiled so far: when the
+    /// refresh after them detiles nothing, each of them copied what the
+    /// host texture held already.
+    forced: std::sync::atomic::AtomicU32,
+    fills: std::sync::atomic::AtomicU32,
     /// How many bytes of the texture's memory were mapped when a list last
     /// recorded an upload of it ([`fill_unlocked`]; 0: not asked).
     expected: std::sync::atomic::AtomicU64,
@@ -205,6 +211,13 @@ impl Last {
         let verifying = if self.verify { self.changed_at + VERIFY_FRAMES + 1 } else { 0 };
         self.hot_until.max(verifying)
     }
+
+    /// The frame until which every list that samples the texture records
+    /// its copy, changed or not ([`hot_level`] 2). With `verifying`, also in
+    /// the frames after a single change ([`hot_copy`]).
+    fn copy_until(&self, verifying: bool) -> u64 {
+        if verifying { self.due_until() } else { self.hot_until }
+    }
 }
 
 /// How a guarded texture that changes behind the guard's back is followed
@@ -227,6 +240,20 @@ fn hot_level() -> u8 {
         Some(v) if v == "1" => 1,
         _ => 2,
     })
+}
+
+/// Whether a texture that changed once is copied by every list that samples
+/// it while its next checks verify the change (`VICTORY_TEXTURE_HOT_COPY=1`,
+/// as before), or only once it is hot (0): found changing again within
+/// [`VERIFY_FRAMES`], or behind the guard's back. Every texture that streams
+/// in changes once, and in the opening of the game many do in a frame;
+/// each was copied again by every list for 24 frames. With 0 a second
+/// change is copied by the next list after its check, a frame late at most,
+/// and makes the texture hot, so a video's frames are copied as before
+/// from then on.
+fn hot_copy() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_HOT_COPY").is_none_or(|v| v != "0"))
 }
 
 /// Whether a texture in its first frames, not changing, is hashed once a
@@ -1209,7 +1236,17 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
         return;
     }
     #[cfg(feature = "diagnostics")]
-    crate::copystat::add(crate::copystat::C::TexUploads, 1);
+    {
+        use crate::copystat::{C, add};
+        let bytes = staging.copied_bytes();
+        add(C::TexUploads, 1);
+        add(C::TexUploadBytes, bytes);
+        if staging.uploaded.load(Relaxed) && !staging.dirty.load(Relaxed) {
+            add(C::TexForced, 1);
+            add(C::TexForcedBytes, bytes);
+            staging.forced.fetch_add(1, Relaxed);
+        }
+    }
     if no_wait() && fill_unlocked() {
         let there = match picking {
             Some(there) if there != u64::MAX => there,
@@ -1656,7 +1693,7 @@ impl Staging {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexHot, 1);
         }
-        self.hot.store(last.due_until(), std::sync::atomic::Ordering::Relaxed);
+        self.hot.store(last.copy_until(hot_copy()), std::sync::atomic::Ordering::Relaxed);
     }
 
     /// The hash found the memory as it was.
@@ -1665,7 +1702,7 @@ impl Staging {
             return;
         }
         last.unchanged(crate::frame::current(), hot_level() >= 2);
-        self.hot.store(last.due_until(), std::sync::atomic::Ordering::Relaxed);
+        self.hot.store(last.copy_until(hot_copy()), std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Forgets what the staging buffer was last filled from: the next
@@ -1677,6 +1714,13 @@ impl Staging {
     /// The title memory the texture is read from: address and bytes.
     pub(crate) fn memory(&self) -> (usize, usize) {
         (self.memory as usize, self.read)
+    }
+
+    /// The bytes an upload copies from the staging buffer.
+    #[cfg(feature = "diagnostics")]
+    fn copied_bytes(&self) -> u64 {
+        let parts = self.footprints.iter().zip(&self.rows);
+        parts.map(|(f, &rows)| u64::from(f.Footprint.RowPitch) * u64::from(rows) * u64::from(f.Footprint.Depth)).sum()
     }
 
     /// The title's level and the array slice of the staging buffer's part
@@ -1728,7 +1772,18 @@ impl Staging {
         }
         let started = std::time::Instant::now();
         let _texture = crate::timeline::span("a texture's refresh");
+        #[cfg(feature = "diagnostics")]
+        let (forced, fills) = (self.forced.swap(0, Relaxed), self.fills.load(Relaxed));
         let read = self.refresh_now();
+        // Of the copies recorded because the texture was hot, one takes what
+        // this refresh detiled, if it detiled; the others copy what the host
+        // texture holds already.
+        #[cfg(feature = "diagnostics")]
+        if forced > 0 {
+            let wasted = u64::from(forced - u32::from(self.fills.load(Relaxed) != fills));
+            crate::copystat::add(crate::copystat::C::TexForcedSame, wasted);
+            crate::copystat::add(crate::copystat::C::TexForcedSameBytes, wasted * self.copied_bytes());
+        }
         let preparing = &crate::host::PREPARING;
         preparing[2].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
         preparing[3].fetch_add(read as u64, Relaxed);
@@ -2041,6 +2096,7 @@ impl Staging {
             return Some(bytes);
         }
         self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.fills.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
         let touched = bands.iter().map(|(rows, _)| rows.clone()).collect::<Vec<_>>();
         for (i, (band, _)) in bands.into_iter().enumerate() {
@@ -2133,6 +2189,7 @@ impl Staging {
     /// Detiles `tiled` (the texture's memory) into the staging buffer.
     fn detile(&self, tiled: &[u8]) {
         self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.fills.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // Levels on demand: which levels are the title's is judged here,
         // once, for what the staging buffer holds from now on. The step
         // that gives levels their memory goes by this answer.
@@ -2574,6 +2631,8 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
         uploaded: std::sync::atomic::AtomicBool::new(false),
         used: std::sync::atomic::AtomicU64::new(crate::host::moment()),
         hot: std::sync::atomic::AtomicU64::new(0),
+        forced: std::sync::atomic::AtomicU32::new(0),
+        fills: std::sync::atomic::AtomicU32::new(0),
         expected: std::sync::atomic::AtomicU64::new(0),
         on_demand,
         detiled: std::sync::atomic::AtomicU32::new(0),
@@ -3130,6 +3189,19 @@ mod hot_texture_tests {
         assert_eq!(last.due_until(), (13 + HOT_FRAMES).max(13 + VERIFY_FRAMES + 1));
         last.unchanged(20, true);
         assert_eq!(last.due_until(), 13 + HOT_FRAMES);
+    }
+
+    /// `VICTORY_TEXTURE_HOT_COPY=0`: a texture that streamed in once is
+    /// copied only by the list after its check, a hot one by every list.
+    #[test]
+    fn copy_until_leaves_out_the_verifying_unless_asked() {
+        let mut last = Last::default();
+        last.changed(10);
+        assert_eq!(last.copy_until(false), 0);
+        assert_eq!(last.copy_until(true), 10 + VERIFY_FRAMES + 1);
+        last.changed(13);
+        assert!(last.copy_until(false) >= 13 + HOT_FRAMES);
+        assert!(last.copy_until(true) >= 13 + HOT_FRAMES);
     }
 
     /// A hot texture that stops changing falls back to the turns.
