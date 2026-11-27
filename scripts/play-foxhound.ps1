@@ -34,6 +34,10 @@ param(
     # Frames begin every 1/Fps s whatever the title asks (it asks 1/30). 1000, the default: no cap, a frame
     # begins as soon as the last is done. 30: the title's own rate.
     [ValidateRange(1, 1000)][int]$Fps = 1000,
+    # -Fps also gives the title its own frame rate (VICTORY_FRAME_INTERVAL_MS), so that its simulation steps by the
+    # time that passed: with only our clock faster, each frame still moved game time 1/30 s and above 30 fps the game
+    # ran fast. -FixedStep: our clock alone (VICTORY_FRAME_INTERVAL_US), as before.
+    [switch]$FixedStep,
     [hashtable]$More = @{}
 )
 $repo = Split-Path $PSScriptRoot -Parent
@@ -104,7 +108,13 @@ if ($Dlss -ne 'off') {
         Write-Host "repository folder fetches them from NVIDIA once (about 70 MB); VICTORY_STREAMLINE_DIR names another folder."
     }
 }
-if ($fpsWanted -gt 0) { $settings.VICTORY_FRAME_INTERVAL_US = [string][int][math]::Round(1000000 / $fpsWanted) }
+if ($FixedStep) { $settings.VICTORY_FRAME_INTERVAL_US = [string][int][math]::Round(1000000 / $fpsWanted) }
+elseif ($fpsWanted -ge 1000) {
+    # No wait of ours, and the title told 59 (not its "no limit", which halves a per-frame scale of its own):
+    # real speed from 15 to 59 rendered frames a second, measured 0.985x at 30-36.
+    $settings.VICTORY_FRAME_INTERVAL_MS = '0'; $settings.VICTORY_TITLE_FPS = '59'
+}
+else { $settings.VICTORY_FRAME_INTERVAL_MS = ([math]::Round(1000 / $fpsWanted, 3)).ToString([Globalization.CultureInfo]::InvariantCulture) }
 foreach ($k in $menu.Keys) {
     if ($k -like 'VICTORY_MENU_*') { continue }
     if ($menu[$k]) { $settings[$k] = $menu[$k] } else { $settings.Remove($k) }
@@ -120,7 +130,7 @@ $settings.VICTORY_MENU_FRAMEGEN = if ($settings.VICTORY_FRAMEGEN -eq '1') { [str
 $settings.VICTORY_MENU_FPS = [string]$fpsWanted
 $settings.VICTORY_MENU_FILE = $menuFile
 $settings.VICTORY_MENU_PLAY = $MyInvocation.MyCommand.Path
-$settings.VICTORY_MENU_ARGS = "-Exe '$($Exe -replace "'", "''")' -Build $Build$(if ($NoFrameGenReady) { ' -NoFrameGenReady' })"
+$settings.VICTORY_MENU_ARGS = "-Exe '$($Exe -replace "'", "''")' -Build $Build$(if ($NoFrameGenReady) { ' -NoFrameGenReady' })$(if ($FixedStep) { ' -FixedStep' })"
 
 $victory = Join-Path $repo "target\$Build\victory.exe"
 if (-not (Test-Path $victory)) {
