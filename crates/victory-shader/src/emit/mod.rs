@@ -982,8 +982,10 @@ fn emit_forms(
         }
     }
     // SCC of a mask operation joined with a scalar test behind a per-lane skip (the 32-lane
-    // trace programs): right once the wave takes that skip together ([`widen`]; the
-    // lowering has named the skipped blocks).
+    // trace programs), and a compare's mask joined with the old one behind a per-lane branch
+    // (`lower::CompareJoins::skipped`): right once the wave takes that branch together ([`widen`];
+    // the lowering has named the blocks). Where it cannot, the compare's joins per lane, as
+    // before.
     let original = match original {
         Err(ShaderError::Unsupported { what, .. })
             if native.stage == HwStage::Cs
@@ -993,7 +995,9 @@ fn emit_forms(
             let again = widen(c, native, p, &[], std::env::var_os("VICTORY_WAVE_WHY").is_some());
             match again {
                 Ok(_) => again,
-                Err(_) => emit_program(c, native, p, st, io, res),
+                Err(_) => {
+                    lower::with_per_lane_compare_joins(|| emit_program(c, native, p, st, io, res))
+                }
             }
         }
         other => other,
