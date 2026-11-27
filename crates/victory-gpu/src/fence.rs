@@ -116,6 +116,18 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
         waiters.push((value, event as usize));
         return S_OK;
     }
+    // Does the title ever wait through a null event at all? Said once per
+    // process, because the answer is what tells a run that exercises this
+    // path from one that cannot: a test that reports "no regression" and a
+    // run where the wait happens fifty times look the same in a log that
+    // never mentions it.
+    static NULL_WAITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if NULL_WAITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
+        tracing::info!(
+            value,
+            "a fence is waited for through a null event: the title's thread blocks until the value is reached"
+        );
+    }
     // A null event means "block until reached". With submissions sent to the
     // card and not waited for (`crate::host::late`) the signal may be behind
     // them: they are settled first, which sets it, so the usual wait finds
