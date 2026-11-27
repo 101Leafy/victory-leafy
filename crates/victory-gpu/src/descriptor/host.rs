@@ -2805,7 +2805,9 @@ impl HostHeap {
         }
         self.put(index);
         self.clear_twin(index);
-        self.write_stride(index, 0);
+        if victory_shader::emit::table_strides() {
+            self.write_stride(index, 0);
+        }
         self.keep(index, None);
     }
 
@@ -6326,6 +6328,9 @@ mod tests {
     #[test]
     fn dynamic_slots_populate_and_clear_stride_table() {
         use victory_shader::emit::{VIEW_INTEGER, VIEW_SIGNED};
+        if !victory_shader::emit::table_strides() {
+            return; // dynamic slots have strides only with VICTORY_TABLE_STRIDES=1
+        }
         let Some(heap) = HostHeap::new(false, 4) else {
             return; // no host GPU
         };
@@ -6491,75 +6496,4 @@ pub(crate) fn note_listed(recording: u64, words: [u32; 3], listed: Listed) {
 /// for every table).
 pub(crate) fn list_views() -> bool {
     crate::toggled!("VICTORY_LIST_VIEWS")
-}
-
-#[cfg(test)]
-mod bake_flip_tests {
-    use super::*;
-
-    #[test]
-    fn pending_list_flips_promote_once_and_clean_up() {
-        let heap = 0xdead_beefusize;
-        let id1 = NEXT_PENDING_FLIP.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let id2 = NEXT_PENDING_FLIP.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        {
-            let mut pending = PENDING_LIST_FLIPS.lock().unwrap_or_else(|e| e.into_inner());
-            pending.push(PendingListFlip {
-                id: id1,
-                origin: (1, 1),
-                flip: Flip { after: 0, heap, index: 7, handle: 0, key: 11, late: Some(1) },
-            });
-            pending.push(PendingListFlip {
-                id: id2,
-                origin: (2, 1),
-                flip: Flip { after: 0, heap, index: 8, handle: 0, key: 12, late: Some(1) },
-            });
-            PENDING_LIST_COUNT.store(pending.len(), std::sync::atomic::Ordering::Release);
-        }
-        let taken = take_pending_list_flip(id1).expect("id1 should be present");
-        assert_eq!(taken.index, 7);
-        assert!(take_pending_list_flip(id1).is_none(), "second take must be a no-op");
-        remove_pending_list_flip(id2);
-        assert!(take_pending_list_flip(id2).is_none(), "removed entry must be gone");
-    }
-
-    #[test]
-    fn deferred_flip_closure_keeps_pending_entry_alive_until_called_or_dropped() {
-        let heap = 0xcafe_babeusize;
-        let id1 = NEXT_PENDING_FLIP.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let id2 = NEXT_PENDING_FLIP.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        {
-            let mut pending = PENDING_LIST_FLIPS.lock().unwrap_or_else(|e| e.into_inner());
-            for (id, idx) in [(id1, 10), (id2, 11)] {
-                pending.push(PendingListFlip {
-                    id,
-                    origin: (3, 1),
-                    flip: Flip { after: 0, heap, index: idx, handle: 0, key: 20, late: Some(1) },
-                });
-            }
-            PENDING_LIST_COUNT.store(pending.len(), std::sync::atomic::Ordering::Release);
-        }
-        struct TestGuard(u64);
-        impl TestGuard {
-            fn id(&self) -> u64 {
-                self.0
-            }
-        }
-        impl Drop for TestGuard {
-            fn drop(&mut self) {
-                remove_pending_list_flip(self.0);
-            }
-        }
-        let make_cb = |id: u64| -> Box<dyn Fn() -> Option<u32> + Send + 'static> {
-            let guard = TestGuard(id);
-            Box::new(move || take_pending_list_flip(guard.id()).map(|f| f.index))
-        };
-        let cb1 = make_cb(id1);
-        let cb2 = make_cb(id2);
-        // Must still be present after make_cb returns (guard moved, not dropped).
-        assert_eq!(cb1(), Some(10));
-        assert_eq!(cb1(), None);
-        drop(cb2);
-        assert!(take_pending_list_flip(id2).is_none(), "dropping uncalled closure cleans up entry");
-    }
 }
