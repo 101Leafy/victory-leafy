@@ -5,6 +5,7 @@
 //! writes it (view creation and descriptor copies) and again when a draw
 //! reads it through a table and finds the slot changed.
 
+use std::borrow::Cow;
 use std::sync::Mutex;
 
 use windows::Win32::Graphics::Direct3D12::*;
@@ -12,6 +13,14 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 
 use super::{VIEW_TAG, View, view_at};
 use crate::host::host;
+
+/// Move an owned reference or acquire a borrowed one only when the identity changes.
+fn replace_kept<T: Clone, Id: Eq>(slot: &mut Option<T>, view: Option<Cow<'_, T>>, id: fn(&T) -> Id) -> Option<T> {
+    if slot.as_ref().map(id) == view.as_deref().map(id) {
+        return None;
+    }
+    std::mem::replace(slot, view.map(Cow::into_owned))
+}
 
 /// A set of a heap's slots, a bit for each: no lock (a pass that went through
 /// a set of 70,000 under its lock kept everyone who writes slots waiting for
@@ -3545,7 +3554,7 @@ impl HostHeap {
                 self.clear_twin(index);
             }
             self.dynamic_stride(index, made.stride);
-            self.keep(index, made.kept.clone());
+            self.keep_view(index, made.kept.as_ref().map(Cow::Borrowed));
             Some(made.listed)
         })
     }
@@ -3604,6 +3613,11 @@ impl HostHeap {
 
     /// Slot `index` now views `resource` (or nothing of the host's).
     fn keep(&self, index: u32, resource: Option<ID3D12Resource>) {
+        self.keep_view(index, resource.map(Cow::Owned));
+    }
+
+    /// A cached view borrows its resource until a different slot needs a reference.
+    fn keep_view(&self, index: u32, resource: Option<Cow<'_, ID3D12Resource>>) {
         // What it shows now is what it was written with, or nothing.
         if kept_views_yield() {
             self.keeping.lock().unwrap_or_else(|e| e.into_inner()).remove(&index);
@@ -3614,11 +3628,7 @@ impl HostHeap {
         let old = {
             use windows::core::Interface;
             let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
-            // The same again: nothing to retire.
-            if slot.as_ref().map(Interface::as_raw) == resource.as_ref().map(Interface::as_raw) {
-                return;
-            }
-            std::mem::replace(&mut *slot, resource)
+            replace_kept(&mut slot, resource, Interface::as_raw)
         };
         // A running submission may still read the old resource through
         // this slot.
@@ -3708,7 +3718,7 @@ impl HostHeap {
         // (Bound by its handle, not read by index.)
         self.clear_twin(index);
         self.dynamic_stride(index, 1);
-        self.keep(index, Some(buffer.clone()));
+        self.keep_view(index, Some(Cow::Borrowed(buffer)));
     }
 
     /// Makes slot `index` (a dynamic one) a raw buffer view that reads
@@ -3766,7 +3776,7 @@ impl HostHeap {
         self.put(index);
         self.clear_twin(index);
         self.dynamic_stride(index, 1);
-        self.keep(index, Some(buffer.clone()));
+        self.keep_view(index, Some(Cow::Borrowed(buffer)));
     }
 
     /// Makes slot `index` (a dynamic one) a raw unordered access view of
@@ -3856,7 +3866,7 @@ impl HostHeap {
         // After the descriptor: what it showed is let go when nothing shows
         // it any more.
         self.dynamic_stride(index, 0);
-        self.keep(index, holds.then(|| buffer.clone()));
+        self.keep_view(index, holds.then_some(Cow::Borrowed(buffer)));
     }
 
     /// Renderer port 5 (`crate::port_cbv`): makes slot `index` (a dynamic
@@ -3904,7 +3914,7 @@ impl HostHeap {
             host.device.CreateShaderResourceView(buffer, Some(&raw), twin);
         }
         self.twin_made(index, true);
-        self.keep(index, Some(buffer.clone()));
+        self.keep_view(index, Some(Cow::Borrowed(buffer)));
         true
     }
 
