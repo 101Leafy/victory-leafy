@@ -18,6 +18,7 @@ use std::sync::mpsc::{Sender, channel};
 use std::time::{Duration, Instant};
 
 use super::Host;
+use super::spans;
 
 /// Frames written so far, for the panel.
 pub(super) static ROWS: AtomicU64 = AtomicU64::new(0);
@@ -26,6 +27,13 @@ pub(super) static ROWS: AtomicU64 = AtomicU64::new(0);
 /// 0 with the frame-rate line.
 const COUNTERS: &[(&str, fn() -> u64)] = &[
     ("worked_us", super::worked),
+    // Of the card's clock (`super::CARD_CLOCK_US`), and worth reading right:
+    // the first is the time the card sat with nothing sent; the second is how
+    // much of that time our own submission thread spent working, so the card
+    // was idle *behind us* and not waiting for us - it is not idle time and a
+    // spreadsheet column called `card_idle_behind_us` reads as one; the third
+    // is how long that thread stood waiting for the card, which is the same
+    // fact as the card being busy, seen from the CPU side.
     ("card_idle_us", || get(&super::CARD_CLOCK_US[0])),
     ("card_idle_behind_us", || get(&super::CARD_CLOCK_US[1])),
     ("stood_waiting_us", || get(&super::CARD_CLOCK_US[2])),
@@ -41,7 +49,12 @@ const COUNTERS: &[(&str, fn() -> u64)] = &[
     ("card_hash_pieces", || get(&super::CARD_PASSES[1])),
     ("card_compare_passes", || get(&super::CARD_PASSES[2])),
     ("mesh_groups", || get(&super::MESH_GROUPS[1])),
-    ("budget_refused", || get(&super::BUDGET_NOTES[0])),
+    // The indirect records that ran empty for want of their command list's
+    // budget (`host::BUDGET_NOTES`), NOT a card-memory refusal: the name said
+    // `budget_refused` until the first outside run read it as one and reported
+    // "nothing refused, 2.2 GB past the budget" from a column that cannot see
+    // card memory at all.
+    ("records_refused", || get(&super::BUDGET_NOTES[0])),
     ("drawn", crate::draw::drawn),
     ("dropped", crate::draw::dropped_now),
     ("heap_buffer_passes", || get(&crate::draw::HEAP_BUFFER_PASSES)),
@@ -59,10 +72,46 @@ const COUNTERS: &[(&str, fn() -> u64)] = &[
     ("refresh_watch_us", || get(&crate::texture::REFRESH_WAITS[1])),
     ("refresh_still_us", || get(&crate::texture::REFRESH_WAITS[2])),
     ("refresh_us", || get(&crate::texture::REFRESH_WAITS[3])),
+    // The bytes of the ranges shaders write, copied per submission: what two
+    // submissions in flight would hold twice, which is the cost the plan puts
+    // before splitting one over two threads (`docs/thirty-fps.md`).
+    ("snapshot_bytes", || get(&crate::shadow::SNAPSHOT_BYTES)),
 ];
 
 /// Read as they are, not as growth: memory in bytes.
-const GAUGES: [&str; 5] = ["private", "working", "vram_used", "vram_budget", "vram_shared"];
+///
+/// `ours_host_textures`, `ours_targets_reserve` and `ours_card_room` are this
+/// port's own share of `vram_used`: the host copies of the title's textures,
+/// the room the queue keeps back for the render targets a world makes, and the
+/// room it keeps for card copies of title buffers not made yet. A card past its
+/// budget then says how much of the overrun is ours and how much is the title's
+/// and the driver's, which no switch of ours can refuse. Without them the only
+/// figure a reader has is `vram_used`, and the only remedy is a guess.
+const GAUGES: [&str; 12] = [
+    "private",
+    "working",
+    "vram_used",
+    "vram_budget",
+    "vram_shared",
+    "ours_host_textures",
+    "ours_targets_reserve",
+    "ours_card_room",
+    // The card's own clock, as `spans::line` leaves it each second: submissions
+    // a frame, the card working, the card idle between submissions, and the
+    // longest one. `VICTORY_CARD_SPANS=1` measures them; without it they stay 0,
+    // which says "not measured" rather than "nothing found". They are what
+    // separates a card that is working all of the frame from one that is starved
+    // between the pieces it is handed.
+    //
+    // Submissions are written in HUNDREDTHS (`spans::LAST[0]` is
+    // `count / frames * 100`, so that a frame of the second does not round to
+    // none): 5 800 is 58 submissions a frame. The column says so in its name,
+    // because a scale nobody can see is a number read a hundred times too big.
+    "card_span_submissions_x100",
+    "card_span_busy_us",
+    "card_span_between_us",
+    "card_span_longest_us",
+];
 
 fn get(a: &AtomicU64) -> u64 {
     a.load(Ordering::Relaxed)
@@ -161,12 +210,25 @@ pub(super) struct Frames {
     last: Instant,
     frame: u64,
     before: Vec<u64>,
+    /// The last sample of [`GAUGES`], and when it was taken: they cost a
+    /// process query and two driver queries, so they are read on a clock
+    /// of their own rather than once per recorded frame ([`Frames::frame`]).
+    gauges: [u64; 8],
+    gauges_at: Instant,
 }
 
 impl Frames {
     pub(super) fn new(host: &Host) -> Frames {
         let now = Instant::now();
-        let mut frames = Frames { out: None, began: now, last: now, frame: 0, before: counters() };
+        let mut frames = Frames {
+            out: None,
+            began: now,
+            last: now,
+            frame: 0,
+            before: counters(),
+            gauges: [0; 8],
+            gauges_at: now - Duration::from_secs(1),
+        };
         let Some(asked) = std::env::var_os("VICTORY_FRAMES").filter(|v| v != "0") else { return frames };
         let path = if asked == "1" { "victory-frames.csv".into() } else { std::path::PathBuf::from(asked) };
         let file = match std::fs::File::create(&path) {
@@ -216,10 +278,34 @@ impl Frames {
     pub(super) fn frame(&mut self, host: &Host, present: Duration) {
         let Some(out) = &self.out else { return };
         let now = Instant::now();
+        // The gauges are not the frame's cost and are not on its clock: a
+        // process query and two `QueryVideoMemoryInfo` calls, which on some
+        // drivers take longer than a frame and land inside the time the line
+        // about that frame reports. Read once a second and held in between,
+        // so what the file says a frame took is what the frame took.
+        if self.gauges_at.elapsed() >= Duration::from_secs(1) {
+            let (working, private) = crate::copystat::process_memory();
+            let [budget, used, _, shared] = host.video_memory().unwrap_or_default();
+            self.gauges = [
+                private,
+                working,
+                used,
+                budget,
+                shared,
+                get(&crate::resource::HOST_TEXTURES[1]),
+                Self::ours_targets_reserve([budget, used, 0, shared]),
+                crate::shadow::card_room_kept(),
+            ];
+            self.gauges_at = now;
+        }
         let counters = counters();
-        let (working, private) = crate::copystat::process_memory();
-        let [budget, used, _, shared] = host.video_memory().unwrap_or_default();
         let mut row = Vec::with_capacity(4 + GAUGES.len() + counters.len());
+        // The eight memory gauges as the second handed them (`self.gauges`,
+        // read once a second for the reason above) and the card's own four
+        // from the last line the stamps drew: one extend of sixteen, so the
+        // row carries exactly as many values as the header names.
+        let [private, working, used, budget, shared, textures, targets, room] = self.gauges;
+        let [submissions, busy, between, longest] = spans::last();
         row.extend([
             self.frame,
             (now - self.began).as_micros() as u64,
@@ -230,6 +316,13 @@ impl Frames {
             used,
             budget,
             shared,
+            textures,
+            targets,
+            room,
+            submissions,
+            busy,
+            between,
+            longest,
         ]);
         row.extend(grown(&counters, &self.before));
         self.before = counters;
@@ -238,6 +331,19 @@ impl Frames {
         if out.send(row).is_err() {
             self.out = None;
         }
+    }
+
+    /// The room the texture queue keeps back for the render targets a world
+    /// makes ([`crate::resource::targets_room_kept`]): a reserve, not bytes
+    /// spent, and the one figure #26 changes.
+    #[cfg(windows)]
+    fn ours_targets_reserve(memory: [u64; 4]) -> u64 {
+        crate::resource::targets_room_kept(Some(memory))
+    }
+
+    #[cfg(not(windows))]
+    fn ours_targets_reserve(_memory: [u64; 4]) -> u64 {
+        0
     }
 
     /// The frame-rate line was written.
