@@ -627,6 +627,9 @@ pub(super) struct Taken {
     /// The fills of the submission done on the CPU: upload memory, place,
     /// length ([`late`]).
     cpu: Vec<(usize, usize, usize)>,
+    /// Those of them on learned pages, done when the card gets to the
+    /// submission ([`put_off`]).
+    put_off: Vec<(usize, usize, usize)>,
 }
 
 /// Places the title writes after the submission that reads them was sent.
@@ -666,8 +669,9 @@ mod late {
     static PAGES: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
     /// Fills done on the card compared, found written again, submissions
     /// refused for a learned page; pages learned in all; fills done on the CPU
-    /// compared, found written again.
-    pub(super) static COUNTS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+    /// compared, found written again; fills put off to the card's turn, and
+    /// the submissions with them ([`super::put_off`]).
+    pub(super) static COUNTS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 
     pub(super) fn on() -> bool {
         static ON: OnceLock<bool> = OnceLock::new();
@@ -761,6 +765,138 @@ mod late {
 /// Why a submission is refused for [`late`].
 const WRITTEN_LATE: &str = "a fill reads a place the title was found writing after sending";
 
+/// `VICTORY_LATE_FILLS=1`: a submission with fills on learned pages
+/// ([`late`]) is not refused when those fills read nothing a flight writes
+/// and none is done on the card. The CPU leaves them out when it prepares the
+/// submission; the card waits on a fence of ours before running it, and a
+/// thread of ours does them and signals that fence once the card has run
+/// everything sent before. So they read title memory when the card gets to
+/// the submission, as on the console, and the rest of it no longer waits.
+///
+/// In Leafy's 9-minute run (game 300-480 s) every submission that waited
+/// (3 a frame, 130-146 ms) waited for this, with the card idle behind us
+/// 31-48 ms a frame.
+pub(super) mod put_off {
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Condvar, Mutex, OnceLock};
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Graphics::Direct3D12::{D3D12_FENCE_FLAG_NONE, ID3D12Device, ID3D12Fence};
+    use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
+
+    pub(in super::super) fn on() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("VICTORY_LATE_FILLS").is_some_and(|v| v == "1"))
+    }
+
+    struct Fence(ID3D12Fence);
+    // SAFETY: D3D12 fences are free-threaded.
+    unsafe impl Send for Fence {}
+    unsafe impl Sync for Fence {}
+
+    struct Job {
+        card: Fence,
+        after: u64,
+        fills: Vec<(usize, usize, usize)>,
+        value: u64,
+    }
+
+    static JOBS: Mutex<VecDeque<Job>> = Mutex::new(VecDeque::new());
+    static MOVED: Condvar = Condvar::new();
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+
+    fn ours(device: &ID3D12Device) -> Option<&'static Fence> {
+        static OURS: OnceLock<Option<Fence>> = OnceLock::new();
+        OURS.get_or_init(|| {
+            // SAFETY: a plain fence of our own.
+            let fence = Fence(unsafe { device.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE) }.ok()?);
+            let signals = Fence(fence.0.clone());
+            if let Err(e) = std::thread::Builder::new().name("victory-late-fills".into()).spawn(move || worker(signals)) {
+                tracing::warn!(error = %e, "no thread for fills put off to the card's turn: they are done when prepared");
+                return None;
+            }
+            tracing::info!("fills on learned pages are done when the card gets to their submission (VICTORY_LATE_FILLS=1)");
+            Some(fence)
+        })
+        .as_ref()
+    }
+
+    /// The fills `fills` (upload memory, place, length) of the submission
+    /// sent after `card` reaches `after`: the fence and value the queue is to
+    /// wait for before it. `None`: done now.
+    pub(in super::super) fn send(
+        device: &ID3D12Device,
+        card: &ID3D12Fence,
+        after: u64,
+        fills: Vec<(usize, usize, usize)>,
+    ) -> Option<(ID3D12Fence, u64)> {
+        let Some(fence) = ours(device) else {
+            for &(dst, src, len) in &fills {
+                crate::host::copy_mapped(dst as *mut u8, src as *const u8, len, false);
+            }
+            return None;
+        };
+        super::late::COUNTS[6].fetch_add(fills.len() as u64, Ordering::Relaxed);
+        super::late::COUNTS[7].fetch_add(1, Ordering::Relaxed);
+        let value = NEXT.fetch_add(1, Ordering::Relaxed) + 1;
+        JOBS.lock().unwrap_or_else(|e| e.into_inner()).push_back(Job {
+            card: Fence(card.clone()),
+            after,
+            fills,
+            value,
+        });
+        MOVED.notify_one();
+        Some((fence.0.clone(), value))
+    }
+
+    fn worker(signals: Fence) {
+        crate::cores::keep_on_fast_cores("victory-late-fills");
+        // SAFETY: a plain event of our own.
+        let event: Option<HANDLE> = unsafe { CreateEventW(None, false, false, None) }.ok();
+        loop {
+            let job = {
+                let mut jobs = JOBS.lock().unwrap_or_else(|e| e.into_inner());
+                loop {
+                    if let Some(job) = jobs.pop_front() {
+                        break job;
+                    }
+                    jobs = MOVED.wait(jobs).unwrap_or_else(|e| e.into_inner());
+                }
+            };
+            // SAFETY: live fences and our event. (A removed device reads
+            // every value as reached.)
+            unsafe {
+                if job.card.0.GetCompletedValue() < job.after {
+                    match event {
+                        Some(event) if job.card.0.SetEventOnCompletion(job.after, event).is_ok() => {
+                            WaitForSingleObject(event, INFINITE);
+                        }
+                        _ => {
+                            while job.card.0.GetCompletedValue() < job.after {
+                                std::thread::yield_now();
+                            }
+                        }
+                    }
+                }
+            }
+            let fills = std::panic::AssertUnwindSafe(&job.fills);
+            let done = std::panic::catch_unwind(|| {
+                for &(dst, src, len) in fills.iter() {
+                    crate::host::copy_mapped(dst as *mut u8, src as *const u8, len, false);
+                }
+            });
+            if done.is_err() {
+                tracing::warn!("a fill put off to the card's turn failed: the card runs its submission anyway");
+            }
+            // (Write-combined upload memory: out to memory before the card is
+            // let go.)
+            std::sync::atomic::fence(Ordering::SeqCst);
+            // SAFETY: our fence. Always signalled: the queue waits for it.
+            let _ = unsafe { signals.0.Signal(job.value) };
+        }
+    }
+}
+
 impl Taken {
     pub(super) fn list(&self) -> &HostList {
         &self.own.list
@@ -769,6 +905,11 @@ impl Taken {
     /// Whether step `i` of `list` is done by this.
     pub(super) fn takes(&self, list: &HostList, i: usize) -> bool {
         self.steps.contains(&(std::ptr::from_ref(list) as usize, i))
+    }
+
+    /// The fills done when the card gets to the submission ([`put_off`]).
+    pub(super) fn put_off(&self) -> Vec<(usize, usize, usize)> {
+        self.put_off.clone()
     }
 
     fn copied(&self) -> impl Iterator<Item = Writer> {
@@ -833,8 +974,19 @@ impl Host {
         let chosen = plan(&does, stage(), placed_order(), &mut None)?;
         // Every fill of the submission, taken or not: one done on the CPU is
         // done now too, not after the wait ([`late`]).
-        if late::on()
-            && does.iter().any(|d| matches!(*d, Does::Fill { src, len, .. } if late::written(src, src + len)))
+        let mut learned = Vec::new();
+        if late::on() {
+            learned = (0..does.len())
+                .filter(|&i| matches!(does[i], Does::Fill { src, len, .. } if late::written(src, src + len)))
+                .collect();
+        }
+        // ([`put_off`]: unless one is read on the card, or reads what a flight
+        // writes.)
+        if !learned.is_empty()
+            && (!put_off::on()
+                || learned.iter().any(|&i| {
+                    matches!(does[i], Does::Fill { asked: true, .. }) || chosen.iter().any(|&(c, _)| c == i)
+                }))
         {
             late::COUNTS[2].fetch_add(1, Ordering::Relaxed);
             return Err(WRITTEN_LATE);
@@ -1025,11 +1177,14 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         noted(&ops);
         spent.end();
+        let put_off: std::collections::HashSet<(usize, usize), std::hash::BuildHasherDefault<AddressHash>> =
+            learned.iter().map(|&i| steps[i]).collect();
         let steps: std::collections::HashSet<(usize, usize), std::hash::BuildHasherDefault<AddressHash>> =
             chosen.iter().map(|&(i, _)| steps[i]).collect();
         // The fills left to the CPU: done when the submission is prepared,
         // now, into upload memory that holds them until its lists are reset.
         let mut cpu = Vec::new();
+        let mut later = Vec::new();
         if late::on() {
             for list in runs {
                 let at = std::ptr::from_ref::<HostList>(list) as usize;
@@ -1038,16 +1193,22 @@ impl Host {
                         && !steps.contains(&(at, i))
                     {
                         cpu.push((dst, src, len));
+                        if put_off.contains(&(at, i)) {
+                            later.push((dst, src, len));
+                        }
                     }
                 }
             }
         }
+        let mut steps = steps;
+        steps.extend(put_off);
         Ok(Some(Taken {
             own,
             steps,
             copied,
             sent,
             cpu,
+            put_off: later,
         }))
     }
 
@@ -1114,13 +1275,16 @@ pub(super) fn log(frames: f64) {
         tracing::info!(
             "card steps, places the title writes after sending (VICTORY_CARD_STEPS_LEARN), per frame: {:.1} fills on the card \
              and {:.1} on the CPU compared at landing, {:.2} and {:.2} found written again, {:.2} submissions waited for a \
-             learned page; {} pages learned",
+             learned page; {} pages learned; {:.1} fills in {:.2} submissions done when the card got to them \
+             (VICTORY_LATE_FILLS)",
             c[0],
             c[4],
             c[1],
             c[5],
             c[2],
-            late::COUNTS[3].load(Ordering::Relaxed)
+            late::COUNTS[3].load(Ordering::Relaxed),
+            c[6],
+            c[7]
         );
     }
     #[cfg(feature = "diagnostics")]

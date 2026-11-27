@@ -6729,6 +6729,14 @@ impl Host {
             }
             // With [`join_one_call`] the parts' barriers stand in for the cuts.
             let cuts: Vec<usize> = if one_call { Vec::new() } else { parts.iter().filter_map(|&n| firsts.get(n).copied()).collect() };
+            // Fills on learned pages, done when the card gets here
+            // ([`card_steps::put_off`]).
+            if let Some(fills) = own.as_ref().map(|own| own.put_off()).filter(|fills| !fills.is_empty())
+                && let Some((fence, value)) = card_steps::put_off::send(&self.device, &self.fence, *submitted - 1, fills)
+            {
+                // SAFETY: a live fence its thread always signals.
+                let _ = unsafe { self.queue.Wait(&fence, value) };
+            }
             // SAFETY: closed lists; the fence is ours.
             let signalled = unsafe {
                 let mut from = 0;
