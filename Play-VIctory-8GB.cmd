@@ -92,7 +92,11 @@ rem scene loads its shaders.
 if not defined VICTORY_PIPELINE_WAIT_MS set "VICTORY_PIPELINE_WAIT_MS=0"
 
 rem Two preparing experiments, off by default in the engine and NOT measured by
-rem anyone on your card. VICTORY_REFRESH_FRONT brings everything a submission
+rem anyone on your card. Note what the engine already does for itself: on a
+rem machine with 4 or more logical CPUs it spreads a flush's copies, the fills
+rem of a submission and its textures over threads already (host.rs,
+rem wide_refresh_enabled), so those are not knobs left unturned.
+rem VICTORY_REFRESH_FRONT brings everything a submission
 rem refreshes up to date in one go on several threads ahead of its steps,
 rem instead of 580 copies one after the other on the submitting thread (3.4 to
 rem 6.5 ms measured on one session); VICTORY_QUIET_WAITS leaves out a full wait
@@ -102,6 +106,12 @@ rem a device loss, run with VICTORY_REFRESH_FRONT=0 and VICTORY_QUIET_WAITS=0
 rem set in your environment before launching, and say so: that is worth knowing.
 if not defined VICTORY_REFRESH_FRONT set "VICTORY_REFRESH_FRONT=1"
 if not defined VICTORY_QUIET_WAITS set "VICTORY_QUIET_WAITS=1"
+rem
+rem VICTORY_WIDE_MERGE is the one spreading switch the engine leaves off by
+rem default: what shaders wrote, fetched and then merged one piece after
+rem another on the thread that settles (about 630 pieces and 40 MB a frame),
+rem taken instead by eight threads an eighth each.
+if not defined VICTORY_WIDE_MERGE set "VICTORY_WIDE_MERGE=1"
 
 rem Keeping the card's clocks up between submissions, and the submission
 rem stages the continuation keeps on for this profile.
