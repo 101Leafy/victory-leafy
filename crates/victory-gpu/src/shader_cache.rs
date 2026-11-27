@@ -114,6 +114,7 @@ fn build(translator: &str) -> [u8; 32] {
             "VICTORY_LDS_INIT_HOIST",
             "VICTORY_BVH_MISS",
             "VICTORY_NAN_SCRUB",
+            "VICTORY_MEMORY_NEAR",
         ] {
             append_switch(&mut bytes, name, std::env::var_os(name).as_deref());
         }
