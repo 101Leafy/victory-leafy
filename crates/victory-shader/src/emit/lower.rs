@@ -1047,12 +1047,71 @@ fn need(block: usize) {
 /// wave-uniform data in VGPRs and fetches it with `v_readfirstlane`.
 /// shortcut: a value joined by a phi counts only where every predecessor is a block all lanes
 /// run (no lane branch can have split the arriving lanes); loop-carried values never do.
+/// With [`uniform_loads_on`] a buffer load's result counts too.
 fn lane_uniform(p: &Program, st: &Structured, all: &[bool]) -> HashSet<Value> {
     let is_mask = |v: Value| st.masks.contains_key(&v) || st.highs.contains_key(&v);
     let mut same: HashSet<Value> = HashSet::new();
-    for b in crate::ir::reverse_postorder(&p.blocks) {
+    let loads = uniform_loads_on();
+    let writes = |inst: &Inst| {
+        matches!(inst.fields, Fields::Buffer { .. } | Fields::Image { .. } | Fields::Flat { .. })
+            && (inst.name().contains("store") || inst.name().contains("atomic"))
+    };
+    // other waves of the dispatch write too, between the two halves' loads: a load counts only
+    // from a table slot no write of the program takes its descriptor from
+    let mut defs: HashMap<Value, (&Inst, i32)> = HashMap::new();
+    for block in &p.blocks {
+        for inst in &block.insts {
+            for (k, w) in inst.writes.iter().enumerate() {
+                defs.insert(w.1, (inst, 4 * k as i32));
+            }
+        }
+    }
+    let slot = |inst: &Inst, rsrc: &Operand| {
+        let Operand::Scalar { code, .. } = *rsrc else { return None };
+        let &(def, at) = defs.get(&inst.read(Reg::S(code))?)?;
+        let Fields::Smem { base: Operand::Scalar { code: base, .. }, offset, soffset, .. } = def.fields else {
+            return None;
+        };
+        if !def.name().starts_with("s_load") && !def.name().starts_with("s_buffer_load") {
+            return None;
+        }
+        let soffset = match soffset {
+            Operand::Scalar { code, .. } if code != NULL => def.read(Reg::S(code)),
+            _ => None,
+        };
+        Some((def.read(Reg::S(base)), def.read(Reg::S(base + 1)), offset + at, soffset))
+    };
+    let mut slots = Vec::new();
+    let mut blind = false;
+    for inst in p.blocks.iter().flat_map(|b| &b.insts).filter(|inst| loads && writes(inst)) {
+        match &inst.fields {
+            Fields::Buffer { rsrc, .. } | Fields::Image { rsrc, .. } => match slot(inst, rsrc) {
+                Some(s) => slots.push(s),
+                None => blind = true,
+            },
+            _ => blind = true,
+        }
+    }
+    // per block: a memory write of the program may have run by its end (loops come round)
+    let mut wrote = vec![false; p.blocks.len()];
+    let order = crate::ir::reverse_postorder(&p.blocks);
+    while loads {
+        let mut more = false;
+        for &b in &order {
+            let w = p.blocks[b].preds.iter().any(|&q| wrote[q]) || p.blocks[b].insts.iter().any(writes);
+            if w && !wrote[b] {
+                wrote[b] = true;
+                more = true;
+            }
+        }
+        if !more {
+            break;
+        }
+    }
+    for b in order {
         let block = &p.blocks[b];
         let whole = block.preds.iter().all(|&q| all.get(q).copied().unwrap_or(false));
+        let mut dirty = block.preds.iter().any(|&q| wrote[q]);
         for phi in &block.phis {
             if matches!(phi.reg, Reg::V(_)) && whole && phi.args.iter().all(|a| same.contains(a)) {
                 same.insert(phi.value);
@@ -1060,6 +1119,8 @@ fn lane_uniform(p: &Program, st: &Structured, all: &[bool]) -> HashSet<Value> {
         }
         for (i, inst) in block.insts.iter().enumerate() {
             let name = inst.name();
+            let wrote_before = dirty;
+            dirty |= writes(inst);
             let ops: Vec<Operand> = match &inst.fields {
                 Fields::Valu(v)
                     if v.dpp.is_none()
@@ -1069,6 +1130,22 @@ fn lane_uniform(p: &Program, st: &Structured, all: &[bool]) -> HashSet<Value> {
                         && !name.contains("lane") =>
                 {
                     v.src.clone()
+                }
+                // the two host waves of a console wave load at different times: the same bytes
+                // only from a slot nothing here writes, before this wave's own writes, not glc
+                Fields::Buffer { addr, rsrc, soffset, offen, idxen, lds: false, tfe: false, cache, .. }
+                    if loads
+                        && !wrote_before
+                        && !cache.glc
+                        && !blind
+                        && name.starts_with("buffer_load")
+                        && slot(inst, rsrc).is_some_and(|s| !slots.contains(&s)) =>
+                {
+                    let mut ops = vec![*rsrc, *soffset];
+                    if *offen || *idxen {
+                        ops.push(*addr);
+                    }
+                    ops
                 }
                 _ => continue,
             };
@@ -1094,6 +1171,17 @@ fn lane_uniform(p: &Program, st: &Structured, all: &[bool]) -> HashSet<Value> {
         }
     }
     same
+}
+
+/// `VICTORY_UNIFORM_LOADS=1`: [`lane_uniform`] also takes what a buffer load reads from an
+/// address made of values every lane holds alike, so a `v_readfirstlane` of it needs no exchange
+/// of the two host waves (an LDS store and load between two group barriers). Only where every
+/// write of the program takes its descriptor from a known table slot, none the load's: two slots
+/// holding one buffer would let another wave's write land between the halves. Off by default
+/// until a game run has tried it.
+fn uniform_loads_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_UNIFORM_LOADS").is_some_and(|v| v == "1"))
 }
 
 /// The paired form: scalar values each console lane has its own of in the lowering, a waterfall
