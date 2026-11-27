@@ -812,11 +812,13 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
         // number is left by then).
         let now = note_shared(&written);
         let mut j = journal_mut();
+        ahead_normalize(&mut asked);
         j.ahead_asked = now;
         j.ahead = asked;
         return;
     }
     let mut j = journal_mut();
+    ahead_normalize(&mut asked);
     j.ahead_asked = next_asking();
     j.ahead = asked;
     let now = j.ahead_asked;
@@ -1146,18 +1148,22 @@ fn ask_rest(ranges: &[(usize, usize)]) {
     // askings a frame with the switch on, as without it). They are asked
     // here, once; what is not write-watched stays with `writes`.
     let mut written = Vec::new();
+    let mut added = Vec::new();
     for &(start, end) in ranges {
         if start >= end || published(start, end) {
             continue;
         }
         let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-        if !ahead.iter().any(|&(a, b)| a <= first && last <= b)
+        if !ahead_holds(&ahead, first, last)
+            && !added.iter().any(|&(a, b)| a <= first && last <= b)
             && let Some(pages) = kernel_written(first, last)
         {
             written.extend(pages);
-            ahead.push((first, last));
+            added.push((first, last));
         }
     }
+    // (Added after the search: `ahead_holds` needs `ahead` in order.)
+    ahead.extend(added);
     note_hot(&written);
     // A number of its own, and the one this asking stands under: between
     // the two parts another thread may have asked about a range of the
@@ -1167,6 +1173,7 @@ fn ask_rest(ranges: &[(usize, usize)]) {
         // Renderer port #7: noted shared first (see `ask_ahead`).
         let now = note_shared(&written);
         let mut j = journal_mut();
+        ahead_normalize(&mut ahead);
         j.ahead_asked = now;
         j.kept = !ahead.is_empty();
         j.ahead = ahead;
@@ -1178,6 +1185,7 @@ fn ask_rest(ranges: &[(usize, usize)]) {
     for (page, parts) in written {
         j.notes.note(page, parts, now);
     }
+    ahead_normalize(&mut ahead);
     j.kept = !ahead.is_empty();
     j.ahead = ahead;
 }
@@ -1304,14 +1312,35 @@ fn ask_run(pieces: &[(usize, usize)], split: bool, asked: &mut Vec<(usize, usize
 pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)> {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let j = journal();
-    j.ahead.iter().any(|&(a, b)| a <= first && last <= b).then(|| (j.ahead_asked, j.notes.range(first, last)))
+    ahead_holds(&j.ahead, first, last).then(|| (j.ahead_asked, j.notes.range(first, last)))
+}
+
+/// Puts `ahead` in order and one range of those that touch: a lookup is a
+/// binary search, not a walk of every range a submission refreshes.
+fn ahead_normalize(ahead: &mut Vec<(usize, usize)>) {
+    ahead.sort_unstable();
+    let mut out: Vec<(usize, usize)> = Vec::with_capacity(ahead.len());
+    for &(a, b) in ahead.iter() {
+        match out.last_mut() {
+            Some((_, e)) if a <= *e => *e = (*e).max(b),
+            _ => out.push((a, b)),
+        }
+    }
+    *ahead = out;
+}
+
+/// Whether `ahead` (in order, one range of those that touch) holds
+/// `[first, last)` whole.
+fn ahead_holds(ahead: &[(usize, usize)], first: usize, last: usize) -> bool {
+    let i = ahead.partition_point(|&(a, _)| a <= first);
+    i > 0 && ahead[i - 1].1 >= last
 }
 
 /// Whether [`writes`] of `[start, end)` would wait for another thread's
 /// asking of some of it (a submission's holds everything).
 pub(crate) fn would_wait(start: usize, end: usize, guarded: bool) -> bool {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-    let ahead = journal().ahead.iter().any(|&(a, b)| a <= first && last <= b);
+    let ahead = ahead_holds(&journal().ahead, first, last);
     if ahead || guarded && published(start, end) {
         return false;
     }
@@ -1328,7 +1357,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     // Asked ahead with the submission's other ranges: the journal has it.
     // (The standing number changes only with the journal held alone, so its
     // notes are all in: a part at a time will do.)
-    let ahead = |j: &Journal| j.ahead.iter().any(|&(a, b)| a <= first && last <= b).then(|| (j.ahead_asked, j.notes.range(first, last)));
+    let ahead = |j: &Journal| ahead_holds(&j.ahead, first, last).then(|| (j.ahead_asked, j.notes.range(first, last)));
     // A fresh number and the notes of the range, its parts held meanwhile
     // (renderer port #7, switch or not: who notes shared takes its number
     // holding the parts it notes in).
@@ -1441,7 +1470,7 @@ pub(crate) fn nothing_new(start: usize, end: usize, base: usize, copied: &[u64],
 
 /// [`nothing_new`] past the bits, `taken` cut to pages `first..last`.
 fn new_in(j: &Journal, known: bool, first: usize, last: usize, taken: &[u64], ranged: u64) -> bool {
-    if !known && !j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
+    if !known && !ahead_holds(&j.ahead, first, last) {
         return false;
     }
     (ranged != 0 || taken.iter().all(|&at| at != 0))

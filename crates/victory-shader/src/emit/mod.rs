@@ -157,7 +157,7 @@ pub use shader::{
 /// The first run after a source change without a raise translates its first
 /// 64 cached shaders again and compares the entries byte for byte; if one
 /// differs, that build keys on the whole source instead, as before.
-pub const VERSION: u32 = 28;
+pub const VERSION: u32 = 29;
 
 static HELPER_LANE_WAVES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
