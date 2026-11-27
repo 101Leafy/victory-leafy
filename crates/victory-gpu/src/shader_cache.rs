@@ -109,6 +109,7 @@ fn build(translator: &str) -> [u8; 32] {
             "VICTORY_WAVE32_LOWERING",
             "VICTORY_LANE_SPILL_STRICT",
             "VICTORY_TABLE_STRIDES",
+            "VICTORY_LDS_INIT_HOIST",
         ] {
             append_switch(&mut bytes, name, std::env::var_os(name).as_deref());
         }

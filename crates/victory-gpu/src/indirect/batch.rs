@@ -44,7 +44,7 @@ ByteAddressBuffer src3 : register(t3);
 ByteAddressBuffer jobs : register(t4);
 RWByteAddressBuffer dst_args : register(u0);
 RWByteAddressBuffer budget : register(u1);
-static const uint BUDGET = 1u << 27;
+static const uint BUDGET = 1u << 30;
 static const uint GROUPS = 1u << 20;
 static const uint PIECE = 65535u;
 static const uint PIECES = 17u;

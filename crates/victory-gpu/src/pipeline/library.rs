@@ -83,8 +83,9 @@ pub(super) fn folder() -> Option<PathBuf> {
 /// driver compile once (each folder made the same 1,300 slow pipelines
 /// again, about 14 minutes). The early and slow lists stay per folder.
 /// Two runs that both save keep the last one's library: the host cannot
-/// list or merge another library's pipelines.
-fn library_dir() -> Option<PathBuf> {
+/// list or merge another library's pipelines. The list of static samplers
+/// the library was filled with goes beside it (`super::samplers`).
+pub(super) fn library_dir() -> Option<PathBuf> {
     static SHARED: OnceLock<Option<PathBuf>> = OnceLock::new();
     let shared = SHARED.get_or_init(|| std::env::var_os("VICTORY_LIBRARY_DIR").filter(|v| !v.is_empty()).map(PathBuf::from));
     shared.clone().or_else(folder)
@@ -538,7 +539,17 @@ fn library() -> Option<&'static Library> {
         .get_or_init(|| {
             let device = crate::host::host()?.device.cast::<ID3D12Device1>().ok()?;
             let library = match library_dir() {
-                Some(dir) => open_dir(&dir, keeps_other(), |blob| load(&device, blob)).or_else(|| empty(&device)),
+                Some(dir) => {
+                    // A library filled before static samplers were made in a
+                    // kept order (`super::samplers`) holds pipelines of any
+                    // order: a pipeline loaded from it may sample with other
+                    // samplers than its root signature names
+                    // (fxceless/victory-fork#1459). It is let go once.
+                    if super::samplers::on() && !super::samplers::listed_at_start(&dir) {
+                        unlisted(&dir);
+                    }
+                    open_dir(&dir, keeps_other(), |blob| load(&device, blob)).or_else(|| empty(&device))
+                }
                 None => open(&device, Blob::None),
             };
             if library.is_none() {
@@ -578,6 +589,23 @@ fn others() -> &'static [Library] {
         }
         all
     })
+}
+
+/// Removes the library in `dir`, one a save left beside it, and another
+/// setup's: they were filled with no list of static samplers beside them.
+fn unlisted(dir: &std::path::Path) {
+    for name in [LIBRARY_FILE, NEXT_FILE, OTHER_FILE] {
+        let path = dir.join(name);
+        let Ok(meta) = std::fs::metadata(&path) else { continue };
+        match std::fs::remove_file(&path) {
+            Ok(()) => tracing::info!(
+                file = name,
+                mb = meta.len() >> 20,
+                "the host pipeline library of before the static samplers' kept order is let go: its pipelines are made again"
+            ),
+            Err(e) => tracing::warn!(error = %e, file = name, "an old host pipeline library could not be removed; it is used as it is"),
+        }
+    }
 }
 
 /// The library of the cache folder `dir`, made by `load` (which hands back
@@ -995,6 +1023,37 @@ fn store_later(library: &Library) {
     for Later(name, pso) in &later {
         store(library, name, pso);
     }
+}
+
+/// As [`save`], from a worker while more pipelines are still queued.
+///
+/// Every save serialises the whole library (over a gigabyte once it is warm)
+/// and, while it does, holds off every store; in the middle of a burst of new
+/// pipelines (a new area, a cutscene) that is exactly when the title is
+/// waiting on them, and the write competes with texture streaming for the
+/// disk. Saves in a burst are kept to one every `VICTORY_LIBRARY_SAVE_BUSY_S`
+/// seconds (default 180; 20 as before); the save when the queue runs dry and
+/// the one at exit are as they were.
+pub(crate) fn save_while_busy() {
+    static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+    static EVERY: OnceLock<std::time::Duration> = OnceLock::new();
+    let every = *EVERY.get_or_init(|| {
+        let secs = std::env::var("VICTORY_LIBRARY_SAVE_BUSY_S").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(180);
+        std::time::Duration::from_secs(secs)
+    });
+    {
+        let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+        match *last {
+            // The first busy save of the run waits a full interval too.
+            None => {
+                *last = Some(std::time::Instant::now());
+                return;
+            }
+            Some(t) if t.elapsed() < every => return,
+            _ => *last = Some(std::time::Instant::now()),
+        }
+    }
+    save(false);
 }
 
 /// Writes the library and the early list if pipelines were added since the
