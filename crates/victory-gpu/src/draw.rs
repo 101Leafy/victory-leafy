@@ -388,8 +388,8 @@ fn split_batch() -> bool {
 }
 
 /// Whether a full wait (a title barrier on buffers, a pipeline sync or
-/// barrier group, the wait that opens a batch of clamps) is left out when
-/// nothing that writes was recorded in the list since the last one
+/// barrier group, the wait before a clamp or a batch of clamps) is left out
+/// when nothing that writes was recorded in the list since the last one
 /// (`VICTORY_QUIET_WAITS=1`; off by default).
 ///
 /// A frame of gameplay has about 865 barrier groups and 870 clamp passes,
@@ -399,10 +399,10 @@ fn split_batch() -> bool {
 /// batch opened after a title wait waits again. What writes: dispatches,
 /// draws whose shaders store to buffers or textures, copies, clears and
 /// resolves. Draws that only write render targets and depth are not
-/// waited for by these (their textures move state at use). Our own passes
-/// in the list (the clamps, the ambient light) bring their own waits, and
-/// the clamp budget is changed only by atomics. The first wait in each
-/// host list is always kept.
+/// waited for by these (their textures move state at use). The clamps
+/// write only their scratch buffers, which move state before the draws
+/// read them, and the budget, by atomics; the ambient light brings its own
+/// waits. The first wait in each host list is always kept.
 fn quiet_waits() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_QUIET_WAITS").is_some_and(|v| v == "1"))
@@ -3675,7 +3675,7 @@ impl State {
         list.noted_done();
         #[cfg(feature = "diagnostics")]
         let began = std::time::Instant::now();
-        self.after_compute_dispatch(pipeline_stores(p));
+        self.dispatched(p);
         #[cfg(feature = "diagnostics")]
         crate::copystat::lap(crate::copystat::C::DrawAfterNs, began);
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
@@ -5010,6 +5010,16 @@ impl State {
         }
     }
 
+    /// A dispatch with the pipeline `p` was recorded: as
+    /// [`State::after_compute_dispatch`], and the next full wait is kept if
+    /// its shaders store to textures only ([`quiet_waits`]).
+    fn dispatched(&mut self, p: &HostPipeline) {
+        self.after_compute_dispatch(pipeline_stores(p));
+        if p.stages.iter().any(|stage| stage.translated().writes) {
+            self.quiet = false;
+        }
+    }
+
     /// A draw with the pipeline `p` was recorded (as [`State::buffers_written`]
     /// if its shaders can store to buffers).
     fn drew(&mut self, p: Option<&HostPipeline>) {
@@ -5301,14 +5311,16 @@ impl State {
                 let count_arg = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
                 // More than the record asked for: a window clamped ahead,
                 // whose unfilled slots must not spend the list's budget.
+                let wait = self.wait_needed(list);
                 let bounded = if windowed && records > 1 {
-                    crate::indirect::bound_ahead(list, (&args.buffer, offset), (kind, step, records))
+                    crate::indirect::bound_ahead(list, (&args.buffer, offset), (kind, step, records), wait)
                 } else {
                     let clamped = if split.is_some() { crate::indirect::SPLIT } else { kind };
-                    crate::indirect::bound(list, (&args.buffer, offset), count_arg, (clamped, step, records))
+                    crate::indirect::bound(list, (&args.buffer, offset), count_arg, (clamped, step, records), wait)
                 };
                 let Some(bounded) = bounded else {
                     self.window = None;
+                    self.quiet = false;
                     why("not bounded (no clamp, or arguments not 4-byte aligned)");
                     return false;
                 };
@@ -5407,7 +5419,7 @@ impl State {
         #[cfg(feature = "diagnostics")]
         let began = std::time::Instant::now();
         if kind == DISPATCH {
-            self.after_compute_dispatch(pipeline_stores(p));
+            self.dispatched(p);
         } else {
             self.drew(Some(p));
         }
