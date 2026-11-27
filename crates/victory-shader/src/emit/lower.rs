@@ -5964,7 +5964,13 @@ impl<'a> Lower<'a> {
                 continue;
             };
             let mut end = i;
-            while end < guards.len() && guards[end] == Some(g) && !section(end) && self.runs_alone(b, end) {
+            // a write VICTORY_GUARDED_UNIFORM lowers in every lane has no guard to select on
+            while end < guards.len()
+                && guards[end] == Some(g)
+                && !section(end)
+                && !self.ungated.contains(&(b, end))
+                && self.runs_alone(b, end)
+            {
                 end += 1;
             }
             if end - i >= RUN_MIN {
@@ -5983,7 +5989,9 @@ impl<'a> Lower<'a> {
     fn guarded_run(&mut self, b: usize, start: usize, end: usize) -> Result<(), Stop> {
         let p = self.x.p;
         let offset = p.blocks[b].insts[start].machine.offset;
-        let g = self.guard(b, start).map_err(|w| unsupported(offset, w))?.expect("a guarded run");
+        let Some(g) = self.guard(b, start).map_err(|w| unsupported(offset, w))? else {
+            return (start..end).try_for_each(|i| self.inst(b, i));
+        };
         self.spec = Some((b, start, end));
         #[cfg(test)]
         self.runs_taken.push((b, start, end));
