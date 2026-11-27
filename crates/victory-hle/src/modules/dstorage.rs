@@ -2628,7 +2628,7 @@ mod tests {
         let tables = Tables::builtin().unwrap();
         let mut kinds: BTreeMap<u32, Vec<(usize, usize, usize)>> = BTreeMap::new();
         for line in index.lines() {
-            let v: Vec<usize> = line.split('	').map(|f| f.parse().unwrap()).collect();
+            let v: Vec<usize> = line.split('\t').map(|f| f.parse().unwrap()).collect();
             kinds.entry(v[0] as u32).or_default().push((v[1], v[2], v[3]));
         }
         let mut out = Vec::new();
