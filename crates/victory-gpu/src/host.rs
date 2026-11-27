@@ -9217,6 +9217,17 @@ impl Host {
             // that draws the console's size while the mode it was given was
             // the screen's own needs this line to say so, since nothing else
             // in the log compares the two.
+            //
+            // Nothing here lowers it, and a reader who takes the ratio for a
+            // switch to turn is misled: `VICTORY_DISPLAY_HOST` and
+            // `VICTORY_DISPLAY_MODE` name the mode the title is given, and a
+            // title that ignores the mode renders its own targets anyway (the
+            // first 5070 Laptop run reported 3840x2160 either way);
+            // `VICTORY_WINDOW_MAX` fits the window to the screen without
+            // changing the title's render targets (`victory_hle::modules::
+            // lifecycle::fit`). A ratio well above 1 is therefore a diagnosis
+            // of a slow run, not a lever: bringing it down is work on what the
+            // title renders into.
             let screen = crate::dxgi::host_display_size();
             let drawn_of_the_screen = screen.map(|(w, h)| {
                 (f64::from(width) * f64::from(height)) / (f64::from(w) * f64::from(h))
