@@ -150,6 +150,35 @@ laptop the title presented **1280x720** instead (Logan-Gaillard, 2026-11-27). So
 floor **as measured**, 540p is unproven, and the launcher now says so before the run
 rather than after it: read the `presenting to a window` line before comparing two runs.
 
+## The levers already in the tree, and why only one is switched on
+
+Audited 2026-11-27: every switch that is **off by default** in `victory-gpu`, read from
+the comment where it is defined rather than guessed at. The sizes are the ones those
+comments measured.
+
+| Switch | What it removes | What it risks | Out |
+|---|---|---|---|
+| `VICTORY_FILL_FORWARD=1` with `VICTORY_PLACED_ORDER=1` | a submission standing **13-28 ms** (runs trace, trace2) and **40-60 ms** (n19) for a fill that reads the constants ring behind a copy at its place — this is `stood_waiting_us` | a fill ahead of a copy keeps the old values: camera, lighting, a smeared sky | both to 0 |
+| `VICTORY_GUARD_FALLBACK_LATER=1` | ~210 `VirtualProtect` calls a frame made **under the lock**, 11.5 µs each (a5c442eec) | the guard's work with the lock let go: a write could be missed between the two | 0 |
+| `VICTORY_MAP_REST=1` | ~1 967 blocks made read-only again a frame, most opened by a mapping just before (a5c442eec) | a write into a mapping-opened block noticed later than now | 0 |
+| `VICTORY_TEXBACK_SAME=1` | a landing puts only the bytes that differ (19 a frame, 5 MB, the boat window) | a compare in place of a write; small | 0 |
+| `VICTORY_BAKE_SYNC=1` | a bake draw waiting for its uploads on the lists | needs lists recorded on one thread (the launcher sets `VICTORY_THIN=0`) | 0 |
+| `VICTORY_HOST_QUERIES=1` | occlusion queries kept on the host heap | culls draws; its own comment says "until a run shows that measured occlusion culls nothing our dropped draws should have drawn" | 0 |
+| `VICTORY_PORT_CONSTANTS=1` | renderer port #1: the title's memory used in place | the largest change of the set, unmeasured on this card | 0 |
+
+**The first row is now set in `Play-VIctory-8GB.cmd`**, because it is the only one whose
+failure mode is visible in the picture rather than silent in a lost write: constants that
+read old values look wrong, and a person watching says so. The rest are not set, and the
+reason is the same for all of them: their failure mode is *a write nobody noticed*, the
+class this repository's own findings record as **six in two hundred runs**. A default is
+not the place for a defect that needs two hundred runs to appear.
+
+And the distinction that keeps this honest: **all of these shorten waits, not
+preparing.** `stood_waiting_us` is 212 ms on an 8 GiB laptop and `preparing_us` is 93 ms;
+the first row may take tens of milliseconds out of the first and nothing out of the
+second. Frames that are lost waiting can come back this way. Frames that are lost
+preparing cannot.
+
 ## What would make me say thirty is out of reach
 
 Stated in advance, so it is not a conclusion moved to fit the result:
