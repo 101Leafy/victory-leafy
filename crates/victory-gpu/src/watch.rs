@@ -1139,6 +1139,17 @@ pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)
     j.ahead.iter().any(|&(a, b)| a <= first && last <= b).then(|| (j.ahead_asked, j.notes.range(first, last)))
 }
 
+/// Whether [`writes`] of `[start, end)` would wait for another thread's
+/// asking of some of it (a submission's holds everything).
+pub(crate) fn would_wait(start: usize, end: usize, guarded: bool) -> bool {
+    let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+    let ahead = journal().ahead.iter().any(|&(a, b)| a <= first && last <= b);
+    if ahead || guarded && published(start, end) {
+        return false;
+    }
+    ASKING.0.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, b)| a < last && first < b)
+}
+
 /// The pages of `[start, end)` (whole pages) as last written, for pages
 /// written since tracking began: `(page number, asking)` in page order, and
 /// this asking's number, which is higher than any in the list but those the

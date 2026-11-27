@@ -221,6 +221,8 @@ struct Stats {
     /// view, a structure named in upload memory.
     came: [u64; 4],
     micros: u64,
+    /// Looks put off while another asking held the range (VICTORY_MEMORY_NO_WAIT).
+    put_off: u64,
 }
 
 // SAFETY: the mappings are of memory the struct owns; all access is under
@@ -525,6 +527,15 @@ impl Memory {
         if !(first..end).any(|page| self.pages.get(&page).is_some_and(|h| h.looked != frame)) {
             return;
         }
+        // Not while a submission asks the write watch (seconds a frame on the
+        // laptop's big play): every recording thread waits on the mutex. The
+        // pages keep what they last took and a later draw looks again. A page
+        // never taken waits.
+        let never = (first..end).any(|page| self.pages.get(&page).is_some_and(|h| h.looked != frame && h.taken == 0));
+        if !never && no_wait() && crate::watch::would_wait((first * PAGE) as usize, (end * PAGE) as usize, true) {
+            self.stats.put_off += 1;
+            return;
+        }
         let started = std::time::Instant::now();
         let answer = crate::watch::writes((first * PAGE) as usize, (end * PAGE) as usize, true);
         for page in first..end {
@@ -790,7 +801,7 @@ impl Memory {
         tracing::info!(
             "title memory by address: {} pages ({} MB) in {} arenas, {} copies in all; per frame {:.0} dispatches that read, {:.0} that build, \
              {:.1} pages that had no copy, {:.1} pages turned down, {:.1} results brought back; {:.0} pages looked at, {:.1} KB changed, \
-             {:.1} packed structures ({} there), {:.2} ms; {} windows; since the last line {} KB of packed structures came and {} of them went, \
+             {:.1} packed structures ({} there), {:.2} ms, {:.1} looks put off; {} windows; since the last line {} KB of packed structures came and {} of them went, \
              and pages for constants {}, views written {}, others {}, upload memory {}, faults in all {}",
             self.pages.len(),
             (self.pages.len() as u64 * PAGE) >> 20,
@@ -806,6 +817,7 @@ impl Memory {
             s.packed as f64 / frames,
             self.packed.len(),
             s.micros as f64 / 1000.0 / frames,
+            s.put_off as f64 / frames,
             self.windows,
             s.packed_bytes >> 10,
             s.gone,
@@ -840,6 +852,11 @@ const SIZES: usize = usize::MAX - (9 << 33);
 /// wrote over its neighbours: of 230 such copies of run light-11, 99 were
 /// asked for two frames earlier and landed in that frame, none of those with
 /// the right size.
+fn no_wait() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MEMORY_NO_WAIT").is_some_and(|v| v == "1"))
+}
+
 fn sizes_wait() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_SIZES_WAIT").is_some_and(|v| v == "1"))
