@@ -527,22 +527,36 @@ impl Xma {
     }
 }
 
+/// Whether a voice that ran out decodes again when the title refills it, and
+/// the pump writes whole blocks only (`VICTORY_XMA_REFILL=1`, codec_d,
+/// pareto-residency 8cc31ab37; off, as before).
+fn refill() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_XMA_REFILL").is_some_and(|v| v == "1"))
+}
+
 fn pump(context: Context, voice: &mut Voice) {
     let size = context.field(0, 22, 5);
     if size == 0 {
         return;
     }
+    let refill = refill();
     while context.field(1, 31, 1) == 1 {
-        // A skipped frame or an input boundary can advance the decoder without
-        // producing samples. Publish only complete blocks, except the final
-        // padded tail. Limit empty steps so a broken looping voice cannot hold
-        // its lock or stall other voices for the whole decoding pass.
-        for _ in 0..8 {
-            if voice.pcm.len() >= SAMPLES_PER_BLOCK || !decode(context, voice) {
-                break;
+        if refill {
+            // A skipped frame or an input boundary can advance the decoder
+            // without producing samples. Publish only complete blocks, except
+            // the final padded tail. Limit empty steps so a broken looping
+            // voice cannot hold its lock or stall other voices for the whole
+            // decoding pass.
+            for _ in 0..8 {
+                if voice.pcm.len() >= SAMPLES_PER_BLOCK || !decode(context, voice) {
+                    break;
+                }
             }
-        }
-        if voice.pcm.is_empty() || (voice.pcm.len() < SAMPLES_PER_BLOCK && !voice.ended) {
+            if voice.pcm.is_empty() || (voice.pcm.len() < SAMPLES_PER_BLOCK && !voice.ended) {
+                return;
+            }
+        } else if voice.pcm.len() < SAMPLES_PER_BLOCK && !decode(context, voice) {
             return;
         }
         // The write block is the title's too: taken modulo the ring before
@@ -575,6 +589,9 @@ fn pump(context: Context, voice: &mut Voice) {
 /// when there is nothing left to decode.
 fn decode(context: Context, voice: &mut Voice) -> bool {
     let valid = context.field(0, 20, 2);
+    if voice.ended && !refill() {
+        return false;
+    }
     if voice.ended {
         // The title can refill either input while the context stays enabled.
         // Flush the previous tail once and leave the ring idle until a valid
