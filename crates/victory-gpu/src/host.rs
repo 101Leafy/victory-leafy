@@ -11452,6 +11452,8 @@ impl Batch {
         self.due.clear();
         self.placed.clear();
         self.fills.clear();
+        self.forwards.clear();
+        self.kept.clear();
         self.ahead.clear();
         self.front = false;
         self.spans.clear();
