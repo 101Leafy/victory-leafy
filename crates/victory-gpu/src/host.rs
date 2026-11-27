@@ -2266,6 +2266,16 @@ fn timing() -> bool {
     *ON.get_or_init(|| crate::switch::on("VICTORY_GPU_TIMING"))
 }
 
+/// Whether every noted command is timed on the card with the submissions
+/// left as they are, summed by pipeline for the five-second report
+/// (`VICTORY_GPU_TIMES`, diagnostics builds). `VICTORY_GPU_TIMING` reads
+/// about ten times the real frame, as the card stands between its lists.
+#[cfg(feature = "diagnostics")]
+fn gpu_times() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_GPU_TIMES"))
+}
+
 /// Names a host object for the device-removed report, which names the
 /// allocations a page fault hit (only with device-removed data on), or for
 /// the frame recorder (`VICTORY_RECORD`).
@@ -7100,7 +7110,7 @@ impl HostList {
     /// The timestamp heap and its read-back buffer (diagnostics, timing on).
     #[cfg(feature = "diagnostics")]
     fn stamps(&self) -> Option<&(ID3D12QueryHeap, ID3D12Resource)> {
-        if !timing() {
+        if !timing() && !gpu_times() {
             return None;
         }
         self.stamps
@@ -7171,6 +7181,43 @@ impl HostList {
         times.sort_by(|a, b| b.0.total_cmp(&a.0));
         times.truncate(n);
         times
+    }
+
+    /// Every noted command's time on the card to the sums by pipeline, once
+    /// the list's last submission ran (`VICTORY_GPU_TIMES`). Of a list sent
+    /// twice since its reset only the last run counts, and a list closed
+    /// and never sent counts nothing: its first and last stamps are zeroed
+    /// once read.
+    #[cfg(feature = "diagnostics")]
+    fn times_taken(&self) {
+        let notes = self.notes.lock().unwrap_or_else(|e| e.into_inner());
+        let count = notes.len().min(STAMPS as usize - 1);
+        let (Some((_, back)), Some(host), 1..) = (self.stamps(), host(), count) else {
+            return;
+        };
+        let mut data = std::ptr::null_mut();
+        let range = D3D12_RANGE { Begin: 0, End: (count + 1) * 8 };
+        // SAFETY: a read-back buffer the finished list resolved into; the
+        // card writes it again only after the next close.
+        let stamps: Vec<u64> = unsafe {
+            if back.Map(0, Some(&range), Some(&mut data)).is_err() {
+                return;
+            }
+            let mapped = std::slice::from_raw_parts_mut(data.cast::<u64>(), count + 1);
+            let stamps = mapped.to_vec();
+            (mapped[0], mapped[count]) = (0, 0);
+            back.Unmap(0, Some(&range));
+            stamps
+        };
+        if stamps[0] == 0 || stamps[count] == 0 {
+            return;
+        }
+        // SAFETY: a plain query.
+        let frequency = unsafe { host.queue.GetTimestampFrequency() }.unwrap_or(1).max(1);
+        for (i, (op, _)) in notes.iter().take(count).enumerate() {
+            let ticks = stamps[i + 1].saturating_sub(stamps[i]);
+            crate::copystat::command_took(op, ticks as f64 * 1e3 / frequency as f64);
+        }
     }
 
     pub(crate) fn close(&self) {
@@ -7256,6 +7303,10 @@ impl HostList {
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.indirects.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        #[cfg(feature = "diagnostics")]
+        if gpu_times() && !timing() {
+            self.times_taken();
+        }
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
@@ -7689,7 +7740,7 @@ impl HostList {
         // A timing run stamps and keeps the texts without the markers, so
         // the sums by pipeline need no device-removed data.
         let dred = dred_on();
-        if !dred && !timing() {
+        if !dred && !timing() && !gpu_times() {
             crate::capture::op(std::ptr::from_ref(self) as usize, what);
             return;
         }
