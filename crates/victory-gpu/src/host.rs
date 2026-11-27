@@ -8618,6 +8618,13 @@ static SPLIT: [std::sync::atomic::AtomicU64; 16] = [const { std::sync::atomic::A
 #[cfg(feature = "diagnostics")]
 static FLUSHES: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
+/// Since the last frame-rate line, of the refreshes in front of submissions
+/// ([`refresh_front`]): nanoseconds sifting out those known to copy nothing
+/// (with few, or [`front_sift`]), asking the write watch ahead, and the
+/// threads' copies; and the ranges asked ahead.
+#[cfg(feature = "diagnostics")]
+static FRONT: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
 /// Counts into [`SPLIT`].
 #[cfg(feature = "diagnostics")]
 struct Split(std::cell::Cell<std::time::Instant>);
@@ -8737,6 +8744,16 @@ fn split_line(frames: f64) {
         ms[15],
         e[0],
         e[1] / 1e3,
+    );
+    let r: Vec<f64> = FRONT.iter().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+    tracing::info!(
+        "refreshes in front of submissions per frame: {:.2} ms sifting, {:.2} asking the write watch ahead over {:.0} ranges, {:.2} \
+         copying on the threads (VICTORY_FRONT_SIFT is {})",
+        r[0] / 1e6,
+        r[1] / 1e6,
+        r[3],
+        r[2] / 1e6,
+        if front_sift() { "on" } else { "off" },
     );
     tracing::info!(
         "asking about title memory per frame, all threads: {:.0} kernel askings over {:.0} MB ({:.1} ms, {:.0} pages of 4 KiB found \
@@ -8968,6 +8985,35 @@ fn ahead_of_writes() -> bool {
 fn refresh_front() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     ahead_of_writes() && (joins_asked().0 > 1 || *ON.get_or_init(|| crate::switch::on("VICTORY_REFRESH_FRONT")))
+}
+
+/// With very many refreshes in front of a submission, those known to copy
+/// nothing are sifted out on all threads before the write watch is asked
+/// ahead, as they are with few: it is asked for those left only, and the
+/// threads then share what copies. Without it the asking ahead takes all of
+/// them, and each is sifted beside the others' copies.
+fn front_sift() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_FRONT_SIFT"))
+}
+
+/// [`front_sift`]: the spans that may copy something, in their order.
+fn sift_front(spans: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>) -> Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> {
+    use std::sync::atomic::AtomicBool;
+    let spans = std::sync::Arc::new(spans);
+    let keep: std::sync::Arc<Vec<AtomicBool>> = std::sync::Arc::new((0..spans.len()).map(|_| AtomicBool::new(false)).collect());
+    let (s, k) = (spans.clone(), keep.clone());
+    crate::shadow::wide_each(spans.len(), move |i| {
+        let (shadow, from, to) = &s[i];
+        if !shadow.nothing_new(*from, *to - *from) {
+            k[i].store(true, Ordering::Relaxed);
+        }
+    });
+    let spans = std::sync::Arc::try_unwrap(spans).unwrap_or_else(|a| (*a).clone());
+    let left: Vec<_> = spans.into_iter().zip(keep.iter()).filter(|(_, k)| k.load(Ordering::Relaxed)).map(|(s, _)| s).collect();
+    #[cfg(feature = "diagnostics")]
+    FLUSHES[2].fetch_add((keep.len() - left.len()) as u64, Ordering::Relaxed);
+    left
 }
 
 /// Per copy what is refreshed in front of a submission's steps, as
@@ -9318,18 +9364,35 @@ impl Batch {
         // many: then beside the others.
         const FEW: usize = 256;
         let mut spans = spans;
-        let many = spans.len() > FEW;
+        let mut many = spans.len() > FEW;
+        #[cfg(feature = "diagnostics")]
+        let mut lap = std::time::Instant::now();
         if !many {
             #[cfg(feature = "diagnostics")]
             let all = spans.len();
             spans.retain(|(shadow, from, to)| !shadow.nothing_new(*from, *to - *from));
             #[cfg(feature = "diagnostics")]
             FLUSHES[2].fetch_add((all - spans.len()) as u64, Ordering::Relaxed);
+        } else if front_sift() {
+            spans = sift_front(spans);
+            many = false;
+        }
+        #[cfg(feature = "diagnostics")]
+        {
+            FRONT[0].fetch_add(lap.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            lap = std::time::Instant::now();
         }
         let ahead = spans.len() > 1;
         if ahead {
             let ranges: Vec<(usize, usize)> = spans.iter().filter(|r| r.0.asked_ahead()).map(|r| (r.1, r.2)).collect();
+            #[cfg(feature = "diagnostics")]
+            FRONT[3].fetch_add(ranges.len() as u64, Ordering::Relaxed);
             crate::watch::ask_ahead(&ranges);
+        }
+        #[cfg(feature = "diagnostics")]
+        {
+            FRONT[1].fetch_add(lap.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            lap = std::time::Instant::now();
         }
         #[cfg(feature = "diagnostics")]
         FLUSHES[3].fetch_add(spans.len() as u64, Ordering::Relaxed);
@@ -9347,6 +9410,8 @@ impl Batch {
             }
             Self::update(shadow, *from, *to);
         });
+        #[cfg(feature = "diagnostics")]
+        FRONT[2].fetch_add(lap.elapsed().as_nanos() as u64, Ordering::Relaxed);
         if ahead {
             crate::watch::ask_ahead_done();
         }
