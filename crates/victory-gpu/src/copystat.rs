@@ -1251,6 +1251,20 @@ fn log_memory() {
             sides[8],
             mb(sides[9])
         );
+        let w = crate::shadow::windows_by_use();
+        tracing::info!(
+            "windows outside buffers by use (idle: no draw for 10 s, no list or slot): on the card {} in use {:.0} MB, {} idle {:.0} MB; in the PC's memory {} in use {:.0} MB, {} idle {:.0} MB; turned away from the card since the start {} {:.0} MB (VICTORY_CARD_WINDOWS_IDLE_MS lets idle ones on the card go sooner)",
+            w[0],
+            mb(w[1]),
+            w[2],
+            mb(w[3]),
+            w[4],
+            mb(w[5]),
+            w[6],
+            mb(w[7]),
+            w[8],
+            mb(w[9])
+        );
     }
     tracing::info!(
         "memory let go since the start: {} windows outside buffers {:.0} MB, {} staging buffers \
