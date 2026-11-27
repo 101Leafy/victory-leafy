@@ -882,6 +882,9 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
         crate::book::root(gpu, len);
         return Some(gpu);
     }
+    if let Some((_, gpu)) = list.place_constant(address as usize, len as usize) {
+        return Some(gpu);
+    }
     list.fill_scratch(address as *const u8, len)
 }
 
@@ -4547,6 +4550,10 @@ impl State {
                             cbv[1] += aligned;
                             cbv[2] += u64::from(size);
                             cbv[3] += aligned * u64::from(size);
+                        }
+                        if let Some((buffer, gpu)) = list.place_constant(address as usize, size as usize) {
+                            host.constant_at(index, &buffer, gpu, size);
+                            continue;
                         }
                         let Some((buffer, gpu, to)) = list.scratch_held(u64::from(size)) else {
                             host.make_null(index);
