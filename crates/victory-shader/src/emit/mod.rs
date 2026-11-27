@@ -133,7 +133,7 @@ pub use rect::rect_list_gs;
 pub use shader::{
     mesh_payload_bytes,
     LAUNCH_SPACE, MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
-    SLOT_STRIDES_COUNT, USER_DATA_SPACE, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, USER_DISPATCH_THREADS_X, USER_GROUP_BASE_X, USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
+    SLOT_STRIDES_COUNT, SLOT_TABLE_STRIDES, USER_DATA_SPACE, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, USER_DISPATCH_THREADS_X, USER_GROUP_BASE_X, USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
     constants_raw, raw_views, set_raw_views, set_view_heap_limit, view_heap_limit,
 };
 
@@ -274,8 +274,44 @@ pub fn guard_runs() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_GUARD_RUNS").is_none_or(|v| v != "0"))
 }
 
+/// Whether a d16 typed access through a view in the program's tables reads
+/// the view's word from the table of strides (root SRV `SLOT_TABLE_STRIDES`)
+/// and passes integer bits for an integer format (`VICTORY_TABLE_STRIDES=1`,
+/// codec_d's; off, such views are taken as floats, as before). The dynamic
+/// slots write their words only then. Part of the translation: the shader
+/// cache keys on it.
+pub fn table_strides() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_TABLE_STRIDES.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TABLE_STRIDES").is_some_and(|v| v == "1"))
+}
+
+/// Whether a descriptor read under an EXEC guard is traced only from the
+/// lanes the guard keeps, so lanes that branch over the arm building it do
+/// not make two values at the join (`VICTORY_GUARDED_DESCRIPTORS=1`, codec_d's
+/// tracer; off, every lane that reaches the block counts, as before). Part
+/// of the translation: the shader cache keys on it.
+pub fn guarded_descriptors() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_GUARDED_DESCRIPTORS.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_GUARDED_DESCRIPTORS").is_some_and(|v| v == "1"))
+}
+
+#[cfg(test)]
+pub(crate) fn test_guarded_descriptors(on: Option<bool>) {
+    TEST_GUARDED_DESCRIPTORS.set(on);
+}
+
 #[cfg(test)]
 thread_local! {
+    static TEST_GUARDED_DESCRIPTORS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    static TEST_TABLE_STRIDES: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
     static TEST_GUARD_FLOAT: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
     static TEST_GUARD_RUNS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
@@ -525,6 +561,27 @@ fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
     emit(&c, &native, &p, &st, &io, &res)
 }
 
+/// codec_d's Wave32 lowering (`VICTORY_WAVE32_LOWERING=1`): a scalar spilled
+/// to a constant VGPR lane and read back in the same block taken from the
+/// scalar, a `ds_read_b32` at a uniform address uniform where group barriers
+/// order shared memory, the SCC of a mask operation read as "some lane", and
+/// an active-lane loop the driver compiles (`s_andn2_wrexec_b64` latch) taken
+/// by the whole wave. Part of the translation: the shader cache keys on it.
+pub fn wave32_lowering() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_WAVE32_LOWERING").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// Whether a `v_readlane_b32` or `v_writelane_b32` with an input or output
+/// modifier, or a constant lane past the wave's width, is left as it is
+/// instead of followed as a spilled scalar (`VICTORY_LANE_SPILL_STRICT=1`,
+/// codec_d's fix; off, every constant lane is followed, as before). Part of
+/// the translation: the shader cache keys on it.
+pub fn lane_spill_strict() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_LANE_SPILL_STRICT").is_ok_and(|v| v.trim() == "1"))
+}
+
 thread_local! {
     /// Wave-wide branches for the program being translated on this thread
     /// ([`with_wave_wide`]), with `VICTORY_WAVE_WIDE` unset.
@@ -555,10 +612,15 @@ pub fn wave_wide_only(hash: &str) -> bool {
 /// Runs `f` (a translation on this thread) with the wave-wide form on when `on`
 /// ([`wave_wide_only`]).
 pub fn with_wave_wide<T>(on: bool, f: impl FnOnce() -> T) -> T {
-    let before = WIDE_HERE.replace(on);
-    let r = f();
-    WIDE_HERE.set(before);
-    r
+    // restored on a panic too: a worker that catches it translates the next shader here
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            WIDE_HERE.set(self.0);
+        }
+    }
+    let _restore = Restore(WIDE_HERE.replace(on));
+    f()
 }
 
 
@@ -784,7 +846,7 @@ fn emit_forms(
         let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1") || WIDE_HERE.get();
         if !splits.is_empty() && (!halves || wide_on) {
             let why = std::env::var_os("VICTORY_WAVE_WHY").is_some();
-            match widen(c, native, p, &splits, why) {
+            match widen(c, native, p, &splits, why, false) {
                 Ok((shader, wave)) if !(halves && wave == Some(64)) => {
                     if why {
                         eprintln!("SCALAR-SPLITS {} branches taken wave-wide", splits.len());
@@ -870,6 +932,15 @@ fn emit_forms(
         // (`ptfx_CS_lightAtlas_Sprite` and `_Trail`). The 32-lane programs' form below, which
         // has no barrier, stays on.
         let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1") || WIDE_HERE.get();
+        // A single guest wave can iterate an active-lane loop until both host
+        // halves have finished. The precise latch and convergence conditions
+        // for the driver compute route are checked by widen().
+        let driver_loop = wave32_lowering()
+            && std::env::var_os("VICTORY_WAVE_WIDE").is_none()
+            && c.part(FourCC::DXIL).is_none()
+            && c.part(FourCC::ACCC).is_some()
+            && matches!(&original, Err(ShaderError::Unsupported { what, .. })
+                if *what == lower::DIVERGENT_MASK_EXCHANGE);
         // Where an approximate form below translates the program, the paired form
         // ([`paired`]) is tried first: it runs each console wave as one host wave and gives
         // what the console's 64 lanes compute, at no barrier but the entry's; the approximate
@@ -915,7 +986,7 @@ fn emit_forms(
                 // Still stopped where not every lane runs: the per-lane branches around
                 // those places taken as the console takes them, by the whole wave at once
                 // ([`widen`]), at two group barriers per such branch.
-                if wide_on {
+                if wide_on || driver_loop {
                     let bases = [
                         deep.as_ref().map(|f| &f.0),
                         forms[1].1.as_ref().map(|f| &f.0),
@@ -923,7 +994,7 @@ fn emit_forms(
                         Some(p),
                     ];
                     if let Some(base) = bases.into_iter().flatten().next() {
-                        let again = widen(c, native, base, &[], why);
+                        let again = widen(c, native, base, &[], why, driver_loop && !wide_on);
                         report("wave-wide branches", &again);
                         if done(&again) {
                             return again;
@@ -985,7 +1056,7 @@ fn emit_forms(
                 && what == lower::LANE_MASK
                 && std::env::var_os("VICTORY_WAVE_WIDE").is_none_or(|v| v != "0") =>
         {
-            let again = widen(c, native, p, &[], std::env::var_os("VICTORY_WAVE_WHY").is_some());
+            let again = widen(c, native, p, &[], std::env::var_os("VICTORY_WAVE_WHY").is_some(), false);
             match again {
                 Ok(_) => again,
                 Err(_) => emit_program(c, native, p, st, io, res),
@@ -1079,6 +1150,7 @@ fn widen(
     p: &ir::Program,
     seed: &[usize],
     why: bool,
+    active_loop_only: bool,
 ) -> Result<(HostShader, Option<u32>), ShaderError> {
     const NOT: ShaderError = ShaderError::Unsupported {
         offset: 0,
@@ -1145,6 +1217,30 @@ fn widen(
                 offset: 0,
                 what: "a barrier where not every lane runs, and no branch left to widen",
             });
+        }
+        if active_loop_only {
+            // Only a single backward branch on the SCC just set by
+            // s_andn2_wrexec_b64. This instruction restricts EXEC to the
+            // unfinished lanes. The guest repeats the loop if *either*
+            // half still has work, while individual vector writes retain
+            // their EXEC predicates.
+            let [latch] = more.as_slice() else {
+                return r;
+            };
+            let block = &p.blocks[*latch];
+            let [.., update, branch] = block.insts.as_slice() else {
+                return r;
+            };
+            if !wide.is_empty()
+                || update.name() != "s_andn2_wrexec_b64"
+                || branch.name() != "s_cbranch_scc1"
+                || !matches!(
+                    block.exit,
+                    ir::Exit::Branch { taken, not_taken } if taken <= *latch && not_taken > *latch
+                )
+            {
+                return r;
+            }
         }
         wide.extend(more);
     }

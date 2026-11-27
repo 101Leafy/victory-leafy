@@ -59,6 +59,11 @@ pub(crate) struct Host {
     /// The adapter the device is on, for its memory budget
     /// ([`Host::video_memory`]); `None` if the system does not name it.
     adapter: Option<IDXGIAdapter3>,
+    /// Heaps of one null view and one sampler, bound where a list has no
+    /// heap of that kind: root signatures that index the heaps directly
+    /// need both set ([`Host::fallback_view_heap`]).
+    fallback_view: OnceLock<Option<ID3D12DescriptorHeap>>,
+    fallback_sampler: OnceLock<Option<ID3D12DescriptorHeap>>,
 }
 
 // SAFETY: D3D12 devices, queues, fences and descriptor heaps are
@@ -691,6 +696,20 @@ fn bury_lag() -> u64 {
     *LAG.get_or_init(|| std::env::var("VICTORY_BURY_LAG").ok().and_then(|v| v.parse().ok()).unwrap_or(64))
 }
 
+/// Whether a flight's lists give their dynamic descriptor slots back when
+/// it lands, as a submission that is waited for does
+/// ([`crate::list::tables_done`]), and not when the lists are reset
+/// [`bury_lag`] landings later (`VICTORY_TABLES_AT_LANDING=1`; off, then, as
+/// before). Held
+/// for 64 landings, the binocular zoom ran the slots out with 4,200 to
+/// 4,600 asks a frame refused and a third of its draws gone (codec_d,
+/// pareto-residency f4b48ad76). The card has read the slots by then; the
+/// objects they name still wait for the bury.
+pub(crate) fn tables_at_landing() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_TABLES_AT_LANDING").is_ok_and(|v| v.trim() == "1"))
+}
+
 /// Drops what waited for submissions up to `finished` ([`bury_lag`]). The
 /// numbers come in order, but for threads that overtake each other: one of
 /// those is dropped a little later than it could be.
@@ -1270,6 +1289,8 @@ fn create() -> windows::core::Result<Host> {
             next_rtv: AtomicU32::new(0),
             presenter: Mutex::new(None),
             adapter,
+            fallback_view: OnceLock::new(),
+            fallback_sampler: OnceLock::new(),
         })
     }
 }
@@ -5779,6 +5800,8 @@ impl Host {
                     // pass: a wait between each copy and its pass had the
                     // card do them one after the other.
                     let mut sent = Vec::new();
+                    // A buffer twice in `dirty` is moved out of COPY_DEST once.
+                    let mut transitioned = Vec::new();
                     if let Some(own) = &own {
                         own.record(self, list, &dirty, |shadow| looks.as_ref().is_some_and(|l| l.hold(shadow)));
                     }
@@ -5797,11 +5820,15 @@ impl Host {
                         #[cfg(feature = "diagnostics")]
                         traffic::moved(traffic::UP, shadow.span(), ranges.iter().copied());
                         if own.is_none() && before.is_some() && !ranges.is_empty() {
-                            sent.push(transition(
-                                &shadow.buffer,
-                                D3D12_RESOURCE_STATE_COPY_DEST,
-                                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-                            ));
+                            let raw = shadow.buffer.as_raw();
+                            if !transitioned.contains(&raw) {
+                                transitioned.push(raw);
+                                sent.push(transition(
+                                    &shadow.buffer,
+                                    D3D12_RESOURCE_STATE_COPY_DEST,
+                                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                ));
+                            }
                         }
                     }
                     if !sent.is_empty() {
@@ -6794,7 +6821,7 @@ impl Host {
         let mut telling = std::time::Instant::now();
         for item in items {
             telling = match item {
-                Late::Run(flight) => {
+                Late::Run(mut flight) => {
                     last = flight.number;
                     for &i in &flight.order {
                         read_backs(flight.lists[i].host());
@@ -6806,6 +6833,11 @@ impl Host {
                         own.landed();
                     }
                     let mut lists = flight.lists;
+                    if tables_at_landing() {
+                        for list in &mut lists {
+                            list.release_tables();
+                        }
+                    }
                     crate::list::tables_early(&mut lists);
                     landed.push((lists, flight.order));
                     crate::land::spent(crate::land::stat::READ_BACKS, telling)
@@ -7308,7 +7340,7 @@ impl Host {
             let mut landed = Vec::new();
             for item in items {
                 match item {
-                    Late::Run(flight) => {
+                    Late::Run(mut flight) => {
                         last = flight.number;
                         for &i in &flight.order {
                             read_backs(flight.lists[i].host());
@@ -7317,6 +7349,11 @@ impl Host {
                             self.card_done(card);
                         }
                         let mut lists = flight.lists;
+                        if tables_at_landing() {
+                            for list in &mut lists {
+                                list.release_tables();
+                            }
+                        }
                         crate::list::tables_early(&mut lists);
                         landed.push((lists, flight.order));
                     }
@@ -11860,6 +11897,66 @@ pub(crate) fn legal_for(flags: u32, state: u32) -> u32 {
 }
 
 impl Host {
+    /// A shader-visible view heap of one null buffer view, for lists that
+    /// set no view heap (codec_d, pareto-residency e05d4633a).
+    pub(crate) fn fallback_view_heap(&self) -> Option<&ID3D12DescriptorHeap> {
+        self.fallback_view
+            .get_or_init(|| {
+                // SAFETY: a heap of one descriptor and a null view in it.
+                unsafe {
+                    let heap: ID3D12DescriptorHeap = self
+                        .device
+                        .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                            Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                            NumDescriptors: 1,
+                            Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                            NodeMask: 0,
+                        })
+                        .ok()?;
+                    let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                        Format: DXGI_FORMAT_R32_UINT,
+                        ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+                        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                        Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 { Buffer: D3D12_BUFFER_SRV::default() },
+                    };
+                    self.device.CreateShaderResourceView(None, Some(&desc), heap.GetCPUDescriptorHandleForHeapStart());
+                    Some(heap)
+                }
+            })
+            .as_ref()
+    }
+
+    /// A shader-visible sampler heap of one point sampler, for lists that
+    /// set no sampler heap.
+    pub(crate) fn fallback_sampler_heap(&self) -> Option<&ID3D12DescriptorHeap> {
+        self.fallback_sampler
+            .get_or_init(|| {
+                // SAFETY: a heap of one descriptor and a sampler in it.
+                unsafe {
+                    let heap: ID3D12DescriptorHeap = self
+                        .device
+                        .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                            Type: D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER,
+                            NumDescriptors: 1,
+                            Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                            NodeMask: 0,
+                        })
+                        .ok()?;
+                    let desc = D3D12_SAMPLER_DESC {
+                        Filter: D3D12_FILTER_MIN_MAG_MIP_POINT,
+                        AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+                        AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+                        AddressW: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+                        MaxLOD: f32::MAX,
+                        ..Default::default()
+                    };
+                    self.device.CreateSampler(&desc, heap.GetCPUDescriptorHandleForHeapStart());
+                    Some(heap)
+                }
+            })
+            .as_ref()
+    }
+
     /// The card's memory as the system accounts it to this process, in
     /// bytes: the budget and the use of the card's own memory, then of the
     /// PC's memory shared with the card (where the system moves what does

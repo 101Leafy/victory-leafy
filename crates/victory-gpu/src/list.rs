@@ -233,6 +233,13 @@ impl Detached {
     pub(crate) fn host(&self) -> &crate::host::HostList {
         &self.host
     }
+
+    /// Its submission has run: the dynamic slots of its tables go back now,
+    /// not when it is reset after the bury lag
+    /// ([`crate::host::tables_at_landing`]).
+    pub(crate) fn release_tables(&mut self) {
+        self._state.tables_done();
+    }
 }
 
 /// A host list that has run and waits to be used again, and the bytes of

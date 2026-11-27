@@ -170,6 +170,22 @@ fn bake_exact() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_BAKE_EXACT").is_none_or(|v| v != "0"))
 }
 
+/// Whether a list that set no view heap or no sampler heap gets one of ours
+/// of a single descriptor (`VICTORY_FALLBACK_HEAPS=1`; off, only the title's
+/// heaps are set, as before).
+fn fallback_heaps() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FALLBACK_HEAPS").is_some_and(|v| v == "1"))
+}
+
+/// Whether the heap buffer pass runs for each heap of a frame and each list
+/// keeps every heap's stride table (`VICTORY_HEAP_PASS_EACH=1`, codec_d
+/// 18bdf7932; off, once a frame and once a list, as before).
+fn heap_pass_each() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_PASS_EACH").is_some_and(|v| v == "1"))
+}
+
 /// Whether a texture found changed with nothing to tell of it is looked at
 /// again in the next frame (`VICTORY_RECHECK_SOON=0`: after four, as
 /// before).
@@ -223,7 +239,7 @@ struct BakeSync {
 /// `PS_BakeDecorations_*`), by the first 16 hex digits of their hash as the
 /// frame listings print it. They draw into a 256x256 corner of 2048x2048
 /// targets and name no texture in a table.
-const BAKE_PIXEL_SHADERS: [&str; 4] =
+pub(crate) const BAKE_PIXEL_SHADERS: [&str; 4] =
     ["c0a7fe77b1862e10", "0d1575a396dfe513", "b7cfd8dda91ebb6b", "280967ad158cee0b"];
 
 /// [`BAKE_PIXEL_SHADERS`] and more of them, with [`bake_sync`].
@@ -483,6 +499,8 @@ pub(crate) struct State {
     /// Graphics, compute.
     host_roots: [usize; 2],
     host_heaps: [usize; 2],
+    /// Whether the host list has heaps set (a fallback one among them).
+    host_heaps_set: bool,
     /// Tables made afresh in this list: (table, slot count, contents) → first
     /// dynamic slot.
     fresh_tables: std::collections::HashMap<(u64, u32, u64), FreshTable, std::hash::BuildHasherDefault<crate::host::AddressHash>>,
@@ -1597,6 +1615,7 @@ impl State {
         self.host_pipeline = 0;
         self.host_roots = [0; 2];
         self.host_heaps = [0; 2];
+        self.host_heaps_set = false;
         self.fresh_tables.clear();
         if self.topology_set {
             self.set_topology(list, self.topology);
@@ -1926,19 +1945,32 @@ impl State {
             self.heaps[0] = heap;
         }
         // Heaps first: a root signature with directly indexed heaps must be
-        // set after them.
-        if self.host_heaps != self.heaps {
-            let heaps: Vec<Option<ID3D12DescriptorHeap>> = self
-                .heaps
-                .iter()
-                .filter(|&&h| h != 0)
-                .filter_map(|&h| crate::descriptor::heap(h as This).host())
-                .map(|h| Some(h.heap.clone()))
-                .collect();
+        // set after them, and needs a view heap and a sampler heap both: one
+        // the title set none of is one of ours of a single descriptor, with
+        // VICTORY_FALLBACK_HEAPS=1 (codec_d, pareto-residency e05d4633a).
+        let fallback = fallback_heaps();
+        if (fallback && !self.host_heaps_set) || self.host_heaps != self.heaps {
+            let mut views = None;
+            let mut samplers = None;
+            for &h in self.heaps.iter().filter(|&&h| h != 0) {
+                let heap = crate::descriptor::heap(h as This);
+                if let Some(host) = heap.host() {
+                    *(if heap.samplers() { &mut samplers } else { &mut views }) = Some(host.heap.clone());
+                }
+            }
+            if fallback {
+                let host = crate::host::host();
+                views = views.or_else(|| host.and_then(|h| h.fallback_view_heap().cloned()));
+                samplers = samplers.or_else(|| host.and_then(|h| h.fallback_sampler_heap().cloned()));
+            }
+            let heaps: Vec<Option<ID3D12DescriptorHeap>> = [views, samplers].into_iter().filter(Option::is_some).collect();
             heaps.iter().flatten().for_each(|h| list.keep(h));
-            // SAFETY: an open list and shader-visible heaps.
-            unsafe { l.SetDescriptorHeaps(&heaps) };
+            if !heaps.is_empty() || !fallback {
+                // SAFETY: an open list and shader-visible heaps.
+                unsafe { l.SetDescriptorHeaps(&heaps) };
+            }
             self.host_heaps = self.heaps;
+            self.host_heaps_set = true;
             self.host_roots = [0; 2];
         }
         // The depth target a draw only tests, for the views of it that the
@@ -2104,6 +2136,15 @@ impl State {
                             (true, true) => l.SetComputeRootShaderResourceView(param, gpu),
                         }
                     };
+                    if srv && slot == victory_shader::emit::SLOT_TABLE_STRIDES {
+                        // Ours: the words of views in the shader's tables,
+                        // which `tables` has made ready; no heap pass.
+                        match self.heap_strides(list) {
+                            Some(gpu) => bind(gpu),
+                            None => once!("a shader reads the words of table views without a view heap set"),
+                        }
+                        continue;
+                    }
                     let tabled = srv && crate::pipeline::host::bounded_root_srvs();
                     let Some(&Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
                     else {
@@ -2432,6 +2473,27 @@ impl State {
     /// writes through a picked unordered access view stays in the host
     /// copy. A list refreshes them where it first runs such a shader;
     /// title writes recorded later in the same list are not seen.
+    /// The table of strides of the view heap that is set, kept by `list`,
+    /// without the heap pass of [`State::heap_buffers`]: for a shader that
+    /// reads the words of the views its tables name (codec_d f4b48ad76).
+    fn heap_strides(&self, list: &HostList) -> Option<u64> {
+        let heap = self
+            .heaps
+            .iter()
+            .filter(|&&h| h != 0)
+            .map(|&h| crate::descriptor::heap(h as This))
+            .find(|h| !h.samplers())?;
+        let host = heap.host()?;
+        let gpu = host.strides_gpu()?;
+        // Bit 1: neither a title address nor `heap_buffers`'s key.
+        if list.first_use(gpu as usize | 2)
+            && let Some(buffer) = host.strides_buffer()
+        {
+            list.keep(buffer);
+        }
+        Some(gpu)
+    }
+
     fn heap_buffers(&self, list: &HostList) -> Option<u64> {
         let heap = self
             .heaps
@@ -2441,9 +2503,12 @@ impl State {
             .find(|h| !h.samplers())?;
         let host = heap.host()?;
         let gpu = host.strides_gpu()?;
-        // One key per list, as textures have: no title resource is there.
+        // One key per list and table (bit 0: no title address), so that a
+        // list that runs such shaders with two heaps keeps both tables
+        // (codec_d 18bdf7932); one per list without heap_pass_each().
         const ONCE: usize = usize::MAX - 0x5e;
-        if !list.first_use(ONCE) {
+        let each = heap_pass_each();
+        if !list.first_use(if each { gpu as usize | 1 } else { ONCE }) {
             return Some(gpu);
         }
         // The list may outlive the title's heap object, which owns the table.
@@ -2455,9 +2520,11 @@ impl State {
         // frame (2026-11-24, run 11).
         // shortcut: what the title writes into such buffers between lists
         // of one frame is seen a frame late.
+        // Per heap: a second heap of the frame had no pass (codec_d 18bdf7932).
         static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
         let frame = crate::frame::current();
-        if FRAME.swap(frame, Ordering::Relaxed) == frame {
+        let last = if each { &host.buffer_frame } else { &FRAME };
+        if last.swap(frame, Ordering::Relaxed) == frame {
             return Some(gpu);
         }
         let started = std::time::Instant::now();
@@ -2465,9 +2532,13 @@ impl State {
         if crate::host::aside::on() {
             let at = std::ptr::from_ref(heap) as usize;
             list.refreshes_coming(move || {
-                crate::descriptor::with_heap(at, |heap| heap.host().map(|host| heap_buffer_pass(heap, host, frame)))
-                    .flatten()
-                    .unwrap_or_default()
+                // Not a heap made at the same address since: its table is
+                // another than the one the list keeps (codec_d 18bdf7932).
+                crate::descriptor::with_heap(at, |heap| {
+                    heap.host().filter(|h| h.strides_gpu() == Some(gpu)).map(|host| heap_buffer_pass(heap, host, frame))
+                })
+                .flatten()
+                .unwrap_or_default()
             });
         } else {
             for (shadow, from, to) in heap_buffer_pass(heap, host, frame) {

@@ -350,6 +350,8 @@ impl Pools {
     }
 }
 pub(crate) struct HostHeap {
+    /// The frame of its last heap pass ([`crate::draw`]'s `heap_buffers`).
+    pub(crate) buffer_frame: std::sync::atomic::AtomicU64,
     pub(crate) heap: ID3D12DescriptorHeap,
     /// Which heap this is, never given to another: what its flips
     /// ([`FLIPS`]) are filed under. Its address was not enough: a heap made
@@ -1518,6 +1520,12 @@ pub(crate) fn device_removed() -> Option<String> {
 pub(crate) static PLACED_TEXTURE_SLOTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub(crate) static OBJECT_TEXTURE_SLOTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// The word the table of strides holds for `view`: [`view_stride`] and
+/// [`view_kind`].
+fn view_stride_word(view: &View) -> u32 {
+    view_stride(view).unwrap_or(0) | view_kind(view)
+}
+
 /// Bytes per element of a buffer view, as the console's descriptor holds
 /// them for indexed reads (structured: the stride; raw: 1, the index is the
 /// byte; typed: the format's); `None` if `view` is not a buffer view.
@@ -2001,6 +2009,7 @@ impl HostHeap {
             })
             .flatten();
         let h = HostHeap {
+            buffer_frame: std::sync::atomic::AtomicU64::new(u64::MAX),
             heap,
             id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             cpu,
@@ -3070,6 +3079,9 @@ impl HostHeap {
         }
         self.put(index);
         self.clear_twin(index);
+        if victory_shader::emit::table_strides() {
+            self.write_stride(index, 0);
+        }
         self.keep(index, None);
     }
 
@@ -3273,13 +3285,7 @@ impl HostHeap {
         }
         let stride = view.and_then(view_stride);
         let kind = view.map_or(0, view_kind);
-        if let Some((_, _, data)) = &self.strides
-            && index < victory_shader::emit::SLOT_STRIDES_COUNT
-        {
-            // SAFETY: inside the mapping; shaders read it while we write (a
-            // dword, either value is one the slot had).
-            unsafe { (*data as *mut u32).add(index as usize).write_volatile(stride.unwrap_or(0) | kind) };
-        }
+        self.write_stride(index, stride.unwrap_or(0) | kind);
         let was = if stride.is_some() {
             self.buffers.put(index);
             true
@@ -3295,6 +3301,26 @@ impl HostHeap {
             }
         }
         stale
+    }
+
+    /// Writes `word` for slot `index` in the table of strides.
+    fn write_stride(&self, index: u32, word: u32) {
+        if let Some((_, _, data)) = &self.strides
+            && index < victory_shader::emit::SLOT_STRIDES_COUNT
+        {
+            // SAFETY: inside the mapping; shaders read it while we write (a
+            // dword, either value is one the slot had).
+            unsafe { (*data as *mut u32).add(index as usize).write_volatile(word) };
+        }
+    }
+
+    /// [`HostHeap::write_stride`] for a dynamic slot, which a shader reads
+    /// through its tables (`victory_shader::emit::SLOT_TABLE_STRIDES`); the
+    /// title's own slots have theirs from [`HostHeap::note_buffer`].
+    fn dynamic_stride(&self, index: u32, word: u32) {
+        if index >= self.count && victory_shader::emit::table_strides() {
+            self.write_stride(index, word);
+        }
     }
 
     /// Gives back `n` dynamic slots from `first` (an index [`dynamic`]
@@ -3327,6 +3353,7 @@ impl HostHeap {
         }
         self.put(index);
         self.twin_made(index, kept.is_some() && twinned(view));
+        self.dynamic_stride(index, if kept.is_some() { view_stride_word(view) } else { 0 });
         self.keep(index, kept.flatten());
     }
 
@@ -3359,13 +3386,14 @@ impl HostHeap {
                 }
                 let twin = twinned(&view);
                 let kept = make_twinned(&view, views.slot(at), Some(views.slot(at + 1)))?;
+                let stride = view_stride_word(&view);
                 let listed = Listed {
                     kind: crate::draw::view_kind(&view),
                     texture: is_texture_view(&view),
                     ready: (0, 0, false),
                     tabled: None,
                 };
-                views.made.insert(words, ListView { view, at, twin, kept, listed });
+                views.made.insert(words, ListView { view, at, twin, stride, kept, listed });
             }
             let made = &views.made[&words];
             self.copy_from(index, views.slot(made.at));
@@ -3375,6 +3403,7 @@ impl HostHeap {
             } else {
                 self.clear_twin(index);
             }
+            self.dynamic_stride(index, made.stride);
             self.keep(index, made.kept.clone());
             Some(made.listed)
         })
@@ -3399,6 +3428,7 @@ impl HostHeap {
         } else {
             null_view(self.at(index));
             self.put(index);
+            self.dynamic_stride(index, 0);
         }
         self.clear_twin(index);
         self.keep(index, None);
@@ -3523,6 +3553,7 @@ impl HostHeap {
         self.put(index);
         // (Bound by its handle, not read by index.)
         self.clear_twin(index);
+        self.dynamic_stride(index, 1);
         self.keep(index, Some(buffer.clone()));
     }
 
@@ -3532,6 +3563,7 @@ impl HostHeap {
         null_buffer_view(self.at(index));
         self.put(index);
         self.clear_twin(index);
+        self.dynamic_stride(index, 0);
         self.keep(index, None);
     }
 
@@ -3566,6 +3598,7 @@ impl HostHeap {
         };
         self.put(index);
         self.clear_twin(index);
+        self.dynamic_stride(index, 1);
         self.keep(index, Some(buffer.clone()));
     }
 
@@ -3595,6 +3628,7 @@ impl HostHeap {
         };
         self.put(index);
         self.clear_twin(index);
+        self.dynamic_stride(index, 0);
         self.keep(index, None);
     }
 
@@ -3654,6 +3688,7 @@ impl HostHeap {
         self.twin_made(index, twin.is_some());
         // After the descriptor: what it showed is let go when nothing shows
         // it any more.
+        self.dynamic_stride(index, 0);
         self.keep(index, holds.then(|| buffer.clone()));
     }
 
@@ -6818,6 +6853,75 @@ mod tests {
         assert_eq!(pools.give(8, 16), 16);
         assert_eq!(pools.free(), 63);
     }
+
+
+    #[test]
+    fn dynamic_slots_populate_and_clear_stride_table() {
+        use victory_shader::emit::{VIEW_INTEGER, VIEW_SIGNED};
+        if !victory_shader::emit::table_strides() {
+            return; // dynamic slots have strides only with VICTORY_TABLE_STRIDES=1
+        }
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return; // no host GPU
+        };
+        let Some((_, _, data)) = heap.strides else {
+            panic!("view heap should allocate strides table");
+        };
+        let read_stride = |slot: u32| -> u32 {
+            // SAFETY: inside `SLOT_STRIDES_COUNT` mapping of `heap.strides`.
+            unsafe { *(data as *const u32).add(slot as usize) }
+        };
+        let memory = vec![0u64; 1 << 11];
+        let addr = (memory.as_ptr() as u64).next_multiple_of(4096);
+        let placed_typed = |uav: bool, dxgi_fmt: u32, elems: u32| {
+            let resource: [u32; 14] = [1, 0, 0, 0, 4096, 0, 1, 1 | 1 << 16, 0, 1, 0, 1, 0, 0];
+            let mut desc = [0u32; 16];
+            // [format, dim=1 (buffer), mapping/pad, ..., num_elements @6, stride @7, flags @8]
+            let words = if uav {
+                [dxgi_fmt, 1, 0, 0, elems, 0, 0, 0, 0, 0]
+            } else {
+                [dxgi_fmt, 1, 5768, 0, 0, 0, elems, 0, 0, 0]
+            };
+            desc[..10].copy_from_slice(&words);
+            (desc[10], desc[11]) = (addr as u32, (addr >> 32) as u32);
+            View::Placed(uav, resource, desc)
+        };
+
+        let s0 = heap.dynamic(4).unwrap();
+        // R16G16B16A16_UINT (12): 8 bytes + VIEW_INTEGER
+        let u16x4 = placed_typed(true, 12, 64);
+        heap.make_at(s0, &u16x4);
+        assert_eq!(read_stride(s0), 8 | VIEW_INTEGER);
+
+        // R16_SINT (59): 2 bytes + VIEW_INTEGER | VIEW_SIGNED
+        let s16 = placed_typed(false, 59, 64);
+        heap.make_at(s0 + 1, &s16);
+        assert_eq!(read_stride(s0 + 1), 2 | VIEW_INTEGER | VIEW_SIGNED);
+
+        // R16G16B16A16_FLOAT (10): 8 bytes, no integer bits
+        let f16x4 = placed_typed(true, 10, 64);
+        heap.make_at(s0 + 2, &f16x4);
+        assert_eq!(read_stride(s0 + 2), 8);
+
+        // Clearing / nulling / raw views overwrite stale bits cleanly.
+        heap.make_null(s0);
+        assert_eq!(read_stride(s0), 0);
+        heap.null_raw_at(s0 + 1);
+        assert_eq!(read_stride(s0 + 1), 0);
+        heap.null_raw_uav_at(s0 + 2);
+        assert_eq!(read_stride(s0 + 2), 0);
+
+        // `make_listed` (both cold creation and cached copy hit) must populate strides.
+        let mut slot_mem = [0u32; 8];
+        crate::descriptor::record(slot_mem.as_mut_ptr() as u64, u16x4);
+        let rec = [slot_mem[0], slot_mem[1], slot_mem[2]];
+        assert!(heap.make_listed(0x1234, rec, s0).is_some());
+        assert_eq!(read_stride(s0), 8 | VIEW_INTEGER);
+        heap.make_null(s0 + 3);
+        assert_eq!(read_stride(s0 + 3), 0);
+        assert!(heap.make_listed(0x1234, rec, s0 + 3).is_some());
+        assert_eq!(read_stride(s0 + 3), 8 | VIEW_INTEGER);
+    }
 }
 
 /// What is known of a record a list's tables hold, in that recording of the
@@ -6838,6 +6942,8 @@ struct ListView {
     /// Its descriptor's slot in [`ListViews`]; its raw twin's is the next.
     at: u32,
     twin: bool,
+    /// Its word in the table of strides ([`view_stride_word`]).
+    stride: u32,
     kept: Kept,
     listed: Listed,
 }

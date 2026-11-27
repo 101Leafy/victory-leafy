@@ -42,7 +42,34 @@ static SPARES: AtomicUsize = AtomicUsize::new(SPARE);
 /// [`SPARE_KEPT`] below 85 % ([`crate::host::keep_freed`]), else [`SPARE`].
 /// Asked once a second.
 pub(crate) fn room(memory: Option<[u64; 4]>) {
-    SPARES.store(spares(memory, crate::host::keep_freed()), Ordering::Relaxed);
+    let limit = spares(memory, crate::host::keep_freed());
+    SPARES.store(limit, Ordering::Relaxed);
+    if !reclaim_on_tick() {
+        return;
+    }
+    // A full pool can become idle while another subsystem needs the VRAM.
+    // A busy allocator observes the new limit on its next allocation or tick.
+    let tick = now();
+    if let Ok(mut pool) = TEXTURES.try_lock() {
+        pool.reclaim(tick, limit, true);
+    }
+    if let Ok(mut pool) = STAGING.try_lock() {
+        pool.reclaim(tick, limit, true);
+    }
+}
+
+/// Whether the once a second check also lets go of the empty blocks past the
+/// limit, not only the next allocation. `VICTORY_POOL_RECLAIM=1`.
+fn reclaim_on_tick() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_POOL_RECLAIM").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// Whether a pool whose block was refused waits 500 ms before asking for
+/// another (`VICTORY_POOL_BACKOFF=1`; off, every miss asks again, as before).
+fn backoff() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_POOL_BACKOFF").map_or(cfg!(test), |v| v.trim() == "1"))
 }
 
 fn spares(memory: Option<[u64; 4]>, keep: bool) -> usize {
@@ -194,6 +221,8 @@ struct Pool<B> {
     /// The empty blocks it was last told to keep, and the most it keeps.
     spare: usize,
     most: usize,
+    /// No block is made before this, after one was refused.
+    retry_growth_at: u64,
     /// Blocks let go so far.
     #[cfg_attr(not(any(test, feature = "diagnostics")), allow(dead_code))]
     let_go: u64,
@@ -201,7 +230,7 @@ struct Pool<B> {
 
 impl<B: Clone> Pool<B> {
     const fn new(most: usize) -> Pool<B> {
-        Pool { blocks: Vec::new(), resting: VecDeque::new(), spare: 0, most, let_go: 0 }
+        Pool { blocks: Vec::new(), resting: VecDeque::new(), spare: 0, most, retry_growth_at: 0, let_go: 0 }
     }
 
     /// A piece of `len` bytes and the memory it lies in, and whether that
@@ -256,10 +285,13 @@ impl<B: Clone> Pool<B> {
             unripe.sort_unstable();
             found = unripe.into_iter().find_map(|(_, i)| Some((i, self.blocks[i].as_mut()?.free.take(len, align)?)));
         }
+        // A failed 64 MiB block must not trigger another driver call for each
+        // small texture. Existing free ranges remain usable during backoff.
         let (i, start) = match found {
             Some(found) => found,
             None => {
-                let i = self.add(make()?, ripe.started);
+                let memory = self.grow(now, &mut make)?;
+                let i = self.add(memory, ripe.started);
                 (i, self.blocks[i].as_mut()?.free.take(len, align)?)
             }
         };
@@ -272,7 +304,7 @@ impl<B: Clone> Pool<B> {
             }
             let empty = self.blocks.iter().flatten().filter(|b| b.free.whole(BLOCK)).count();
             if empty < ripe.ahead
-                && let Some(memory) = make()
+                && let Some(memory) = self.grow(now, &mut make)
             {
                 self.add(memory, ripe.started);
             }
@@ -282,6 +314,20 @@ impl<B: Clone> Pool<B> {
         block.used_to = block.used_to.max(start + len);
         block.taken += len;
         Some((Piece { block: i, start, len }, block.memory.clone(), again))
+    }
+
+    fn grow(&mut self, now: u64, make: &mut impl FnMut() -> Option<B>) -> Option<B> {
+        if !backoff() {
+            return make();
+        }
+        if now < self.retry_growth_at {
+            return None;
+        }
+        let block = make();
+        if block.is_none() {
+            self.retry_growth_at = now.saturating_add(500);
+        }
+        block
     }
 
     fn add(&mut self, memory: B, made: u64) -> usize {
@@ -304,6 +350,10 @@ impl<B: Clone> Pool<B> {
     /// Makes the pieces that rested long enough free, and lets go of empty
     /// blocks past [`SPARE`].
     fn rested(&mut self, now: u64) {
+        self.reclaim(now, SPARES.load(Ordering::Relaxed), false);
+    }
+
+    fn reclaim(&mut self, now: u64, limit: usize, sweep: bool) {
         let mut any = false;
         while let Some(&(ready, piece)) = self.resting.front()
             && ready <= now
@@ -316,8 +366,8 @@ impl<B: Clone> Pool<B> {
             }
         }
         // (Without a piece given back too, once there is less room.)
-        let most = SPARES.load(Ordering::Relaxed).min(self.most);
-        if any || most < self.spare {
+        let most = limit.min(self.most);
+        if sweep || any || most < self.spare {
             self.spare = most;
             let mut spare = 0;
             for block in &mut self.blocks {
@@ -612,6 +662,43 @@ mod tests {
         assert_eq!(spares(Some([100, 85, 0, 0]), true), SPARE);
         assert_eq!(spares(Some([100, 10, 0, 0]), false), SPARE);
         assert_eq!(spares(None, true), SPARE);
+    }
+
+    #[test]
+    fn a_failed_block_is_not_retried_for_each_small_upload() {
+        let mut pool: Pool<u32> = Pool::new(2);
+        let calls = std::cell::Cell::new(0);
+        let refuse = || {
+            calls.set(calls.get() + 1);
+            None
+        };
+        for size in [704008, 179720, 179720, 24080, 48648, 524288, 89616, 351760] {
+            assert!(pool.take(size, 512, 12, refuse).is_none());
+        }
+        assert_eq!(calls.get(), 1);
+        assert!(pool.take(24080, 512, 1012, || Some(1)).is_some());
+    }
+
+    #[test]
+    fn budget_tick_reclaims_idle_blocks_without_reusing_live_or_resting_pieces() {
+        let mut pool = Pool::new(STAGING_KEPT);
+        let (held, _, _) = pool.take(BLOCK / 2, 1, 0, || Some(1)).unwrap();
+        let (resting, _, _) = pool.take(BLOCK / 2, 1, 0, || Some(2)).unwrap();
+        pool.give(resting, 0);
+        for i in 0..12 {
+            pool.add(i, 0);
+        }
+        pool.reclaim(0, SPARE_KEPT, true);
+        assert_eq!(pool.blocks(), STAGING_KEPT + 1);
+        pool.reclaim(REST - 1, SPARE, true);
+        assert_eq!(pool.blocks(), SPARE + 1);
+        assert_eq!(pool.resting.len(), 1);
+        pool.reclaim(REST, 0, true);
+        assert_eq!(pool.blocks(), 1);
+        assert!(pool.resting.is_empty());
+        pool.give(held, REST);
+        pool.reclaim(2 * REST, 0, true);
+        assert_eq!(pool.blocks(), 0);
     }
 
     #[test]
