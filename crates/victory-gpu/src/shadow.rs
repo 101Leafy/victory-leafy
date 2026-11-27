@@ -2208,15 +2208,22 @@ fn wide(jobs: Vec<Job>) {
         return;
     }
     let _wide = crate::timeline::span("work spread over threads");
-    drop(Beside(Some(queued(jobs))));
+    drop(Beside(Some(queued(jobs, 1))));
 }
 
 /// Jobs left of those [`queued`] put on the kept threads' queue.
 type Left = Arc<(Mutex<usize>, std::sync::Condvar)>;
 
-/// Puts `jobs` on the kept threads' queue and wakes them.
-fn queued(jobs: Vec<Job>) -> Left {
+/// Puts `jobs` on the kept threads' queue and wakes as many of them as
+/// there are jobs beyond the `own` this thread takes first.
+fn queued(jobs: Vec<Job>, own: usize) -> Left {
     let workers = workers();
+    // Helpers woken: one for each job beyond those this thread takes
+    // first, at most all of them. All were woken for every call (4 for 2
+    // jobs), and those that found nothing went back to sleep; a helper busy
+    // meanwhile looks at the queue before it sleeps again, and this thread
+    // takes what nobody took.
+    let wake = jobs.len().saturating_sub(own).min(wide_threads());
     let left = Arc::new((Mutex::new(jobs.len()), std::sync::Condvar::new()));
     {
         let mut queue = workers.jobs.lock().unwrap_or_else(|e| e.into_inner());
@@ -2233,7 +2240,11 @@ fn queued(jobs: Vec<Job>) -> Left {
             }));
         }
     }
-    workers.more.notify_all();
+    if wake >= wide_threads() {
+        workers.more.notify_all();
+    } else {
+        (0..wake).for_each(|_| workers.more.notify_one());
+    }
     left
 }
 
@@ -2277,7 +2288,7 @@ pub(crate) fn copy_beside(copies: Vec<(usize, usize, usize)>) -> Beside {
     if copies.is_empty() {
         return Beside(None);
     }
-    Beside(Some(queued(copy_jobs(copies, WIDE_JOB))))
+    Beside(Some(queued(copy_jobs(copies, WIDE_JOB), 0)))
 }
 
 /// [`wide`], for the host's own work on host copies (a submission's

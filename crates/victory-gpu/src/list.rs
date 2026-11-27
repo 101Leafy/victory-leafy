@@ -180,9 +180,19 @@ pub(crate) fn tables_done(lists: &[This]) {
     }
 }
 
-/// The host list behind a title list, if there is a host GPU.
+/// The host list behind a title list, if there is a host GPU, for a call
+/// that may record into it: counted as a title call
+/// ([`crate::host::HostList::title_call`]).
 #[cfg(windows)]
 pub(crate) fn host_list<'a>(this: This) -> Option<&'a crate::host::HostList> {
+    let list = host_list_quiet(this)?;
+    list.title_call();
+    Some(list)
+}
+
+/// As [`host_list`], not counted as a title call: for the title's reset.
+#[cfg(windows)]
+fn host_list_quiet<'a>(this: This) -> Option<&'a crate::host::HostList> {
     if this.is_null() {
         return None;
     }
@@ -480,8 +490,8 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
                 continue;
             };
             // A new host list is open; the title's next call on its list is a
-            // reset, which wants it closed.
-            fresh.close();
+            // reset, which finds it so (or wants it closed).
+            fresh.leave_open();
             Some(fresh)
         };
         // SAFETY: one of our lists, closed and submitted: nothing records
@@ -490,6 +500,8 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
         let Some(host) = std::mem::replace(&mut list.host, spare) else {
             continue;
         };
+        // (Submitted again without a reset: it runs closed, empty.)
+        host.close_if_left_open();
         let earlier = std::mem::take(&mut list.earlier);
         let gate = std::mem::take(&mut list.gate);
         let uploads = std::mem::take(&mut *list.uploads.lock().unwrap_or_else(|e| e.into_inner()));
@@ -557,8 +569,8 @@ pub(crate) fn detach(lists: &[This]) -> (Vec<Detached>, Vec<usize>) {
                 continue;
             };
             // A new host list is open; the title's next call on its list is a
-            // reset, which wants it closed.
-            fresh.close();
+            // reset, which finds it so (or wants it closed).
+            fresh.leave_open();
             Some(fresh)
         };
         let list = this.cast_mut().cast::<List>();
@@ -568,6 +580,8 @@ pub(crate) fn detach(lists: &[This]) -> (Vec<Detached>, Vec<usize>) {
             let Some(host) = std::mem::replace(&mut (*list).host, spare) else {
                 continue;
             };
+            // (Submitted again without a reset: it runs closed, empty.)
+            host.close_if_left_open();
             let uploads =
                 std::mem::take(&mut *(*list).uploads.lock().unwrap_or_else(|e| e.into_inner()));
             let state =
@@ -776,11 +790,19 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
             list.host = Some(fresh);
         }
     }
+    // Not counted as a title call: the reset finds a host list left open
+    // as it was (`crate::host::HostList::leave_open`).
     #[cfg(windows)]
-    with_state(this, |host, state| {
+    if let Some(host) = host_list_quiet(this) {
+        #[cfg(feature = "diagnostics")]
+        let started = std::time::Instant::now();
+        // SAFETY: the title passes one of our lists.
+        let state = unsafe { &(*this.cast::<List>()).state };
         host.reset();
-        state.reset(pipeline);
-    });
+        state.lock().unwrap_or_else(|e| e.into_inner()).reset(pipeline);
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::recorded(started);
+    }
     crate::pipeline::bound(pipeline);
     #[cfg(not(windows))]
     let _ = this;
@@ -1763,6 +1785,7 @@ extern "system" fn begin_query(this: This, heap: This, kind: u32, index: u32) {
     let Some(recording) = list.host.as_ref() else {
         return;
     };
+    recording.title_call();
     recording.keep(&host);
     // SAFETY: an open list and our query heap.
     unsafe { recording.list.BeginQuery(&host, r#type, index) };
@@ -1788,6 +1811,7 @@ extern "system" fn end_query(this: This, heap: This, kind: u32, index: u32) {
     let Some(recording) = list.host.as_ref() else {
         return;
     };
+    recording.title_call();
     if r#type != D3D12_QUERY_TYPE_TIMESTAMP {
         let Some(at) = list.open_queries.iter().position(|&(h, _, i)| h == heap as usize && i == index) else {
             return;

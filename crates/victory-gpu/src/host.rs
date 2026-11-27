@@ -1134,6 +1134,67 @@ fn thread_times() -> (u64, u64) {
     (ms(user), ms(kernel))
 }
 
+/// The adapter to make the device on: the one `VICTORY_ADAPTER` names (a
+/// case-insensitive substring of its description), else the one DXGI ranks
+/// for high performance. On a hybrid laptop the default adapter is the
+/// integrated GPU, and the title runs there at about a frame a second.
+fn host_adapter() -> Option<IDXGIAdapter> {
+    // SAFETY: plain DXGI enumeration with valid out parameters.
+    unsafe {
+        let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
+        if let Ok(wanted) = std::env::var("VICTORY_ADAPTER") {
+            let mut index = 0;
+            while let Ok(a) = factory.EnumAdapters1(index) {
+                // `EnumAdapters1` lists the software adapter too; it stays
+                // behind `VICTORY_D3D12_WARP`, whose path checks that DXGI
+                // names it as software, so a name that matches it here is not
+                // taken.
+                if let Ok(desc) = a.GetDesc1()
+                    && desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0
+                    && names_adapter(&adapter_name(&desc), &wanted)
+                {
+                    let name = adapter_name(&desc);
+                    tracing::info!(adapter = %name, "host adapter (VICTORY_ADAPTER)");
+                    return a.cast().ok();
+                }
+                index += 1;
+            }
+            if !wanted.trim().is_empty() {
+                tracing::warn!(
+                    wanted = %wanted,
+                    "VICTORY_ADAPTER names no adapter; taking the high-performance one"
+                );
+            }
+        }
+        let high = factory
+            .cast::<IDXGIFactory6>()
+            .and_then(|f| {
+                f.EnumAdapterByGpuPreference::<IDXGIAdapter1>(0, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE)
+            })
+            .ok()?;
+        let name = adapter_name(&high.GetDesc1().ok()?);
+        tracing::info!(adapter = %name, "host adapter");
+        high.cast().ok()
+    }
+}
+
+/// An adapter's description without its NUL padding.
+fn adapter_name(desc: &DXGI_ADAPTER_DESC1) -> String {
+    let len = desc
+        .Description
+        .iter()
+        .position(|&c| c == 0)
+        .unwrap_or(desc.Description.len());
+    String::from_utf16_lossy(&desc.Description[..len])
+}
+
+/// Whether `wanted` names `adapter`: a case-insensitive substring of its
+/// description, ignoring surrounding spaces. An empty `wanted` names none.
+fn names_adapter(adapter: &str, wanted: &str) -> bool {
+    let wanted = wanted.trim();
+    !wanted.is_empty() && adapter.to_lowercase().contains(&wanted.to_lowercase())
+}
+
 fn create() -> windows::core::Result<Host> {
     let started = std::time::Instant::now();
     // SAFETY: plain D3D12 object creation with valid descriptions.
@@ -1193,8 +1254,17 @@ fn create() -> windows::core::Result<Host> {
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");
         } else {
+            let adapter = host_adapter();
             let driver = std::time::Instant::now();
-            D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            match adapter {
+                Some(adapter) => D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?,
+                None => {
+                    // The one thing this patch exists to stop: a device made
+                    // on whichever adapter DXGI defaults to, unannounced.
+                    tracing::warn!("no adapter enumerated; the device is made on the default one");
+                    D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?
+                }
+            }
             tracing::info!(ms = driver.elapsed().as_millis() as u64, "D3D12CreateDevice done");
             // Whether a GPU hang ends the run or freezes the PC (#1054).
             crate::tdr::log();
@@ -1882,6 +1952,12 @@ pub(crate) struct HostList {
     /// depends on ([`HostList::changed_something`]); no two lists have the
     /// same.
     epoch: std::sync::atomic::AtomicU64,
+    /// The title calls that may record into the list ([`HostList::title_call`]).
+    title_calls: std::sync::atomic::AtomicU64,
+    /// Left open and empty, as made or reset, for the title's next reset
+    /// ([`HostList::leave_open`]): that reset finds nothing to undo. The
+    /// list's title calls and epoch then, each plus one (0: not left open).
+    left_open: [std::sync::atomic::AtomicU64; 2],
     /// Counts the list in [`ALIVE`] while it lives.
     _alive: Counted,
     /// The texts of the markers `note_op` set, in order (for device-removed
@@ -1947,6 +2023,31 @@ impl<T> Preludes<T> {
                 *n = number;
             }
         }
+    }
+}
+
+/// Whether the new host list each of the title's lists gets when it is
+/// submitted is left open for the title's next reset ([`HostList::leave_open`];
+/// `VICTORY_FRESH_OPEN=0`: closed at once and reset again, as before). What
+/// runs on the card is the same: those lists are empty either way.
+fn fresh_open() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FRESH_OPEN").is_none_or(|v| v != "0"))
+}
+
+/// Since the last frame line: host lists left open ([`fresh_open`]), the
+/// title's resets that found one so and did nothing to it, and those closed
+/// after all (submitted again without a reset, or recorded into before it).
+static FRESH_OPEN: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// [`FRESH_OPEN`], for the frame-rate line.
+fn fresh_open_line(frames: f64) {
+    let [open, kept, closed] = [0, 1, 2].map(|i| FRESH_OPEN[i].swap(0, Ordering::Relaxed) as f64 / frames);
+    if open + kept + closed > 0.0 {
+        tracing::info!(
+            "new host lists for the title's lists left open per frame (VICTORY_FRESH_OPEN=0: closed at once): {open:.1}, \
+             {kept:.1} resets of the title found them so and had nothing to undo, {closed:.2} closed after all"
+        );
     }
 }
 
@@ -5760,6 +5861,8 @@ impl Host {
                 batch_args: Mutex::default(),
                 coming: Mutex::default(),
                 epoch: std::sync::atomic::AtomicU64::new(next_epoch()),
+                title_calls: std::sync::atomic::AtomicU64::new(0),
+                left_open: [const { std::sync::atomic::AtomicU64::new(0) }; 2],
                 _alive: Counted::new(),
                 #[cfg(feature = "diagnostics")]
                 notes,
@@ -8496,6 +8599,7 @@ impl HostList {
 
     pub(crate) fn close(&self) {
         let _closing = crate::timeline::span("closing a host list");
+        self.left_open[0].store(0, Ordering::Release);
         let mut lap = Lap::begin();
         // Each step of the close is timed as a command of its own
         // (`VICTORY_GPU_TIMES`), not summed into "closing list".
@@ -8584,9 +8688,61 @@ impl HostList {
             .splice(at..at, found.into_iter().map(|(shadow, from, to)| Step::Refresh(shadow, from as usize, (to - from) as usize)));
     }
 
+    /// A new host list for one of the title's lists (`crate::list::detach`),
+    /// open and empty as it was made or reset: left so, for the title's next
+    /// call on its list, a reset, which then has nothing to undo
+    /// ([`fresh_open`]); or closed now, as before.
+    ///
+    /// Each of the title's lists got a new host list at every submission,
+    /// closed at once on the submitting thread (an empty list's close, some
+    /// 5 us in the driver, 200 a frame) and reset again by the title's reset
+    /// (allocator and list) after the reset that made it ready for reuse.
+    pub(crate) fn leave_open(&self) {
+        if !fresh_open() {
+            self.close();
+            return;
+        }
+        // (The marks first: a reset that sees the list left open sees them.)
+        self.left_open[1].store(self.epoch() + 1, Ordering::Relaxed);
+        self.left_open[0].store(self.title_calls() + 1, Ordering::Release);
+        FRESH_OPEN[0].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A host list taken from one of the title's lists to run
+    /// (`crate::list::detach`): closed first if it was left open
+    /// ([`HostList::leave_open`]), as it is when the title submits its list
+    /// again without a reset.
+    pub(crate) fn close_if_left_open(&self) {
+        if self.left_open[0].load(Ordering::Acquire) != 0 {
+            FRESH_OPEN[2].fetch_add(1, Ordering::Relaxed);
+            self.close();
+        }
+    }
+
+    /// Whether the list is as [`HostList::leave_open`] left it: nothing was
+    /// recorded into it since, as far as its title calls and its epoch say.
+    /// It is no longer marked so; one left open that something was recorded
+    /// into is closed here, for the reset that follows.
+    fn still_left_open(&self) -> bool {
+        let calls = self.left_open[0].swap(0, Ordering::AcqRel);
+        let epoch = self.left_open[1].swap(0, Ordering::Relaxed);
+        if calls == 0 {
+            return false;
+        }
+        if calls == self.title_calls() + 1 && epoch == self.epoch() + 1 {
+            return true;
+        }
+        FRESH_OPEN[2].fetch_add(1, Ordering::Relaxed);
+        // SAFETY: our list, open; what went into it goes with the reset.
+        let _ = unsafe { self.list.Close() };
+        false
+    }
+
     /// Only after the list's last submission finished (every one is waited
     /// for).
     pub(crate) fn reset(&self) {
+        // Before the epoch moves on below.
+        let left_open = self.still_left_open();
         self.changed_something();
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
@@ -8628,14 +8784,20 @@ impl HostList {
             let mut readbacks = self.readbacks.lock().unwrap_or_else(|e| e.into_inner());
             (readbacks.current, readbacks.used) = (0, 0);
         }
-        // SAFETY: the list is not executing.
-        let reset = unsafe {
-            self.allocator
-                .Reset()
-                .and_then(|()| self.list.Reset(&self.allocator, None))
-        };
-        if let Err(e) = reset {
-            fail(format_args!("a host command list did not reset ({e})"));
+        // Open and empty since it was made or last reset: the allocator holds
+        // nothing, the list nothing recorded (`HostList::leave_open`).
+        if left_open {
+            FRESH_OPEN[1].fetch_add(1, Ordering::Relaxed);
+        } else {
+            // SAFETY: the list is not executing.
+            let reset = unsafe {
+                self.allocator
+                    .Reset()
+                    .and_then(|()| self.list.Reset(&self.allocator, None))
+            };
+            if let Err(e) = reset {
+                fail(format_args!("a host command list did not reset ({e})"));
+            }
         }
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::ResetNs, started.elapsed().as_nanos() as u64);
@@ -8651,6 +8813,16 @@ impl HostList {
     /// See [`HostList::changed_something`].
     pub(crate) fn epoch(&self) -> u64 {
         self.epoch.load(Ordering::Relaxed)
+    }
+
+    /// A title call that may record into the list (`crate::list::host_list`).
+    pub(crate) fn title_call(&self) {
+        self.title_calls.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The title calls recorded into the list so far.
+    pub(crate) fn title_calls(&self) -> u64 {
+        self.title_calls.load(Ordering::Relaxed)
     }
 
     /// Whether steps or texture state changes were recorded since the list
@@ -11742,6 +11914,7 @@ impl Meter {
         #[cfg(feature = "diagnostics")]
         spans::line(frames);
         crate::shadow::back_line(frames);
+        fresh_open_line(frames);
         #[cfg(feature = "diagnostics")]
         split_line(frames);
         {
