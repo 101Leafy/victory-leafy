@@ -521,6 +521,9 @@ struct Lower<'a> {
     /// The program tests rays against tree nodes (`image_bvh*`): its loops
     /// are cut at [`TRACE_LOOP_LIMIT`].
     traces: bool,
+    /// Back edges per entry of the loops whose count the code fixes
+    /// (`super::trips`), by IR header: their limit is that count.
+    trips: HashMap<usize, u32>,
     /// The block a loop stopped by [`LOOP_LIMIT`] leaves the program from.
     abort: Option<usize>,
     /// The loops closed by a plain jump that test the limit at their own exits instead.
@@ -582,6 +585,17 @@ pub(super) const LOOP_LIMIT: u32 = 1 << 20;
 /// runs of the opening of the gameplay, RTX 5090); a ray stopped either way
 /// leaves the program as killed, as before.
 pub(super) const TRACE_LOOP_LIMIT: u32 = 1 << 10;
+
+/// A loop's iteration limit: the stage's, or for a loop whose count the
+/// code fixes (`trips` back edges per entry) just above that count, so the
+/// loop runs to its end. A limit named by `VICTORY_SHADER_LOOP_LIMIT` is
+/// kept as named.
+pub(super) fn counted_limit(stage: u32, switch: u32, trips: Option<u32>) -> u32 {
+    match trips {
+        Some(n) if switch == LOOP_LIMIT => stage.max(n.saturating_add(1)),
+        _ => stage,
+    }
+}
 
 /// Lane masks read as numbers (`s_bcnt1`, `s_ff1`, `v_mbcnt`, scalar
 /// compares, bit tests) are ballots of the lanes' booleans, taken where the
@@ -2661,6 +2675,7 @@ impl<'a> Lower<'a> {
             edges: HashMap::new(),
             exported: vec![false; p.blocks.len()],
             rpo: vec![usize::MAX; p.blocks.len()],
+            trips: HashMap::new(),
             tail: vec![None; p.blocks.len()],
             writes_uavs,
             src0: None,
@@ -3492,6 +3507,7 @@ impl<'a> Lower<'a> {
                 self.s.m.new_block()
             });
         }
+        self.trips = super::trips::trips(p, &self.rpo);
         // Loop headers count iterations (`LOOP_LIMIT`).
         for &b in &order {
             let header = p.blocks[b]
@@ -4409,9 +4425,14 @@ impl<'a> Lower<'a> {
         let c = self.cur;
         let (i32t, res) = (self.s.t.i32, self.s.t.res_ret);
         let k = |l: &mut Self, v: u32| l.s.m.i32(v);
-        let (k16, k8) = (k(self, 16), k(self, 0xFF));
+        let (k16, max_hi) = (k(self, 16), k(self, MEMORY_PAGES >> 16));
         let low = self.s.m.bin(c, Bin::LShr, lo, k16);
-        let high = self.s.m.bin(c, Bin::And, hi, k8);
+        // Clamp `hi` before shifting so addresses at or above 2^40 (1 TiB,
+        // e.g. `hi = 0x100`) never wrap back into mapped pages below 128 GiB.
+        let high = self
+            .s
+            .op(c, "binary.i32", Attr::ReadNone, i32t, 40, &[hi, max_hi]);
+        self.s.m.tag(high, Tag::Clamp);
         let high = self.s.m.bin(c, Bin::Shl, high, k16);
         let page = self.s.m.bin(c, Bin::Or, low, high);
         // Inside the directory whatever the address (lanes that do not run
@@ -6370,7 +6391,7 @@ impl<'a> Lower<'a> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
         };
-        if v.clamp || v.omod != 0 {
+        if v.omod != 0 {
             return Err("integer output modifiers");
         }
         match v.dst {
@@ -9813,7 +9834,12 @@ impl<'a> Lower<'a> {
         let f = |l: &mut Self, k| l.fsrc(inst, k);
         let s = |l: &mut Self, k| l.src(inst, k);
         let float = |l: &mut Self, r: V| l.write_f(inst, r, guard);
-        let int = |l: &mut Self, r: V| l.write_i(inst, r, guard);
+        let int = |l: &mut Self, r: V| {
+            if v.clamp {
+                return Err("integer output modifiers");
+            }
+            l.write_i(inst, r, guard)
+        };
         if let Some(r) = self.valu16(inst, name, guard) {
             return r;
         }
@@ -10542,8 +10568,13 @@ impl<'a> Lower<'a> {
                 } else {
                     None
                 };
-                let (r, carry) = self.add_sub_carry(c, name.starts_with("v_add"), a, bb, cin);
-                int(self, r)?;
+                let add = name.starts_with("v_add");
+                let (mut r, carry) = self.add_sub_carry(c, add, a, bb, cin);
+                if v.clamp {
+                    let limit = self.s.m.i32(if add { u32::MAX } else { 0 });
+                    r = self.s.m.select(c, carry, limit, r);
+                }
+                self.write_i(inst, r, guard)?;
                 if let Some(Operand::Scalar { code, .. }) = v.carry
                     && let Some(w) = inst.write(Reg::S(code))
                 {
@@ -10630,6 +10661,23 @@ impl<'a> Lower<'a> {
                     self.s.m.select(c, active, read, fallback)
                 };
                 int(self, r)
+            }
+            "v_add_nc_u32" | "v_sub_nc_u32" | "v_subrev_nc_u32" | "v_add3_u32" if v.clamp => {
+                let add = name.starts_with("v_add");
+                let (mut a, mut b) = (s(self, 0)?, s(self, 1)?);
+                if name == "v_subrev_nc_u32" {
+                    std::mem::swap(&mut a, &mut b);
+                }
+                let (mut r, mut overflow) = self.add_sub_carry(c, add, a, b, None);
+                if name == "v_add3_u32" {
+                    let d = s(self, 2)?;
+                    let (sum, carry) = self.add_sub_carry(c, true, r, d, None);
+                    r = sum;
+                    overflow = self.s.m.bin(c, Bin::Or, overflow, carry);
+                }
+                let limit = self.s.m.i32(if add { u32::MAX } else { 0 });
+                let r = self.s.m.select(c, overflow, limit, r);
+                self.write_i(inst, r, guard)
             }
             "v_readlane_b32" => {
                 let (a, lane) = (s(self, 0)?, s(self, 1)?);
@@ -10785,7 +10833,11 @@ impl<'a> Lower<'a> {
             }
             _ => {
                 let r = self.integer(inst, name)?;
-                int(self, r)
+                if matches!(name, "v_add_nc_i32" | "v_sub_nc_i32") {
+                    self.write_i(inst, r, guard)
+                } else {
+                    int(self, r)
+                }
             }
         }
     }
@@ -10987,6 +11039,8 @@ impl<'a> Lower<'a> {
         const INT: &[&str] = &[
             "v_add_nc_u16",
             "v_sub_nc_u16",
+            "v_add_nc_i16",
+            "v_sub_nc_i16",
             "v_subrev_nc_u16",
             "v_mul_lo_u16",
             "v_lshlrev_b16",
@@ -11204,8 +11258,9 @@ impl<'a> Lower<'a> {
             let r = self.cvt_norm16(inst, name == "v_cvt_norm_i16_f16")?;
             return self.write_half(inst, r, guard);
         }
-        // 16-bit integers: computed on the low halves, the low 16 bits kept.
-        if v.clamp || v.omod != 0 || v.abs != 0 || v.neg != 0 {
+        // 16-bit integer results keep the low 16 bits after any saturation.
+        let signed_add_sub = matches!(name, "v_add_nc_i16" | "v_sub_nc_i16");
+        if (v.clamp && !signed_add_sub) || v.omod != 0 || v.abs != 0 || v.neg != 0 {
             return Err("modifiers on a 16-bit integer operation");
         }
         let r = {
@@ -11223,6 +11278,30 @@ impl<'a> Lower<'a> {
             match name {
                 "v_add_nc_u16" => self.s.m.bin(c, Bin::Add, a, b),
                 "v_sub_nc_u16" => self.s.m.bin(c, Bin::Sub, a, b),
+                "v_add_nc_i16" | "v_sub_nc_i16" => {
+                    let op = if name == "v_add_nc_i16" {
+                        Bin::Add
+                    } else {
+                        Bin::Sub
+                    };
+                    let r = self.s.m.bin(c, op, a, b);
+                    if v.clamp {
+                        // The selects pick 16-bit patterns, never a clamped i32: NVIDIA
+                        // drivers fold a clamped i32 into a saturating 16-bit add whose
+                        // sign-extended result then drops write_half's 0xFFFF mask.
+                        let lo = self.s.m.i32(i32::from(i16::MIN) as u32);
+                        let hi = self.s.m.i32(i16::MAX as u32);
+                        let mask = self.s.m.i32(0xFFFF);
+                        let low = self.s.m.bin(c, Bin::And, r, mask);
+                        let below = self.s.m.cmp(c, pred::SLT, r, lo);
+                        let min = self.s.m.i32(0x8000);
+                        let x = self.s.m.select(c, below, min, low);
+                        let above = self.s.m.cmp(c, pred::SGT, r, hi);
+                        self.s.m.select(c, above, hi, x)
+                    } else {
+                        r
+                    }
+                }
                 "v_subrev_nc_u16" => self.s.m.bin(c, Bin::Sub, b, a),
                 "v_mul_lo_u16" => self.s.m.bin(c, Bin::Mul, a, b),
                 "v_lshlrev_b16" | "v_lshrrev_b16" | "v_ashrrev_i16" => {
@@ -11560,6 +11639,29 @@ impl<'a> Lower<'a> {
                     _ => (Bin::Mul, a, b),
                 };
                 self.s.m.bin(c, op, a, b)
+            }
+            "v_add_nc_i32" | "v_sub_nc_i32" => {
+                let Fields::Valu(v) = &inst.fields else {
+                    unreachable!()
+                };
+                let (a, b) = (s(self, 0)?, s(self, 1)?);
+                let add = name == "v_add_nc_i32";
+                let r = self.s.m.bin(c, if add { Bin::Add } else { Bin::Sub }, a, b);
+                if v.clamp {
+                    // Overflow changes the sign of a with equal operand signs
+                    // for addition, or opposite operand signs for subtraction.
+                    let ar = self.s.m.bin(c, Bin::Xor, a, r);
+                    let other = self.s.m.bin(c, Bin::Xor, b, if add { r } else { a });
+                    let bits = self.s.m.bin(c, Bin::And, ar, other);
+                    let zero = k(self, 0);
+                    let overflow = self.s.m.cmp(c, pred::SLT, bits, zero);
+                    let negative = self.s.m.cmp(c, pred::SLT, a, zero);
+                    let (lo, hi) = (k(self, i32::MIN as u32), k(self, i32::MAX as u32));
+                    let limit = self.s.m.select(c, negative, lo, hi);
+                    self.s.m.select(c, overflow, limit, r)
+                } else {
+                    r
+                }
             }
             "v_xnor_b32" => {
                 let (a, b) = (s(self, 0)?, s(self, 1)?);
@@ -14395,7 +14497,7 @@ impl<'a> Lower<'a> {
                 // (`LimitExits`).
                 for h in self.limit.tests.get(&b).cloned().unwrap_or_default() {
                     let Some(&(count, _)) = self.counters.get(&h) else { continue };
-                    let last = self.s.m.i32(self.iteration_limit() - 1);
+                    let last = self.s.m.i32(self.iteration_limit(h) - 1);
                     cond = if self.limit.bodies[&h].contains(&taken) {
                         let under = self.s.m.cmp(self.cur, pred::IULT, count, last);
                         self.s.m.tag(under, Tag::Counter);
@@ -14452,7 +14554,7 @@ impl<'a> Lower<'a> {
     /// [`LOOP_LIMIT`] by `p` (below: go on; at or above: stop).
     fn count_iteration(&mut self, to: usize, p: u8) -> V {
         let next = self.next_iteration(to);
-        let limit = self.s.m.i32(self.iteration_limit());
+        let limit = self.s.m.i32(self.iteration_limit(to));
         let over = self.s.m.cmp(self.cur, p, next, limit);
         self.s.m.tag(over, Tag::Counter);
         over
@@ -14475,7 +14577,7 @@ impl<'a> Lower<'a> {
     }
 
     /// The iterations a lane makes of a loop it entered before it is taken out of it.
-    fn iteration_limit(&self) -> u32 {
+    fn iteration_limit(&self, to: usize) -> u32 {
         // Per stage unless the switch names one: a loop that never meets its
         // exit (a count read from a buffer the host has not got yet, say)
         // runs to the limit in every lane. A million iterations a pixel
@@ -14487,13 +14589,14 @@ impl<'a> Lower<'a> {
         // 14-25 frames in, in a minimap or shadow mesh draw; with every
         // loop cut at 64 it ran 90 frames. Raise them again once shaders
         // stop reading data that is not there yet.)
-        match super::loop_limit() {
+        let stage = match super::loop_limit() {
             LOOP_LIMIT if self.s.pixel => 1 << 7,
             LOOP_LIMIT if self.s.mesh.is_some() || self.s.threads.is_none() => 1 << 8,
             LOOP_LIMIT if self.traces => TRACE_LOOP_LIMIT,
             LOOP_LIMIT => 1 << 12,
             named => named,
-        }
+        };
+        counted_limit(stage, super::loop_limit(), self.trips.get(&to).copied())
     }
 
     /// The block a lane stopped by [`LOOP_LIMIT`] leaves through.

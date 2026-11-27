@@ -267,6 +267,101 @@ fn run_cases_on(
     }
 }
 
+fn assert_no_int64(shader: &HostShader) {
+    let container = crate::Container::parse(&shader.dxil).unwrap();
+    let features = container.part(crate::FourCC::SFI0).unwrap();
+    let features = u64::from_le_bytes(features.data.try_into().unwrap());
+    assert_eq!(
+        features & 0x8000,
+        0,
+        "signed no-carry arithmetic requires INT64"
+    );
+}
+
+#[test]
+fn v_add_sub_nc_i32_wrap_and_saturate() {
+    for (op, add) in [(0x37f, true), (0x376, false)] {
+        let inputs = [
+            [20, -3, 0, 0],
+            [-20, -3, 0, 0],
+            [i32::MAX, if add { 1 } else { -1 }, 0, 0],
+            [i32::MIN, if add { -1 } else { 1 }, 0, 0],
+            [i32::MIN, if add { i32::MAX } else { i32::MIN }, 0, 0],
+            [i32::MAX, 0, 0, 0],
+            [i32::MIN, 0, 0, 0],
+        ]
+        .map(|input| input.map(|x| x as u32));
+        for clamp in [false, true] {
+            let mut body = vop3(op, 0, vgpr(1), vgpr(2), 0);
+            body[0] |= u32::from(clamp) << 15;
+            let shader = build_valu_cs(&body);
+            assert_no_int64(&shader);
+            run_cases(&shader, &inputs, |backend, i, [a, b, ..], got| {
+                let (a, b) = (a as i32, b as i32);
+                let want = match (add, clamp) {
+                    (true, false) => a.wrapping_add(b),
+                    (true, true) => a.saturating_add(b),
+                    (false, false) => a.wrapping_sub(b),
+                    (false, true) => a.saturating_sub(b),
+                };
+                assert_eq!(
+                    got, want as u32,
+                    "{backend}: VOP3 {op:#x}, clamp {clamp}, case {i}"
+                );
+            });
+        }
+    }
+}
+
+#[test]
+fn v_add_sub_nc_i16_wrap_and_saturate_with_op_sel() {
+    let old = 0xA5A5_5A5A;
+    for (op, add) in [(0x30d, true), (0x30e, false)] {
+        let operands = [
+            (20, -3),
+            (-20, -3),
+            (i16::MAX, if add { 1 } else { -1 }),
+            (i16::MIN, if add { -1 } else { 1 }),
+            (i16::MAX, 0),
+            (i16::MIN, 0),
+        ];
+        for opsel in [0, 0b0001, 0b0010, 0b1011] {
+            let a_high = (opsel & 1) * 16;
+            let b_high = (opsel >> 1 & 1) * 16;
+            let dst_high = (opsel >> 3 & 1) * 16;
+            let inputs = operands.map(|(a, b)| {
+                [
+                    (u32::from(a as u16) << a_high) | (0x1234 << (16 - a_high)),
+                    (u32::from(b as u16) << b_high) | (0x5678 << (16 - b_high)),
+                    old,
+                    0,
+                ]
+            });
+            for clamp in [false, true] {
+                let mut inst = vop3(op, 0, vgpr(1), vgpr(2), 0);
+                inst[0] |= u32::from(clamp) << 15 | opsel << 11;
+                let shader = build_valu_cs(&[vop1(0x001, 0, vgpr(3)), inst[0], inst[1]]);
+                assert_no_int64(&shader);
+                run_cases(&shader, &inputs, |backend, i, _, got| {
+                    let (a, b) = operands[i];
+                    let result = match (add, clamp) {
+                        (true, false) => a.wrapping_add(b),
+                        (true, true) => a.saturating_add(b),
+                        (false, false) => a.wrapping_sub(b),
+                        (false, true) => a.saturating_sub(b),
+                    };
+                    let want =
+                        (old & !(0xFFFF << dst_high)) | (u32::from(result as u16) << dst_high);
+                    assert_eq!(
+                        got, want,
+                        "{backend}: VOP3 {op:#x}, clamp {clamp}, op_sel {opsel:#06b}, case {i}"
+                    );
+                });
+            }
+        }
+    }
+}
+
 #[test]
 fn scalar_quad_masks_pack_nibbles_and_set_scc() {
     let pack_words = |opcode: u32| {
@@ -817,6 +912,83 @@ fn v_med3_f16_matches_rdna2_with_nan() {
             ),
         }
     });
+}
+
+#[test]
+fn vop3_unsigned_add_sub_clamp() {
+    let cases = [
+        [0, 0, 1, u32::MAX],
+        [0, 1, 1, 0],
+        [1, 0, 1, 0],
+        [7, 4, 9, 0],
+        [u32::MAX, 0, 1, u32::MAX],
+        [u32::MAX, 2, u32::MAX, 0],
+        [u32::MAX, u32::MAX, u32::MAX, 0],
+    ];
+    for (op, add, reverse, carry_out) in [
+        (0x125, true, false, false), // v_add_nc_u32
+        (0x126, false, false, false), // v_sub_nc_u32
+        (0x127, false, true, false), // v_subrev_nc_u32
+        (0x30f, true, false, true), // v_add_co_u32
+        (0x310, false, false, true), // v_sub_co_u32
+        (0x319, false, true, true), // v_subrev_co_u32
+        (0x128, true, false, true), // v_add_co_ci_u32
+        (0x129, false, false, true), // v_sub_co_ci_u32
+        (0x12a, false, true, true), // v_subrev_co_ci_u32
+        (0x36d, true, false, false), // v_add3_u32
+    ] {
+        for clamp in [false, true] {
+            let add3 = op == 0x36d;
+            let carry_in = matches!(op, 0x128..=0x12a);
+            let src2 = if carry_in {
+                sgpr(20)
+            } else if add3 {
+                vgpr(3)
+            } else {
+                0
+            };
+            let mut body = Vec::new();
+            if carry_in {
+                // v_add_co_u32 v5, s20, v4, 1
+                let mut seed = vop3(0x30f, 5, vgpr(4), 129, 0);
+                seed[0] |= 20 << 8;
+                body.extend(seed);
+            }
+            let mut inst = vop3(op, 0, vgpr(1), vgpr(2), src2);
+            inst[0] |= u32::from(clamp) << 15;
+            body.extend(inst);
+            let exact = |[a, b, d, seed]: [u32; 4]| {
+                let (a, b) = if reverse { (b, a) } else { (a, b) };
+                let carry = i64::from(carry_in && seed == u32::MAX);
+                if add {
+                    i64::from(a) + i64::from(b) + carry + if add3 { i64::from(d) } else { 0 }
+                } else {
+                    i64::from(a) - i64::from(b) - carry
+                }
+            };
+            let saturate = |result: i64| result.clamp(0, i64::from(u32::MAX));
+            run_cases(&build_valu_cs(&body), &cases, |backend, _, inputs, got| {
+                let result = exact(inputs);
+                let expected = if clamp { saturate(result) } else { result } as u32;
+                assert_eq!(
+                    got, expected,
+                    "{backend}: op {op:#x}, clamp {clamp}, {inputs:?}"
+                );
+            });
+            if carry_out {
+                // Read the carry/borrow mask in s0 independently of the result.
+                body.extend(vop3(0x101, 0, 128, 129, sgpr(0))); // v_cndmask_b32
+                run_cases(&build_valu_cs(&body), &cases, |backend, _, inputs, got| {
+                    let result = exact(inputs);
+                    let expected = u32::from(saturate(result) != result);
+                    assert_eq!(
+                        got, expected,
+                        "{backend}: op {op:#x}, clamp {clamp}, carry for {inputs:?}"
+                    );
+                });
+            }
+        }
+    }
 }
 
 /// `v_cmp_lg_*` is "less or greater": ordered and not equal, so false when

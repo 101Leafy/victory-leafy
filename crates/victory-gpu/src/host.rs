@@ -4,6 +4,8 @@
 //! shortcut: every submission is waited for, so CPU and GPU never overlap
 //! (unless `VICTORY_LATE_WAIT=1`, see [`late`]);
 //! overlap them with per-submission fences once more than clears run.
+//! `VICTORY_SETTLE_ROOM=1|alt` gives flights more room before a wait (off by
+//! default, see [`settle_room`]).
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -2892,7 +2894,8 @@ impl Readbacks {
 /// lists put a few constants or a rectangle's corners there, and every
 /// list that did took 4 MiB of the PC's memory for it.
 const SCRATCH_FIRST: u64 = 256 << 10;
-/// The most bytes of chunks kept while no list holds them.
+/// The most bytes of chunks kept while no list holds them, unless
+/// `VICTORY_SCRATCH_SPARE_MB` says otherwise ([`spare_most`]).
 const SPARE_MOST: u64 = 128 << 20;
 /// The same with [`keep_freed`].
 const SPARE_KEPT: u64 = 1 << 30;
@@ -2951,28 +2954,64 @@ impl<T> Spare<T> {
 /// Scratch chunks no list holds.
 static SPARE: Mutex<Spare<Chunk>> = Mutex::new(Spare::new());
 
-/// A scratch chunk of `size` bytes: one kept ([`SPARE`]) or a new one.
-fn take_chunk(host: &Host, size: u64) -> Option<Chunk> {
-    if scratch_pool()
-        && let Some(chunk) = SPARE.lock().unwrap_or_else(|e| e.into_inner()).take(size)
-    {
-        ALIVE[3].fetch_sub(1, Ordering::Relaxed);
-        ALIVE[4].fetch_sub(size, Ordering::Relaxed);
-        ALIVE[5].fetch_add(1, Ordering::Relaxed);
-        return Some(chunk);
+/// A scratch chunk of `size` bytes or more: one kept ([`SPARE`]) or a new
+/// one; and its size.
+///
+/// A small first chunk ([`SCRATCH_FIRST`]) asked for while none of them is
+/// kept is a kept 4 MiB one. Without that, on an RTX 5080 (Jason's balcony,
+/// Series S) the spares sat at their bound the whole time, all of them
+/// 4 MiB ones, while some 35 small first chunks a frame were made new and
+/// as many came back past the bound and were freed (about 1 ms each, a
+/// committed upload buffer).
+fn take_chunk(host: &Host, size: u64) -> Option<(Chunk, u64)> {
+    if scratch_pool() {
+        let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+        let kept = spare.take(size).map(|c| (c, size)).or_else(|| {
+            let any = size == SCRATCH_FIRST && scratch_any_size();
+            any.then(|| spare.take(SCRATCH_CHUNK).map(|c| (c, SCRATCH_CHUNK))).flatten()
+        });
+        if let Some((chunk, size)) = kept {
+            ALIVE[3].fetch_sub(1, Ordering::Relaxed);
+            ALIVE[4].fetch_sub(size, Ordering::Relaxed);
+            ALIVE[5].fetch_add(1, Ordering::Relaxed);
+            return Some((chunk, size));
+        }
     }
     let (buffer, data) = host.upload_buffer(size)?;
     name(&buffer, || "list scratch".into());
     ALIVE[1].fetch_add(1, Ordering::Relaxed);
     ALIVE[2].fetch_add(size, Ordering::Relaxed);
-    Some(Chunk {
+    let chunk = Chunk {
         buffer,
         data: data as usize,
+    };
+    Some((chunk, size))
+}
+
+/// Whether a list's small first chunk may be a kept 4 MiB one
+/// (`VICTORY_SCRATCH_ANY_SIZE`, on; `=0`: only one of its own size).
+fn scratch_any_size() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SCRATCH_ANY_SIZE").is_none_or(|v| v != "0"))
+}
+
+/// The most bytes of scratch chunks kept while no list holds them:
+/// [`SPARE_MOST`], or `VICTORY_SCRATCH_SPARE_MB`.
+///
+/// On the balcony the lists hold some 140 MB of chunks at once, and with
+/// 128 MB the spares stood at the bound the whole run: what came back past
+/// it was freed and what was asked for next made new, some 12 chunks of
+/// 4 MiB a frame, about 2 ms each to free.
+fn spare_most() -> u64 {
+    static MOST: OnceLock<u64> = OnceLock::new();
+    *MOST.get_or_init(|| {
+        let mb = std::env::var("VICTORY_SCRATCH_SPARE_MB").ok();
+        mb.and_then(|v| v.trim().parse::<u64>().ok()).map_or(SPARE_MOST, |mb| mb << 20)
     })
 }
 
 /// A list is done with `chunks` (it was reset after its submissions ran,
-/// or dropped): kept for the next list, or freed past [`SPARE_MOST`] and
+/// or dropped): kept for the next list, or freed past [`spare_most`] and
 /// without the pool.
 fn give_chunks(chunks: Vec<(Chunk, u64)>) {
     if chunks.is_empty() {
@@ -2983,7 +3022,7 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
         let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
         for (chunk, size) in chunks {
             let back = if scratch_pool() {
-                spare.give(chunk, size, if keep_freed() { SPARE_KEPT } else { SPARE_MOST })
+                spare.give(chunk, size, if keep_freed() { SPARE_KEPT } else { spare_most() })
             } else {
                 Some(chunk)
             };
@@ -4295,9 +4334,10 @@ mod relay_tests {
 /// all at once ran the slots out before (run 45).
 fn late_most() -> usize {
     static MOST: OnceLock<usize> = OnceLock::new();
-    *MOST.get_or_init(|| {
+    let base = *MOST.get_or_init(|| {
         std::env::var("VICTORY_LATE_WAIT_LISTS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(256).max(1)
-    })
+    });
+    settle_room::list_limit(base, settle_room::on())
 }
 
 /// Whether a submission with bottom-of-pipe writes may fly
@@ -4758,7 +4798,7 @@ fn stale_of(
         // copy of its own there. With [`card_steps`] the pages of the
         // title's ring of constants come here too, which were waited for
         // before: hundreds of short runs each, at about 1.5 us a run.
-        let mut runs_left = if card_steps::stage() > 0 { 4096 } else { 512 };
+        let mut runs_left = settle_room::merge_budget(card_steps::stage() > 0, settle_room::on());
         let busy: Vec<Vec<(usize, usize)>> = spans.iter().map(|(shadow, from, to)| shadow.busy(*from, *to - *from)).collect();
         let asked = crate::shadow::Writes::ask(
             spans.iter().zip(&busy).filter(|((shadow, ..), _)| !shadow.unwatched()).flat_map(|(_, b)| b.iter().copied()).collect(),
@@ -5732,6 +5772,7 @@ mod place;
 #[cfg(feature = "diagnostics")]
 pub(crate) mod pstats;
 mod send;
+mod settle_room;
 
 /// Whether what goes up to copies in the card's memory goes from memory of
 /// its own (`send::own`).
@@ -7847,6 +7888,8 @@ impl Host {
         };
         let told = !sent.writes.is_empty();
         let sizes = crate::memory::asked_sizes(order.iter().map(|&i| lists[i].host()));
+        // Keep the same limit if an `alt` phase ends while this flight is waiting.
+        let limit = late_most();
         let most = {
             let mut line = line();
             let Line { line: items, written, lists: flying, target, .. } = &mut *line;
@@ -7870,7 +7913,7 @@ impl Host {
                 texture_back_ranges: sent.texture_back_ranges,
             }));
             items.extend(sent.writes.into_iter().map(|(at, what, bytes)| Late::Write(at, what, bytes)));
-            *flying >= late_most()
+            *flying >= limit
         };
         LATE_STATS[0].fetch_add(1, Ordering::Relaxed);
         RELAY_MOVED.notify_one();
@@ -7882,7 +7925,7 @@ impl Host {
             // Until there are fewer, not until there are none.
             #[cfg(feature = "diagnostics")]
             let began = std::time::Instant::now();
-            relay_wait(WHY_MOST, |line| line.lists < late_most());
+            relay_wait(WHY_MOST, |line| line.lists < limit);
             #[cfg(feature = "diagnostics")]
             crate::copystat::lap(crate::copystat::C::SettleListsNs, began);
         } else if most {
@@ -9313,14 +9356,14 @@ impl HostList {
     }
 
     /// Moves a title texture's host copy to `wanted` (a host state) in this
-    /// list: the host texture and the state it leaves, if that is a change.
-    /// The list's first use of a texture records nothing: its prelude brings
-    /// the texture there at submission.
+    /// list: the host texture, the state it leaves and the (legal) state it
+    /// takes, if that is a change. The list's first use of a texture records
+    /// nothing: its prelude brings the texture there at submission.
     pub(crate) fn transition(
         &self,
         resource: crate::object::This,
         wanted: u32,
-    ) -> Option<(&'static ID3D12Resource, u32)> {
+    ) -> Option<(&'static ID3D12Resource, u32, u32)> {
         let copy = crate::resource::host_copy(resource)?;
         // SAFETY: as in `crate::resource::host_resource`; the list's states
         // hold the copy from here on.
@@ -9338,7 +9381,7 @@ impl HostList {
                 if before != wanted {
                     self.changed_something();
                 }
-                (before != wanted).then_some((texture, before))
+                (before != wanted).then_some((texture, before, wanted))
             }
         }
     }
@@ -10077,7 +10120,7 @@ impl HostList {
             } else {
                 SCRATCH_CHUNK
             };
-            let chunk = take_chunk(host, size)?;
+            let (chunk, size) = take_chunk(host, size)?;
             s.chunks.push((chunk, size));
             s.used = 0;
         }
@@ -11785,6 +11828,37 @@ impl Batch {
     }
 }
 
+/// Copies of at least this many bytes are cut into pieces for the kept
+/// threads of [`crate::shadow::wide_run`] (`VICTORY_WIDE_COPY=1`; off by
+/// default, an A/B switch). Pieces are [`WIDE_COPY_PIECE`] bytes each.
+const WIDE_COPY_MIN: usize = 8 << 20;
+const WIDE_COPY_PIECE: usize = 2 << 20;
+
+fn wide_copy_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_COPY").is_some_and(|v| v == "1"))
+}
+
+/// The `[from, to)` pieces that cover `len` bytes, `piece` bytes each (the
+/// last one may be shorter).
+fn piece_bounds(len: usize, piece: usize) -> Vec<(usize, usize)> {
+    (0..len.div_ceil(piece)).map(|i| (i * piece, ((i + 1) * piece).min(len))).collect()
+}
+
+/// [`copy_mapped`] of a big copy, piece by piece on several threads. Each
+/// piece is shorter than [`WIDE_COPY_MIN`], so it does not come back here.
+fn copy_pieces(dst: *mut u8, src: *const u8, len: usize, title_dst: bool) {
+    let (d, s) = (dst as usize, src as usize);
+    let jobs: Vec<Box<dyn FnOnce() + Send>> = piece_bounds(len, WIDE_COPY_PIECE)
+        .into_iter()
+        .map(|(a, b)| {
+            Box::new(move || copy_mapped((d + a) as *mut u8, (s + a) as *const u8, b - a, title_dst))
+                as Box<dyn FnOnce() + Send>
+        })
+        .collect();
+    crate::shadow::wide_run(jobs);
+}
+
 /// Copies title memory at submission. The ranges were checked against their
 /// resources when recorded, but the title may since have unmapped pages of
 /// them (tiled memory, page mappings), which read as zeros here; a title
@@ -11806,6 +11880,10 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
         _ => {}
     }
     if len == 0 {
+        return;
+    }
+    if len >= WIDE_COPY_MIN && wide_copy_on() {
+        copy_pieces(dst, src, len, title_dst);
         return;
     }
     // A title destination that is not all mapped is left alone. Asking
@@ -14258,6 +14336,56 @@ mod refresh_tests {
         }
     }
 
+    #[test]
+    fn settle_room_merges_without_waiting_and_preserves_flight_bytes() {
+        // Five 64 KiB blocks, each with 128 separate changes too long for
+        // a word scatter. The flight also writes in the gaps between them.
+        const LEN: usize = 5 * PAGE;
+        const STRIDE: usize = 512;
+        let mut expected = vec![0u8; LEN];
+        for chunk in expected.chunks_exact_mut(STRIDE) {
+            chunk[..320].fill(0x35);
+            chunk[STRIDE - 4..].fill(0x72);
+        }
+        let run = |extra| {
+            let at = title(LEN, false);
+            let copy = Carded::new(at, LEN, 0);
+            copy.shadow.update(at, LEN);
+            copy.send();
+            copy.shadow.writing(at, LEN);
+            let (fence, fetched) = {
+                let mut card = copy.card.lock().unwrap();
+                for (i, chunk) in card.2.chunks_exact_mut(STRIDE).enumerate() {
+                    chunk[STRIDE - 4..].fill(0x72);
+                    // SAFETY: inside the test's private title allocation.
+                    unsafe { std::ptr::write_bytes((at + i * STRIDE) as *mut u8, 0x35, 320) };
+                }
+                (card.0, card.2.clone())
+            };
+            let mut budget = super::settle_room::merge_budget(false, extra);
+            let wait = copy.shadow.merge_alone(at, LEN, &mut budget);
+            assert_eq!(wait, !extra, "640 changed runs");
+            if !wait {
+                copy.send();
+            }
+            copy.shadow.card_merge_relay(0, &fetched, fence, &mut Vec::new());
+            copy.shadow.copy_back_done(&[(at, at + LEN)]);
+            if wait {
+                copy.shadow.update(at, LEN);
+                copy.send();
+            }
+            // SAFETY: the CPU is finished writing both private allocations.
+            for address in [at, copy.data] {
+                let bytes = unsafe { std::slice::from_raw_parts(address as *const u8, LEN) };
+                assert!(bytes == expected, "title or upload bytes, extra room {extra}");
+            }
+            copy.card.into_inner().unwrap().2
+        };
+        let normal = run(false);
+        assert!(normal == expected);
+        assert!(run(true) == normal);
+    }
+
     /// Everything at once: the title writes its memory on two threads, the
     /// submitting thread puts its bytes in under shader writes
     /// (`Shadow::merge_under_writes`), refreshes copies that overlap (two in
@@ -14937,5 +15065,34 @@ mod breadcrumbs {
         assert_eq!(stopped_at(&whole, committed as u32, 7), "; a list stopped at command 7 of 1024 (op 6)");
         // SAFETY: the reservation made above.
         assert_ne!(unsafe { VirtualFree(base.cast(), 0, MEM_RELEASE) }, 0);
+    }
+}
+
+#[cfg(test)]
+mod piece_copy_tests {
+    use super::{copy_pieces, piece_bounds};
+
+    /// The pieces cover the copy exactly once, the last one shorter.
+    #[test]
+    fn pieces_cover_the_copy_once() {
+        assert_eq!(piece_bounds(0, 4), vec![]);
+        assert_eq!(piece_bounds(4, 4), vec![(0, 4)]);
+        assert_eq!(piece_bounds(10, 4), vec![(0, 4), (4, 8), (8, 10)]);
+        let len = 9 << 20;
+        let cut = piece_bounds(len, 2 << 20);
+        assert_eq!(cut.len(), 5);
+        assert_eq!(cut.iter().map(|(a, b)| b - a).sum::<usize>(), len);
+        assert!(cut.windows(2).all(|w| w[0].1 == w[1].0));
+    }
+
+    /// A big copy made on several threads copies every byte, the last
+    /// partial piece included.
+    #[test]
+    fn a_big_copy_in_pieces_copies_every_byte() {
+        let len = (9 << 20) + 4097;
+        let src: Vec<u8> = (0..len).map(|i| (i * 131 + i / 4099) as u8).collect();
+        let mut dst = vec![0u8; len];
+        copy_pieces(dst.as_mut_ptr(), src.as_ptr(), len, false);
+        assert!(dst == src, "the pieces did not copy the same bytes");
     }
 }
