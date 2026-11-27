@@ -954,7 +954,7 @@ fn workers() -> bool {
                         if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
                             drained();
                         } else {
-                            super::library::save(false);
+                            super::library::save_while_busy();
                         }
                     }
                 });
@@ -967,10 +967,16 @@ fn workers() -> bool {
         // The workers save after a pipeline (at most every 20 s), so the
         // last of a burst waited for the next pipeline, and with none made
         // until the window was closed they were lost: the binoculars' in
-        // play-g. Saves nothing when nothing was added.
+        // play-g. Saves nothing when nothing was added. While pipelines are
+        // still queued it keeps to the workers' burst interval, or it would
+        // save the whole library every 20 s in the middle of a burst anyway.
         let saver = std::thread::Builder::new().name("victory-pipelines-save".into()).spawn(|| loop {
             std::thread::sleep(Duration::from_secs(20));
-            super::library::save(false);
+            if WAITING.load(Ordering::Relaxed) > 0 {
+                super::library::save_while_busy();
+            } else {
+                super::library::save(false);
+            }
         });
         if let Err(e) = saver {
             tracing::warn!(error = %e, "no pipeline library saver");
