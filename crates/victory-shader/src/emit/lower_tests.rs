@@ -369,6 +369,7 @@ fn lower_with(
 
 // Where the constant table starts when a built descriptor's loads read below its base:
 // kept in its own file (lower.rs is at the size limit).
+#[path = "lower/tests/code_table.rs"]
 mod code_table;
 
 /// [`lower_with`] in wave64 if `wave64`.
