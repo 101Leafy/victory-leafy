@@ -505,10 +505,70 @@ pub(crate) fn queued() -> u64 {
 /// For the frame-rate line.
 #[cfg(windows)]
 pub(crate) fn behind_line(frames: f64) {
+    census_line(frames);
     if behind::on() {
         crate::list::thin::line(frames);
         behind::line(frames);
     }
+}
+
+/// Whether each queue's submissions are counted for the frame-rate line
+/// (`VICTORY_QUEUE_CENSUS=1`): how much of its work the title gives its
+/// compute and copy queues, which all run on our one direct queue.
+fn census() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_QUEUE_CENSUS").is_some_and(|v| v == "1"))
+}
+
+/// The queues the title submitted to, in the order it first did: address,
+/// kind, then submissions and lists since the last line.
+/// shortcut: a queue let go of keeps its row, and one made later at the
+/// same address is counted in it.
+#[cfg(windows)]
+static CENSUS: Mutex<Vec<(usize, u32, u64, u64)>> = Mutex::new(Vec::new());
+
+#[cfg(windows)]
+fn count_submission(this: This, lists: u32) {
+    let mut rows = lock(&CENSUS);
+    let at = this as usize;
+    match rows.iter_mut().find(|r| r.0 == at) {
+        Some(row) => {
+            row.2 += 1;
+            row.3 += u64::from(lists);
+        }
+        None => rows.push((at, queue(this).kind, 1, u64::from(lists))),
+    }
+}
+
+fn kind_name(kind: u32) -> String {
+    match kind {
+        0 => "direct".into(),
+        2 => "compute".into(),
+        3 => "copy".into(),
+        k => format!("kind {k}"),
+    }
+}
+
+#[cfg(windows)]
+fn census_line(frames: f64) {
+    if !census() {
+        return;
+    }
+    let mut rows = lock(&CENSUS);
+    let each: Vec<String> = rows
+        .iter_mut()
+        .enumerate()
+        .map(|(i, r)| {
+            let (submissions, lists) = (std::mem::take(&mut r.2), std::mem::take(&mut r.3));
+            format!(
+                "{} {i} {:.1} submissions {:.1} lists",
+                kind_name(r.1),
+                submissions as f64 / frames,
+                lists as f64 / frames
+            )
+        })
+        .collect();
+    tracing::info!("the title's queues per frame (VICTORY_QUEUE_CENSUS=1): {}", each.join(", "));
 }
 
 /// Whether a queue may pass `wait`: memory holds the value, or, with
@@ -572,7 +632,11 @@ pub(crate) extern "system" fn create_x(
     let Some(&x) = (unsafe { desc.as_ref() }) else {
         return E_INVALIDARG;
     };
-    tracing::debug!(desc = ?x, "console command queue");
+    if census() {
+        tracing::info!(kind = %kind_name(x.kind), engine_or_pipe = x.engine_or_pipe, queue = x.queue, flags = x.flags, "the title makes a queue (all run on our one direct queue)");
+    } else {
+        tracing::debug!(desc = ?x, "console command queue");
+    }
     let desc = QueueDesc {
         kind: x.kind,
         priority: 0,
@@ -618,6 +682,10 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
         return;
     }
     let _called = crate::timeline::span("the title's ExecuteCommandLists");
+    #[cfg(windows)]
+    if census() && !this.is_null() {
+        count_submission(this, count);
+    }
     #[cfg(all(windows, feature = "diagnostics"))]
     crate::timeline::title_thread();
     #[cfg(windows)]
