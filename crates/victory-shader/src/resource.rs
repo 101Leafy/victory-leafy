@@ -2358,14 +2358,15 @@ impl Tracer<'_> {
         let Fields::Valu(v) = &inst.fields else {
             return None;
         };
-        if inst.name() != "v_readlane_b32" || !plain_lane(v) {
+        let strict = crate::emit::lane_spill_strict();
+        if inst.name() != "v_readlane_b32" || strict && !plain_lane(v) {
             return None;
         }
         let [Operand::Vector { reg, .. }, lane] = v.src[..] else {
             return None;
         };
         let lane = lane_of(lane)?;
-        if lane >= if self.p.wave64 { 64 } else { 32 } {
+        if strict && lane >= if self.p.wave64 { 64 } else { 32 } {
             return None;
         }
         self.spilled(inst.read(Reg::V(reg))?, lane, block, &mut Vec::new())
@@ -2412,11 +2413,12 @@ impl Tracer<'_> {
         let (Some(Operand::Vector { reg, .. }), [value, at]) = (w.dst, &w.src[..]) else {
             return Err(());
         };
-        if inst.name() != "v_writelane_b32" || !plain_lane(w) {
+        let strict = crate::emit::lane_spill_strict();
+        if inst.name() != "v_writelane_b32" || strict && !plain_lane(w) {
             return Err(());
         }
         let written = lane_of(*at).ok_or(())?;
-        if written >= if self.p.wave64 { 64 } else { 32 } {
+        if strict && written >= if self.p.wave64 { 64 } else { 32 } {
             return Err(());
         }
         if written != lane {

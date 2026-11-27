@@ -555,6 +555,16 @@ pub fn wave32_lowering() -> bool {
     *ON.get_or_init(|| std::env::var("VICTORY_WAVE32_LOWERING").is_ok_and(|v| v.trim() == "1"))
 }
 
+/// Whether a `v_readlane_b32` or `v_writelane_b32` with an input or output
+/// modifier, or a constant lane past the wave's width, is left as it is
+/// instead of followed as a spilled scalar (`VICTORY_LANE_SPILL_STRICT=1`,
+/// codec_d's fix; off, every constant lane is followed, as before). Part of
+/// the translation: the shader cache keys on it.
+pub fn lane_spill_strict() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_LANE_SPILL_STRICT").is_ok_and(|v| v.trim() == "1"))
+}
+
 thread_local! {
     /// Wave-wide branches for the program being translated on this thread
     /// ([`with_wave_wide`]), with `VICTORY_WAVE_WIDE` unset.
