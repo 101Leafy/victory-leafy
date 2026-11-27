@@ -973,6 +973,17 @@ fn heap_pass_ahead() -> bool {
     })
 }
 
+/// Whether the rounds ahead begin at the first list that binds a view heap
+/// with a host heap, before any pass (`VICTORY_HEAP_AHEAD_EARLY=1`). They
+/// began at the first pass: it looked at every slot the world load wrote,
+/// some 40,000 of them and 4,400 host copies (1.3 GB) made one by one under
+/// the copies' lock, 2.9 to 4.7 s of the first world frame (leafy-0314,
+/// main-own, main-all), while the game clock stood still beside it.
+fn ahead_early() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_AHEAD_EARLY").is_some_and(|v| v == "1"))
+}
+
 /// Starts the thread of the rounds ahead, once. After each round of the
 /// heap sync thread it looks at the buffer view slots written since, and
 /// once a frame makes the sweep, so that the pass a list's close waits for
@@ -1345,6 +1356,14 @@ impl State {
             if !h.is_null() {
                 let samplers = crate::descriptor::heap(h).samplers();
                 self.heaps[usize::from(samplers)] = h as usize;
+            }
+        }
+        #[cfg(windows)]
+        if self.heaps[0] != 0 && AHEAD_HEAP.load(Ordering::Relaxed) == 0 && ahead_early() && heap_pass_ahead() {
+            let heap = crate::descriptor::heap(self.heaps[0] as This);
+            if heap.host_made().is_some() {
+                AHEAD_HEAP.store(std::ptr::from_ref(heap) as usize, Ordering::Relaxed);
+                start_ahead();
             }
         }
     }
