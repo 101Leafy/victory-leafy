@@ -169,6 +169,10 @@ fn screens_first() -> bool {
 /// Pipelines queued and not made yet.
 static WAITING: AtomicU64 = AtomicU64::new(0);
 
+/// Waits that ran out of the frame's budget with the pipeline still not
+/// there, for the one line that says what a run like that is.
+static GAVE_UP: AtomicU64 = AtomicU64::new(0);
+
 /// Pipelines queued and not made yet (for the frame line).
 pub(crate) fn waiting() -> u64 {
     WAITING.load(Ordering::Relaxed)
@@ -310,6 +314,19 @@ fn wait(p: &Pending, frame: u64) {
         held = done.wait_timeout(held, rest).unwrap_or_else(|e| e.into_inner()).0;
     }
     drop(held);
+    // The frame's share of the budget is gone and the pipeline is still not
+    // there: this is the shape of a first run that stalls its way through the
+    // world while pipelines are made as they are drawn, and of a run that
+    // would have been quick had it been warmed. Said once per process, with
+    // the two things that fix it, because nothing else in the log says the
+    // difference between a slow run and a cold one.
+    if p.made.get().is_none() && GAVE_UP.fetch_add(1, Ordering::Relaxed) == 0 {
+        tracing::warn!(
+            still_being_made = waiting(),
+            budget_ms = budget.as_millis() as u64,
+            "a frame's pipelines did not arrive within its budget (victory warm --used makes them ahead of a run; VICTORY_PIPELINE_WORKERS makes them sooner)"
+        );
+    }
     let waited = started.elapsed().min(left);
     if screen && waited > Duration::from_millis(500) {
         tracing::info!(
