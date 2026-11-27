@@ -447,11 +447,19 @@ pub(crate) enum C {
     /// (`texture::partial_due`).
     TexPartialWritten,
     TexPartialSkipped,
+    /// Bytes of the texture uploads recorded; uploads recorded only because
+    /// the texture was hot and their bytes; and of those the ones whose
+    /// refresh detiled nothing new, which copied what the host texture held.
+    TexUploadBytes,
+    TexForced,
+    TexForcedBytes,
+    TexForcedSame,
+    TexForcedSameBytes,
 }
 const COUNTERS: usize = 256;
 
 /// The counters' names, in the order of [`C`], for the frame recorder's columns.
-pub(crate) const NAMES: [&str; 236] = [
+pub(crate) const NAMES: [&str; 241] = [
     "Submissions", "Copies", "CopyBytes", "Refreshes", "RefreshBytes", "Skipped", "SkippedBytes", "Runs",
     "RunUs", "Queries", "QueryUs", "MoveUs", "Unmapped", "Watches", "WatchUs", "Checked", "Unchanged",
     "Fallbacks", "GuardFaults", "TexWatched", "TexHashed", "TexChanged", "TexHot", "Frames", "RecordCalls",
@@ -504,6 +512,7 @@ pub(crate) const NAMES: [&str; 236] = [
     "CardLateMoved", "CardLateMovedBytes", "CardLateRefused",
     "WaitsQuiet",
     "TexPartialWritten", "TexPartialSkipped",
+    "TexUploadBytes", "TexForced", "TexForcedBytes", "TexForcedSame", "TexForcedSameBytes",
 ];
 /// One of some sets of counters, each in lines of the processor's memory of
 /// its own: a set for all threads had them wait for each other's lines at
@@ -882,7 +891,7 @@ mod command_tests {
     #[test]
     fn every_counter_is_named() {
         use super::{C, COUNTERS, NAMES};
-        assert_eq!(C::WaitsQuiet as usize + 1, NAMES.len());
+        assert_eq!(C::TexForcedSameBytes as usize + 1, NAMES.len());
         assert_eq!(NAMES[C::Frames as usize], "Frames");
         assert!(NAMES.len() <= COUNTERS);
     }
@@ -1844,6 +1853,19 @@ pub(crate) fn log(frames: f64) {
         c[C::HostLists as usize],
         c[C::HostListNs as usize] / 1e6,
         c[C::PartsTogether as usize],
+    );
+    tracing::info!(
+        "texture uploads per frame: {:.0} recorded {:.1} MB; {:.0} of them only because the texture \
+         was hot {:.1} MB, {:.0} of those {:.1} MB after a refresh that found nothing new; partly \
+         mapped textures {:.1} MB read early as written, {:.1} MB passed over",
+        c[C::TexUploads as usize],
+        mb(c[C::TexUploadBytes as usize]),
+        c[C::TexForced as usize],
+        mb(c[C::TexForcedBytes as usize]),
+        c[C::TexForcedSame as usize],
+        mb(c[C::TexForcedSameBytes as usize]),
+        mb(c[C::TexPartialWritten as usize]),
+        mb(c[C::TexPartialSkipped as usize]),
     );
     // What is copied whole, largest first: memory nobody tells us about.
     let whole = WHOLE.lock().unwrap_or_else(|e| e.into_inner()).take();
