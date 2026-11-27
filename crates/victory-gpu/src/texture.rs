@@ -108,6 +108,10 @@ pub(crate) struct Staging {
     /// recorded again about a second later if the card has room by then
     /// ([`upload`]).
     waiting: std::sync::atomic::AtomicU64,
+    /// Recorded for a one-shot decoration bake (`BAKING`, with
+    /// `VICTORY_BAKE_SYNC=1`): the check at submission waits for title
+    /// memory to stop remapping and takes none of its shortcuts.
+    exact: std::sync::atomic::AtomicBool,
 }
 
 /// What a texture's staging buffer holds: the hash of the memory detiled
@@ -1190,6 +1194,10 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
         return;
     };
     use std::sync::atomic::Ordering::Relaxed;
+    let baking = BAKING.get() && crate::draw::bake_sync();
+    if baking {
+        staging.exact.store(true, Relaxed);
+    }
     let picking = PICKING.get();
     if picking.is_none() {
         // A draw samples it through a table: kept and checked from here on.
@@ -1229,7 +1237,13 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
     // A hot texture is copied by every list that samples it: its check
     // finds it changed, and the copy, which runs after the check, takes
     // what the check detiled.
-    if staging.uploaded.load(Relaxed) && !staging.dirty.load(Relaxed) && !staging.hot_at(crate::frame::current()) {
+    // A bake records the copy always, so what the check finds lands before
+    // the bake draw runs.
+    if !baking
+        && staging.uploaded.load(Relaxed)
+        && !staging.dirty.load(Relaxed)
+        && !staging.hot_at(crate::frame::current())
+    {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexSkipped, 1);
         list.defer_texture(staging);
@@ -1802,12 +1816,13 @@ impl Staging {
         let start = self.memory as usize;
         let mut last = waited(0, || self.last.lock().unwrap_or_else(|e| e.into_inner()));
         let last = &mut *last;
+        let exact = self.exact.swap(false, std::sync::atomic::Ordering::Relaxed);
         let alone = self.once.load(std::sync::atomic::Ordering::Relaxed);
-        if alone && last.hash.is_some() {
+        if alone && !exact && last.hash.is_some() {
             return 0;
         }
         if !alone && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, false)) {
-            if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
+            if !exact && last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
                 return 0;
             }
             let since = std::mem::replace(&mut last.asked, now);
@@ -1867,7 +1882,7 @@ impl Staging {
             if passed {
                 due = false;
             }
-            if unwritten && !due && (!turn || last.turned == frame) {
+            if !exact && unwritten && !due && (!turn || last.turned == frame) {
                 #[cfg(feature = "diagnostics")]
                 if passed {
                     crate::copystat::add(crate::copystat::C::TexFirstSkipped, size as u64);
@@ -1895,7 +1910,7 @@ impl Staging {
         // stays mapped (see `crate::watch::title_memory_reading`; without
         // it a page went between the asking and the read in runs 71 and
         // 74).
-        let _mapped = if no_wait() {
+        let _mapped = if no_wait() && !exact {
             // Not waited for: while the runtime remaps title memory the
             // texture is read through the kernel instead, whole or not at
             // all (`no_wait`).
@@ -1915,7 +1930,7 @@ impl Staging {
             // see no write ([`partial_due`]): a change they miss shows up
             // to 30 frames late.
             let frame = crate::frame::current();
-            if !partial_due(last.partial, frame, seen) {
+            if !exact && !partial_due(last.partial, frame, seen) {
                 if seen {
                     // Read in the next frame: the write is not forgotten.
                     last.asked = 0;
@@ -2638,6 +2653,7 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
         detiled: std::sync::atomic::AtomicU32::new(0),
         judged: [const { std::sync::atomic::AtomicU64::new(0) }; 2],
         waiting: std::sync::atomic::AtomicU64::new(0),
+        exact: std::sync::atomic::AtomicBool::new(BAKING.get() && crate::draw::bake_sync()),
     });
     map.insert(resource as usize, s.clone());
     add_to_address_index(&s);

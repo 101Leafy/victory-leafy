@@ -189,12 +189,58 @@ const BAKE_AHEAD: [u64; 2] = [12, 2];
 /// until something is new, the next bakes of the frame need no pass.
 static BAKE_SERVED: AtomicU64 = AtomicU64::new(0);
 
+/// Whether the textures a bake draw reads are uploaded on a list of their
+/// own that runs to its end before the draw is recorded, their slots made
+/// only then (`VICTORY_BAKE_SYNC=1`; off). Also counts more of the title's
+/// bake programs as bakes ([`BAKE_SYNC_PIXEL_SHADERS`],
+/// [`BAKE_GEOMETRY_SHADERS`], and depth-less square targets of four or
+/// more), takes the stand-ins and flips still waiting in other lists out
+/// first, and wakes slots whose bytes streamed in since the last bake.
+/// Lists recorded on other threads (`VICTORY_THIN=1`) cannot run a bake
+/// ahead of its uploads then.
+pub(crate) fn bake_sync() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_BAKE_SYNC").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// The list [`bake_sync`] records a bake's uploads into, kept for the next
+/// one; under [`BAKE_UPLOAD`] alone.
+struct BakeList(HostList);
+// SAFETY: used under `BAKE_UPLOAD`'s lock only.
+unsafe impl Send for BakeList {}
+
+/// One bake's uploads at a time, from whichever thread records it.
+static BAKE_UPLOAD: std::sync::Mutex<Option<BakeList>> = std::sync::Mutex::new(None);
+
+/// The slots a [`bake_sync`] pass makes once its list has run (slot, where
+/// its record is, which record), and the host copies they need until then.
+struct BakeSync {
+    publish: Vec<(u32, u64, u64)>,
+    keep: Vec<std::sync::Arc<crate::resource::HostTexture>>,
+}
+
 /// The pixel shaders of the title's decoration bake (the title:
 /// `PS_BakeDecorations_*`), by the first 16 hex digits of their hash as the
 /// frame listings print it. They draw into a 256x256 corner of 2048x2048
 /// targets and name no texture in a table.
 const BAKE_PIXEL_SHADERS: [&str; 4] =
     ["c0a7fe77b1862e10", "0d1575a396dfe513", "b7cfd8dda91ebb6b", "280967ad158cee0b"];
+
+/// [`BAKE_PIXEL_SHADERS`] and more of them, with [`bake_sync`].
+const BAKE_SYNC_PIXEL_SHADERS: [&str; 7] = [
+    "c0a7fe77b1862e10",
+    "0d1575a396dfe513",
+    "b7cfd8dda91ebb6b",
+    "280967ad158cee0b",
+    "fa455c8a3c32577b",
+    "d126bcae5d5d8d26",
+    "fcee612943c008e0",
+];
+
+/// The vertex and mesh shaders every bake program shares (the ped
+/// texture's full-screen triangle, the decoration's projection), with
+/// [`bake_sync`]: they catch pixel shaders not named above.
+const BAKE_GEOMETRY_SHADERS: [&str; 2] = ["089d6271be6650ef", "d4111a6e6ea49d91"];
 
 /// Since the start: early runs of the texture pass, and those of them
 /// made for a bake draw.
@@ -2403,7 +2449,7 @@ impl State {
         #[cfg(feature = "diagnostics")]
         let refreshed = std::time::Instant::now();
         stage.next("the heap pass: textures");
-        self.heap_textures(list, heap, host);
+        let _ = self.heap_textures(list, heap, host, None);
         stage.end();
         #[cfg(feature = "diagnostics")]
         HEAP_SPLIT[2].fetch_add(refreshed.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -2411,6 +2457,138 @@ impl State {
         HEAP_BUFFER_MICROS.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         Some(gpu)
     }
+
+    /// Ensures textures claimed by background copy-queue uploads
+    /// (`VICTORY_UPLOAD_AHEAD=1`) or deferred behind the `neutral()` gray
+    /// stand-in (`VICTORY_SHOW_AFTER=1` / `shows_other`) have finished
+    /// uploading and flipped to their real descriptors before a one-shot
+    /// decoration bake draw samples them.
+    fn flush_for_bake(
+        &self,
+        list: &HostList,
+        host: &crate::descriptor::host::HostHeap,
+        mut sync: Option<&mut BakeSync>,
+    ) {
+        static RESCUED: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+        let drained = crate::texture::ahead::drain();
+        let mut settled = false;
+        let mut flipped = 0usize;
+        for _ in 0..4 {
+            let need_settle = host.needs_gpu_settle_for_bake();
+            if need_settle {
+                settled = true;
+                crate::host::settle_for_fence();
+            }
+            flipped += host.texture_views_remade();
+            flipped += host.texture_slots_flip();
+            if !need_settle || !host.needs_gpu_settle_for_bake() {
+                break;
+            }
+        }
+        let pending = host.take_pending_list_flips();
+        let mut promoted = 0usize;
+        if !pending.is_empty() {
+            let this_list = (std::ptr::from_ref(list) as usize, list.epoch());
+            let sampled = UsedResource {
+                kind: ResourceType::Srv,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 8,
+                user_data: 0,
+                slot: 0,
+            };
+            for item in pending {
+                let (origin, index, handle, key) = (item.origin, item.index(), item.handle(), item.key());
+                if !host.slot_still_at(handle, key) {
+                    continue;
+                }
+                let Some(view) = crate::descriptor::view(handle) else {
+                    continue;
+                };
+                if let View::Placed(_, resource, desc) = &view {
+                    let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+                    let len = crate::resource::placed_bytes(resource).unwrap_or(1);
+                    if crate::texture::mapped_bytes(address as *const u8, len as usize) == 0 {
+                        host.restore_pending_list_flip(item);
+                        continue;
+                    }
+                }
+                if sync.is_some() || origin != this_list {
+                    let placed = crate::descriptor::host::placed_texture(&view);
+                    if let &View::Shader(resource, _) = placed.as_ref().map_or(&view, |placed| &placed.view) {
+                        let resource = resource as This;
+                        let texture = crate::resource::host_resource(resource);
+                        let title_fills = texture.is_some_and(crate::texture::title_written);
+                        let first = match (&placed, &view) {
+                            (Some(_), View::Placed(_, _, desc)) => crate::resource::first_mip(desc),
+                            _ => 0,
+                        };
+                        if let (Some(sync), Some(copy)) = (sync.as_deref_mut(), crate::resource::host_copy(resource)) {
+                            sync.keep.push(copy);
+                        }
+                        if title_fills
+                            && !crate::texture::ahead::there(resource)
+                            && (sync.is_some() || !crate::texture::unchanged(resource, first))
+                        {
+                            let was_staged = crate::texture::is_staged(resource);
+                            readable(list, sampled.kind, &view);
+                            if !was_staged {
+                                crate::texture::unstage(resource);
+                            }
+                        }
+                    }
+                }
+                if let Some(sync) = sync.as_deref_mut() {
+                    sync.publish.push((index, handle, key));
+                } else {
+                    let _ = host.mirror(index, handle, true);
+                }
+                promoted += 1;
+            }
+        }
+        if drained > 0 || settled || flipped > 0 || promoted > 0 {
+            let n = RESCUED[0].fetch_add(1, Ordering::Relaxed) + 1;
+            let all_drained = RESCUED[1].fetch_add(drained as u64, Ordering::Relaxed) + drained as u64;
+            let all_flipped = RESCUED[2].fetch_add(flipped as u64, Ordering::Relaxed) + flipped as u64;
+            let all_promoted = RESCUED[3].fetch_add(promoted as u64, Ordering::Relaxed) + promoted as u64;
+            if n.is_power_of_two() {
+                tracing::info!(
+                    frame = crate::frame::current(),
+                    flushes = n,
+                    drained_ahead = all_drained,
+                    flipped = all_flipped,
+                    promoted_from_lists = all_promoted,
+                    settled,
+                    "flushed deferred texture stand-ins before decoration bake"
+                );
+            }
+        }
+    }
+
+    /// Whether a graphics draw is a one-shot texture compositor / decoration
+    /// bake whose bindless texture inputs must be flushed and up to date
+    /// before recording the draw. Matches known bake pixel/geometry shaders
+    /// and structurally detects depth-less 4+ MRT square atlas bakes
+    /// (`>= 512x512`) so unseen NPC/head/clothing shader permutations never
+    /// bake `neutral()` or `null` stand-ins into permanent ped textures.
+    fn is_bake_draw(&self, p: &HostPipeline) -> bool {
+        if p.stages.iter().any(|s| {
+            let h = s.shader.hash.as_str();
+            BAKE_SYNC_PIXEL_SHADERS.contains(&h) || BAKE_GEOMETRY_SHADERS.contains(&h)
+        }) {
+            return true;
+        }
+        self.depth == 0
+            && self.targets.len() >= 4
+            && self
+                .targets
+                .first()
+                .and_then(|&t| crate::resource::texture_kind(t as This))
+                .is_some_and(|(w, h, _)| w >= 512 && w == u64::from(h))
+    }
+
 
     /// Runs the pass that uploads textures picked by index
     /// ([`State::heap_textures`]) where nothing has asked for it yet
@@ -2437,6 +2615,9 @@ impl State {
             FRAME.load(Ordering::Relaxed) != frame && FRAME.swap(frame, Ordering::Relaxed) != frame;
         if first {
             BAKED_MS.store(0, Ordering::Relaxed);
+        }
+        if bake_sync() && bake_ms > 0 && self.is_bake_draw(p) {
+            return self.bake_textures(list, first, frame, bake_ms, &BAKED_MS);
         }
         let left = bake_ms.saturating_sub(BAKED_MS.load(Ordering::Relaxed));
         let budget = if bake && left > 0 {
@@ -2481,12 +2662,111 @@ impl State {
         let began = std::time::Instant::now();
         PASS_BUDGET.set(Some(budget));
         crate::texture::BAKING.set(bake && bake_exact());
-        self.heap_textures(list, heap, host);
+        self.heap_textures(list, heap, host, None);
         crate::texture::BAKING.set(false);
         PASS_BUDGET.set(None);
         if bake {
             BAKED_MS.fetch_add(began.elapsed().as_millis() as u64, Ordering::Relaxed);
         }
+    }
+
+    /// [`State::early_textures`] before a bake draw with [`bake_sync`].
+    fn bake_textures(&self, list: &HostList, first: bool, frame: u64, bake_ms: u64, baked_ms: &AtomicU64) {
+        let Some(heap) = self
+            .heaps
+            .iter()
+            .filter(|&&h| h != 0)
+            .map(|&h| crate::descriptor::heap(h as This))
+            .find(|h| !h.samplers())
+        else {
+            return;
+        };
+        let Some(host) = heap.host() else {
+            return;
+        };
+        let began = std::time::Instant::now();
+        let mut bake_slot = BAKE_UPLOAD.lock().unwrap_or_else(|e| e.into_inner());
+        let gpu = crate::host::host();
+        if bake_slot.is_none()
+            && let Some(gpu) = gpu
+        {
+            match gpu.new_list() {
+                Ok(upload_list) => *bake_slot = Some(BakeList(upload_list)),
+                Err(e) => tracing::warn!(error = %e, "no host list for synchronous bake uploads"),
+            }
+        }
+        let exact = bake_exact();
+        if let (Some(gpu), Some(BakeList(bake_list))) = (gpu, bake_slot.as_ref()) {
+            let mut sync = BakeSync { publish: Vec::new(), keep: Vec::new() };
+            crate::texture::BAKING.set(exact);
+            self.flush_for_bake(bake_list, host, Some(&mut sync));
+            let left = bake_ms.saturating_sub(baked_ms.load(Ordering::Relaxed));
+            let run_pass = left > 0
+                && (first || !exact || {
+                    let (writes, noted) = host.texture_news();
+                    noted || BAKE_SERVED.load(Ordering::Relaxed) != writes + 1
+                });
+            let mut served = false;
+            if run_pass {
+                let n = EARLY_TEXTURE_PASSES[1].fetch_add(1, Ordering::Relaxed) + 1;
+                if n.is_power_of_two() {
+                    let [slots, due, ..] = HEAP_TEXTURES_QUEUE.each_ref().map(|c| c.load(Ordering::Relaxed));
+                    tracing::info!(
+                        frame,
+                        bakes = n,
+                        queued_at_the_last_pass = slots,
+                        due_at_the_last_pass = due,
+                        uploaded_so_far = HEAP_TEXTURES.load(Ordering::Relaxed),
+                        "a draw of the title's decoration bake: textures picked by index are uploaded on a list of their own first (VICTORY_BAKE_SYNC)"
+                    );
+                }
+                BAKE_SERVED.store(0, Ordering::Relaxed);
+                PASS_BUDGET.set(Some((left, 2 << 30)));
+                served = self.heap_textures(bake_list, heap, host, Some(&mut sync));
+                PASS_BUDGET.set(None);
+            }
+            crate::texture::BAKING.set(false);
+            if bake_list.has_recorded_work() {
+                bake_list.close();
+                gpu.execute_sync_internal(bake_list);
+                bake_list.reset();
+            } else if !sync.publish.is_empty() {
+                crate::host::settle_for_fence();
+            }
+            for (index, handle, key) in sync.publish {
+                let _ = host.publish_uploaded_slot(index, handle, key);
+            }
+            host.texture_views_remade();
+            host.texture_slots_flip();
+            drop(sync.keep);
+            if run_pass && served && exact {
+                BAKE_SERVED.store(host.texture_news().0 + 1, Ordering::Relaxed);
+            }
+            baked_ms.fetch_add(began.elapsed().as_millis() as u64, Ordering::Relaxed);
+            return;
+        }
+        // No list of its own (no host device: tests): into the draw's.
+        drop(bake_slot);
+        crate::texture::BAKING.set(exact);
+        self.flush_for_bake(list, host, None);
+        crate::texture::BAKING.set(false);
+        let left = bake_ms.saturating_sub(baked_ms.load(Ordering::Relaxed));
+        if left == 0 {
+            return;
+        }
+        if !first && exact {
+            let (writes, noted) = host.texture_news();
+            if !noted && BAKE_SERVED.load(Ordering::Relaxed) == writes + 1 {
+                return;
+            }
+        }
+        EARLY_TEXTURE_PASSES[1].fetch_add(1, Ordering::Relaxed);
+        PASS_BUDGET.set(Some((left, 2 << 30)));
+        crate::texture::BAKING.set(exact);
+        let _ = self.heap_textures(list, heap, host, None);
+        crate::texture::BAKING.set(false);
+        PASS_BUDGET.set(None);
+        baked_ms.fetch_add(began.elapsed().as_millis() as u64, Ordering::Relaxed);
     }
 
     /// The queue's side of the card accounting line
@@ -2583,10 +2863,11 @@ impl State {
         list: &HostList,
         heap: &crate::descriptor::Heap,
         host: &crate::descriptor::host::HostHeap,
-    ) {
+        mut sync: Option<&mut BakeSync>,
+    ) -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if !*ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_TEXTURES").is_none_or(|v| v != "0")) {
-            return;
+            return false;
         }
         let memory = crate::host::host().and_then(|h| h.video_memory());
         // `VICTORY_TEXTURE_STAGE_MB` sets it: a backlog of tens of thousands of
@@ -2651,6 +2932,9 @@ impl State {
         // Slots whose texture's memory the runtime mapped, unmapped or
         // wrote since the last pass are due again.
         host.texture_slots_remapped(frame);
+        if crate::texture::BAKING.get() && bake_sync() {
+            host.texture_slots_bake_written(frame);
+        }
         #[cfg(feature = "diagnostics")]
         lap(crate::copystat::C::HeapTexRemappedNs);
         host.texture_slots_short(frame);
@@ -2739,7 +3023,9 @@ impl State {
             None => (span, per_frame),
         };
         let began = std::time::Instant::now();
-        BAKE_SERVED.store(0, Ordering::Relaxed);
+        if sync.is_none() {
+            BAKE_SERVED.store(0, Ordering::Relaxed);
+        }
         let mut served = true;
         for (index, write) in due {
             if SPENT.load(Ordering::Relaxed) >= bytes_at_most || began.elapsed() > span {
@@ -2900,35 +3186,46 @@ impl State {
             // A slot that shows the texture by an earlier view of it (one
             // from another level) goes on doing so until the upload of what
             // the new one shows has run.
+            let sync_bake = sync.is_some();
             let shows_other = !baking
+                && !sync_bake
                 && crate::resource::held_only()
                 && heap.handle(index).is_some_and(|handle| host.texture_slot_shows_other(index, handle));
             // A slot that shows nothing of it yet, or something else, shows it
             // when the upload has run too.
             let late = !shows_other
                 && !baking
+                && !sync_bake
                 && crate::descriptor::host::show_after()
                 && heap.handle(index).is_some_and(|handle| !host.texture_slot_made_from(index, handle));
             #[cfg(feature = "diagnostics")]
             let mirroring = std::time::Instant::now();
-            // (The record is read once: the upload is made of this view, and
-            // the slot made later by this key, whatever the title writes
-            // there meanwhile.)
-            let picked = heap.handle(index).and_then(|handle| {
-                if shows_other || late {
-                    host.prepare_texture_slot(index, handle)
-                } else {
-                    host.mirror(index, handle, true).map(|view| (view, 0))
+            // With a bake's own list, the slot is made once that has run.
+            let (view, key, bake_key) = if sync_bake {
+                match heap.handle(index).and_then(|handle| host.prepare_bake_slot(index, handle)) {
+                    Some((view, key)) => (Some(view), 0, Some(key)),
+                    None => (None, 0, None),
                 }
-            });
-            let (view, key) = match picked {
-                Some((view, key)) => (Some(view), key),
-                None => (None, 0),
+            } else {
+                // (The record is read once: the upload is made of this view,
+                // and the slot made later by this key, whatever the title
+                // writes there meanwhile.)
+                let picked = heap.handle(index).and_then(|handle| {
+                    if shows_other || late {
+                        host.prepare_texture_slot(index, handle)
+                    } else {
+                        host.mirror(index, handle, true).map(|view| (view, 0))
+                    }
+                });
+                match picked {
+                    Some((view, key)) => (Some(view), key, None),
+                    None => (None, 0, None),
+                }
             };
             #[cfg(feature = "diagnostics")]
             crate::copystat::lap(crate::copystat::C::HeapTexMirrorNs, mirroring);
             let at_once = || {
-                if late && let Some(handle) = heap.handle(index) {
+                if (late || bake_key.is_some()) && let Some(handle) = heap.handle(index) {
                     let _ = host.mirror(index, handle, true);
                 }
             };
@@ -2976,16 +3273,23 @@ impl State {
             crate::copystat::lap(crate::copystat::C::HeapTexSameNs, started);
             if same {
                 HEAP_TEXTURES_SAME.fetch_add(1, Ordering::Relaxed);
-                if shows_other && let Some(handle) = heap.handle(index) {
-                    let _ = host.mirror(index, handle, true);
-                }
-                // Its bytes are in, or on the way there in a list before.
-                if late && texture.is_some_and(crate::pool::fresh) && !crate::texture::ahead::there(resource) {
-                    if let Some(handle) = heap.handle(index) {
-                        host.texture_slot_show_after(list, index, handle, key);
+                if let (Some(sync), Some(key), Some(handle)) = (sync.as_deref_mut(), bake_key, heap.handle(index)) {
+                    if let Some(copy) = crate::resource::host_copy(resource) {
+                        sync.keep.push(copy);
                     }
+                    sync.publish.push((index, handle, key));
                 } else {
-                    at_once();
+                    if shows_other && let Some(handle) = heap.handle(index) {
+                        let _ = host.mirror(index, handle, true);
+                    }
+                    // Its bytes are in, or on the way there in a list before.
+                    if late && texture.is_some_and(crate::pool::fresh) && !crate::texture::ahead::there(resource) {
+                        if let Some(handle) = heap.handle(index) {
+                            host.texture_slot_show_after(list, index, handle, key);
+                        }
+                    } else {
+                        at_once();
+                    }
                 }
                 let again = partly.map(|mapped| (frame + 1, mapped));
                 let memory = if again.is_none() && heap_recheck() { crate::texture::title_span(resource, first) } else { None };
@@ -3033,6 +3337,12 @@ impl State {
                 crate::copystat::lap(crate::copystat::C::HeapTexUploadNs, started);
                 crate::texture::PICKING.set(None);
             }
+            if let (Some(sync), Some(key), Some(handle)) = (sync.as_deref_mut(), bake_key, heap.handle(index)) {
+                if let Some(copy) = crate::resource::host_copy(resource) {
+                    sync.keep.push(copy);
+                }
+                sync.publish.push((index, handle, key));
+            }
             if shows_other && let Some(handle) = heap.handle(index) {
                 host.texture_slot_flip(list, index, handle, key);
             }
@@ -3065,7 +3375,7 @@ impl State {
                 let text: String = format!("{view:?}").chars().take(300).collect();
                 tracing::error!(why, slot = index, "the host device went while textures picked by index were made ready; last: {text}");
                 crate::host::log_removal_context();
-                return;
+                return false;
             }
             let (bytes, whole) = crate::texture::staged(resource, there.is_none()).unwrap_or((0, true));
             // Not all of it there: looked at again next frame, and from
@@ -3122,9 +3432,10 @@ impl State {
         }
         #[cfg(feature = "diagnostics")]
         lap(crate::copystat::C::HeapTexLoopNs);
-        if baking && served {
+        if sync.is_none() && baking && served {
             BAKE_SERVED.store(host.texture_news().0 + 1, Ordering::Relaxed);
         }
+        served
     }
 
     /// For the frame listing, after a dropped dispatch's line: its group
@@ -6465,7 +6776,7 @@ void lighting_consume(uint3 id : SV_DispatchThreadID) {
         let Some((src, _)) = host.shared_buffer(4096) else {
             return;
         };
-        let (table, scratch) = crate::indirect::open_batch(&list, (1, &src), &[]).unwrap();
+        let (table, scratch) = crate::indirect::open_batch(&list, (1, &src), &[], true).unwrap();
         let mut state = State::default();
         state.batch = Some(Batch { table, scratch: scratch.clone(), wrote: false });
         state.window = Some(Window {
@@ -6749,7 +7060,7 @@ void lighting_consume(uint3 id : SV_DispatchThreadID) {
                     return (b.scratch.clone(), at);
                 }
                 state.batch = None;
-                let (mut table, scratch) = crate::indirect::open_batch(list, (1, &raw_args), &[]).unwrap();
+                let (mut table, scratch) = crate::indirect::open_batch(list, (1, &raw_args), &[], true).unwrap();
                 *opened += 1;
                 state.host_pipeline = 0;
                 state.host_roots[1] = 0;
