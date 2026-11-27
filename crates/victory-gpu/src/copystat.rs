@@ -442,6 +442,10 @@ pub(crate) enum C {
     CardLateRefused,
     /// Full waits with nothing written since the last one (`crate::draw::State::wait_needed`).
     WaitsQuiet,
+    /// Barrier group calls that need no full wait, and those that need one
+    /// only for textures the host's state moves order (`crate::list::groups_wait`).
+    WaitsGroupsRead,
+    WaitsGroupsTexture,
     /// Bytes of partly mapped textures read before their 30 frames were up
     /// as the guards saw a write, and of those passed over until then
     /// (`texture::partial_due`).
@@ -459,7 +463,7 @@ pub(crate) enum C {
 const COUNTERS: usize = 256;
 
 /// The counters' names, in the order of [`C`], for the frame recorder's columns.
-pub(crate) const NAMES: [&str; 241] = [
+pub(crate) const NAMES: [&str; 243] = [
     "Submissions", "Copies", "CopyBytes", "Refreshes", "RefreshBytes", "Skipped", "SkippedBytes", "Runs",
     "RunUs", "Queries", "QueryUs", "MoveUs", "Unmapped", "Watches", "WatchUs", "Checked", "Unchanged",
     "Fallbacks", "GuardFaults", "TexWatched", "TexHashed", "TexChanged", "TexHot", "Frames", "RecordCalls",
@@ -510,7 +514,7 @@ pub(crate) const NAMES: [&str; 241] = [
     "CbvViews", "CbvAligned", "CbvBytes", "CbvAlignedBytes",
     "CbvTables", "CbvTablesAligned", "CbvTablesAlignedSlots", "CbvAgainAlignedSlots",
     "CardLateMoved", "CardLateMovedBytes", "CardLateRefused",
-    "WaitsQuiet",
+    "WaitsQuiet", "WaitsGroupsRead", "WaitsGroupsTexture",
     "TexPartialWritten", "TexPartialSkipped",
     "TexUploadBytes", "TexForced", "TexForcedBytes", "TexForcedSame", "TexForcedSameBytes",
 ];
@@ -1984,11 +1988,14 @@ pub(crate) fn log(frames: f64) {
     tracing::info!(
         "  waits for every earlier shader write, per frame: {:.0} for the title's barrier groups, {:.0} \
          for its barriers on buffers; {:.0} indirect commands bounded (a dispatch of ours between two \
-         such waits each); {:.0} of all these after nothing that writes; barrier experiment {}",
+         such waits each); {:.0} of all these after nothing that writes; of the groups' waits {:.0} \
+         for reads alone and {:.0} for textures alone (VICTORY_GROUP_WAITS); barrier experiment {}",
         c[C::WaitsForGroups as usize],
         c[C::WaitsForBuffers as usize],
         c[C::IndirectBounded as usize],
         c[C::WaitsQuiet as usize],
+        c[C::WaitsGroupsRead as usize],
+        c[C::WaitsGroupsTexture as usize],
         barrier_test()
     );
     barrier_next();

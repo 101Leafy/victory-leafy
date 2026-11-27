@@ -2409,6 +2409,22 @@ fn card_budget() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_CARD_BUDGET").is_none_or(|v| v != "0"))
 }
 
+/// What a list leaves out when it closes (`VICTORY_CLOSE_LEAN`): `notes` 1,
+/// the copy of the clamp's notes out of the card's budget and the barriers
+/// around it (the notes only feed the log: largest mesh group count,
+/// records refused); any other value but `0`, 2, also the moves of the
+/// list's indirect scratch buffers back to common. Each of these buffers
+/// is the list's own and decays to common when the submission finishes,
+/// as every buffer does, so the next recording finds it there anyway.
+fn close_lean() -> u8 {
+    static LEAN: OnceLock<u8> = OnceLock::new();
+    *LEAN.get_or_init(|| match std::env::var("VICTORY_CLOSE_LEAN").as_deref() {
+        Err(_) | Ok("0") => 0,
+        Ok("notes") => 1,
+        Ok(_) => 2,
+    })
+}
+
 /// Whether each list of a submission runs and is timed on its own, slow
 /// ones logged with their commands and every command's time summed by
 /// pipeline (`VICTORY_GPU_TIMING`, diagnostics builds).
@@ -7451,7 +7467,11 @@ impl HostList {
         self.note_op(|| "closing: indirect arguments common".into());
         let scratch = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner()).clone();
         if let Some((scratch, _)) = scratch {
-            self.indirect_common(&scratch);
+            if close_lean() >= 2 {
+                self.deferred().indirect_readable = 0;
+            } else {
+                self.indirect_common(&scratch);
+            }
         }
         lap.to(2);
         #[cfg(feature = "diagnostics")]
@@ -8400,7 +8420,7 @@ impl HostList {
     /// of the budget: its notes on mesh records go to the mapped words
     /// (read at the next submission), and it goes back to common.
     fn card_budget_out(&self) {
-        if !self.deferred().budget_zeroed {
+        if !self.deferred().budget_zeroed || close_lean() >= 1 {
             return;
         }
         let (Some(Some(card)), Some(Some((mapped, _)))) =
@@ -8480,6 +8500,9 @@ impl HostList {
     fn batches_common(&self) {
         let mut args = self.batch_args.lock().unwrap_or_else(|e| e.into_inner());
         let used = std::mem::take(&mut args.1).div_ceil(BATCHES) as usize;
+        if close_lean() >= 2 {
+            return;
+        }
         let barriers: Vec<D3D12_RESOURCE_BARRIER> = args.0[..used]
             .iter()
             .map(|b| transition(b, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_COMMON))
