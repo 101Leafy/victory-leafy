@@ -248,6 +248,28 @@ fn display_size() -> (u32, u32) {
     })
 }
 
+/// The host display's current mode, in pixels: the primary display, whose
+/// mode a title presented to a window lands on. Read by the presentation's
+/// log line as well, so a frame that draws more pixels than the screen has
+/// says so where anyone looking at a slow run will see it.
+#[cfg(windows)]
+pub(crate) fn host_display_size() -> Option<(u32, u32)> {
+    use windows_sys::Win32::Graphics::Gdi::{
+        DEVMODEW, ENUM_CURRENT_SETTINGS, EnumDisplaySettingsW,
+    };
+    // SAFETY: a plain C structure of numbers; the call is told its size.
+    let mut mode: DEVMODEW = unsafe { std::mem::zeroed() };
+    mode.dmSize = size_of::<DEVMODEW>() as u16;
+    // SAFETY: the primary display (no name), a mode structure with its size.
+    let found = unsafe { EnumDisplaySettingsW(std::ptr::null(), ENUM_CURRENT_SETTINGS, &mut mode) };
+    (found != 0).then_some((mode.dmPelsWidth, mode.dmPelsHeight))
+}
+
+#[cfg(not(windows))]
+pub(crate) fn host_display_size() -> Option<(u32, u32)> {
+    None
+}
+
 /// The console's mode list: one 4K mode at 60 Hz (the title looks
 /// for a 120 Hz one to allow 120 Hz frame intervals).
 /// shortcut: fixed mode, not the host display's; report the host's rates if
