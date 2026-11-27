@@ -2411,14 +2411,14 @@ extern "system" fn wait_value64(this: This, address: u64, comparison: u32, refer
     wait_for(this, address, comparison, reference, true);
 }
 
-/// Diagnostics: the title's barrier groups read as the PC's structures: a
+/// The title's barrier groups read as the PC's structures: a
 /// group of 16 bytes (kind, count, pointer); a global barrier of 16 bytes
 /// (kind 0), a texture's of 64 (kind 1), a buffer's of 40 (kind 2), each
 /// beginning with the work before and after and the accesses before and
 /// after, a texture's with its layouts before and after next. `each` gets a
 /// barrier's kind and those six words (the layouts 0 but for a texture).
 /// False if a group does not look like one of these (the rest is not read).
-#[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(windows)]
 fn each_barrier(count: u32, groups: *const u8, mut each: impl FnMut(u32, [u32; 6])) -> bool {
     if groups.is_null() {
         return false;
@@ -2515,6 +2515,66 @@ fn count_groups(count: u32, groups: *const u8) {
     }
 }
 
+/// What a call of the title's barrier groups needs the host's full wait for
+/// ([`each_barrier`]): 2 for nothing, every barrier waiting on reads alone
+/// before reads after, or on no work, or on no access; 1 only for textures
+/// that the host moves between states anyway (`ensure_state`: a target, copy
+/// or unordered access write read after, or a read before a write), so the
+/// state move orders them; 0 for a write nothing else orders (unordered
+/// access, or the common access, which says nothing, on both sides of a
+/// texture; any write before or after on a buffer or a global barrier), or
+/// groups that cannot be read.
+#[cfg(windows)]
+pub(crate) fn groups_wait(count: u32, groups: *const u8) -> u8 {
+    use windows::Win32::Graphics::Direct3D12::*;
+    let reads = [
+        D3D12_BARRIER_ACCESS_VERTEX_BUFFER,
+        D3D12_BARRIER_ACCESS_CONSTANT_BUFFER,
+        D3D12_BARRIER_ACCESS_INDEX_BUFFER,
+        D3D12_BARRIER_ACCESS_DEPTH_STENCIL_READ,
+        D3D12_BARRIER_ACCESS_SHADER_RESOURCE,
+        D3D12_BARRIER_ACCESS_INDIRECT_ARGUMENT,
+        D3D12_BARRIER_ACCESS_COPY_SOURCE,
+        D3D12_BARRIER_ACCESS_RESOLVE_SOURCE,
+        D3D12_BARRIER_ACCESS_RAYTRACING_ACCELERATION_STRUCTURE_READ,
+        D3D12_BARRIER_ACCESS_SHADING_RATE_SOURCE,
+    ]
+    .iter()
+    .fold(0u32, |m, a| m | a.0 as u32);
+    let none = D3D12_BARRIER_ACCESS_NO_ACCESS.0 as u32;
+    let unordered = |a: u32| a == 0 || a & D3D12_BARRIER_ACCESS_UNORDERED_ACCESS.0 as u32 != 0;
+    let read_only = |a: u32| a != 0 && a & !reads == 0;
+    let mut least = 2u8;
+    let read = each_barrier(count, groups, |kind, w| {
+        let (work, before, after) = (w[0], w[2], w[3]);
+        if work == D3D12_BARRIER_SYNC_NONE.0 as u32 || before == none {
+            return;
+        }
+        let need = if read_only(before) && (read_only(after) || after == none) {
+            2
+        } else if kind == 1 && !(unordered(before) && unordered(after)) {
+            1
+        } else {
+            0
+        };
+        least = least.min(need);
+    });
+    if read { least } else { 0 }
+}
+
+/// The least [`groups_wait`] of a call whose full wait is left out
+/// (`VICTORY_GROUP_WAITS`): `reads` 2, `textures` 1; unset, or anything
+/// else, 3 (none left out).
+#[cfg(windows)]
+fn group_waits_left() -> u8 {
+    static LEFT: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *LEFT.get_or_init(|| match std::env::var("VICTORY_GROUP_WAITS").as_deref() {
+        Ok("reads") => 2,
+        Ok("textures") => 1,
+        _ => 3,
+    })
+}
+
 /// The enhanced barriers `(group count, groups)`: buffer, texture and
 /// global barriers with layouts instead of states. Every host use of a
 /// title texture (clears, copies) moves its host copy to the state it needs
@@ -2530,32 +2590,47 @@ fn count_groups(count: u32, groups: *const u8) {
 /// against 32.5): unlike the waits around our clamps (`crate::indirect`'s
 /// `narrow`), these are not what the card stands still for. Taken out again.
 extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
-    // Diagnostics: counted (with what the groups ask for, where the title's
-    // structures still stand: `count_groups`), and left out under
-    // `VICTORY_BARRIER_TEST=groups`.
     #[cfg(all(windows, feature = "diagnostics"))]
     if count > 0 {
         count_groups(count, _groups);
-        crate::copystat::add(crate::copystat::C::WaitsForGroups, 1);
+    }
+    #[cfg(windows)]
+    barrier_groups_waiting(this, count, if _groups.is_null() { 0 } else { groups_wait(count, _groups) });
+    #[cfg(not(windows))]
+    let _ = (this, count);
+}
+
+/// [`barrier_groups`] with what the groups need a wait for, [`groups_wait`]
+/// (worked out where the title's structures still stand).
+#[cfg(windows)]
+pub(crate) fn barrier_groups_waiting(this: This, count: u32, need: u8) {
+    // Diagnostics: counted, and left out under `VICTORY_BARRIER_TEST=groups`.
+    #[cfg(feature = "diagnostics")]
+    if count > 0 {
+        use crate::copystat::{C, add};
+        add(C::WaitsForGroups, 1);
+        match need {
+            2.. => add(C::WaitsGroupsRead, 1),
+            1 => add(C::WaitsGroupsTexture, 1),
+            0 => {}
+        }
         if crate::copystat::barrier_test() & 1 != 0 {
             return;
         }
     }
-    #[cfg(windows)]
     if count > 0
         && let Some(list) = host_list(this)
     {
         use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
         with_state(this, |_, state| state.synced());
-        if wait_needed(this) {
+        // A wait left out is not one the quiet waits count as made.
+        if need < group_waits_left() && wait_needed(this) {
             // SAFETY: the same layout; no resource named.
             let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
             // SAFETY: an open list.
             unsafe { list.list.ResourceBarrier(&[barrier]) };
         }
     }
-    #[cfg(not(windows))]
-    let _ = (this, count);
 }
 
 /// The bottom-of-pipe value writes `(address, value, flush, flags)`, 32 and

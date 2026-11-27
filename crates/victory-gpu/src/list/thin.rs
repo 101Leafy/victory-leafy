@@ -621,7 +621,8 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
     if count > 0 {
         super::count_groups(count, _groups);
     }
-    front(this).put(BARRIER_GROUPS, &[u64::from(count)]);
+    let need = if count > 0 && !_groups.is_null() { super::groups_wait(count, _groups) } else { 0 };
+    front(this).put(BARRIER_GROUPS, &[u64::from(count), u64::from(need)]);
 }
 extern "system" fn viewports(this: This, count: u32, items: *const D3D12_VIEWPORT) {
     let count = if items.is_null() { 0 } else { count };
@@ -803,7 +804,7 @@ fn one(list: This, op: u64, w: &[u64]) -> bool {
         BARRIER => {
             super::barrier(list, n as u32, at_or(w, 1));
         }
-        BARRIER_GROUPS => super::barrier_groups(list, n as u32, std::ptr::null()),
+        BARRIER_GROUPS => super::barrier_groups_waiting(list, n as u32, w.get(1).map_or(0, |&need| need as u8)),
         VIEWPORTS => state::viewports(list, n as u32, at(w, 1, n)),
         SCISSORS => state::scissors(list, n as u32, at(w, 1, n)),
         BLEND_FACTOR => state::blend_factor(list, at(w, 1, n)),
