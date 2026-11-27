@@ -52,6 +52,8 @@ groupshared uint costs[64];
 groupshared uint fits[64];
 groupshared uint largest_asked;
 groupshared uint all_asked;
+// Executions of records that asked for no work at all (diagnostics).
+groupshared uint empties;
 uint load(uint source, uint at) {
     if (source == 0) return src0.Load(at);
     if (source == 1) return src1.Load(at);
@@ -72,6 +74,7 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     if (gi == 0) {
         largest_asked = 0;
         all_asked = 0;
+        empties = 0;
     }
     // As the clamp of one execution (`super::SOURCE`) bounds them.
     if (active) {
@@ -128,6 +131,10 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         InterlockedMax(largest_asked, asked, was);
         InterlockedAdd(all_asked, min(asked, 1u << 24), was);
     }
+    if (active && cost == 0) {
+        uint was;
+        InterlockedAdd(empties, job.x >> 16, was);
+    }
     uint first = id.x - gi;
     uint n = count > first ? min(64u, count - first) : 0u;
     if (gi == 0 && n > 0) {
@@ -177,6 +184,10 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         uint was;
         budget.InterlockedMax(4, largest_asked, was);
         budget.InterlockedAdd(8, all_asked, was);
+    }
+    if (gi == 0 && empties > 0) {
+        uint was;
+        budget.InterlockedAdd(20, empties, was);
     }
     if (!active) {
         return;

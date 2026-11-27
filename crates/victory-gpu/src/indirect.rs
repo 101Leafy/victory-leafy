@@ -186,6 +186,7 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         uint at = before;
         uint refused = 0;
         uint biggest = 0;
+        uint empty = 0;
         for (uint k = 0; k < n; k++) {
             uint c = costs[k];
             uint fit = 1;
@@ -194,14 +195,20 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
                 at = (at >= BUDGET || BUDGET - at < c) ? (REST ? BUDGET : at) : (at + c);
                 refused += 1 - fit;
                 biggest = max(biggest, c);
+            } else {
+                empty++;
             }
             fits[k] = fit;
         }
         // Diagnostics: the records that run empty for want of budget, and
-        // the largest cost there was (small ones are not told).
+        // the largest cost there was (small ones are not told), and the
+        // records that asked for no work at all.
         uint told;
         if (refused > 0) {
             budget.InterlockedAdd(12, refused, told);
+        }
+        if (empty > 0) {
+            budget.InterlockedAdd(20, empty, told);
         }
         if (biggest >= (1u << 22)) {
             budget.InterlockedMax(16, biggest, told);
@@ -2539,10 +2546,11 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
             }
             warp.submit_and_wait();
             // SAFETY: the work is done; mapped buffers.
-            let (spent, largest, out) = unsafe {
+            let (spent, largest, empty, out) = unsafe {
                 (
                     (budget_ptr as *const u32).read_volatile(),
                     (budget_ptr as *const u32).add(1).read_volatile(),
+                    (budget_ptr as *const u32).add(5).read_volatile(),
                     std::slice::from_raw_parts(readback_ptr.cast::<u32>().cast_const(), total / 4).to_vec(),
                 )
             };
@@ -2558,6 +2566,7 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
             }
             assert_eq!(spent, charged_filled, "unfilled slots charge nothing");
             assert_eq!(largest, 519, "and are not counted as asked for");
+            assert_eq!(empty, RECORDS - 2, "the record of no groups and the unfilled slots are told as empty");
         }
     }
 
@@ -3445,15 +3454,17 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
             }
             warp.submit_and_wait();
             // SAFETY: the list has run; mapped words.
-            let (spent, out): (u32, Vec<u32>) = unsafe {
+            let (spent, empty, out): (u32, u32, Vec<u32>) = unsafe {
                 (
                     budget_ptr.cast::<u32>().read_volatile(),
+                    budget_ptr.cast::<u32>().add(5).read_volatile(),
                     (0..records as usize).map(|r| back_ptr.cast::<u32>().add(r * batch::SLOT as usize / 4).read_volatile()).collect(),
                 )
             };
             assert_eq!(out.iter().filter(|&&v| v == 1 << 22).count(), filled, "{times} times {records}: {out:?}");
             assert!(out.iter().all(|&v| v == 0 || v == 1 << 22));
             assert_eq!(spent, BUDGET.min((1 << 26) * times * records as u32));
+            assert_eq!(empty, 0, "records refused for budget asked for work");
         }
     }
 
