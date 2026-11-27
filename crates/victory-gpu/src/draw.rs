@@ -726,6 +726,11 @@ fn dynamic_slots(heap: usize, host: &crate::descriptor::host::HostHeap, n: u32) 
     {
         return Some(first);
     }
+    // Then the next landings, without the submission lock
+    // (`VICTORY_DYNAMIC_WAIT`).
+    if let Some(first) = crate::host::wait_for_slots(|| host.dynamic(n)) {
+        return Some(first);
+    }
     let mode = *MODE.get_or_init(|| match std::env::var("VICTORY_TABLE_SETTLE").as_deref().map(str::trim) {
         Ok("0") => 0,
         Ok("2") => 2,
