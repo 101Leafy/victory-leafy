@@ -161,12 +161,25 @@ pub(super) struct Frames {
     last: Instant,
     frame: u64,
     before: Vec<u64>,
+    /// The last sample of [`GAUGES`], and when it was taken: they cost a
+    /// process query and two driver queries, so they are read on a clock
+    /// of their own rather than once per recorded frame ([`Frames::frame`]).
+    gauges: [u64; 5],
+    gauges_at: Instant,
 }
 
 impl Frames {
     pub(super) fn new(host: &Host) -> Frames {
         let now = Instant::now();
-        let mut frames = Frames { out: None, began: now, last: now, frame: 0, before: counters() };
+        let mut frames = Frames {
+            out: None,
+            began: now,
+            last: now,
+            frame: 0,
+            before: counters(),
+            gauges: [0; 5],
+            gauges_at: now - Duration::from_secs(1),
+        };
         let Some(asked) = std::env::var_os("VICTORY_FRAMES").filter(|v| v != "0") else { return frames };
         let path = if asked == "1" { "victory-frames.csv".into() } else { std::path::PathBuf::from(asked) };
         let file = match std::fs::File::create(&path) {
@@ -216,21 +229,26 @@ impl Frames {
     pub(super) fn frame(&mut self, host: &Host, present: Duration) {
         let Some(out) = &self.out else { return };
         let now = Instant::now();
+        // The gauges are not the frame's cost and are not on its clock: a
+        // process query and two `QueryVideoMemoryInfo` calls, which on some
+        // drivers take longer than a frame and land inside the time the line
+        // about that frame reports. Read once a second and held in between,
+        // so what the file says a frame took is what the frame took.
+        if self.gauges_at.elapsed() >= Duration::from_secs(1) {
+            let (working, private) = crate::copystat::process_memory();
+            let [budget, used, _, shared] = host.video_memory().unwrap_or_default();
+            self.gauges = [private, working, used, budget, shared];
+            self.gauges_at = now;
+        }
         let counters = counters();
-        let (working, private) = crate::copystat::process_memory();
-        let [budget, used, _, shared] = host.video_memory().unwrap_or_default();
         let mut row = Vec::with_capacity(4 + GAUGES.len() + counters.len());
         row.extend([
             self.frame,
             (now - self.began).as_micros() as u64,
             (now - self.last).as_micros() as u64,
             present.as_micros() as u64,
-            private,
-            working,
-            used,
-            budget,
-            shared,
         ]);
+        row.extend(self.gauges);
         row.extend(grown(&counters, &self.before));
         self.before = counters;
         self.last = now;
