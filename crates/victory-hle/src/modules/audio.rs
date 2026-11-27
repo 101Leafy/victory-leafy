@@ -689,6 +689,19 @@ fn wake_decoder() {
             std::thread::Builder::new()
                 .name("victory XMA decoder".into())
                 .spawn(|| {
+                    #[cfg(windows)]
+                    {
+                        use windows_sys::Win32::System::Threading::{
+                            GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL,
+                        };
+                        // A 256-byte XMA block lasts 2.7 ms; keep decoding ahead of
+                        // thin-list and pipeline workers so high CPU load does not
+                        // starve the output ring into robotic/crackling audio.
+                        // SAFETY: GetCurrentThread is a pseudo-handle to this thread.
+                        unsafe {
+                            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL)
+                        };
+                    }
                     loop {
                         let active = xma().pump();
                         if active == 0 {
