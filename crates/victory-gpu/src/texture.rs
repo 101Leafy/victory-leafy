@@ -21,6 +21,8 @@
 //! (every mip and array slice), depth and stencil planes are not.
 
 pub(crate) mod ahead;
+#[cfg(feature = "diagnostics")]
+pub(crate) mod audit;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, Weak};
@@ -2118,6 +2120,8 @@ impl Staging {
         } else {
             u32::MAX
         };
+        #[cfg(feature = "diagnostics")]
+        audit::read(self.memory as usize, tiled);
         #[cfg(feature = "diagnostics")]
         if tiled.iter().all(|&b| b == 0) {
             tracing::debug!(
