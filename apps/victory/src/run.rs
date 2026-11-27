@@ -258,6 +258,14 @@ pub fn run(
     victory_hle::runtime::use_console_timers();
     #[cfg(feature = "diagnostics")]
     diagnostics(&image, &cfg);
+    // The timer log and the capture are diagnostics only: a run set up for
+    // them on a plain build would otherwise give no line and no picture.
+    #[cfg(not(feature = "diagnostics"))]
+    for name in ["VICTORY_TIMER_LOG", "VICTORY_CAPTURE"] {
+        if std::env::var_os(name).is_some() {
+            tracing::warn!("{name} is set, but this build has no diagnostics feature: no timer lines or captures");
+        }
+    }
     let late = LateDlls {
         host: resolver.host.clone(),
         title_dir: title_dir.to_owned(),
