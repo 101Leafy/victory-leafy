@@ -63,6 +63,16 @@ pub fn use_pipeline_cache(dir: PathBuf) {
     let _ = DIR.set(dir);
 }
 
+/// Libraries of other folders, looked in when this run's own library has
+/// no pipeline by that name: `victory warm`'s processes look in the cache
+/// folder's library, so that what a run already keeps is not made again,
+/// and its last process in theirs, keeping what it finds (`keep`).
+static OTHER_DIRS: OnceLock<(Vec<PathBuf>, bool)> = OnceLock::new();
+
+pub fn use_other_libraries(dirs: Vec<PathBuf>, keep: bool) {
+    let _ = OTHER_DIRS.set((dirs, keep));
+}
+
 /// The folder the library is kept in.
 pub(super) fn folder() -> Option<PathBuf> {
     DIR.get().cloned()
@@ -99,9 +109,12 @@ fn writer(dir: &std::path::Path, wait: std::time::Duration) -> Option<std::fs::F
 }
 
 /// Host pipelines created, loaded from the library, and title pipelines
-/// started at creation, since the start.
+/// started at creation, since the start; loaded from another folder's
+/// library ([`use_other_libraries`]), and stored in this run's.
 pub(crate) static MADE: AtomicU64 = AtomicU64::new(0);
 pub(crate) static LOADED: AtomicU64 = AtomicU64::new(0);
+pub(crate) static LOADED_OTHER: AtomicU64 = AtomicU64::new(0);
+pub(crate) static STORED: AtomicU64 = AtomicU64::new(0);
 pub(crate) static EARLY: AtomicU64 = AtomicU64::new(0);
 /// For the memory lines: the bytes of the library's file, kept in memory
 /// while the library lives, and the bytes the last save wrote (a buffer of
@@ -536,6 +549,37 @@ fn library() -> Option<&'static Library> {
         .as_ref()
 }
 
+/// The libraries of [`use_other_libraries`] the host takes, read only.
+fn others() -> &'static [Library] {
+    static OTHERS: OnceLock<Vec<Library>> = OnceLock::new();
+    OTHERS.get_or_init(|| {
+        let Some((dirs, _)) = OTHER_DIRS.get() else { return Vec::new() };
+        let Some(device) = crate::host::host().and_then(|h| h.device.cast::<ID3D12Device1>().ok()) else {
+            return Vec::new();
+        };
+        let mut all = Vec::new();
+        for dir in dirs {
+            let blob = Blob::at(&dir.join(LIBRARY_FILE));
+            if blob.bytes().is_empty() {
+                continue;
+            }
+            match make(&device, blob.bytes()) {
+                Ok(library) => {
+                    tracing::info!(dir = %dir.display(), bytes = blob.bytes().len(), "other host pipeline library loaded");
+                    all.push(Library {
+                        library,
+                        _blob: blob,
+                        added: AtomicU64::new(0),
+                        saving: RwLock::new(()),
+                    });
+                }
+                Err(e) => tracing::warn!(dir = %dir.display(), error = %e, "other host pipeline library rejected"),
+            }
+        }
+        all
+    })
+}
+
 /// The library of the cache folder `dir`, made by `load` (which hands back
 /// the bytes it rejects, with the host's reason), or `None` for an empty one.
 ///
@@ -784,7 +828,7 @@ unsafe extern "system" fn compiler_crashed(
 /// there with the same description, else made by `create` and stored.
 pub(crate) fn pipeline(
     name: &str,
-    load: impl FnOnce(&ID3D12PipelineLibrary1, PCWSTR) -> windows::core::Result<ID3D12PipelineState>,
+    load: impl Fn(&ID3D12PipelineLibrary1, PCWSTR) -> windows::core::Result<ID3D12PipelineState>,
     create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
 ) -> windows::core::Result<ID3D12PipelineState> {
     if crashed(name) {
@@ -830,6 +874,18 @@ pub(crate) fn pipeline(
         }
         Err(e) => e,
     };
+    if let Some(pso) = others().iter().find_map(|other| {
+        let _all = one_call();
+        load(&other.library, PCWSTR(wide.as_ptr())).ok()
+    }) {
+        LOADED_OTHER.fetch_add(1, Ordering::Relaxed);
+        if OTHER_DIRS.get().is_some_and(|(_, keep)| *keep) {
+            let _all = one_call();
+            let _stores = library.saving.read().unwrap_or_else(|e| e.into_inner());
+            store(library, &wide, &pso);
+        }
+        return Ok(pso);
+    }
     // Compiles take up to seconds. Keep only this name held.
     let pso = {
         let _call = call("make", name);
@@ -895,6 +951,7 @@ fn store(library: &Library, name: &HSTRING, pso: &ID3D12PipelineState) {
     // differs) is refused, which leaves the library as it was.
     if unsafe { library.library.StorePipeline(PCWSTR(name.as_ptr()), pso) }.is_ok() {
         library.added.fetch_add(1, Ordering::Relaxed);
+        STORED.fetch_add(1, Ordering::Relaxed);
     }
 }
 
