@@ -12,6 +12,8 @@ use std::thread::LocalKey;
 
 #[path = "quad.rs"]
 mod quad;
+#[path = "paired_fp32.rs"]
+mod paired_fp32;
 
 use super::UserData;
 use super::bitcode::{Attr, Bin, Cast, Rmw, Tag, Term, V, pred};
@@ -497,6 +499,7 @@ struct Lower<'a> {
     runs_taken: Vec<(usize, usize, usize)>,
     /// Values written in a section that code outside it reads.
     section_out: HashSet<Value>,
+    paired_fp32: bool,
     /// The program's constant table (the code from the first byte read
     /// through `s_getpc_b64` on): global, first byte, dwords.
     code_table: Option<(V, u32, u32)>,
@@ -2161,6 +2164,7 @@ impl<'a> Lower<'a> {
             #[cfg(test)]
             runs_taken: Vec::new(),
             section_out: HashSet::new(),
+            paired_fp32: false,
             code_table: None,
             #[cfg(test)]
             code_words: Vec::new(),
@@ -2714,6 +2718,9 @@ impl<'a> Lower<'a> {
             return self.paired_sum64(high, lo, hi, mask);
         }
         let (op, src, mask, ident, prefix) = match shape {
+            Shape::Prefix(Op::AddF | Op::AddH | Op::MinF | Op::MaxF, ..) => {
+                return Err("a paired floating-point prefix");
+            }
             Shape::Active(op, src, mask, ident) => (op, src, mask, ident, None),
             Shape::Prefix(op, src, mask, ident, inclusive) => (op, src, mask, ident, Some(inclusive)),
             _ => return Err("a whole-wave section value of another shape"),
@@ -3011,6 +3018,10 @@ impl<'a> Lower<'a> {
                     self.inst(b, i)?;
                 }
                 if let Some(end) = self.sections.get(&b).and_then(|s| s.get(&i)).map(|s| s.end) {
+                    if self.twin.is_some() && self.replay_paired_fp32(b, i, end)? {
+                        i = end;
+                        continue;
+                    }
                     for j in i + 1..end {
                         if self.twin.is_some() {
                             self.paired_section_inst(b, j, i);
@@ -6814,10 +6825,10 @@ impl<'a> Lower<'a> {
         }
     }
 
-    /// The paired form: an instruction that reads other lanes of the console wave:
-    /// `v_readlane_b32` and `v_readfirstlane_b32`, any of its 64 (scalar results, the same in
-    /// both lanes of the thread), and `ds_bpermute_b32`, within the lane's own half. Lane n and
-    /// lane n + 32 are the lower and the upper lane of host lane n.
+    /// The paired form: an instruction that reads other lanes of the console wave, any of its
+    /// 64: `v_readlane_b32` and `v_readfirstlane_b32` (scalar results, the same in both lanes of
+    /// the thread). `ds_bpermute_b32` stays within its own 32-lane half on GFX10.
+    /// Lane n and lane n + 32 are the lower and the upper lane of host lane n.
     fn paired_cross(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
         self.cross_lane(false)?;
         let c = self.cur;
@@ -6850,9 +6861,8 @@ impl<'a> Lower<'a> {
                 self.write_i(inst, r, None)?;
             }
             _ => {
-                // `ds_bpermute_b32`: each lane reads the lane its address names in its own
-                // half (the lower lanes the lower values, the upper lanes the upper ones),
-                // which gives its data, or 0 outside EXEC
+                // GFX10 bpermute addresses only the destination lane's own half.
+                // An inactive source lane supplies zero.
                 let Fields::Ds {
                     dst: Some(Operand::Vector { reg, .. }),
                     addr: Some(addr),
@@ -9368,6 +9378,11 @@ impl<'a> Lower<'a> {
             }
             "v_add_f32" | "v_sub_f32" | "v_subrev_f32" | "v_mul_f32" | "v_mul_legacy_f32"
             | "v_max_f32" | "v_min_f32" => {
+                if self.paired_fp32 && matches!(name, "v_add_f32" | "v_min_f32" | "v_max_f32") {
+                    let (a, b) = (s(self, 0)?, s(self, 1)?);
+                    let r = self.paired_fp32_op(name, a, b);
+                    return int(self, r);
+                }
                 let (a, bb) = (f(self, 0)?, f(self, 1)?);
                 let r = match name {
                     "v_add_f32" => self.s.m.bin(c, Bin::Add, a, bb),
