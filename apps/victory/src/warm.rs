@@ -388,7 +388,7 @@ fn merge_parts(dir: &Path) -> Result<()> {
     known::merge(library_dir(dir), found);
     let these: Vec<usize> = these.into_iter().collect();
     let mut there = 0;
-    known::make(dir, &these, |_, came| there += usize::from(came.is_some_and(|(_, t)| t)));
+    known::make(dir, &these, |_, came| there += usize::from(came.is_some_and(|(_, t)| t)))?;
     let stored = known::save();
     println!("kept {stored} new pipelines of {} in the library ({there} made or loaded)", these.len());
     let _ = std::io::stdout().flush();
