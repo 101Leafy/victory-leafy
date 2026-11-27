@@ -603,10 +603,14 @@ fn window_room_for(size: u64) -> Option<ID3D12Resource> {
     if let Some([budget, used, ..]) = host.video_memory()
         && used + size > budget / 10 * 8
     {
+        WINDOW_ROOM_REFUSED[0].fetch_add(1, Ordering::Relaxed);
+        WINDOW_ROOM_REFUSED[1].fetch_add(size, Ordering::Relaxed);
         return None;
     }
     if WINDOW_CARD_BYTES.fetch_add(size, Ordering::Relaxed) + size > most {
         WINDOW_CARD_BYTES.fetch_sub(size, Ordering::Relaxed);
+        WINDOW_ROOM_REFUSED[0].fetch_add(1, Ordering::Relaxed);
+        WINDOW_ROOM_REFUSED[1].fetch_add(size, Ordering::Relaxed);
         return None;
     }
     let buffer = host.uav_buffer(size);
@@ -734,6 +738,27 @@ fn card_late_windows() {
         }
         crate::host::retire(old);
     }
+}
+
+/// Windows turned away from the card's memory since the start, by its budget
+/// or by [`window_card_most`]: copies and bytes.
+static WINDOW_ROOM_REFUSED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// How long a window with a side in the card's memory may be held by no list
+/// and no slot before it is let go, in milliseconds
+/// (`VICTORY_CARD_WINDOWS_IDLE_MS`; 0, the default: as other windows, five
+/// minutes while the PC has RAM free).
+///
+/// Windows get card room in the order draws first ask for them, until a fifth
+/// of the card's budget is left. At the boat in gpt-b1 (CARD_WINDOWS_MB=3072)
+/// 1,666 MB of windows were on the card, 1,538 MB of them with nothing sent
+/// for 10 s, and every window made after that was read over the bus. One idle
+/// this long gives its room back to the next window made.
+fn card_windows_idle_ms() -> u64 {
+    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MS.get_or_init(|| {
+        std::env::var("VICTORY_CARD_WINDOWS_IDLE_MS").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0)
+    })
 }
 
 /// What went up, by send: its number, and the offsets, in order and joined
@@ -954,6 +979,31 @@ pub(crate) fn card_sides_census() -> [u64; 10] {
             }
         }
     }
+    out
+}
+
+/// For the memory line: the windows outside buffers by where shaders read
+/// them and whether they are idle (no draw asked for them for 10 s, and no
+/// list or slot holds them). Copies and bytes, four times: on the card and in
+/// use, on the card and idle, in the PC's memory and in use, there and idle.
+/// Then the windows turned away from the card since the start.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn windows_by_use() -> [u64; 10] {
+    let mut out = [0u64; 10];
+    {
+        let loose = LOOSE.read().unwrap_or_else(|e| e.into_inner());
+        let mut seen = std::collections::HashSet::new();
+        for s in loose.values().filter(|s| seen.insert(Arc::as_ptr(s) as usize)) {
+            let idle = crate::host::long_ago(s.used.load(Ordering::Relaxed), 10_000, 4)
+                && Arc::strong_count(s) == 1
+                && crate::host::references(&s.buffer) == 1;
+            let at = (if s.card.is_some() || s.mapped { 0 } else { 4 }) + if idle { 2 } else { 0 };
+            out[at] += 1;
+            out[at + 1] += s.len;
+        }
+    }
+    out[8] = WINDOW_ROOM_REFUSED[0].load(Ordering::Relaxed);
+    out[9] = WINDOW_ROOM_REFUSED[1].load(Ordering::Relaxed);
     out
 }
 
@@ -3267,11 +3317,13 @@ pub(crate) fn let_go_idle() {
             return;
         }
         let idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
+        let card_ms = card_windows_idle_ms();
         let idle: Vec<(u64, u64)> = map
             .iter()
             .filter(|(_, s)| {
+                let ms = if card_ms > 0 && s.card.is_some() { idle_ms.min(card_ms) } else { idle_ms };
                 Arc::strong_count(s) == 1
-                    && crate::host::long_ago(s.used.load(Ordering::Relaxed), idle_ms, IDLE_FRAMES)
+                    && crate::host::long_ago(s.used.load(Ordering::Relaxed), ms, IDLE_FRAMES)
                     && crate::host::references(&s.buffer) == 1
                     // Slots made before a window went to the card late
                     // show its CPU's side ([`card_late_windows`]).
