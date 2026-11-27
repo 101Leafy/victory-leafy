@@ -959,6 +959,62 @@ fn thread_times() -> (u64, u64) {
     (ms(user), ms(kernel))
 }
 
+/// The adapter to make the device on: the one `VICTORY_ADAPTER` names (a
+/// case-insensitive substring of its description), else the one DXGI ranks
+/// for high performance. On a hybrid laptop the default adapter is the
+/// integrated GPU, and the title runs there at about a frame a second.
+fn host_adapter() -> Option<IDXGIAdapter> {
+    // SAFETY: plain DXGI enumeration with valid out parameters.
+    unsafe {
+        let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
+        if let Ok(wanted) = std::env::var("VICTORY_ADAPTER") {
+            let mut index = 0;
+            while let Ok(a) = factory.EnumAdapters1(index) {
+                if let Ok(desc) = a.GetDesc1()
+                    && names_adapter(&adapter_name(&desc), &wanted)
+                {
+                    let name = adapter_name(&desc);
+                    tracing::info!(adapter = %name, "host adapter (VICTORY_ADAPTER)");
+                    return a.cast().ok();
+                }
+                index += 1;
+            }
+            if !wanted.trim().is_empty() {
+                tracing::warn!(
+                    wanted = %wanted,
+                    "VICTORY_ADAPTER names no adapter; taking the high-performance one"
+                );
+            }
+        }
+        let high = factory
+            .cast::<IDXGIFactory6>()
+            .and_then(|f| {
+                f.EnumAdapterByGpuPreference::<IDXGIAdapter1>(0, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE)
+            })
+            .ok()?;
+        let name = adapter_name(&high.GetDesc1().ok()?);
+        tracing::info!(adapter = %name, "host adapter");
+        high.cast().ok()
+    }
+}
+
+/// An adapter's description without its NUL padding.
+fn adapter_name(desc: &DXGI_ADAPTER_DESC1) -> String {
+    let len = desc
+        .Description
+        .iter()
+        .position(|&c| c == 0)
+        .unwrap_or(desc.Description.len());
+    String::from_utf16_lossy(&desc.Description[..len])
+}
+
+/// Whether `wanted` names `adapter`: a case-insensitive substring of its
+/// description, ignoring surrounding spaces. An empty `wanted` names none.
+fn names_adapter(adapter: &str, wanted: &str) -> bool {
+    let wanted = wanted.trim();
+    !wanted.is_empty() && adapter.to_lowercase().contains(&wanted.to_lowercase())
+}
+
 fn create() -> windows::core::Result<Host> {
     let started = std::time::Instant::now();
     // SAFETY: plain D3D12 object creation with valid descriptions.
@@ -1019,7 +1075,10 @@ fn create() -> windows::core::Result<Host> {
             tracing::info!("host device on the software adapter (WARP)");
         } else {
             let driver = std::time::Instant::now();
-            D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            match host_adapter() {
+                Some(adapter) => D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?,
+                None => D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?,
+            }
             tracing::info!(ms = driver.elapsed().as_millis() as u64, "D3D12CreateDevice done");
             // Whether a GPU hang ends the run or freezes the PC (#1054).
             crate::tdr::log();
