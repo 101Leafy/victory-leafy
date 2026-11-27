@@ -885,6 +885,8 @@ mod loose;
 #[cfg(windows)]
 mod make;
 #[cfg(windows)]
+mod samplers;
+#[cfg(windows)]
 mod spent;
 
 /// Lets the pipeline library's mapped file go from memory when no pipeline
