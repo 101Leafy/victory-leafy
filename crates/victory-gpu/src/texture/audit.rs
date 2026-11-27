@@ -115,6 +115,10 @@ pub(crate) fn check(frame: u64) {
         // (Before `READS`: a refresh holds its texture's lock as it reads.)
         let staging = super::staged_under(memory, memory + 1).into_iter().find(|s| s.memory() == (memory, len));
         let partly = staging.as_ref().and_then(|s| s.last.try_lock().ok().map(|last| last.partial.is_some()));
+        // Whether a list sampled it since: a texture nothing draws is not
+        // read again, and its old bytes show nowhere.
+        let used = staging.as_ref().map(|s| frame.saturating_sub(s.used.load(Relaxed) >> 32));
+        let once = staging.as_ref().is_some_and(|s| s.once.load(Relaxed));
         let mut reads = READS.lock().unwrap_or_else(|e| e.into_inner());
         let Some(read) = reads.get_mut(&(memory, len)) else {
             continue;
@@ -144,6 +148,8 @@ pub(crate) fn check(frame: u64) {
             first_changed_zero = zero,
             staged,
             partly_mapped = partly.unwrap_or(false),
+            frames_since_used = used.unwrap_or(u64::MAX),
+            once,
             told = told.as_deref().unwrap_or("never since its read"),
             "texture audit: title memory changed since the texture was last read"
         );
