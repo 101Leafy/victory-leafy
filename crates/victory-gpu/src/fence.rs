@@ -1,10 +1,13 @@
-//! Fences: a 64-bit value and the events waiting for it. Nothing runs on a
-//! GPU yet, so only signals (the title's, later our queues') move one.
+//! Fences: a 64-bit value and what waits for it, the events the title names
+//! and (no event) the title's own thread, which `SetEventOnCompletion`
+//! blocks. Nothing runs on a GPU yet, so only signals (the title's, later our
+//! queues') move one.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::ffi::c_void;
-use std::sync::Mutex;
+use std::sync::{Condvar, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use crate::object::{self, E_NOTIMPL, FENCE, HRESULT, Iid, Object, S_OK, Table, This, guid};
 use crate::resource::PAGEABLE_IIDS;
@@ -35,8 +38,13 @@ struct Fence {
     /// address.
     value: AtomicU64,
     flags: u32,
-    /// Events to set once the value reaches theirs (handles as integers).
+    /// Events to set once the value reaches theirs (handles as integers),
+    /// and what a thread blocked on the fence wakes on.
     waiters: Mutex<Vec<(u64, usize)>>,
+    /// Told whenever the value moves, for a thread blocked without an
+    /// event. Its lock is `waiters`, so a value stored between a blocked
+    /// thread's look and its wait is never missed.
+    reached: Condvar,
 }
 
 fn fence<'a>(this: This) -> &'a Fence {
@@ -57,6 +65,7 @@ pub(crate) extern "system" fn create(
         value: AtomicU64::new(initial),
         flags,
         waiters: Mutex::new(Vec::new()),
+        reached: Condvar::new(),
     });
     object::hand_out(FENCE, fence, iid, &FENCE_IIDS, out)
 }
@@ -145,7 +154,8 @@ extern "system" fn completed_called(this: This) -> u64 {
 ///   cannot exercise it from one that is not fixed;
 /// - a wait that does not get its value warns with `value`: "blocking fence
 ///   wait timed out" under `VICTORY_FENCE_BLOCK=1` (see [`block`]), "not
-///   implemented" without it.
+///   implemented" under `VICTORY_FENCE_WAIT=0`; otherwise the thread waits
+///   in [`wait_for`], which warns every [`STALL_REPORT_SECS`].
 extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c_void) -> HRESULT {
     let fence = fence(this);
     let mut waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
@@ -173,9 +183,9 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
         // With submissions sent to the card and not waited for
         // (`crate::host::late`) the signal may be behind them: they are
         // settled, which sets it.
+        drop(waiters);
         #[cfg(windows)]
         if crate::host::late() {
-            drop(waiters);
             crate::queue::before_sync();
             crate::host::settle_for_fence();
             if fence.value.load(Ordering::Acquire) >= value {
@@ -213,16 +223,58 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
                 tracing::warn!(value, "blocking fence wait timed out");
                 return E_NOTIMPL;
             }
-            tracing::warn!(value, "blocking fence wait not implemented");
+        }
+        if !blocks() {
+            tracing::warn!(value, "blocking fence wait not implemented (VICTORY_FENCE_WAIT=0)");
             return E_NOTIMPL;
         }
-        // shortcut: a null event means "block until reached"; nothing can
-        // reach it while no GPU work runs, so fail instead of hanging.
-        tracing::warn!(value, "blocking fence wait not implemented");
-        return E_NOTIMPL;
+        return wait_for(fence, value);
     }
     waiters.push((value, event as usize));
     S_OK
+}
+
+/// How long a blocked wait goes unreported, in seconds.
+const STALL_REPORT_SECS: u64 = 10;
+
+/// Whether a null event blocks the title's thread until its value is
+/// reached, as `SetEventOnCompletion` says it does. `VICTORY_FENCE_WAIT=0`
+/// answers `E_NOTIMPL` instead, for a run that shows a wait nothing
+/// satisfies.
+fn blocks() -> bool {
+    static BLOCKS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *BLOCKS.get_or_init(|| std::env::var("VICTORY_FENCE_WAIT").map_or(true, |v| v != "0"))
+}
+
+/// Blocks the calling thread until `value` is reached, as a null event asks.
+/// `set` moves the value and wakes it; events waiting beside it are left
+/// alone. A wait still unmet says so every [`STALL_REPORT_SECS`], so one
+/// nothing will satisfy leaves a line in the log and not only a title that
+/// stopped.
+fn wait_for(fence: &Fence, value: u64) -> HRESULT {
+    let started = std::time::Instant::now();
+    let mut waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
+    loop {
+        if fence.value.load(Ordering::Acquire) >= value {
+            return S_OK;
+        }
+        let (guard, waited) = fence
+            .reached
+            .wait_timeout(waiters, Duration::from_secs(STALL_REPORT_SECS))
+            .unwrap_or_else(|e| e.into_inner());
+        waiters = guard;
+        let reached = fence.value.load(Ordering::Acquire);
+        // A signal below the value is news, not a stall: only a wait that
+        // went the whole time without reaching it is reported.
+        if waited.timed_out() && reached < value {
+            tracing::warn!(
+                value,
+                reached,
+                waited_ms = started.elapsed().as_millis() as u64,
+                "a fence the title blocks on is unmet (VICTORY_FENCE_WAIT=0: fail the wait instead)"
+            );
+        }
+    }
 }
 /// Whether a wait with no event, behind submissions not waited for, waits up
 /// to 250 ms for the value, and fence values wake threads waiting on their
@@ -247,6 +299,8 @@ pub(crate) fn set(this: This, value: u64) {
         }
         !reached
     });
+    // A thread blocked without an event looks at the value again.
+    fence.reached.notify_all();
     drop(waiters);
     // The title's threads may wait on the value's address (its GPU address).
     #[cfg(windows)]
@@ -317,7 +371,8 @@ mod tests {
         assert_eq!(wait(f, 5, event), S_OK, "already reached");
         // SAFETY: as above.
         assert_eq!(unsafe { WaitForSingleObject(event, 0) }, WAIT_OBJECT_0);
-        assert_eq!(wait(f, 9, std::ptr::null_mut()), E_NOTIMPL);
+        // A null event blocks; the value is already reached here.
+        assert_eq!(wait(f, 5, std::ptr::null_mut()), S_OK);
         // The title reads the value at the fence's address.
         let at = slot::<extern "system" fn(This) -> u64>(f, 0x60)(f);
         // SAFETY: the fence's value.
@@ -358,5 +413,49 @@ mod tests {
         assert_eq!(slot::<Flags>(queried, 0x58)(queried), 0x2);
         assert_eq!(slot::<Release>(queried, 0x10)(queried), 1);
         assert_eq!(slot::<Release>(f, 0x10)(f), 0);
+    }
+
+    /// A null event blocks its thread until the value is reached, and
+    /// `Signal` wakes it, once it is at or past the value. Runs on every
+    /// host: no event handle is made.
+    #[test]
+    fn a_null_event_blocks_until_the_value_is_reached() {
+        use std::sync::mpsc;
+        type Wait = extern "system" fn(This, u64, *mut c_void) -> HRESULT;
+        type Signal = extern "system" fn(This, u64) -> HRESULT;
+        type Release = extern "system" fn(This) -> u32;
+
+        let mut f = std::ptr::null();
+        assert_eq!(create(std::ptr::null(), 1, 0, &FENCE_IIDS[0], &mut f), S_OK);
+        let wait = slot::<Wait>(f, 0x48);
+        let signal = slot::<Signal>(f, 0x50);
+        let release = slot::<Release>(f, 0x10);
+        let at = f as usize;
+        let (done, finished) = mpsc::channel();
+        let blocking = std::thread::spawn(move || {
+            // The fence is released below, after this thread is joined; a
+            // null event asks for a blocking wait.
+            let hr = wait(at as This, 5, std::ptr::null_mut());
+            done.send(hr).expect("the test is still listening");
+        });
+        // Unmet, so the call is still in its wait.
+        assert!(
+            finished.recv_timeout(Duration::from_millis(200)).is_err(),
+            "a null event returned before its value was reached"
+        );
+        // A value below the one waited for is news, but not enough.
+        assert_eq!(signal(f, 4), S_OK);
+        assert!(
+            finished.recv_timeout(Duration::from_millis(200)).is_err(),
+            "a signal below the wanted value woke the wait"
+        );
+        assert_eq!(signal(f, 5), S_OK);
+        assert_eq!(
+            finished.recv_timeout(Duration::from_secs(10)),
+            Ok(S_OK),
+            "the signal that reached the value did not wake the wait"
+        );
+        blocking.join().expect("the waiting thread panicked");
+        assert_eq!(release(f), 0);
     }
 }

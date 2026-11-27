@@ -5479,6 +5479,7 @@ fn late_line(frames: f64) {
     card_steps::log(frames);
     fetch_waits::log(frames);
     crate::port_journal::line(frames);
+    crate::port::log(frames);
     crate::port_cbv::log(frames);
     crate::picked::log(frames);
     #[cfg(feature = "diagnostics")]
@@ -10163,6 +10164,7 @@ impl HostList {
                     if crate::descriptor::in_shader_heap(dst, len) {
                         crate::port_journal::prep_wrote();
                     }
+                    crate::port::copied(dst, src, len);
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     // With the submission's one asking: the journal learns it.
                     crate::watch::wrote(dst, len);
@@ -10178,6 +10180,7 @@ impl HostList {
                     {
                         copies += 1;
                     }
+                    crate::port::filled(src, len);
                     if let Some(f) = batch.forwards.iter().find(|f| f.fill == (n, i))
                         && let Some((_, from)) = batch.kept.iter().find(|k| k.0 == f.copy)
                     {
