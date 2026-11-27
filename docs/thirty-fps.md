@@ -159,6 +159,61 @@ Stated in advance, so it is not a conclusion moved to fit the result:
 - **Shared memory above the budget after step 2.** Then the split cannot be bought at
   this memory, and 30 fps waits for a card with more of it.
 
+## What the code says about each step (read 2026-11-27, before writing any of it)
+
+Going through the steps one by one, against the code rather than the plan, changed two
+of them. This section is the result, and it is the reason steps 2, 3 and 5 are not in
+the pull requests yet.
+
+**Step 1 — done.** `VICTORY_JOIN_ONE_CALL=1`, off by default upstream, on in
+`Play-VIctory-8GB.cmd` (#31). It is a wait removed, not a preparing.
+
+**Step 2 — the lists' steps cannot be forked and joined, and this is the finding.**
+`HostList::run_deferred` (`host.rs`, the loop over a list's `deferred().copies`) is not a
+pure function of its list: inside it, in order, it calls `batch.fill()`,
+`batch.flush_one(shadow)`, `crate::watch::wrote`, `crate::watch::ask_once_end`,
+`crate::port_journal::prep_wrote` and `batch.title_written()`. That last one is the one
+that matters: it means *"what was refreshed before this write is stale, refresh it
+again"*. Those calls are a **serial log of writes**, not a set of independent jobs, and
+splitting them across two threads changes which refreshes happen, not only when —
+which is a rendering difference, not a timing one. Two threads in a row therefore need
+**two batches and two journals with a stated merge point** (where `title_written` of one
+half becomes a refresh for the other), before any thread is spawned. That is a design
+first; the patch is the easy half, and it cannot be written from this machine where
+the title cannot be run to see whether the log still holds.
+
+**Step 3 — the lock is cheaper to describe than to take.** `self.submitted` is held from
+preparation to copy-back because "snapshots and the ranges shaders write are per host
+copy, not per submission". Letting the next submission be prepared while this one is
+sent means two of those alive at once: `shadow::take_snapshots` and
+`shadow::writing` would each have two sets. That is the memory cost the plan names, and
+on a card with 6.44 GiB already shared it is the difference between a gain and a swap.
+It is also the step where a wrong lock shows up as a rare lost write — the class of bug
+this repository's own findings record as *six of two hundred runs*, i.e. one that will
+not be caught by a single test run.
+
+**Step 4 — largely already done, and the record says so.** The narrowing this step asks
+for is what took 280 → 124 ms (descriptor records left to the draws), 69 → 6 ms (guards
+looked at first) and 14 → 4-7 ms (AVX2 over the title's bytes). What is left of the
+6 ms and 5 ms is the log above, not bytes looked at: there is no widened comparison
+to narrow. I would not claim a gain here without a profile, and there is none on this
+machine.
+
+**Step 5 — a storage change, not a sleeve.** Viewing the card's own buffers where
+fills copy them now means a `Shadow` (`Arc`, one per host copy) that sometimes has no
+host copy at all, and every `Step::Refresh` and `batch.add` would have to answer what
+to do when there is nothing on this side. It is the step with the largest measured
+prize (~19 ms of Logan's 93) and the largest surface: `refresh_front`, `refresh_ahead`
+and `apart()` all assume a host side exists.
+
+**Step 6 — already upstream.** `VICTORY_OUTPUT` (the loader's patch) and
+`VICTORY_TEST_LOWRES` for 540p; the launcher's ladder (#31) drives both.
+
+What is measured today stands: **preparing is 93 ms against a 33 ms budget**, and a
+frame cannot be shorter than the work of preparing it. Steps 2, 3 and 5 are the work
+that would remove it. They are also the three that change what the title sees, and
+none of them can be validated without the card they are for.
+
 The honest current answer, with what is measured today: **30 fps is not reachable by
 changing switches.** Preparing is 93 ms against a 33 ms budget, on a design whose own
 record on a much faster card is 48 ms. It is reachable by removing about 60 ms of
