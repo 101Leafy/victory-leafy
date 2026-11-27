@@ -2110,7 +2110,7 @@ impl State {
                 } else {
                     crate::memory::Use::Reads
                 };
-                let Some(ready) = self.memory_ready(list, &t, compute, use_) else {
+                let Some(ready) = self.memory_ready(list, t, compute, use_) else {
                     let heap = self.heaps[0] != 0 && crate::descriptor::heap(self.heaps[0] as This).host().is_some();
                     if !heap {
                         once!("a shader that reads title memory by address without a view heap to hold its views: the draw is dropped");
