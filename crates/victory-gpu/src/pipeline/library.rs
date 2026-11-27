@@ -1217,21 +1217,32 @@ fn compiles_only() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_SLOW_LIST").is_none_or(|v| v != "0"))
 }
 
+/// `VICTORY_PIPELINE_HITS_FIRST=1`: a load from the library takes its key
+/// off the slow list, and the slow list is taken shortest first. In main-all
+/// 703 of 731 pipelines came from the slow list, most of them library loads
+/// put there by a cold run, and loads of 0.2-0.7 s waited 12-21 s behind
+/// driver compiles of 4-13 s while the game clock stood still.
+pub(crate) fn hits_first() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_HITS_FIRST").is_some_and(|v| v == "1"))
+}
+
 /// What a make of `ms` that came about as `came` does to the slow list:
 /// `Some(true)` adds (or raises) the key, `Some(false)` takes it off.
-fn slow_change(ms: u64, came: Came, compiles_only: bool) -> Option<bool> {
+fn slow_change(ms: u64, came: Came, compiles_only: bool, hits_first: bool) -> Option<bool> {
     if !compiles_only {
         return (ms >= SLOW_MS).then_some(true);
     }
     match came {
         Came::Compiled => Some(ms >= SLOW_MS),
+        Came::Loaded if hits_first => Some(false),
         Came::Nothing | Came::Loaded => None,
     }
 }
 
 /// The title pipeline with `key` took `ms` to make, and came about as `came`.
 pub(crate) fn note_time(key: &str, ms: u64, came: Came) {
-    let Some(add) = slow_change(ms, came, compiles_only()) else { return };
+    let Some(add) = slow_change(ms, came, compiles_only(), hits_first()) else { return };
     let mut slow = slow_ones();
     let slow = slow.get_or_insert_default();
     if !add {
@@ -1312,14 +1323,25 @@ mod tests {
     /// off, as before, any make of a second goes on and nothing comes off.
     #[test]
     fn the_slow_list_counts_compiles_only() {
-        assert_eq!(slow_change(SLOW_MS, Came::Compiled, true), Some(true));
-        assert_eq!(slow_change(SLOW_MS - 1, Came::Compiled, true), Some(false));
+        assert_eq!(slow_change(SLOW_MS, Came::Compiled, true, false), Some(true));
+        assert_eq!(slow_change(SLOW_MS - 1, Came::Compiled, true, false), Some(false));
         for came in [Came::Loaded, Came::Nothing] {
-            assert_eq!(slow_change(5 * SLOW_MS, came, true), None, "{came:?}");
-            assert_eq!(slow_change(1, came, true), None, "{came:?}");
+            assert_eq!(slow_change(5 * SLOW_MS, came, true, false), None, "{came:?}");
+            assert_eq!(slow_change(1, came, true, false), None, "{came:?}");
         }
-        assert_eq!(slow_change(SLOW_MS, Came::Loaded, false), Some(true));
-        assert_eq!(slow_change(SLOW_MS - 1, Came::Compiled, false), None);
+        assert_eq!(slow_change(SLOW_MS, Came::Loaded, false, false), Some(true));
+        assert_eq!(slow_change(SLOW_MS - 1, Came::Compiled, false, false), None);
+    }
+
+    /// With hits first a load, quick or slow, takes the key off; compiles
+    /// and the old way are as without it.
+    #[test]
+    fn a_library_load_comes_off_the_slow_list_with_hits_first() {
+        assert_eq!(slow_change(5 * SLOW_MS, Came::Loaded, true, true), Some(false));
+        assert_eq!(slow_change(1, Came::Loaded, true, true), Some(false));
+        assert_eq!(slow_change(5 * SLOW_MS, Came::Nothing, true, true), None);
+        assert_eq!(slow_change(SLOW_MS, Came::Compiled, true, true), Some(true));
+        assert_eq!(slow_change(SLOW_MS, Came::Loaded, false, true), Some(true));
     }
 
     #[test]

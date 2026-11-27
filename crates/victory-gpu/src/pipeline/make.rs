@@ -738,6 +738,14 @@ fn longest(list: &mut VecDeque<Arc<Pending>>, ms: impl Fn(&str) -> u64) -> Optio
     list.remove(at)
 }
 
+/// The unclaimed entry of `list` that took least by `ms` (the first among
+/// equals), for [`super::library::hits_first`]; claimed ones are dropped.
+fn shortest(list: &mut VecDeque<Arc<Pending>>, ms: impl Fn(&str) -> u64) -> Option<Arc<Pending>> {
+    list.retain(|p| p.queue_state.load(Ordering::Relaxed) == EARLY);
+    let at = (0..list.len()).min_by_key(|&i| (ms(&list[i].key), i))?;
+    list.remove(at)
+}
+
 /// Graphics pipelines are made before compute ones, and compute ones never
 /// hold every worker (upstream #3025). In the world some 180 compute
 /// pipelines take the driver 3.7 s each on average (up to 24 s); taken in
@@ -873,6 +881,8 @@ impl Queue {
             if p.is_none() && self.slow_now < slow_limit {
                 p = if longest_first() {
                     longest(&mut self.slow, super::library::slow_ms)
+                } else if super::library::hits_first() {
+                    shortest(&mut self.slow, super::library::slow_ms)
                 } else {
                     unclaimed(&mut self.slow)
                 };
@@ -1370,6 +1380,26 @@ mod tests {
         list[1].queue_state.store(MAKING, Ordering::Relaxed);
         let taken: Vec<String> = std::iter::from_fn(|| longest(&mut list, ms)).map(|p| p.key.clone()).collect();
         assert_eq!(taken, ["c", "d", "a", "e"]);
+    }
+
+    #[test]
+    fn the_shortest_unclaimed_is_taken_first() {
+        let one = |key: &str| {
+            let mut p = Pending::new(Vec::new(), None);
+            p.key = key.to_owned();
+            p.queue_state.store(EARLY, Ordering::Relaxed);
+            Arc::new(p)
+        };
+        let ms = |key: &str| match key {
+            "a" => 5_000,
+            "b" | "c" => 1_200,
+            "d" => 130_000,
+            _ => 0,
+        };
+        let mut list: VecDeque<_> = ["a", "b", "c", "d", "e"].map(one).into();
+        list[1].queue_state.store(MAKING, Ordering::Relaxed);
+        let taken: Vec<String> = std::iter::from_fn(|| shortest(&mut list, ms)).map(|p| p.key.clone()).collect();
+        assert_eq!(taken, ["e", "c", "a", "d"]);
     }
 
     /// Graphics pipelines go before compute ones of the same list, and
