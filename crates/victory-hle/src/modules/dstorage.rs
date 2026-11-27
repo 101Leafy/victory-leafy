@@ -2608,6 +2608,51 @@ mod tests {
         }
     }
 
+    /// Inflate and BCPack speed on one worker, over chunks taken from a
+    /// title's packs: `VICTORY_BENCH_CHUNKS` names a folder with
+    /// `chunks.bin` and `chunks.tsv` (kind, offset, packed size, size; kind
+    /// 32 zlib, else BCPack with the BC number in kind >> 2).
+    /// `cargo test -p victory-hle --release decode_bench -- --ignored --nocapture`
+    #[test]
+    #[ignore = "a benchmark"]
+    fn decode_bench() {
+        let dir = std::path::PathBuf::from(std::env::var("VICTORY_BENCH_CHUNKS").expect("VICTORY_BENCH_CHUNKS"));
+        let blob = std::fs::read(dir.join("chunks.bin")).unwrap();
+        let index = std::fs::read_to_string(dir.join("chunks.tsv")).unwrap();
+        let tables = Tables::builtin().unwrap();
+        let mut kinds: BTreeMap<u32, Vec<(usize, usize, usize)>> = BTreeMap::new();
+        for line in index.lines() {
+            let v: Vec<usize> = line.split('	').map(|f| f.parse().unwrap()).collect();
+            kinds.entry(v[0] as u32).or_default().push((v[1], v[2], v[3]));
+        }
+        let mut out = Vec::new();
+        for (kind, chunks) in &kinds {
+            let (mut failed, mut bytes, mut packed) = (0, 0, 0);
+            let start = Instant::now();
+            for &(at, len, size) in chunks {
+                out.resize(size, 0);
+                let source = &blob[at..at + len];
+                let ok = if *kind == 32 {
+                    inflate(source, &mut out).is_ok()
+                } else {
+                    bcpack::decode((kind >> 2) as u8, source, &mut out, &tables).is_ok()
+                };
+                failed += usize::from(!ok);
+                (bytes, packed) = (bytes + size, packed + len);
+            }
+            let took = start.elapsed().as_secs_f64();
+            println!(
+                "kind {kind}: {} chunks, {} failed, {:.1} MB packed, {:.1} MB out, {:.0} MB/s out, {:.1} us a chunk",
+                chunks.len(),
+                failed,
+                packed as f64 / 1e6,
+                bytes as f64 / 1e6,
+                bytes as f64 / took / 1e6,
+                took * 1e6 / chunks.len() as f64
+            );
+        }
+    }
+
     /// Every way of reading a file gives its bytes, also past its end.
     #[test]
     fn every_way_of_reading_gives_the_same_bytes() {
