@@ -629,6 +629,20 @@ fn slow_limit() -> usize {
     })
 }
 
+/// `VICTORY_PIPELINE_KEEP_FREE=n`: early and slow pipelines, which no draw
+/// has asked for, take at most all workers but `n`, so a pipeline a draw asks
+/// for finds a free worker. In main-own-r1 (cold driver cache) early ones
+/// held all 24 workers in the minute before game 41, 6 s each, and the requested ones then
+/// queued behind them: from game 41 to 66 every frame waited its 500 ms in
+/// vain. Off (0) by default.
+fn keep_free() -> usize {
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| {
+        let n = std::env::var("VICTORY_PIPELINE_KEEP_FREE").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0);
+        n.min(workers_wanted().saturating_sub(1))
+    })
+}
+
 /// How long nothing but known slow pipelines must have been queued before
 /// [`quiet_slow_limit`] holds.
 const QUIET: Duration = Duration::from_secs(2);
@@ -731,6 +745,8 @@ struct Queue {
     /// one, so one is always free for graphics.
     compute_now: usize,
     compute_cap: usize,
+    /// Early and slow pipelines being made ([`keep_free`]).
+    unasked_now: usize,
     /// When a pipeline last went into a list other than the slow one.
     others_at: Option<Instant>,
 }
@@ -747,6 +763,7 @@ impl Queue {
             early_compute: VecDeque::new(),
             compute_now: 0,
             compute_cap: usize::MAX,
+            unasked_now: 0,
             others_at: None,
         }
     }
@@ -803,14 +820,15 @@ impl Queue {
             if p.is_none() && compute_free {
                 p = quickest(&mut self.requested_compute);
             }
-            if p.is_none() {
+            let unasked_free = self.unasked_now + keep_free() < workers_wanted();
+            if p.is_none() && unasked_free {
                 p = unclaimed(&mut self.early);
                 from = TAKEN_EARLY;
             }
-            if p.is_none() && compute_free {
+            if p.is_none() && compute_free && unasked_free {
                 p = unclaimed(&mut self.early_compute);
             }
-            if p.is_none() && self.slow_now < slow_limit {
+            if p.is_none() && self.slow_now < slow_limit && unasked_free {
                 p = if longest_first() {
                     longest(&mut self.slow, super::library::slow_ms)
                 } else {
@@ -830,6 +848,9 @@ impl Queue {
         let p = p?;
         if p.graphics.is_none() {
             self.compute_now += 1;
+        }
+        if from >= TAKEN_EARLY && keep_free() > 0 {
+            self.unasked_now += 1;
         }
         p.taken_from.store(from, Ordering::Relaxed);
         p.queue_state.store(MAKING, Ordering::Relaxed);
@@ -972,9 +993,16 @@ fn workers() -> bool {
                         if long && hold {
                             crate::cores::hold_on_fast_cores(false);
                         }
-                        if p.was_slow.load(Ordering::Relaxed) {
+                        let slow = p.was_slow.load(Ordering::Relaxed);
+                        let unasked = keep_free() > 0 && p.taken_from.load(Ordering::Relaxed) >= TAKEN_EARLY;
+                        if slow || unasked {
                             let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
-                            queue.slow_now -= 1;
+                            if slow {
+                                queue.slow_now -= 1;
+                            }
+                            if unasked {
+                                queue.unasked_now -= 1;
+                            }
                             AVAILABLE.notify_all();
                         }
                         if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
