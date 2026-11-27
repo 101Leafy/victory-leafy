@@ -2130,8 +2130,11 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
         assert_eq!(validate_layout((1, 16, 1), 0, None), None);
         assert_eq!(validate_layout((2, 8, 1), 0, None), None);
         assert_eq!(validate_layout((10, 8, 1), 0, None), None);
+        // A dispatch run in pieces reads a dispatch record.
+        assert_eq!(validate_layout((SPLIT, 12, 2), 0, None), Some(24));
+        assert_eq!(validate_layout((SPLIT, 8, 1), 0, None), None);
         // Unknown kind.
-        assert_eq!(validate_layout((3, 16, 1), 0, None), None);
+        assert_eq!(validate_layout((4, 16, 1), 0, None), None);
         // Unaligned stride, source offset, or count offset.
         assert_eq!(validate_layout((0, 18, 1), 0, None), None);
         assert_eq!(validate_layout((0, 16, 1), 2, None), None);
@@ -3150,7 +3153,7 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
         assert_eq!(memory[8..12], [job(1, 10, 2), 64, 4096 + SLOT, 0]);
         assert_eq!(job(1, 10, 2), 1 | 10 << 4 | 3 << 8 | 2 << 16);
         // Not a copy of the pass, not on 4 bytes, past 32 bits, not a kind.
-        for (id, offset, kind) in [(8, 64, 10), (7, 66, 10), (7, 1 << 32, 10), (7, u64::from(u32::MAX) & !3, 10), (7, 64, 3)] {
+        for (id, offset, kind) in [(8, 64, 10), (7, 66, 10), (7, 1 << 32, 10), (7, u64::from(u32::MAX) & !3, 10), (7, 64, 4)] {
             assert_eq!(t.place(id, offset, kind), None);
         }
         // Read more often than one job may be charged for: another job.
