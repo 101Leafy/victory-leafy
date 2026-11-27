@@ -16,6 +16,21 @@ use super::Host;
 /// Submissions stamped before the first stamps are read and used again.
 const SPANS: usize = 512;
 
+/// What [`line`] last worked out, per frame, for the frame recorder's columns
+/// (`frames::GAUGES`): submissions (in hundredths, so a frame of the second
+/// does not round to none), the card working (µs), the card idle between
+/// submissions (µs), and the longest submission (µs). Zero until the line has
+/// run once, which is what a run without `VICTORY_CARD_SPANS=1` shows: the
+/// columns are there and say nothing was measured, rather than nothing found.
+pub(super) static LAST: [std::sync::atomic::AtomicU64; 4] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// [`LAST`] as the recorder reads it.
+pub(super) fn last() -> [u64; 4] {
+    use std::sync::atomic::Ordering::Relaxed;
+    [0, 1, 2, 3].map(|i| LAST[i].load(Relaxed))
+}
+
 /// The stamps of one queue's submissions.
 pub(super) struct Spans {
     _allocator: ID3D12CommandAllocator,
@@ -208,6 +223,18 @@ pub(super) fn line(frames: f64) {
         ms(s.between),
         s.longest as f64 / spans.ticks_per_ms
     );
+    // The same figures per frame, left where the recorder reads its gauges, so
+    // that a frame in the CSV carries the card's own account of itself and not
+    // only the frame's length.
+    {
+        use std::sync::atomic::Ordering::Relaxed;
+        let frames = if frames > 0.0 { frames } else { 1.0 };
+        let per_frame_us = |ticks: u64| (ticks as f64 / spans.ticks_per_ms * 1000.0 / frames) as u64;
+        LAST[0].store((s.count as f64 / frames * 100.0) as u64, Relaxed);
+        LAST[1].store(per_frame_us(s.busy), Relaxed);
+        LAST[2].store(per_frame_us(s.between), Relaxed);
+        LAST[3].store((s.longest as f64 / spans.ticks_per_ms * 1000.0) as u64, Relaxed);
+    }
 }
 
 #[cfg(test)]
