@@ -1613,8 +1613,8 @@ mod tests {
         let texture = std::sync::Arc::new(crate::resource::HostTexture::new(made.unwrap(), 0));
         let key = std::sync::Arc::as_ptr(&texture) as usize;
         list.states.lock().unwrap().insert(key, (start, leave, texture.clone()));
-        let first = list.prelude(false, &[]).expect("a move is recorded");
-        let second = list.prelude(false, &[]).expect("the second use records a move too");
+        let first = list.prelude(false).expect("a move is recorded");
+        let second = list.prelude(false).expect("the second use records a move too");
         assert_ne!(
             windows::core::Interface::as_raw(&first),
             windows::core::Interface::as_raw(&second),
@@ -1633,8 +1633,8 @@ mod tests {
         let Some(host) = super::host() else { return };
         let list = host.new_list().unwrap();
         list.close();
-        assert!(list.prelude(false, &[]).is_none(), "nothing to move: no prelude");
-        assert!(list.prelude(true, &[]).is_some(), "behind another part: a prelude with the barriers");
+        assert!(list.prelude(false).is_none(), "nothing to move: no prelude");
+        assert!(list.prelude(true).is_some(), "behind another part: a prelude with the barriers");
     }
 
     mod builder_memory {
