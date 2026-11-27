@@ -906,6 +906,37 @@ fn store_later(library: &Library) {
     }
 }
 
+/// As [`save`], from a worker while more pipelines are still queued.
+///
+/// Every save serialises the whole library (over a gigabyte once it is warm)
+/// and, while it does, holds off every store; in the middle of a burst of new
+/// pipelines (a new area, a cutscene) that is exactly when the title is
+/// waiting on them, and the write competes with texture streaming for the
+/// disk. Saves in a burst are kept to one every `VICTORY_LIBRARY_SAVE_BUSY_S`
+/// seconds (default 180; 20 as before); the save when the queue runs dry and
+/// the one at exit are as they were.
+pub(crate) fn save_while_busy() {
+    static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+    static EVERY: OnceLock<std::time::Duration> = OnceLock::new();
+    let every = *EVERY.get_or_init(|| {
+        let secs = std::env::var("VICTORY_LIBRARY_SAVE_BUSY_S").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(180);
+        std::time::Duration::from_secs(secs)
+    });
+    {
+        let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+        match *last {
+            // The first busy save of the run waits a full interval too.
+            None => {
+                *last = Some(std::time::Instant::now());
+                return;
+            }
+            Some(t) if t.elapsed() < every => return,
+            _ => *last = Some(std::time::Instant::now()),
+        }
+    }
+    save(false);
+}
+
 /// Writes the library and the early list if pipelines were added since the
 /// last save and `SAVE_EVERY` has passed (or `now`).
 pub(crate) fn save(now: bool) {
