@@ -156,6 +156,20 @@ fn count_hashed(size: usize, why: u8) {
 /// check after its last change, and a guarded texture once a frame from its
 /// first check.
 const HOT_FRAMES: u64 = 64;
+
+/// Every how many frames a partly mapped texture is read while the guards
+/// see no write to it (reading around unmapped pages is slow).
+const PARTIAL_EVERY: u64 = 30;
+
+/// Whether a partly mapped texture last read in frame `at` is read again in
+/// `frame`: once a frame while the guards see writes to it, else every
+/// [`PARTIAL_EVERY`]th frame. A texture streamed into pages mapped with
+/// another's bytes was read with those, and kept them for up to 30 frames
+/// after its own texels landed: blocks of noise on the shirt of a close-up
+/// (dc-d frame 2469, detile-audit-tell frame 2639).
+fn partial_due(at: Option<u64>, frame: u64, written: bool) -> bool {
+    at.is_none_or(|at| if written { frame != at } else { frame >= at + PARTIAL_EVERY })
+}
 /// How long after a change the next check still counts as "again".
 const VERIFY_FRAMES: u64 = 24;
 
@@ -1773,6 +1787,8 @@ impl Staging {
         static GUARD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         // The guard saw no write: a change the hash finds came another way.
         let mut blind = false;
+        // The guard saw a write since the last check.
+        let mut seen = false;
         // Why an unwritten texture is hashed: 0 written or unguarded, 1 its
         // turn, 2 due, 3 in its first frames only.
         let mut why = 0;
@@ -1816,6 +1832,7 @@ impl Staging {
                 }
             }
             blind = unwritten;
+            seen = !unwritten;
         }
         // From here on the texture's memory may be read in place. Held until
         // that read is done: the runtime changes what title memory shows
@@ -1839,12 +1856,22 @@ impl Staging {
             // there, the usual state while it streams in. Read through the
             // copy, which stands unmapped pages (zeros), and upload what
             // is there; nothing at all mapped changes nothing.
-            // shortcut: read again at most every 30 frames (reading around
-            // unmapped pages is slow, and nothing tells us when pages
-            // arrive): a mip that streams in shows up to 30 frames late.
+            // shortcut: read again at most every 30 frames while the guards
+            // see no write ([`partial_due`]): a change they miss shows up
+            // to 30 frames late.
             let frame = crate::frame::current();
-            if last.partial.is_some_and(|at| frame < at + 30) {
+            if !partial_due(last.partial, frame, seen) {
+                if seen {
+                    // Read in the next frame: the write is not forgotten.
+                    last.asked = 0;
+                }
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::TexPartialSkipped, size as u64);
                 return 0;
+            }
+            #[cfg(feature = "diagnostics")]
+            if !partial_due(last.partial, frame, false) {
+                crate::copystat::add(crate::copystat::C::TexPartialWritten, size as u64);
             }
             last.partial = Some(frame);
             count_hashed(size, why);
@@ -2666,6 +2693,21 @@ mod remap_tests {
         assert!(!s.note(8, 40, 1_000, || 8));
         assert_eq!(s.settled(1_000, 200, 2_000, 64, 150), vec![5]);
         assert_eq!(s.settled(1_000, 200, 2_000, 64, 150), vec![8]);
+    }
+
+    /// A partly mapped texture read with the bytes its pages held before
+    /// its texels landed is read again the frame after the guards see the
+    /// write, not 30 frames later; with no write, every 30th frame.
+    #[test]
+    fn a_partly_mapped_texture_is_read_again_after_a_write() {
+        use super::partial_due;
+        assert!(partial_due(None, 100, false));
+        assert!(partial_due(None, 100, true));
+        assert!(!partial_due(Some(100), 100, true));
+        assert!(partial_due(Some(100), 101, true));
+        assert!(!partial_due(Some(100), 101, false));
+        assert!(!partial_due(Some(100), 129, false));
+        assert!(partial_due(Some(100), 130, false));
     }
 }
 
