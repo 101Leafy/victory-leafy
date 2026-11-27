@@ -1887,13 +1887,14 @@ pub(crate) fn asks() -> [u64; 13] {
 /// 100 us or more. Under the guards' lock: 0 other views of a page made
 /// read-only as a copy takes it, 3 blocks with parts open made read-only
 /// again, 4 runs and 5 single blocks given write access back, 7 a 4 KiB part
-/// opened for a fault. With the lock let go: 1 the runs an asking makes
+/// opened for a fault, 9 view blocks an asking guards under the lock
+/// ([`protect_here`]). With the lock let go: 1 the runs an asking makes
 /// read-only (and their blocks one by one when a run fails), 2 other views
 /// made read-only after the asking (`VICTORY_ALIAS_LATER`), 6 blocks a write
 /// fault opens with no lock. 8 put back as they were (not ours to guard).
 #[cfg(feature = "diagnostics")]
-static PROTECTS: [[std::sync::atomic::AtomicU64; 4]; 9] =
-    [const { [const { std::sync::atomic::AtomicU64::new(0) }; 4] }; 9];
+static PROTECTS: [[std::sync::atomic::AtomicU64; 4]; 10] =
+    [const { [const { std::sync::atomic::AtomicU64::new(0) }; 4] }; 10];
 
 /// `VirtualProtect`, counted in `who`'s row of [`PROTECTS`].
 ///
@@ -1922,7 +1923,7 @@ unsafe fn protect_as(who: usize, at: *const std::ffi::c_void, len: usize, new: u
 
 /// [`PROTECTS`], taken.
 #[cfg(feature = "diagnostics")]
-pub(crate) fn protects() -> [[u64; 4]; 9] {
+pub(crate) fn protects() -> [[u64; 4]; 10] {
     std::array::from_fn(|i| std::array::from_fn(|j| PROTECTS[i][j].swap(0, std::sync::atomic::Ordering::Relaxed)))
 }
 
@@ -3626,7 +3627,7 @@ fn not_a_view(from: usize, to: usize, kind: u32, protection: u32) {
 /// [`protect_here`] for blocks Windows said were view memory just now
 /// ([`there`]). Called for nothing else.
 fn protect_views(g: &mut Guards, from: usize, to: usize) {
-    let set = read_only;
+    let set = |from, to| read_only(from, to, 9);
     let note = |g: &mut Guards, from: usize, to: usize| {
         g.protected.insert_all(from..to);
         g.clean.insert_all(from..to);

@@ -8933,13 +8933,14 @@ fn split_line(frames: f64) {
     };
     tracing::info!(
         "title memory protections changed per frame, by who: under the guards' lock, other views as a copy takes the page {}, \
-         parted blocks closed {}, runs opened {}, blocks opened {}, parts opened for faults {}; with the lock let go, runs an \
+         parted blocks closed {}, runs opened {}, blocks opened {}, parts opened for faults {}, view blocks an asking guards {}; with the lock let go, runs an \
          asking guards {}, other views after the asking {}, blocks faults open with no lock {}; put back as they were {}",
         row(0),
         row(3),
         row(4),
         row(5),
         row(7),
+        row(9),
         row(1),
         row(2),
         row(6),
