@@ -2530,8 +2530,16 @@ static CARD_WORK: Mutex<Option<CardWork>> = Mutex::new(None);
 /// walked the piece before, 4,096 steps; the passes took 24.8 ms of a frame's
 /// 82 on the card (capture replay1, 405 of them), most of it waiting for
 /// those steps.
+///
+/// Built with `TABLE` ([`card_batch`]), a group takes its piece, its mode
+/// and the dwords of `differs` it answers for from a table, so that one
+/// dispatch holds every piece of a copy that a list hashes or compares.
 pub(crate) const CARD_COMPARE: &str = r#"
+#ifdef TABLE
+#define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), UAV(u0), UAV(u1), SRV(t1)"
+#else
 #define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), UAV(u0), UAV(u1)"
+#endif
 cbuffer Span : register(b0) {
     uint first;    // the first piece
     uint skew;     // where the copy starts in its piece 0
@@ -2545,11 +2553,25 @@ ByteAddressBuffer now : register(t0);
 // last sent up (or hashed whole, the first time).
 RWByteAddressBuffer hashes : register(u0);
 RWByteAddressBuffer differs : register(u1);
+#ifdef TABLE
+// 16 bytes per group from entry `first` on: the piece, the first of its
+// dwords in the list at byte `out_at` (each the byte of one in `differs`),
+// the mode (as `compare`), how many dwords. A piece is in one entry of a
+// dispatch, so its hash is read before it is stored.
+ByteAddressBuffer table : register(t1);
+#endif
 groupshared uint4 parts[64];
 [RootSignature(RS)]
 [numthreads(64, 1, 1)]
 void main(uint3 id : SV_GroupID, uint thread : SV_GroupIndex) {
+#ifdef TABLE
+    uint4 entry = table.Load4((first + id.x) * 16u);
+    uint piece = entry.x;
+    uint mode = entry.z;
+#else
     uint piece = first + id.x;
+    uint mode = compare;
+#endif
     uint lo = piece * 65536u;
     lo = lo > skew ? lo - skew : 0u;
     uint hi = min((piece + 1u) * 65536u - skew, size);
@@ -2599,13 +2621,18 @@ void main(uint3 id : SV_GroupID, uint thread : SV_GroupIndex) {
         h = (h ^ parts[i]) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
         h = h.yzwx ^ (h >> 15);
     }
-    if (compare != 0u) {
+    if (mode != 0u) {
         // The flag, and above it 31 bits of the hash (`torn`).
         uint folded = h.x ^ (h.y * 3u) ^ (h.z * 5u) ^ (h.w * 7u);
-        differs.Store(out_at + id.x * 4u, (folded << 1u) | (any(h != hashes.Load4(piece * 16u)) ? 1u : 0u));
+        uint flag = (folded << 1u) | (any(h != hashes.Load4(piece * 16u)) ? 1u : 0u);
+#ifdef TABLE
+        for (uint k = 0u; k < entry.w; ++k) differs.Store(table.Load(out_at + (entry.y + k) * 4u), flag);
+#else
+        differs.Store(out_at + id.x * 4u, flag);
+#endif
         // With the copy-back on its own thread: the next compare of the
         // piece finds what is written from here on.
-        if (compare == 2u) hashes.Store4(piece * 16u, h);
+        if (mode == 2u) hashes.Store4(piece * 16u, h);
     } else {
         hashes.Store4(piece * 16u, h);
     }
@@ -2638,6 +2665,190 @@ unsafe fn card_pass(list: &ID3D12GraphicsCommandList, span: &crate::shadow::Card
         }
         done += n;
     }
+}
+
+/// Whether our hash and compare passes over copies in the card's memory go
+/// in one dispatch per copy a list takes them for (`VICTORY_CARD_BATCH=1`;
+/// off by default), each piece once, and not in a dispatch per range.
+///
+/// Profile-watch: 160-190 hash passes and 74-83 compare passes a frame, a
+/// pass of 2.7 pieces on average at about 69 us, nearly all of it the
+/// dispatch itself. A piece in several ranges of one compare (spans of a
+/// copy that share a 64 KiB piece) is hashed once and its flag goes to each
+/// range's dword: as passes, the second could find the hash the first one
+/// stored.
+fn card_batch() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_BATCH").is_some_and(|v| v == "1"))
+}
+
+/// [`CARD_COMPARE`] built with `TABLE`, and a table per host list.
+struct CardBatch {
+    root: ID3D12RootSignature,
+    pso: ID3D12PipelineState,
+    /// By the list's pointer: the buffer (PC memory, mapped), its mapping,
+    /// its bytes. Written while the list is recorded, which is after its
+    /// last run finished.
+    tables: Mutex<std::collections::HashMap<usize, (ID3D12Resource, usize, usize)>>,
+}
+
+// SAFETY: D3D12 objects (free-threaded), and mappings written under the lock.
+unsafe impl Send for CardBatch {}
+unsafe impl Sync for CardBatch {}
+
+/// One copy's part of [`card_batched`]: its buffer and hashes (GPU
+/// addresses), [`CardSpan`]'s size and skew, and its pieces with their
+/// mode and the byte of their dword in `differs`, if any.
+///
+/// [`CardSpan`]: crate::shadow::CardSpan
+struct CardJob {
+    key: usize,
+    now: u64,
+    hashes: u64,
+    size: u32,
+    skew: u32,
+    pieces: Vec<(u32, u32, Option<u32>)>,
+}
+
+/// The batch's pipeline, made once; `None` when off or it could not be made.
+fn card_batch_work(device: &ID3D12Device) -> Option<&'static CardBatch> {
+    use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+    use windows::Win32::Graphics::Direct3D::{D3D_SHADER_MACRO, ID3DBlob};
+    static WORK: OnceLock<Option<CardBatch>> = OnceLock::new();
+    if !card_batch() {
+        return None;
+    }
+    WORK.get_or_init(|| {
+        let defines = [
+            D3D_SHADER_MACRO {
+                Name: windows::core::s!("TABLE"),
+                Definition: windows::core::s!("1"),
+            },
+            D3D_SHADER_MACRO::default(),
+        ];
+        let mut code: Option<ID3DBlob> = None;
+        // SAFETY: the source, names and macros live through the calls; the
+        // root signature is inside the shader.
+        let made = unsafe {
+            (|| -> windows::core::Result<CardBatch> {
+                D3DCompile(
+                    CARD_COMPARE.as_ptr().cast(),
+                    CARD_COMPARE.len(),
+                    windows::core::s!("card compare table"),
+                    Some(defines.as_ptr()),
+                    None,
+                    windows::core::s!("main"),
+                    windows::core::s!("cs_5_1"),
+                    0,
+                    0,
+                    &mut code,
+                    None,
+                )?;
+                let code = code.ok_or_else(windows::core::Error::empty)?;
+                let bytes = std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
+                let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes)?;
+                let pso: ID3D12PipelineState = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&root),
+                    CS: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: bytes.as_ptr().cast(),
+                        BytecodeLength: bytes.len(),
+                    },
+                    ..Default::default()
+                })?;
+                Ok(CardBatch {
+                    root,
+                    pso,
+                    tables: Mutex::new(std::collections::HashMap::new()),
+                })
+            })()
+        };
+        made.inspect_err(|e| tracing::warn!(error = %e, "the card's batched compare could not be made; passes per range")).ok()
+    })
+    .as_ref()
+}
+
+/// Records `jobs` on an open list: a dispatch per copy (in parts a dispatch
+/// holds), with `differs` at GPU address `differs`. `kind` is the
+/// [`CARD_PASSES`] counter the dispatches go to (0 hashes, 2 compares).
+///
+/// # Safety
+/// The list is open, its last run finished, and the jobs' pieces lie in
+/// their buffers. It leaves the batch's root signature set.
+unsafe fn card_batched(host: &Host, batch: &CardBatch, list: &ID3D12GraphicsCommandList, differs: u64, jobs: Vec<CardJob>, kind: usize) -> windows::core::Result<()> {
+    const MOST: usize = D3D12_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION as usize;
+    let mut entries: Vec<[u32; 4]> = Vec::new();
+    let mut slots: Vec<u32> = Vec::new();
+    let mut parts = Vec::with_capacity(jobs.len());
+    for mut job in jobs {
+        job.pieces.sort_unstable_by_key(|&(piece, ..)| piece);
+        let first = entries.len();
+        for &(piece, mode, slot) in &job.pieces {
+            let fresh = entries.len() == first;
+            match entries.last_mut() {
+                Some(e) if !fresh && e[0] == piece => e[2] = e[2].max(mode),
+                _ => entries.push([piece, slots.len() as u32, mode, 0]),
+            }
+            if let Some(slot) = slot {
+                slots.push(slot);
+                entries.last_mut().unwrap()[3] += 1;
+            }
+        }
+        parts.push((job, first, entries.len() - first));
+    }
+    if entries.is_empty() {
+        return Ok(());
+    }
+    let tail = entries.len() * 16;
+    let bytes = tail + slots.len() * 4;
+    let table = {
+        let mut tables = batch.tables.lock().unwrap_or_else(|e| e.into_inner());
+        let key = list.as_raw() as usize;
+        if tables.get(&key).is_none_or(|t| t.2 < bytes) {
+            // The one it replaces was last read by this list's last run,
+            // which finished.
+            let size = bytes.next_power_of_two().max(1 << 16);
+            let (buffer, data) = host.shared_buffer(size as u64).ok_or_else(windows::core::Error::empty)?;
+            name(&buffer, || "card compare table".into());
+            tables.insert(key, (buffer, data as usize, size));
+        }
+        let table = &tables[&key];
+        // SAFETY: the mapping holds `bytes`; the list that reads it is not
+        // running (the caller's).
+        unsafe {
+            std::ptr::copy_nonoverlapping(entries.as_ptr().cast::<u8>(), table.1 as *mut u8, tail);
+            std::ptr::copy_nonoverlapping(slots.as_ptr().cast::<u8>(), (table.1 + tail) as *mut u8, slots.len() * 4);
+            table.0.GetGPUVirtualAddress()
+        }
+    };
+    let mut dispatches = 0u64;
+    // SAFETY: the caller's.
+    unsafe {
+        list.SetComputeRootSignature(&batch.root);
+        list.SetPipelineState(&batch.pso);
+        list.SetComputeRootUnorderedAccessView(3, differs);
+        list.SetComputeRootShaderResourceView(4, table);
+        for (job, first, count) in &parts {
+            if *count == 0 {
+                continue;
+            }
+            list.SetComputeRootShaderResourceView(1, job.now);
+            list.SetComputeRootUnorderedAccessView(2, job.hashes);
+            let mut done = 0;
+            while done < *count {
+                let n = (count - done).min(MOST);
+                let constants = [(first + done) as u32, job.skew, job.size, n as u32, tail as u32, 0];
+                list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+                list.Dispatch(n as u32, 1, 1);
+                dispatches += 1;
+                done += n;
+            }
+        }
+    }
+    CARD_PASSES[kind].fetch_add(dispatches, Ordering::Relaxed);
+    if kind == 0 {
+        CARD_PASSES[1].fetch_add(entries.len() as u64, Ordering::Relaxed);
+    }
+    Ok(())
 }
 
 /// Whether the pieces hashed again after ranges were sent up to a copy in
@@ -4972,9 +5183,17 @@ impl Host {
                     if !sent.is_empty() {
                         list.ResourceBarrier(&sent);
                     }
-                    list.SetComputeRootSignature(&work.root);
-                    list.SetPipelineState(&work.pso);
-                    list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
+                    #[cfg(feature = "diagnostics")]
+                    crate::sidetime::end(list, side);
+                    #[cfg(feature = "diagnostics")]
+                    let side = crate::sidetime::begin(&self.device, &self.queue, list, crate::sidetime::HASH);
+                    let batch = card_batch_work(&self.device);
+                    let mut jobs = Vec::new();
+                    if batch.is_none() {
+                        list.SetComputeRootSignature(&work.root);
+                        list.SetPipelineState(&work.pso);
+                        list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
+                    }
                     for (shadow, ranges) in &dirty {
                         let (Some((_, Some(before), _)), size) = (shadow.card_sides(), shadow.card_hash_size()) else {
                             continue;
@@ -5002,6 +5221,17 @@ impl Host {
                             }
                             runs
                         };
+                        if batch.is_some() {
+                            jobs.push(CardJob {
+                                key: 0,
+                                now: shadow.buffer.GetGPUVirtualAddress(),
+                                hashes: before.GetGPUVirtualAddress(),
+                                size: size as u32,
+                                skew: runs.first().map_or(0, |r| r.skew),
+                                pieces: runs.iter().flat_map(|r| (r.first..r.first + r.pieces).map(|p| (p, 0, None))).collect(),
+                            });
+                            continue;
+                        }
                         // The same pieces in fewer passes (`rehash_runs`).
                         let runs = if joins { crate::shadow::joined_piece_runs(runs) } else { runs };
                         CARD_PASSES[0].fetch_add(runs.len() as u64, Ordering::Relaxed);
@@ -5009,6 +5239,9 @@ impl Host {
                         for run in runs {
                             card_pass(list, &run, size as u32, 0, 0);
                         }
+                    }
+                    if let Some(batch) = batch {
+                        card_batched(self, batch, list, work.differs.0.GetGPUVirtualAddress(), jobs, 0)?;
                     }
                     #[cfg(feature = "diagnostics")]
                     crate::sidetime::end(list, side);
@@ -5106,19 +5339,47 @@ impl Host {
                             }),
                         },
                     }]);
-                    list.SetComputeRootSignature(&work.root);
-                    list.SetPipelineState(&work.pso);
-                    list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
-                    for r in plan.ranges.iter().filter(|r| r.compared) {
-                        let (Some((_, Some(before), _)), size) = (r.shadow.card_sides(), r.shadow.card_hash_size()) else {
-                            continue;
-                        };
-                        list.SetComputeRootShaderResourceView(1, r.shadow.buffer.GetGPUVirtualAddress());
-                        list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
-                        // (What is only looked at keeps its hashes: what
-                        // changed there is the next declared range's to land.)
-                        card_pass(list, &r.span, size as u32, r.at, if flown && !r.picked { 2 } else { 1 });
-                        CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
+                    if let Some(batch) = card_batch_work(&self.device) {
+                        // A job per copy, its ranges in one dispatch.
+                        let mut jobs: Vec<CardJob> = Vec::new();
+                        for r in plan.ranges.iter().filter(|r| r.compared) {
+                            let (Some((_, Some(before), _)), size) = (r.shadow.card_sides(), r.shadow.card_hash_size()) else {
+                                continue;
+                            };
+                            let key = Arc::as_ptr(&r.shadow) as usize;
+                            let at = match jobs.iter().position(|j| j.key == key) {
+                                Some(at) => at,
+                                None => {
+                                    jobs.push(CardJob {
+                                        key,
+                                        now: r.shadow.buffer.GetGPUVirtualAddress(),
+                                        hashes: before.GetGPUVirtualAddress(),
+                                        size: size as u32,
+                                        skew: r.span.skew,
+                                        pieces: Vec::new(),
+                                    });
+                                    jobs.len() - 1
+                                }
+                            };
+                            let mode = if flown && !r.picked { 2 } else { 1 };
+                            jobs[at].pieces.extend((0..r.span.pieces).map(|i| (r.span.first + i, mode, Some((r.at + i) * 4))));
+                        }
+                        card_batched(self, batch, list, work.differs.0.GetGPUVirtualAddress(), jobs, 2)?;
+                    } else {
+                        list.SetComputeRootSignature(&work.root);
+                        list.SetPipelineState(&work.pso);
+                        list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
+                        for r in plan.ranges.iter().filter(|r| r.compared) {
+                            let (Some((_, Some(before), _)), size) = (r.shadow.card_sides(), r.shadow.card_hash_size()) else {
+                                continue;
+                            };
+                            list.SetComputeRootShaderResourceView(1, r.shadow.buffer.GetGPUVirtualAddress());
+                            list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
+                            // (What is only looked at keeps its hashes: what
+                            // changed there is the next declared range's to land.)
+                            card_pass(list, &r.span, size as u32, r.at, if flown && !r.picked { 2 } else { 1 });
+                            CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                     #[cfg(feature = "diagnostics")]
                     crate::sidetime::end(list, side);
