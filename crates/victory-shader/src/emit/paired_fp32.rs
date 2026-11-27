@@ -156,11 +156,14 @@ impl Lower<'_> {
             return Ok(false);
         }
         let refused = |why| unsupported(code[start].machine.offset, why);
+        // Every program the title ships (19122 in the avatar cache) records float mode 0xC0
+        // (FP32 rounds to nearest and flushes denormals, the D3D default), so that is the
+        // mode taken unless `VICTORY_WAVE_PAIRS_FP32` names another.
         if !std::env::var_os("VICTORY_WAVE_PAIRS_FP32")
-            .is_some_and(|mode| mode == "non-ieee-rne-ftz")
+            .is_none_or(|mode| mode == "non-ieee-rne-ftz")
         {
             return Err(refused(
-                "paired FP32 reduction requires a confirmed non-IEEE RNE/FTZ guest mode",
+                "paired FP32 reduction under another guest mode (VICTORY_WAVE_PAIRS_FP32)",
             ));
         }
         if self

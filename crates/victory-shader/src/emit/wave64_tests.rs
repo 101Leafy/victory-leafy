@@ -2257,7 +2257,7 @@ fn paired_fp32_takes_the_water_sums() {
     let output = std::process::Command::new(std::env::current_exe().unwrap())
         .args(["paired_fp32_takes_the_water_sums", "--nocapture"])
         .env(TEST, "1")
-        .env("VICTORY_WAVE_PAIRS_FP32", "non-ieee-rne-ftz")
+        .env_remove("VICTORY_WAVE_PAIRS_FP32")
         .output()
         .unwrap();
     assert!(output.status.success(), "{output:?}");
