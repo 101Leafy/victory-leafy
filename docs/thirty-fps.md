@@ -209,6 +209,31 @@ and `apart()` all assume a host side exists.
 **Step 6 — already upstream.** `VICTORY_OUTPUT` (the loader's patch) and
 `VICTORY_TEST_LOWRES` for 540p; the launcher's ladder (#31) drives both.
 
+### Step 2 as a design, before it is a patch
+
+The loop cannot be forked wholesale. It can be **cut at a boundary**, and this is the
+cut I would write:
+
+1. **A boundary is a call that changes the log**: `batch.fill()`, `batch.flush_one`,
+   `watch::wrote`, `watch::ask_once_end`, `port_journal::prep_wrote`,
+   `batch.title_written()`, and the side effects of `Step::Run` (which may write
+   anywhere and therefore ends the asking). Nothing else in the loop is one.
+2. **The cut goes at the last boundary before the halfway step index**, and each half
+   gets its own `Batch`, its own staging list and its own place in the journal. The
+   second half does not start until the first half's batch has been flushed — the
+   threads overlap the *work*, not the *log*.
+3. **The merge point, stated as the invariant it has to keep**: a refresh collected
+   before a title write must never be satisfied by bytes read after that write. So a
+   half may only be cut where the two halves touch **no common `Shadow`** —
+   `Arc::ptr_eq` over the two halves' copies, decided when the lists are handed over,
+   not guessed per step. Where they do share one, the cut moves left.
+4. **What proves it**: the same dump, the refresh count on the frame line, and a
+   rendering comparison — not a timing. A wrong cut changes *which* refreshes happen,
+   so it must be checked against the picture before it is checked against the clock.
+5. **What it costs**: the `snapshot_bytes` column added to the CSV in this branch. If a
+   submission's snapshots are a large part of 6.44 GiB shared, two of them is the
+   answer to "can this be bought", and it is answered before the code is written.
+
 What is measured today stands: **preparing is 93 ms against a 33 ms budget**, and a
 frame cannot be shorter than the work of preparing it. Steps 2, 3 and 5 are the work
 that would remove it. They are also the three that change what the title sees, and

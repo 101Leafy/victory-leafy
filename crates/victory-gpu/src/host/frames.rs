@@ -67,6 +67,10 @@ const COUNTERS: &[(&str, fn() -> u64)] = &[
     ("refresh_watch_us", || get(&crate::texture::REFRESH_WAITS[1])),
     ("refresh_still_us", || get(&crate::texture::REFRESH_WAITS[2])),
     ("refresh_us", || get(&crate::texture::REFRESH_WAITS[3])),
+    // The bytes of the ranges shaders write, copied per submission: what two
+    // submissions in flight would hold twice, which is the cost the plan puts
+    // before splitting one over two threads (`docs/thirty-fps.md`).
+    ("snapshot_bytes", || get(&crate::shadow::SNAPSHOT_BYTES)),
 ];
 
 /// Read as they are, not as growth: memory in bytes.

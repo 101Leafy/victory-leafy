@@ -2134,8 +2134,24 @@ pub(crate) fn take_snapshots() {
     if snaps.is_empty() {
         return;
     }
+    // What the ranges shaders write came to, a submission: the part of a
+    // submission's memory that would be alive twice if two were prepared at
+    // once (`docs/thirty-fps.md`, steps 2 and 3). Counted here, where the
+    // copies are made, so the number is the one the work is, not an estimate.
+    let bytes: u64 = snaps.iter().map(|&(_, _, len)| len as u64).sum();
+    SNAPSHOT_BYTES.fetch_add(bytes, Ordering::Relaxed);
     wide(copy_jobs(snaps));
 }
+
+/// Bytes [`take_snapshots`] copied, added up since the counters were last
+/// read (`frames::COUNTERS`, the `snapshot_bytes` column).
+///
+/// It is the gate the plan puts before splitting a submission over two
+/// threads: a submission's snapshots must stay until its copy-back, so two
+/// in flight means two of these alive, and on an 8 GiB card with 6.44 GiB
+/// already shared that is the number that decides whether the split is a
+/// gain or a swap.
+pub(crate) static SNAPSHOT_BYTES: AtomicU64 = AtomicU64::new(0);
 
 /// `copies` (from, to, bytes) as pieces of work of about [`WIDE_JOB`]
 /// bytes each: long ones cut, short ones together.
