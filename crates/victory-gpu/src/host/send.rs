@@ -27,6 +27,26 @@ pub(super) fn own() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_SEND_OWN").is_none_or(|v| v != "0"))
 }
 
+/// Whether the long runs are copied on several threads from more than
+/// [`PIECE`] bytes on (`VICTORY_SEND_WIDE=1`; off by default), not only
+/// past 4 MB ([`crate::shadow::copy_all`]).
+///
+/// Why: in Leafy's run leafy-0314 the taking was 6.7 ms a frame of the
+/// submitting thread in play, for 36 MB in some 300 runs over 18
+/// submissions: about 2 MB a submission, mostly under the 4 MB that goes
+/// wide, so copied on that thread alone into the upload memory.
+fn wide() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_SEND_WIDE") {
+        return on;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_SEND_WIDE"))
+}
+
+/// With [`wide`]: about this many bytes to a thread's piece.
+const PIECE: usize = 256 << 10;
+
 /// Runs up to this many bytes go as pairs.
 const SHORT: usize = 256;
 
@@ -170,8 +190,9 @@ pub(super) fn give_back(memory: Memory) {
 }
 
 /// Since the last frame-rate line: bytes copied, runs copied, words stored,
-/// microseconds of taking them out of the CPU sides.
-pub(super) static STATS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+/// microseconds of taking them out of the CPU sides, of copying the runs
+/// among them.
+pub(super) static STATS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 
 /// One copy's sends: ranges copied (offset in the copy, in the memory,
 /// bytes), and its pairs (where in the memory, how many).
@@ -270,7 +291,13 @@ pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, us
     STATS[0].fetch_add(moves.iter().map(|m| m.2 as u64).sum(), Ordering::Relaxed);
     STATS[1].fetch_add(moves.len() as u64, Ordering::Relaxed);
     STATS[2].fetch_add(copies.iter().map(|c| u64::from(c.pairs.1)).sum(), Ordering::Relaxed);
-    crate::shadow::copy_all(moves);
+    let copying = std::time::Instant::now();
+    if wide() {
+        crate::shadow::copy_in_pieces(moves, PIECE);
+    } else {
+        crate::shadow::copy_all(moves);
+    }
+    STATS[4].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
     STATS[3].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
     Some(Own { memory, copies })
 }

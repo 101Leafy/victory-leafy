@@ -924,9 +924,24 @@ pub(crate) fn stale_pages(most: usize, say: &mut dyn FnMut(&Shadow, usize, usize
 pub(crate) fn copy_all(copies: Vec<(usize, usize, usize)>) {
     let bytes: usize = copies.iter().map(|c| c.2).sum();
     if bytes > 4 << 20 {
-        wide(copy_jobs(copies));
+        wide(copy_jobs(copies, WIDE_JOB));
         return;
     }
+    copy_here(copies);
+}
+
+/// [`copy_all`] on several threads from more than `piece` bytes on, in
+/// pieces of about that many.
+pub(crate) fn copy_in_pieces(copies: Vec<(usize, usize, usize)>, piece: usize) {
+    let bytes: usize = copies.iter().map(|c| c.2).sum();
+    if bytes > piece {
+        wide(copy_jobs(copies, piece));
+        return;
+    }
+    copy_here(copies);
+}
+
+fn copy_here(copies: Vec<(usize, usize, usize)>) {
     for (src, dst, len) in copies {
         // SAFETY: the caller's ranges.
         unsafe { std::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, len) };
@@ -2177,12 +2192,12 @@ pub(crate) fn take_snapshots() {
     if snaps.is_empty() {
         return;
     }
-    wide(copy_jobs(snaps));
+    wide(copy_jobs(snaps, WIDE_JOB));
 }
 
-/// `copies` (from, to, bytes) as pieces of work of about [`WIDE_JOB`]
-/// bytes each: long ones cut, short ones together.
-fn copy_jobs(copies: Vec<(usize, usize, usize)>) -> Vec<Job> {
+/// `copies` (from, to, bytes) as pieces of work of about `job` bytes each:
+/// long ones cut, short ones together.
+fn copy_jobs(copies: Vec<(usize, usize, usize)>, job: usize) -> Vec<Job> {
     let mut jobs: Vec<Job> = Vec::new();
     let mut group: Vec<(usize, usize, usize)> = Vec::new();
     let mut bytes = 0;
@@ -2201,11 +2216,11 @@ fn copy_jobs(copies: Vec<(usize, usize, usize)>) -> Vec<Job> {
     for (src, dst, len) in copies {
         let mut at = 0;
         while at < len {
-            let n = (WIDE_JOB - bytes).min(len - at);
+            let n = (job - bytes).min(len - at);
             group.push((src + at, dst + at, n));
             at += n;
             bytes += n;
-            if bytes >= WIDE_JOB {
+            if bytes >= job {
                 flush(&mut group, &mut jobs);
                 bytes = 0;
             }
@@ -2385,7 +2400,7 @@ mod wide_tests {
         // Ranges of the buffer, each to the same offsets of the other.
         let cuts = [0, 1, 1, 4096, 70_000, WIDE_JOB + 3, 2 * WIDE_JOB + 3, 2 * WIDE_JOB + 9, len];
         let copies: Vec<(usize, usize, usize)> = cuts.windows(2).map(|w| (s + w[0], d + w[0], w[1] - w[0])).collect();
-        let jobs = copy_jobs(copies);
+        let jobs = copy_jobs(copies, WIDE_JOB);
         assert!(jobs.len() >= 3);
         wide(jobs);
         assert!(src == dst);
