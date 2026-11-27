@@ -125,6 +125,30 @@ fn scene_input(shaders: &[Arc<Shader>]) -> bool {
         })
 }
 
+/// Shader hashes whose pipelines are left out in every build
+/// (`VICTORY_LEAVE_OUT=<16 hex digits>[,..]`; `VICTORY_SKIP_PIPELINES` does
+/// the same in diagnostics builds only). The decal heap's
+/// `CS_DefragHeap_ComputeRelocations` (02384a60fda6f2d0), translatable for
+/// 32-lane hosts through host waves that meet by spinning, took 11.85 ms of
+/// the card a frame in the first gameplay area (timing run, 2026-11-26).
+/// Such a pipeline is never made: it starts out refused, and its draws and
+/// dispatches are dropped as those of a pipeline that does not translate.
+fn leave_out() -> &'static [String] {
+    static HASHES: OnceLock<Vec<String>> = OnceLock::new();
+    HASHES.get_or_init(|| {
+        std::env::var("VICTORY_LEAVE_OUT")
+            .unwrap_or_default()
+            .split(',')
+            .map(|h| h.trim().to_ascii_lowercase())
+            .filter(|h| h.len() == 16 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+            .collect()
+    })
+}
+
+fn leave_out_hash(shaders: &[Arc<Shader>]) -> bool {
+    !leave_out().is_empty() && shaders.iter().any(|s| leave_out().contains(&s.hash))
+}
+
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
 // elements point into its own names) is only read after creation.
 unsafe impl Send for Pending {}
@@ -144,6 +168,7 @@ impl Pending {
             && !(scene_inputs() && shaders.iter().any(|s| s.stage == "mesh")))
             || scene_input;
         let left_out = left_out(&shaders);
+        let made = if leave_out_hash(&shaders) { OnceLock::from(None) } else { OnceLock::new() };
         Pending {
             screen,
             scene_input,
@@ -157,7 +182,7 @@ impl Pending {
             queued: OnceLock::new(),
             taken_from: AtomicU8::new(TAKEN_BY_TITLE),
             started_early: AtomicBool::new(false),
-            made: OnceLock::new(),
+            made,
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
             given_up: AtomicBool::new(false),
@@ -273,6 +298,7 @@ pub(crate) fn missing(p: &Pending) -> Option<String> {
     match p.made.get() {
         Some(Some(_)) => None,
         None => Some("being made".into()),
+        Some(None) if leave_out_hash(&p.shaders) => Some("left out (VICTORY_LEAVE_OUT)".into()),
         Some(None) => {
             let failed: Vec<String> = p
                 .shaders
