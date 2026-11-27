@@ -8475,7 +8475,7 @@ impl<'a> Lower<'a> {
     /// and whether a signed one (`ResourceHeap` or `Table`; `None`: another
     /// view).
     fn integer_view(&mut self, src: &Source) -> Result<Option<(V, V)>, Why> {
-        let Some(word) = self.slot_word(src, true)? else {
+        let Some(word) = self.slot_word(src, super::table_strides())? else {
             return Ok(None);
         };
         let c = self.cur;

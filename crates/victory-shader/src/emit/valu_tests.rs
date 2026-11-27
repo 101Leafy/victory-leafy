@@ -2541,6 +2541,7 @@ fn build_table_typed_cs(body: &[u32], used: Vec<UsedResource>) -> HostShader {
     let res =
         resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
     let io = io::raise(&p, &native).expect("io::raise");
+    let was = super::TEST_TABLE_STRIDES.replace(Some(true));
     let lowered = lower::lower(&lower::Parts {
         native: &native,
         p: &p,
@@ -2551,8 +2552,9 @@ fn build_table_typed_cs(body: &[u32], used: Vec<UsedResource>) -> HostShader {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
-    })
-    .expect("lower");
+    });
+    super::TEST_TABLE_STRIDES.set(was);
+    let lowered = lowered.expect("lower");
     let shader = HostShader {
         stage: HwStage::Cs,
         dxil: lowered.dxil,

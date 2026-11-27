@@ -3041,7 +3041,7 @@ impl HostHeap {
     /// through its tables (`victory_shader::emit::SLOT_TABLE_STRIDES`); the
     /// title's own slots have theirs from [`HostHeap::note_buffer`].
     fn dynamic_stride(&self, index: u32, word: u32) {
-        if index >= self.count {
+        if index >= self.count && victory_shader::emit::table_strides() {
             self.write_stride(index, word);
         }
     }

@@ -273,6 +273,21 @@ pub fn guard_runs() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_GUARD_RUNS").is_none_or(|v| v != "0"))
 }
 
+/// Whether a d16 typed access through a view in the program's tables reads
+/// the view's word from the table of strides (root SRV `SLOT_TABLE_STRIDES`)
+/// and passes integer bits for an integer format (`VICTORY_TABLE_STRIDES=1`,
+/// codec_d's; off, such views are taken as floats, as before). The dynamic
+/// slots write their words only then. Part of the translation: the shader
+/// cache keys on it.
+pub fn table_strides() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_TABLE_STRIDES.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TABLE_STRIDES").is_some_and(|v| v == "1"))
+}
+
 /// Whether a descriptor read under an EXEC guard is traced only from the
 /// lanes the guard keeps, so lanes that branch over the arm building it do
 /// not make two values at the join (`VICTORY_GUARDED_DESCRIPTORS=1`, codec_d's
@@ -295,6 +310,7 @@ pub(crate) fn test_guarded_descriptors(on: Option<bool>) {
 #[cfg(test)]
 thread_local! {
     static TEST_GUARDED_DESCRIPTORS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    static TEST_TABLE_STRIDES: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
     static TEST_GUARD_FLOAT: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
     static TEST_GUARD_RUNS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
