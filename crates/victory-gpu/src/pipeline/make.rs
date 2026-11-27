@@ -351,6 +351,8 @@ fn dropped(p: &Arc<Pending>, frame: u64) {
             d.keys.push(p.key.clone());
         }
     }
+}
+
 /// Pipelines made again for the formats bound at a draw, since the start.
 static VARIANTS: AtomicU64 = AtomicU64::new(0);
 
