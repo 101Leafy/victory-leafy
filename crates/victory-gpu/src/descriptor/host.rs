@@ -2522,6 +2522,9 @@ impl HostHeap {
                 remade += 1;
             }
         }
+        if remade > 0 {
+            VIEWS_CHANGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         remade
     }
 
@@ -3227,6 +3230,40 @@ impl HostHeap {
     /// What slot `index` views.
     fn kept_in(&self, index: u32) -> Option<ID3D12Resource> {
         self.kept.get(index as usize)?.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Whether dynamic slot `index`, made from `view` in an earlier frame,
+    /// still views what [`HostHeap::make_at`] would make it from now: the
+    /// same host copy of a texture, the same shadow of a buffer. Other views
+    /// are taken as they are; a texture view made again with another
+    /// description bumps [`VIEWS_CHANGED`] instead.
+    pub(crate) fn still_views(&self, index: u32, view: &View) -> bool {
+        use windows::core::Interface;
+        let now = match view {
+            View::Shader(resource, _) => match crate::resource::host_copy(*resource as crate::object::This) {
+                Some(copy) => Some(copy.texture.as_raw()),
+                None => buffer_copy(view).map(|(shadow, ..)| shadow.buffer.as_raw()),
+            },
+            View::Unordered(resource, _, _) => {
+                let resource = *resource as crate::object::This;
+                match buffer_copy(view) {
+                    Some((shadow, ..)) => Some(shadow.buffer.as_raw()),
+                    None => crate::resource::twin_resource(resource)
+                        .or_else(|| crate::resource::twin_plane_resource(resource))
+                        .or_else(|| crate::resource::host_resource(resource))
+                        .map(Interface::as_raw),
+                }
+            }
+            View::Placed(..) => match buffer_copy(view) {
+                Some((shadow, ..)) => Some(shadow.buffer.as_raw()),
+                None => return true,
+            },
+            _ => return true,
+        };
+        let Some(slot) = self.kept.get(index as usize) else {
+            return false;
+        };
+        slot.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(Interface::as_raw) == now
     }
 
     /// Makes slot `index` (a dynamic one) a raw buffer view of `len` bytes
@@ -4783,6 +4820,11 @@ pub(crate) static KEPT_YIELDED: std::sync::atomic::AtomicU64 = std::sync::atomic
 
 /// Slots showing an older texture as of the texture pass's last look.
 pub(crate) static KEEPING_NOW: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Bumped when title texture views are made again with other descriptions
+/// ([`HostHeap::texture_views_remade`]): a table kept from an earlier frame
+/// (`crate::draw`, `VICTORY_TABLE_CACHE`) made before it is made afresh.
+pub(crate) static VIEWS_CHANGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Whether a slot that goes on showing an older texture while the newer one
 /// waits ([`keep_views`], [`keep_shown`]) gives it up when the card has no
