@@ -1620,8 +1620,8 @@ mod tests {
         let texture = std::sync::Arc::new(crate::resource::HostTexture::new(made.unwrap(), 0));
         let key = std::sync::Arc::as_ptr(&texture) as usize;
         list.states.lock().unwrap().insert(key, (start, leave, texture.clone()));
-        let first = list.prelude(false).expect("a move is recorded");
-        let second = list.prelude(false).expect("the second use records a move too");
+        let first = list.prelude(false, &[]).expect("a move is recorded");
+        let second = list.prelude(false, &[]).expect("the second use records a move too");
         assert_ne!(
             windows::core::Interface::as_raw(&first),
             windows::core::Interface::as_raw(&second),
@@ -1640,8 +1640,8 @@ mod tests {
         let Some(host) = super::host() else { return };
         let list = host.new_list().unwrap();
         list.close();
-        assert!(list.prelude(false).is_none(), "nothing to move: no prelude");
-        assert!(list.prelude(true).is_some(), "behind another part: a prelude with the barriers");
+        assert!(list.prelude(false, &[]).is_none(), "nothing to move: no prelude");
+        assert!(list.prelude(true, &[]).is_some(), "behind another part: a prelude with the barriers");
     }
 
     mod builder_memory {
@@ -3877,6 +3877,9 @@ struct Deferred {
     /// class, whether it is a shared buffer. Given back to the pool when the
     /// list is reset.
     pooled: Vec<(Chunk, u64, bool)>,
+    /// Title textures whose upload the list's prelude records if the check at
+    /// submission finds it due (`crate::texture::prelude_uploads`).
+    prelude_uploads: Vec<crate::texture::PreludeUpload>,
     /// The bytes of `uploads` (counted in [`ALIVE`] while they are held).
     upload_bytes: u64,
     /// Upload buffers taken from the pool of shared buffers
@@ -8513,7 +8516,9 @@ impl Host {
         for (n, list) in runs.iter().enumerate() {
             list.run_deferred(&mut batch, &air, n, |i| own.as_ref().is_some_and(|own| own.takes(list, i)));
             firsts.push(lists.len());
-            if let Some(prelude) = list.prelude(one_call && parts.contains(&n)) {
+            // (None unless `VICTORY_PRELUDE_UPLOADS=1`.)
+            let uploads = list.prelude_uploads(&mut batch);
+            if let Some(prelude) = list.prelude(one_call && parts.contains(&n), &uploads) {
                 lists.push(Some(prelude));
             }
             lists.push(list.list.cast().ok());
@@ -9725,11 +9730,15 @@ impl HostList {
     /// its real state to the one the list starts with; the textures' real
     /// states become those the list ends with. For depth textures with a
     /// colour twin it first copies the side the list uses as it finds it
-    /// from the other, if a list submitted earlier left it behind.
+    /// from the other, if a list submitted earlier left it behind. Title
+    /// textures whose upload is decided at submission (`uploads`,
+    /// `crate::texture::prelude_uploads`) are copied into their host copies
+    /// here, right before the list runs (Belobug/VIctory-Belobug-AMD
+    /// 5d6bd84).
     /// With `join` the list is the first of a part sent in one call behind
     /// others ([`join_one_call`]): the prelude is made in any case, and first
     /// waits for everything before it ([`join_barriers`]).
-    fn prelude(&self, join: bool) -> Option<ID3D12CommandList> {
+    fn prelude(&self, join: bool, uploads: &[(crate::texture::PreludeUpload, bool)]) -> Option<ID3D12CommandList> {
         const COPY_DEST: u32 = 0x400;
         const COPY_SOURCE: u32 = 0x800;
         let host_state = |state: u32| D3D12_RESOURCE_STATES(state as i32);
@@ -9784,13 +9793,45 @@ impl HostList {
                 }
             }
         }
+        // The uploads decided at submission: each host copy to the copy
+        // destination state, and from there to the state the list starts
+        // with (back to its real state if the list does not use it).
+        let mut aliasing = Vec::new();
+        for (upload, first_upload) in uploads {
+            let copy = &upload.copy;
+            let key = std::sync::Arc::as_ptr(copy) as usize;
+            // A texture cut from a block may lie where another did: what the
+            // card holds of that one is done with before the first upload
+            // into this one.
+            if crate::pool::on() && *first_upload {
+                aliasing.push(D3D12_RESOURCE_BARRIER {
+                    Type: D3D12_RESOURCE_BARRIER_TYPE_ALIASING,
+                    Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                    Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                        Aliasing: std::mem::ManuallyDrop::new(D3D12_RESOURCE_ALIASING_BARRIER {
+                            pResourceBefore: std::mem::ManuallyDrop::new(None),
+                            // SAFETY: a borrowed pointer the barrier never releases.
+                            pResourceAfter: unsafe { std::mem::transmute_copy(&copy.texture) },
+                        }),
+                    },
+                });
+            }
+            let real = copying.get(&key).copied().unwrap_or_else(|| copy.state.load(Ordering::Relaxed));
+            if real != COPY_DEST {
+                to_copy.push(transition(&copy.texture, host_state(real), host_state(COPY_DEST)));
+                if !states.contains_key(&key) {
+                    barriers.push(transition(&copy.texture, host_state(COPY_DEST), host_state(real)));
+                }
+            }
+            copying.insert(key, COPY_DEST);
+        }
         barriers.extend(states.iter().filter_map(|(key, (first, last, copy))| {
             let real = copy.state.swap(*last, Ordering::Relaxed);
             let real = copying.get(key).copied().unwrap_or(real);
             (real != *first)
                 .then(|| transition(&copy.texture, host_state(real), host_state(*first)))
         }));
-        if !join && barriers.is_empty() && syncs.is_empty() {
+        if !join && barriers.is_empty() && syncs.is_empty() && uploads.is_empty() {
             return None;
         }
         // SAFETY: a plain query.
@@ -9807,11 +9848,17 @@ impl HostList {
                 if join {
                     list.ResourceBarrier(&join_barriers());
                 }
+                if !aliasing.is_empty() {
+                    list.ResourceBarrier(&aliasing);
+                }
                 if !to_copy.is_empty() {
                     list.ResourceBarrier(&to_copy);
                 }
                 for (depth, twin, colour) in &syncs {
                     record_twin_copy(&list, &depth.texture, twin, *colour);
+                }
+                for (upload, _) in uploads {
+                    upload.record(&list);
                 }
                 if !barriers.is_empty() {
                     list.ResourceBarrier(&barriers);
@@ -10536,6 +10583,32 @@ impl HostList {
     /// submitted, keeping it alive until the list is reset.
     pub(crate) fn defer_texture(&self, staging: std::sync::Arc<crate::texture::Staging>) {
         self.deferred().copies.push(Step::Texture(staging));
+    }
+
+    /// [`HostList::defer_texture`] of a texture whose upload the list's
+    /// prelude records if the check finds it due
+    /// (`crate::texture::prelude_uploads`; [`HostList::prelude_uploads`]).
+    pub(crate) fn defer_prelude_upload(&self, upload: crate::texture::PreludeUpload) {
+        let mut deferred = self.deferred();
+        deferred.copies.push(Step::Texture(upload.staging()));
+        deferred.prelude_uploads.push(upload);
+    }
+
+    /// At submission, after the list's steps: the textures whose upload its
+    /// prelude records, each with whether it is the first upload into its
+    /// host copy. Their staging buffers are refreshed first (those the
+    /// submission's steps left pending). Ported from
+    /// Belobug/VIctory-Belobug-AMD 5d6bd84.
+    fn prelude_uploads(&self, batch: &mut Batch) -> Vec<(crate::texture::PreludeUpload, bool)> {
+        let waiting = self.deferred().prelude_uploads.clone();
+        if waiting.is_empty() {
+            return Vec::new();
+        }
+        batch.refresh_textures();
+        waiting
+            .into_iter()
+            .filter_map(|upload| upload.finish_refresh().map(|first| (upload, first)))
+            .collect()
     }
 
     /// Runs the list's submission-time steps; refreshes go into `batch`
