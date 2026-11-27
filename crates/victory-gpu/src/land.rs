@@ -133,6 +133,7 @@ pub(crate) fn spent(which: usize, from: std::time::Instant) -> std::time::Instan
 
 /// For the frame-rate line: where landing went, per frame.
 pub(crate) fn log(frames: f64) {
+    reads::log(frames);
     let t: Vec<f64> = TAKEN.iter().map(|t| t.swap(0, Ordering::Relaxed) as f64 / frames).collect();
     if t[0] > 0.0 {
         tracing::info!(
@@ -610,6 +611,9 @@ unsafe fn piece_at(
         let last = differing.iter().rposition(|&d| d).unwrap_or(first);
         let (from, to) = (((base + first) * PAGE).max(title), ((base + last + 1) * PAGE).min(title + end));
         let opening = std::time::Instant::now();
+        if reads::on() {
+            reads::again(from, to - from);
+        }
         crate::watch::landing(from, to - from);
         spent(stat::NOTES, opening);
     }
@@ -617,6 +621,8 @@ unsafe fn piece_at(
     let since = crate::watch::changes();
     let (mut pages, mut new_pages, mut blocks, mut dwords, mut missing) = (0, 0u64, 0, 0, 0);
     let mut span: Option<(usize, usize)> = None;
+    // Through the title's own address: the parts that changed, told once they are in.
+    let mut apart: Vec<(usize, usize)> = Vec::new();
     for_pages(title, parts, |from, n| {
         pages += 1;
         if !differing[(title + from) / PAGE - base] {
@@ -657,6 +663,8 @@ unsafe fn piece_at(
                 }
                 let s = span.get_or_insert((title + from, title + from + n));
                 s.1 = title + from + n;
+            } else {
+                apart.push((title + from, n));
             }
         }
     });
@@ -666,6 +674,10 @@ unsafe fn piece_at(
         // block then has two.
         let through = if missing == 0 { copy } else { std::ptr::null() };
         notes.landed.push((title / BLOCK, through));
+    }
+    crate::watch::told(&apart);
+    if reads::on() {
+        reads::watch(&apart);
     }
     count(stat::NEW_PIECES, u64::from(new_pages > 0));
     count(stat::PAGES, pages);
@@ -691,5 +703,6 @@ fn for_pages(title: usize, parts: &[(usize, usize)], mut f: impl FnMut(usize, us
     }
 }
 
+mod reads;
 #[cfg(test)]
 mod tests;

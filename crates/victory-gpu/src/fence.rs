@@ -91,6 +91,45 @@ extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT
 extern "system" fn release(this: This) -> u32 {
     object::release_boxed::<Fence>(this)
 }
+/// A reference of ours to a fence the title may release meanwhile. D3D12's
+/// queue Wait keeps one until the wait is met, so a title can release its
+/// fence right after the call; a queue holding a wait or a signal keeps it
+/// alive this way.
+#[cfg(windows)]
+pub(crate) struct Kept(usize);
+#[cfg(windows)]
+impl Kept {
+    pub(crate) fn new(fence: This) -> Self {
+        if !fence.is_null() {
+            object::add_ref(fence);
+        }
+        Self(fence as usize)
+    }
+    /// No fence: what a job being refilled stands at for a moment.
+    pub(crate) const fn none() -> Self {
+        Self(0)
+    }
+    pub(crate) fn this(&self) -> This {
+        self.0 as This
+    }
+    pub(crate) fn at(&self) -> usize {
+        self.0
+    }
+}
+#[cfg(windows)]
+impl Clone for Kept {
+    fn clone(&self) -> Self {
+        Self::new(self.this())
+    }
+}
+#[cfg(windows)]
+impl Drop for Kept {
+    fn drop(&mut self) {
+        if self.0 != 0 {
+            release(self.this());
+        }
+    }
+}
 pub(crate) extern "system" fn completed(this: This) -> u64 {
     fence(this).value.load(Ordering::Acquire)
 }

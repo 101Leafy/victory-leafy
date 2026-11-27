@@ -13,7 +13,6 @@ use crate::resource::{Memory, PAGEABLE_IIDS};
 #[cfg(windows)]
 pub(crate) mod host;
 #[cfg_attr(not(windows), allow(dead_code))]
-mod taken;
 
 const HEAP_IIDS: [Iid; 4] = [
     guid(
@@ -283,6 +282,79 @@ pub(crate) fn begin_sync_heaps() -> SyncedHeaps {
     drop(rounds);
     SYNC_ROUNDS.1.notify_all();
     SyncedHeaps(Some(mine))
+}
+
+/// Renderer port #7 (`crate::port_journal`, from renderer patch #4): [`begin_sync_heaps`] for a
+/// submission that needs round `mark` (one that began after what it waits
+/// for was written, `crate::port_journal::round_after`): asked for if it has not
+/// been. 0: as [`begin_sync_heaps`].
+#[cfg(windows)]
+pub(crate) fn begin_sync_heaps_after(mark: u64) -> SyncedHeaps {
+    if mark == 0 || !sync_aside() {
+        return begin_sync_heaps();
+    }
+    // (The thread is started by the first `begin_sync_heaps`.)
+    let mut rounds = SYNC_ROUNDS.0.lock().unwrap_or_else(|e| e.into_inner());
+    if rounds.1 == 0 && rounds.0 == 0 {
+        drop(rounds);
+        return begin_sync_heaps();
+    }
+    let asked = rounds.0 < mark;
+    rounds.0 = rounds.0.max(mark);
+    drop(rounds);
+    if asked {
+        SYNC_ROUNDS.1.notify_all();
+        crate::port_journal::STATS[crate::port_journal::LATE_ROUNDS].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    } else {
+        crate::port_journal::STATS[crate::port_journal::EARLY_ROUNDS].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    SyncedHeaps(Some(mark))
+}
+
+/// Renderer port #7: the number of a round of the heaps' records that
+/// begins after this call, asked for if none is waiting to begin (at the
+/// title's submit: the round runs while the submission waits in the line).
+/// 0 if the records are not synced by a thread of their own (or it has not
+/// started yet).
+#[cfg(windows)]
+pub(crate) fn round_after_now() -> u64 {
+    if !sync_aside() {
+        return 0;
+    }
+    let mut rounds = SYNC_ROUNDS.0.lock().unwrap_or_else(|e| e.into_inner());
+    if rounds.1 == 0 && rounds.0 == 0 {
+        return 0;
+    }
+    let (round, ask) = crate::port_journal::round_after(rounds.0, rounds.1);
+    if ask {
+        rounds.0 = round;
+        drop(rounds);
+        SYNC_ROUNDS.1.notify_all();
+        crate::port_journal::STATS[crate::port_journal::ROUNDS_ASKED].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    round
+}
+
+/// Renderer port #7: the number of the first round that begins after this
+/// call, not asked for ([`begin_sync_heaps_after`] asks for it if nobody did).
+#[cfg(windows)]
+pub(crate) fn round_mark() -> u64 {
+    if !sync_aside() {
+        return 0;
+    }
+    let rounds = SYNC_ROUNDS.0.lock().unwrap_or_else(|e| e.into_inner());
+    if rounds.1 == 0 && rounds.0 == 0 {
+        return 0;
+    }
+    rounds.0 + 1
+}
+
+/// Whether `[at, at + len)` touches the title memory of a placed
+/// shader-visible heap of descriptors.
+#[cfg(windows)]
+pub(crate) fn in_shader_heap(at: usize, len: usize) -> bool {
+    let (from, to) = (at as u64, at as u64 + len as u64);
+    SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner()).iter().any(|&(start, end, _)| from < end && start < to)
 }
 
 #[cfg(windows)]
@@ -628,15 +700,18 @@ pub(crate) fn with_heap<T>(heap: usize, f: impl FnOnce(&Heap) -> T) -> Option<T>
 }
 
 /// Gives back dynamic slots of the host heap behind the title heap at
-/// `heap`, if that heap still exists.
+/// `heap`, if that heap is still there and `id` says it is the one that
+/// took them ([`host::HostHeap::id`]): the title can release the heap a
+/// list's slots came from, and a later heap can be made at the same address
+/// before the list is reset.
 #[cfg(windows)]
-pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
+pub(crate) fn release_dynamic(heap: usize, id: u64, first: u32, n: u32) {
     let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
     if heaps.iter().any(|&(_, _, h)| h == heap)
         // SAFETY: registered heaps are live (removed when dropped).
         && let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get()
     {
-        host.release(first, n);
+        host.release(id, first, n);
     }
 }
 
@@ -800,7 +875,7 @@ const DSV_TAG: u32 = u32::from_le_bytes(*b"vDSV");
 
 /// A shader view or sampler as the title described it (descriptions in the
 /// host's layout, kept as words), for the host to build its own from.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum View {
     /// Constant buffer: GPU address and size.
     Constant(u64, u32),
@@ -857,30 +932,126 @@ impl View {
 /// without the address: as many as the title has kinds of textures and
 /// buffers, however often it moves them).
 /// `VICTORY_VIEW_INLINE=0`: every view is an entry, as before.
+///
+/// The shapes were not bounded after all. A record numbers at most
+/// [`SHAPES`] of them, and play-g reached that in about an hour; from
+/// then on each placed view of a shape not seen before was a table entry,
+/// which nothing frees: 5,404,074 of them at the end, and the table with
+/// its indexes 3,301 MB. Each view and shape was kept twice, in the list
+/// and again as a key of a tree index, whose nodes were millions of small
+/// blocks. The indexes now hold a digest of each ([`digest`]) and the
+/// number of its entry or shape, and the list is checked for the view
+/// itself; a view whose digest another view already has is kept in a
+/// small tree of its own.
+///
+/// What is still an entry without a resource (a placed view once the shapes
+/// are full, or one past 1 TiB; a constant buffer view that does not fit
+/// its record) is kept up to [`ownerless_cap`] entries, oldest freed first.
 struct Views {
     /// Each entry's view and generation.
     list: Vec<(View, u32)>,
-    index: std::collections::BTreeMap<View, u32>,
+    /// The entry of each view by its digest, but those in `collided`.
+    index: std::collections::HashMap<u64, u32, std::hash::BuildHasherDefault<Digested>>,
+    /// Entries whose view's digest was taken by another view's entry.
+    collided: std::collections::BTreeMap<View, u32>,
     /// Entries naming each resource.
     by_resource: std::collections::BTreeMap<usize, Vec<u32>>,
     free: Vec<u32>,
-    /// The shapes of views of placed memory, and where each is.
+    /// The shapes of views of placed memory, and where each is (by digest,
+    /// as the entries).
     shapes: Vec<Shape>,
-    shape_index: std::collections::BTreeMap<Shape, u32>,
+    shape_index: std::collections::HashMap<u64, u32, std::hash::BuildHasherDefault<Digested>>,
+    shapes_collided: std::collections::BTreeMap<Shape, u32>,
+    /// For the memory line: the last new shape of each kind (unordered or
+    /// not, resource dimension, view dimension), how often each word of a
+    /// new shape differed from it ([`Views::note_new`]), and the placed
+    /// views of title memory made table entries because the shapes were
+    /// full.
+    last_shapes: std::collections::BTreeMap<(bool, u32, u32), Shape>,
+    varied: [u64; 28],
+    past_shapes: u64,
+    /// Entries no resource owns (constant buffer views and views of placed
+    /// memory), oldest first, with the generation each was made at: past
+    /// [`ownerless_cap`] the oldest is freed, as nothing else frees them.
+    ownerless: std::collections::VecDeque<(u32, u32)>,
+    /// Entries of [`ownerless`](Self::ownerless) freed under the cap since
+    /// the start.
+    ownerless_freed: u64,
+}
+
+/// How many table entries no resource owns are kept ([`Views::ownerless`]).
+/// Nothing else frees them, and once the shapes of placed views are full
+/// every placed view the title writes is one: TaynanGT/Vice-Tay saw the
+/// 4,194,304 shapes full after half an hour of play, then some 15,000 such
+/// entries a second, 34.9 million of them and 16.7 GB after 70 minutes, and
+/// the frame rate halved. That many come from views written anew every
+/// frame or few, so the oldest of a million are long out of use; a record
+/// that still names a freed entry reads as stale (no view).
+/// `VICTORY_OWNERLESS_VIEWS=<n>` keeps `n` (0: all, as before). By default
+/// 1,048,576; all with `VICTORY_VIEW_INLINE=0`, where every constant buffer
+/// view is such an entry (10,000 a second) and a million would last under
+/// two minutes, so that switch stays as before.
+fn ownerless_cap() -> usize {
+    static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("VICTORY_OWNERLESS_VIEWS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(if inline() { 1 << 20 } else { 0 })
+    })
+}
+
+impl Views {
+    const fn new() -> Views {
+        Views {
+            list: Vec::new(),
+            index: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()),
+            collided: std::collections::BTreeMap::new(),
+            by_resource: std::collections::BTreeMap::new(),
+            free: Vec::new(),
+            shapes: Vec::new(),
+            shape_index: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()),
+            shapes_collided: std::collections::BTreeMap::new(),
+            last_shapes: std::collections::BTreeMap::new(),
+            varied: [0; 28],
+            past_shapes: 0,
+            ownerless: std::collections::VecDeque::new(),
+            ownerless_freed: 0,
+        }
+    }
+}
+
+/// A view's or a shape's digest, which the indexes of [`Views`] keep in
+/// place of the value.
+fn digest<T: std::hash::Hash>(value: &T) -> u64 {
+    use std::hash::BuildHasher;
+    std::hash::BuildHasherDefault::<std::hash::DefaultHasher>::default().hash_one(value)
+}
+
+/// The hash of the indexes of [`Views`]: their keys are digests, spread
+/// already.
+#[derive(Default)]
+struct Digested(u64);
+
+impl std::hash::Hasher for Digested {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = self.0.rotate_left(8) ^ u64::from(b);
+        }
+    }
+    fn write_u64(&mut self, n: u64) {
+        self.0 = n;
+    }
 }
 
 /// Read far more often than written: every slot a draw reads through a
 /// table is looked up here, on several recording threads at once in the
 /// world. Readers share it; only a view not seen before (a new table entry
 /// or shape) and a released resource take it alone.
-static VIEWS: std::sync::RwLock<Views> = std::sync::RwLock::new(Views {
-    list: Vec::new(),
-    index: std::collections::BTreeMap::new(),
-    by_resource: std::collections::BTreeMap::new(),
-    free: Vec::new(),
-    shapes: Vec::new(),
-    shape_index: std::collections::BTreeMap::new(),
-});
+static VIEWS: std::sync::RwLock<Views> = std::sync::RwLock::new(Views::new());
 const VIEW_TAG: u32 = u32::from_le_bytes(*b"vVIE");
 
 /// A record is the tag and two words, `i` and `generation` (the host keeps
@@ -955,7 +1126,9 @@ fn constant_of(i: u32, generation: u32) -> View {
     View::Constant(payload & ((1 << CONSTANT_ADDRESS_BITS) - 1), size)
 }
 
-/// A placed view's shape and its address.
+/// A placed view's shape and its address. (The view comes without the words
+/// the title leaves unwritten: [`placed_resource_words`],
+/// [`placed_view_words`].)
 fn shape_of(unordered: bool, resource: &[u32; 14], desc: &[u32; 16]) -> (Shape, u64) {
     let mut rest = [0u32; 14];
     rest[..10].copy_from_slice(&desc[..10]);
@@ -966,6 +1139,109 @@ fn shape_of(unordered: bool, resource: &[u32; 14], desc: &[u32; 16]) -> (Shape, 
     )
 }
 
+/// Whether the filler of placed views' descriptions is kept as the title
+/// left it ([`placed_resource_words`], [`placed_view_words`]). Off by
+/// default; `VICTORY_PLACED_FILLER=1` keeps it, as before.
+fn keep_placed_filler() -> bool {
+    static KEPT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *KEPT.get_or_init(|| std::env::var_os("VICTORY_PLACED_FILLER").is_some_and(|v| v == "1"))
+}
+
+/// A placed view's resource description as words, its filler zeroed: word 1
+/// (after the dimension, before the 8-byte alignment) and word 13 (after the
+/// flags, to the 8-byte end). The title leaves there what its stack held
+/// (`crate::resource::texture_at` keeps them out of its key for the same
+/// reason); kept, they made a new shape for most views, 1.5 million shapes
+/// by the end of play-g.
+fn placed_resource_words(desc: *const [u32; 14]) -> Option<[u32; 14]> {
+    let mut words = words(desc)?;
+    if !keep_placed_filler() {
+        (words[1], words[13]) = (0, 0);
+    }
+    Some(words)
+}
+
+/// By D3D12_SRV_DIMENSION (unknown, buffer, 1D, 1D array, 2D, 2D array, 2D
+/// multisample, 2D multisample array, 3D, cube, cube array, acceleration
+/// structure): the words of D3D12_SHADER_RESOURCE_VIEW_DESC's union that
+/// the dimension's member takes, up to the end of its last field.
+/// - Buffer (D3D12_BUFFER_SRV): first element (two words), count, stride,
+///   flags: 5; the sixth is the member's padding to 8 bytes.
+/// - 1D: most detailed mip, mips, LOD clamp: 3; 1D array: most detailed
+///   mip, mips, first slice, slices, LOD clamp: 5.
+/// - 2D: most detailed mip, mips, plane, LOD clamp: 4; 2D array: most
+///   detailed mip, mips, first slice, slices, plane, LOD clamp: 6.
+/// - 2D multisample: one field D3D12 does not read
+///   (`UnusedField_NothingToDefine`): 0; its array: first slice, slices: 2.
+/// - 3D and cube: most detailed mip, mips, LOD clamp: 3; cube array: most
+///   detailed mip, mips, first face, cubes, LOD clamp: 5.
+/// - Acceleration structure: its address (two words): 2.
+const SRV_UNION_WORDS: [u8; 12] = [0, 5, 3, 5, 4, 6, 0, 2, 3, 3, 5, 2];
+
+/// As [`SRV_UNION_WORDS`], of D3D12_UNORDERED_ACCESS_VIEW_DESC, by
+/// D3D12_UAV_DIMENSION (unknown, buffer, 1D, 1D array, 2D, 2D array, 2D
+/// multisample, 2D multisample array, 3D).
+/// - Buffer (D3D12_BUFFER_UAV): first element (two words), count, stride,
+///   counter offset (two words), flags: 7; the eighth is padding.
+/// - 1D: mip: 1; 1D array: mip, first slice, slices: 3.
+/// - 2D: mip, plane: 2; 2D array: mip, first slice, slices, plane: 4.
+/// - 2D multisample: the unused field: 0; its array: first slice, slices: 2.
+/// - 3D: mip, first depth slice, depth slices: 3.
+const UAV_UNION_WORDS: [u8; 9] = [0, 7, 1, 3, 2, 4, 0, 2, 3];
+
+/// Which of the sixteen words of a placed view's description tell it apart
+/// (as bits) for view dimension `dimension`; `None` for a dimension D3D12
+/// has not. Words 0 to 9 are the PC's view description: for a shader
+/// resource view the format, the dimension and the component mapping, a
+/// word of padding (the union holds 8-byte fields, so it starts at byte 16)
+/// and the union's six words; for an unordered access view the format, the
+/// dimension and the union's eight. Each dimension takes the head of the
+/// union only. Words 10 and 11 are the address and 12 to 15 the console's
+/// own: kept.
+fn placed_view_used(unordered: bool, dimension: u32) -> Option<u16> {
+    let (head, union, by_dimension): (u16, u32, &[u8]) = if unordered {
+        (0b11, 2, &UAV_UNION_WORDS)
+    } else {
+        (0b111, 4, &SRV_UNION_WORDS)
+    };
+    if dimension == 0 {
+        return None;
+    }
+    let n = *by_dimension.get(dimension as usize)?;
+    Some(head | ((1u16 << n) - 1) << union | 0xfc00)
+}
+
+/// A placed view's description as words, those its dimension does not take
+/// zeroed ([`placed_view_used`]). The title leaves them unwritten:
+/// TaynanGT/Vice-Tay counted 131,392 values in word 3 and 36,413 in word 9
+/// over a million shapes, each a new shape for the same view. A shader
+/// resource view's word 3 is padding whatever its dimension and always
+/// goes. Kept whole otherwise: a dimension D3D12 has not, and a view of a
+/// buffer that names another dimension (the host reads the buffer member of
+/// its words whatever the dimension says: `host::view_stride`,
+/// `host::make`).
+fn placed_view_words(unordered: bool, resource: &[u32; 14], desc: *const [u32; 16]) -> Option<[u32; 16]> {
+    const BUFFER: u32 = 1;
+    let mut words = words(desc)?;
+    if keep_placed_filler() {
+        return Some(words);
+    }
+    if !unordered {
+        words[3] = 0;
+    }
+    if resource[0] == BUFFER && words[1] != BUFFER {
+        return Some(words);
+    }
+    if let Some(used) = placed_view_used(unordered, words[1]) {
+        for (k, word) in words.iter_mut().enumerate() {
+            if used >> k & 1 == 0 {
+                *word = 0;
+            }
+        }
+    }
+    Some(words)
+}
+
 /// The record words that name the view of placed memory at `address` with
 /// shape number `shape`.
 fn placed_words(shape: u32, address: u64) -> [u32; 2] {
@@ -973,19 +1249,57 @@ fn placed_words(shape: u32, address: u64) -> [u32; 2] {
 }
 
 impl Views {
-    /// The number of `shape`, a new one if it is not there yet; `None` when
-    /// the shapes are full (the view is then a table entry).
-    fn shape(&mut self, shape: Shape) -> Option<u32> {
-        if let Some(&at) = self.shape_index.get(&shape) {
+    /// The number of `shape`, of digest `digest`, if it has one.
+    fn shape_at(&self, shape: &Shape, digest: u64) -> Option<u32> {
+        match self.shape_index.get(&digest) {
+            Some(&at) if self.shapes[at as usize] == *shape => Some(at),
+            _ if self.shapes_collided.is_empty() => None,
+            _ => self.shapes_collided.get(shape).copied(),
+        }
+    }
+
+    /// Whether every number a record has for a shape is taken.
+    fn shapes_full(&self) -> bool {
+        self.shapes.len() >= SHAPES
+    }
+
+    /// The number of `shape`, of digest `digest`, a new one if it is not
+    /// there yet; `None` when the shapes are full (the view is then a table
+    /// entry).
+    fn shape(&mut self, shape: Shape, digest: u64) -> Option<u32> {
+        if let Some(at) = self.shape_at(&shape, digest) {
             return Some(at);
         }
-        if self.shapes.len() >= SHAPES {
+        if self.shapes_full() {
             return None;
         }
         let at = self.shapes.len() as u32;
+        self.note_new(&shape);
+        match self.shape_index.entry(digest) {
+            std::collections::hash_map::Entry::Vacant(free) => {
+                free.insert(at);
+            }
+            std::collections::hash_map::Entry::Occupied(_) => {
+                self.shapes_collided.insert(shape, at);
+            }
+        }
         self.shapes.push(shape);
-        self.shape_index.insert(shape, at);
         Some(at)
+    }
+
+    /// Counts the words of the new shape `shape` that differ from the last
+    /// new shape of its kind: the words that make shapes new.
+    fn note_new(&mut self, shape: &Shape) {
+        let kind = (shape.0, shape.1[0], shape.2[1]);
+        let Some(last) = self.last_shapes.insert(kind, *shape) else {
+            return;
+        };
+        let words = |s: &Shape| s.1.into_iter().chain(s.2);
+        for (k, (a, b)) in words(&last).zip(words(shape)).enumerate() {
+            if a != b {
+                self.varied[k] += 1;
+            }
+        }
     }
 
     /// The view of placed memory [`placed_words`] named.
@@ -1000,36 +1314,135 @@ impl Views {
         Some(View::Placed(unordered, resource, desc))
     }
 
+    /// The entry of `view`, of digest `digest`, if it has one.
+    fn entry_at(&self, view: &View, digest: u64) -> Option<u32> {
+        match self.index.get(&digest) {
+            Some(&i) if self.list[i as usize].0 == *view => Some(i),
+            _ if self.collided.is_empty() => None,
+            _ => self.collided.get(view).copied(),
+        }
+    }
+
     /// The record words of `view` as a table entry, if it has one.
-    fn entry_of(&self, view: &View) -> Option<[u32; 2]> {
-        let &i = self.index.get(view)?;
+    fn entry_of(&self, view: &View, digest: u64) -> Option<[u32; 2]> {
+        let i = self.entry_at(view, digest)?;
         Some([i, self.list[i as usize].1])
     }
 
     /// The record words of `view` as a table entry: its entry (a new or a
     /// freed one if the view is not there yet) and that entry's generation.
-    fn entry(&mut self, view: View) -> [u32; 2] {
-        let i = match self.index.get(&view) {
-            Some(&i) => i,
-            None => {
-                let i = match self.free.pop() {
-                    Some(i) => {
-                        self.list[i as usize].0 = view.clone();
-                        i
-                    }
-                    None => {
-                        self.list.push((view.clone(), 1));
-                        self.list.len() as u32 - 1
-                    }
+    fn entry(&mut self, view: View, digest: u64) -> [u32; 2] {
+        self.entry_kept(view, digest, ownerless_cap())
+    }
+
+    /// [`entry`](Self::entry), keeping at most `cap` entries no resource
+    /// owns (0: all).
+    fn entry_kept(&mut self, view: View, digest: u64, cap: usize) -> [u32; 2] {
+        if let Some(words) = self.entry_of(&view, digest) {
+            return words;
+        }
+        let ownerless = matches!(view, View::Constant(..) | View::Placed(..));
+        let words = self.entry_new(view, digest);
+        if ownerless {
+            self.ownerless.push_back((words[0], words[1]));
+            while cap != 0 && self.ownerless.len() > cap {
+                let Some((i, generation)) = self.ownerless.pop_front() else {
+                    break;
                 };
-                for r in view.resources().into_iter().filter(|&r| r != 0) {
-                    self.by_resource.entry(r).or_default().push(i);
-                }
-                self.index.insert(view, i);
+                self.free_ownerless(i, generation);
+            }
+        }
+        words
+    }
+
+    /// Frees entry `i` if it still holds the view it had at `generation`,
+    /// as [`release`](Self::release) frees the entries of a released
+    /// resource.
+    fn free_ownerless(&mut self, i: u32, generation: u32) {
+        let Some((view, current)) = self.list.get(i as usize).cloned() else {
+            return;
+        };
+        let digest = digest(&view);
+        if current != generation || self.entry_at(&view, digest) != Some(i) {
+            return;
+        }
+        if self.index.get(&digest) == Some(&i) {
+            self.index.remove(&digest);
+        } else {
+            self.collided.remove(&view);
+        }
+        // (Below the bits that say a record is no table entry.)
+        self.list[i as usize].1 = ((generation + 1) & GENERATIONS).max(1);
+        self.free.push(i);
+        self.ownerless_freed += 1;
+        // Slots whose record names it read nothing now: the pass over the
+        // heap's buffer views looks at them again.
+        note_forgotten(i);
+    }
+
+    /// A new entry for `view`, which has none.
+    fn entry_new(&mut self, view: View, digest: u64) -> [u32; 2] {
+        if let View::Placed(unordered, resource, desc) = &view
+            && self.shapes_full()
+        {
+            let (shape, address) = shape_of(*unordered, resource, desc);
+            if address >> PLACED_ADDRESS_BITS == 0 {
+                self.past_shapes += 1;
+                self.note_new(&shape);
+            }
+        }
+        let i = match self.free.pop() {
+            Some(i) => {
+                self.list[i as usize].0 = view.clone();
                 i
             }
+            None => {
+                self.list.push((view.clone(), 1));
+                self.list.len() as u32 - 1
+            }
         };
+        for r in view.resources().into_iter().filter(|&r| r != 0) {
+            self.by_resource.entry(r).or_default().push(i);
+        }
+        match self.index.entry(digest) {
+            std::collections::hash_map::Entry::Vacant(free) => {
+                free.insert(i);
+            }
+            std::collections::hash_map::Entry::Occupied(_) => {
+                self.collided.insert(view, i);
+            }
+        }
         [i, self.list[i as usize].1]
+    }
+
+    /// Frees the entries of views naming `resource`, under a new
+    /// generation each; the entries freed.
+    fn release(&mut self, resource: usize) -> Vec<u32> {
+        let Some(entries) = self.by_resource.remove(&resource) else {
+            return Vec::new();
+        };
+        let mut freed = Vec::with_capacity(entries.len());
+        for i in entries {
+            let (view, generation) = self.list[i as usize].clone();
+            // Entries freed through a view's other resource may hold another
+            // view by now.
+            let digest = digest(&view);
+            if self.entry_at(&view, digest) != Some(i) || !view.resources().contains(&resource) {
+                continue;
+            }
+            if self.index.get(&digest) == Some(&i) {
+                self.index.remove(&digest);
+            } else {
+                self.collided.remove(&view);
+            }
+            // (Below the bits that say a record is no table entry.)
+            self.list[i as usize].1 = ((generation + 1) & GENERATIONS).max(1);
+            // The view's other resource (a counter) keeps a stale entry, which
+            // `forget` of that resource skips.
+            self.free.push(i);
+            freed.push(i);
+        }
+        freed
     }
 }
 
@@ -1048,9 +1461,15 @@ fn words_for(view: View) -> [u32; 2] {
             View::Placed(unordered, resource, desc) => {
                 let (shape, address) = shape_of(*unordered, resource, desc);
                 if address >> PLACED_ADDRESS_BITS == 0 {
-                    // Nearly every placed view has a shape seen before.
-                    let known = views_read().shape_index.get(&shape).copied();
-                    let shape = known.or_else(|| views_write().shape(shape));
+                    // Nearly every placed view has a shape seen before. Once
+                    // the shapes are full a new one takes no write lock for
+                    // its shape, only for its entry.
+                    let digest = digest(&shape);
+                    let (known, full) = {
+                        let views = views_read();
+                        (views.shape_at(&shape, digest), views.shapes_full())
+                    };
+                    let shape = known.or_else(|| if full { None } else { views_write().shape(shape, digest) });
                     if let Some(shape) = shape {
                         NAMED_WHOLE[1].fetch_add(1, Relaxed);
                         return placed_words(shape, address);
@@ -1061,10 +1480,11 @@ fn words_for(view: View) -> [u32; 2] {
         }
     }
     // A view written before keeps its entry and generation.
-    if let Some(words) = views_read().entry_of(&view) {
+    let digest = digest(&view);
+    if let Some(words) = views_read().entry_of(&view, digest) {
         return words;
     }
-    views_write().entry(view)
+    views_write().entry(view, digest)
 }
 
 fn views_read() -> std::sync::RwLockReadGuard<'static, Views> {
@@ -1077,8 +1497,9 @@ fn views_write() -> std::sync::RwLockWriteGuard<'static, Views> {
 
 /// For the memory line: the distinct views kept ([`Views`]), those of them
 /// free for reuse, and the bytes the table and its index hold for them (an
-/// estimate: an entry of the table, and one of the index with its share of
-/// a tree node; the shapes likewise); then the entries that are constant
+/// estimate: an entry of the table, a place in the index for its digest and
+/// number, and a tree entry for each view whose digest was taken; the
+/// shapes likewise); then the entries that are constant
 /// buffer views and views of placed memory (those that did not fit a
 /// record, or all of them with `VICTORY_VIEW_INLINE=0`), the shapes of
 /// placed views kept, and the views named whole in their records since the
@@ -1101,15 +1522,42 @@ pub(crate) fn views_kept() -> [u64; 8] {
         views.list.len() as u64,
         views.free.len() as u64,
         views.list.capacity() as u64 * each
-            + views.index.len() as u64 * each * 3 / 2
+            + views.index.capacity() as u64 * 17 * 8 / 7
+            + views.collided.len() as u64 * each * 3 / 2
             + views.shapes.capacity() as u64 * shape
-            + views.shape_index.len() as u64 * shape * 3 / 2,
+            + views.shape_index.capacity() as u64 * 17 * 8 / 7
+            + views.shapes_collided.len() as u64 * shape * 3 / 2,
         constants,
         placed,
         views.shapes.len() as u64,
         NAMED_WHOLE[0].load(Relaxed),
         NAMED_WHOLE[1].load(Relaxed),
     ]
+}
+
+/// For the memory line: the placed views of title memory made table
+/// entries because the shapes were full, the views and shapes kept by
+/// themselves because another had their digest, and how often each word
+/// of a new shape differed from the last new shape of its kind (the 14
+/// words of the resource description, then the view's 0 to 9 and 12 to
+/// 15).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn shapes_new() -> (u64, u64, [u64; 28]) {
+    let views = views_read();
+    (
+        views.past_shapes,
+        (views.collided.len() + views.shapes_collided.len()) as u64,
+        views.varied,
+    )
+}
+
+/// For the memory line: the entries no resource owns ([`Views::ownerless`]),
+/// the most kept ([`ownerless_cap`], 0: all), and how many were freed under
+/// it since the start.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn ownerless_kept() -> [u64; 3] {
+    let views = views_read();
+    [views.ownerless.len() as u64, ownerless_cap() as u64, views.ownerless_freed]
 }
 
 impl View {
@@ -1244,23 +1692,8 @@ pub(crate) fn forget(resource: usize) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(&resource);
-    let mut views = views_write();
-    let Some(entries) = views.by_resource.remove(&resource) else {
-        return;
-    };
-    for i in entries {
-        let (view, generation) = views.list[i as usize].clone();
-        // Entries freed through a view's other resource may hold another
-        // view by now.
-        if views.index.get(&view) != Some(&i) || !view.resources().contains(&resource) {
-            continue;
-        }
-        views.index.remove(&view);
-        // (Below the bits that say a record is no table entry.)
-        views.list[i as usize].1 = ((generation + 1) & GENERATIONS).max(1);
-        // The view's other resource (a counter) keeps a stale entry, which
-        // `forget` of that resource skips.
-        views.free.push(i);
+    let freed = views_write().release(resource);
+    for i in freed {
         note_forgotten(i);
     }
 }
@@ -1360,11 +1793,19 @@ fn words<const N: usize>(desc: *const [u32; N]) -> Option<[u32; N]> {
 }
 
 /// Device method.
+///
+/// A null `desc` writes a null CBV (`Constant(0, 0)`), matching D3D12's
+/// `CreateConstantBufferView` with a null description. Leaving the slot
+/// untouched would keep a stale view active.
 pub(crate) extern "system" fn create_cbv(_: This, desc: *const [u32; 4], handle: u64) {
-    if let Some([lo, hi, size, _]) = words(desc) {
-        let address = u64::from(lo) | u64::from(hi) << 32;
-        record(handle, View::Constant(address, size));
-    }
+    let view = match words(desc) {
+        Some([lo, hi, size, _]) => {
+            let address = u64::from(lo) | u64::from(hi) << 32;
+            View::Constant(address, size)
+        }
+        None => View::Constant(0, 0),
+    };
+    record(handle, view);
 }
 
 /// Device method.
@@ -1391,14 +1832,19 @@ pub(crate) extern "system" fn create_uav(
 
 /// Device methods 0x230 and 0x238: shader resource and unordered access
 /// views of memory the title placed itself, `(resource desc, view desc,
-/// handle)`.
+/// handle)`. What the title leaves unwritten in both descriptions is left
+/// out ([`placed_resource_words`], [`placed_view_words`]): one texture's
+/// views are one shape however often it writes them.
 pub(crate) extern "system" fn create_placed_srv(
     _: This,
     resource: *const [u32; 14],
     desc: *const [u32; 16],
     handle: u64,
 ) {
-    if let (Some(resource), Some(desc)) = (words(resource), words(desc)) {
+    let Some(resource) = placed_resource_words(resource) else {
+        return;
+    };
+    if let Some(desc) = placed_view_words(false, &resource, desc) {
         record(handle, View::Placed(false, resource, desc));
     }
 }
@@ -1409,7 +1855,10 @@ pub(crate) extern "system" fn create_placed_uav(
     desc: *const [u32; 16],
     handle: u64,
 ) {
-    if let (Some(resource), Some(desc)) = (words(resource), words(desc)) {
+    let Some(resource) = placed_resource_words(resource) else {
+        return;
+    };
+    if let Some(desc) = placed_view_words(true, &resource, desc) {
         record(handle, View::Placed(true, resource, desc));
     }
 }
@@ -1790,6 +2239,48 @@ mod tests {
         assert_ne!(constant_words(0x1000, 1 << 14), constant_words(0x1000, 64));
     }
 
+    /// Views of one placed texture whose resource descriptions differ only
+    /// in the filler words keep one shape.
+    #[test]
+    fn placed_views_that_differ_in_filler_share_a_shape() {
+        if !inline() || keep_placed_filler() {
+            return;
+        }
+        let null = std::ptr::null();
+        let slots = [0u64; 4];
+        let at = slots.as_ptr() as u64;
+        let resource: [u32; 14] = std::array::from_fn(|k| 0x5ef0_0000 + k as u32);
+        let mut desc: [u32; 16] = std::array::from_fn(|k| 0x7a80_0000 + k as u32);
+        (desc[10], desc[11]) = (0x4940_0000, 0xd);
+        let mut blank = resource;
+        (blank[1], blank[13]) = (0, 0);
+        let shapes = || VIEWS.read().unwrap().shapes.iter().filter(|s| s.1 == blank).count();
+        let mut blank_desc = desc;
+        blank_desc[3] = 0;
+        for n in 0..100u32 {
+            let (mut stack, mut stack_desc) = (resource, desc);
+            (stack[1], stack[13], stack_desc[3]) = (n.wrapping_mul(0x9e37_79b9), !n, n ^ 0xb717_5a38);
+            create_placed_srv(null, &stack, &stack_desc, at);
+            // The view comes back without its filler.
+            assert_eq!(view(at), Some(View::Placed(false, blank, blank_desc)));
+        }
+        assert_eq!(shapes(), 1, "one shape for 100 fillers");
+        // A buffer view's word 9, shader resource and unordered access alike.
+        (desc[1], blank_desc[1]) = (1, 1);
+        blank_desc[9] = 0;
+        for n in 0..100u32 {
+            let mut stack_desc = desc;
+            (stack_desc[3], stack_desc[9]) = (n, n.wrapping_mul(0x9e37_79b9));
+            create_placed_srv(null, &blank, &stack_desc, at);
+            assert_eq!(view(at), Some(View::Placed(false, blank, blank_desc)));
+            create_placed_uav(null, &blank, &stack_desc, at);
+            let mut unordered = blank_desc;
+            unordered[3] = n;
+            assert_eq!(view(at), Some(View::Placed(true, blank, unordered)));
+        }
+        assert_eq!(shapes(), 102, "a buffer shape for views, one for each word 3 of unordered ones");
+    }
+
     /// The leak of run 65: a title that writes constant buffer views and
     /// views of placed memory at ever new addresses adds nothing to the
     /// table; one shape stands for all the placed views alike.
@@ -1801,9 +2292,11 @@ mod tests {
         let null = std::ptr::null();
         let slots = [0u64; 4];
         let at = slots.as_ptr() as u64;
-        // A resource description and a view no other test uses.
-        let resource: [u32; 14] = std::array::from_fn(|k| 0x5ee0_0000 + k as u32);
-        let mut desc: [u32; 16] = std::array::from_fn(|k| 0x7a70_0000 + k as u32);
+        // A resource description and a view no other test uses, with no
+        // filler (words 1 and 13 and view word 3 leave the shape: the test
+        // above).
+        let resource: [u32; 14] = std::array::from_fn(|k| if k == 1 || k == 13 { 0 } else { 0x5ee0_0000 + k as u32 });
+        let mut desc: [u32; 16] = std::array::from_fn(|k| if k == 3 { 0 } else { 0x7a70_0000 + k as u32 });
         let mine = |v: &View| match v {
             View::Constant(address, _) => (0x6_0000_0000..0x6_1000_0000).contains(address),
             View::Placed(_, r, _) => *r == resource,
@@ -1841,6 +2334,287 @@ mod tests {
         assert_eq!(words(at), words(other.as_ptr() as u64));
         create_cbv(null, &[0x140, 6, 512, 0], other.as_ptr() as u64);
         assert_ne!(words(at), words(other.as_ptr() as u64));
+    }
+
+    /// The words [`placed_view_used`] keeps are D3D12's, as the windows
+    /// crate lays its view descriptions out: the head, and of the union
+    /// the member of the view's dimension up to the end of its last field.
+    #[cfg(windows)]
+    #[test]
+    fn placed_view_words_follow_the_d3d12_layout() {
+        use std::mem::offset_of;
+        use windows::Win32::Graphics::Direct3D12::*;
+        fn size_of_field<M, F>(_: impl Fn(&M) -> &F) -> usize {
+            size_of::<F>()
+        }
+        // Words of `$t` up to the end of its field `$last`.
+        macro_rules! words_to {
+            ($t:ty, $last:ident) => {
+                (offset_of!($t, $last) + size_of_field(|m: &$t| &m.$last)) / 4
+            };
+        }
+        let srv_head = words_to!(D3D12_SHADER_RESOURCE_VIEW_DESC, Shader4ComponentMapping);
+        let uav_head = words_to!(D3D12_UNORDERED_ACCESS_VIEW_DESC, ViewDimension);
+        let srv_union = offset_of!(D3D12_SHADER_RESOURCE_VIEW_DESC, Anonymous) / 4;
+        let uav_union = offset_of!(D3D12_UNORDERED_ACCESS_VIEW_DESC, Anonymous) / 4;
+        // Ten words each; the shader resource view's word 3 is padding.
+        assert_eq!((srv_head, srv_union, uav_head, uav_union), (3, 4, 2, 2));
+        assert_eq!(size_of::<D3D12_SHADER_RESOURCE_VIEW_DESC>(), 40);
+        assert_eq!(size_of::<D3D12_UNORDERED_ACCESS_VIEW_DESC>(), 40);
+        // The multisample members hold one field, which D3D12 does not
+        // read (`UnusedField_NothingToDefine`): no word.
+        assert_eq!(size_of::<D3D12_TEX2DMS_SRV>(), 4);
+        assert_eq!(size_of::<D3D12_TEX2DMS_UAV>(), 4);
+        let srv = [
+            (D3D12_SRV_DIMENSION_BUFFER, words_to!(D3D12_BUFFER_SRV, Flags)),
+            (D3D12_SRV_DIMENSION_TEXTURE1D, words_to!(D3D12_TEX1D_SRV, ResourceMinLODClamp)),
+            (D3D12_SRV_DIMENSION_TEXTURE1DARRAY, words_to!(D3D12_TEX1D_ARRAY_SRV, ResourceMinLODClamp)),
+            (D3D12_SRV_DIMENSION_TEXTURE2D, words_to!(D3D12_TEX2D_SRV, ResourceMinLODClamp)),
+            (D3D12_SRV_DIMENSION_TEXTURE2DARRAY, words_to!(D3D12_TEX2D_ARRAY_SRV, ResourceMinLODClamp)),
+            (D3D12_SRV_DIMENSION_TEXTURE2DMS, 0),
+            (D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY, words_to!(D3D12_TEX2DMS_ARRAY_SRV, ArraySize)),
+            (D3D12_SRV_DIMENSION_TEXTURE3D, words_to!(D3D12_TEX3D_SRV, ResourceMinLODClamp)),
+            (D3D12_SRV_DIMENSION_TEXTURECUBE, words_to!(D3D12_TEXCUBE_SRV, ResourceMinLODClamp)),
+            (D3D12_SRV_DIMENSION_TEXTURECUBEARRAY, words_to!(D3D12_TEXCUBE_ARRAY_SRV, ResourceMinLODClamp)),
+            (
+                D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE,
+                words_to!(D3D12_RAYTRACING_ACCELERATION_STRUCTURE_SRV, Location),
+            ),
+        ];
+        let uav = [
+            (D3D12_UAV_DIMENSION_BUFFER, words_to!(D3D12_BUFFER_UAV, Flags)),
+            (D3D12_UAV_DIMENSION_TEXTURE1D, words_to!(D3D12_TEX1D_UAV, MipSlice)),
+            (D3D12_UAV_DIMENSION_TEXTURE1DARRAY, words_to!(D3D12_TEX1D_ARRAY_UAV, ArraySize)),
+            (D3D12_UAV_DIMENSION_TEXTURE2D, words_to!(D3D12_TEX2D_UAV, PlaneSlice)),
+            (D3D12_UAV_DIMENSION_TEXTURE2DARRAY, words_to!(D3D12_TEX2D_ARRAY_UAV, PlaneSlice)),
+            (D3D12_UAV_DIMENSION_TEXTURE2DMS, 0),
+            (D3D12_UAV_DIMENSION_TEXTURE2DMSARRAY, words_to!(D3D12_TEX2DMS_ARRAY_UAV, ArraySize)),
+            (D3D12_UAV_DIMENSION_TEXTURE3D, words_to!(D3D12_TEX3D_UAV, WSize)),
+        ];
+        // Every dimension D3D12 has, in order: 1 to 11, and 1 to 8.
+        assert_eq!(srv.map(|(d, _)| d.0), std::array::from_fn(|k| k as i32 + 1));
+        assert_eq!(uav.map(|(d, _)| d.0), std::array::from_fn(|k| k as i32 + 1));
+        let mask = |head: usize, union: usize, n: usize| ((1u16 << head) - 1) | ((1u16 << n) - 1) << union | 0xfc00;
+        for (dimension, n) in srv {
+            assert!(n <= 6, "inside the union");
+            let expected = mask(srv_head, srv_union, n);
+            assert_eq!(placed_view_used(false, dimension.0 as u32), Some(expected), "SRV dimension {}", dimension.0);
+        }
+        for (dimension, n) in uav {
+            assert!(n <= 8, "inside the union");
+            let expected = mask(uav_head, uav_union, n);
+            assert_eq!(placed_view_used(true, dimension.0 as u32), Some(expected), "UAV dimension {}", dimension.0);
+        }
+        // Unknown and past the last: every word counts.
+        for (unordered, past) in [(false, 12), (true, 9)] {
+            assert_eq!(placed_view_used(unordered, 0), None);
+            assert_eq!(placed_view_used(unordered, past), None);
+        }
+    }
+
+    /// Placed views of one texture are one shape whatever the words their
+    /// dimension does not take and the resource description's filler hold,
+    /// and two when a word that is taken differs: for every dimension of
+    /// both kinds, every word (TaynanGT/Vice-Tay: 4,194,304 shapes full in
+    /// half an hour of play, then a table entry kept for the run per view).
+    #[test]
+    fn placed_views_of_one_texture_share_a_shape_whatever_their_filler() {
+        if !inline() || keep_placed_filler() {
+            return;
+        }
+        let null = std::ptr::null();
+        let slot = [0u64; 4];
+        let at = slot.as_ptr() as u64;
+        // Title memory (below 1 TiB): words 10 and 11, not in the shape.
+        let address = 0x3_5ad0_0000u64;
+        let kinds = [
+            (false, create_placed_srv as extern "system" fn(_, _, _, _), 0..=12u32),
+            (true, create_placed_uav, 0..=9),
+        ];
+        for (unordered, create, dimensions) in kinds {
+            for dimension in dimensions {
+                // Words no other test uses; a buffer view of a buffer, the
+                // others of a 2D texture.
+                let tag = 0x5ad0_0000 | u32::from(unordered) << 12 | dimension << 6;
+                let mut resource: [u32; 14] = std::array::from_fn(|k| tag | k as u32);
+                resource[0] = if dimension == 1 { 1 } else { 3 };
+                let mut desc: [u32; 16] = std::array::from_fn(|k| tag | 0x20 | k as u32);
+                desc[1] = dimension;
+                (desc[10], desc[11]) = (address as u32, (address >> 32) as u32);
+                // A shader resource view's word 3 is padding whatever the
+                // dimension.
+                let used = placed_view_used(unordered, dimension);
+                let taken = |k: usize| !(k == 3 && !unordered) && used.is_none_or(|u| u >> k & 1 != 0);
+                let mut kept = desc;
+                for (k, word) in kept.iter_mut().enumerate() {
+                    if !taken(k) {
+                        *word = 0;
+                    }
+                }
+                let mut stored = resource;
+                (stored[1], stored[13]) = (0, 0);
+                create(null, &resource, &desc, at);
+                let first = record_words(at);
+                let what = format!("unordered {unordered}, dimension {dimension}");
+                assert_eq!(first[2] >> KIND_SHIFT, PLACED, "{what}: named whole");
+                assert_eq!(view(at), Some(View::Placed(unordered, stored, kept)), "{what}");
+                for k in (0..16).filter(|k| !(10..12).contains(k)) {
+                    let mut other = desc;
+                    other[k] ^= 0x4000_0000;
+                    create(null, &resource, &other, at);
+                    if taken(k) {
+                        assert_ne!(record_words(at), first, "{what}: view word {k} is taken, two shapes");
+                    } else {
+                        assert_eq!(record_words(at), first, "{what}: view word {k} is not, one shape");
+                    }
+                }
+                for k in 0..14 {
+                    let mut other = resource;
+                    other[k] ^= 0x4000_0000;
+                    create(null, &other, &desc, at);
+                    if k == 1 || k == 13 {
+                        assert_eq!(record_words(at), first, "{what}: resource filler word {k}, one shape");
+                    } else {
+                        assert_ne!(record_words(at), first, "{what}: resource word {k}, two shapes");
+                    }
+                }
+            }
+        }
+        // A view of a buffer that names a texture dimension is kept whole
+        // (but its word 3): the host reads its words as a buffer view's
+        // whatever it names.
+        let mut resource: [u32; 14] = std::array::from_fn(|k| 0x5ad1_0000 | k as u32);
+        resource[0] = 1;
+        let mut desc = [0u32; 16];
+        (desc[1], desc[10], desc[11]) = (4, address as u32, (address >> 32) as u32);
+        create_placed_srv(null, &resource, &desc, at);
+        let first = record_words(at);
+        // A buffer view's flags; past a 2D view's member.
+        desc[8] = 1;
+        create_placed_srv(null, &resource, &desc, at);
+        assert_ne!(record_words(at), first);
+    }
+
+    /// Entries no resource owns stay under their cap: the oldest go stale
+    /// (and the heap pass hears of it), the newest still name their views,
+    /// entries are reused rather than added, and views of resources are
+    /// never dropped.
+    #[test]
+    fn ownerless_entries_are_capped() {
+        let mut views = Views::new();
+        let placed = |n: u32| View::Placed(false, [n; 14], [n; 16]);
+        let named = |views: &Views, words: [u32; 2], view: &View| {
+            views.list.get(words[0] as usize).is_some_and(|(v, g)| *g == words[1] && v == view)
+        };
+        let kept = |views: &mut Views, view: View, cap: usize| {
+            let digest = digest(&view);
+            views.entry_kept(view, digest, cap)
+        };
+        // From here the entries freed are noted (another test's may be too).
+        let _ = take_forgotten();
+        let words: Vec<[u32; 2]> = (0..10).map(|n| kept(&mut views, placed(n), 4)).collect();
+        assert_eq!(views.index.len() + views.collided.len(), 4, "four kept");
+        assert_eq!((views.ownerless.len(), views.ownerless_freed), (4, 6));
+        assert!(views.list.len() <= 5, "entries reused, not added: {}", views.list.len());
+        for n in 0..6 {
+            assert!(!named(&views, words[n], &placed(n as u32)), "entry {n} stale");
+        }
+        for n in 6..10 {
+            assert!(named(&views, words[n], &placed(n as u32)), "entry {n} kept");
+        }
+        let forgotten = take_forgotten().expect("asked before");
+        for n in 0..6 {
+            assert!(forgotten.contains(&words[n][0]), "entry {n} noted for the heap pass");
+        }
+        // The same view written again keeps its words; a constant buffer
+        // view counts as well.
+        assert_eq!(kept(&mut views, placed(9), 4), words[9]);
+        let constant = View::Constant(0x7_0000_0000, 1 << 22);
+        let kept_constant = kept(&mut views, constant.clone(), 4);
+        assert!(named(&views, kept_constant, &constant));
+        assert!(!named(&views, words[6], &placed(6)), "pushed out by the constant view");
+        // A view of a resource is freed with the resource only.
+        let shader = View::Shader(0x1234, None);
+        let kept_shader = kept(&mut views, shader.clone(), 4);
+        for n in 10..40 {
+            kept(&mut views, placed(n), 4);
+        }
+        assert!(named(&views, kept_shader, &shader));
+        assert!(views.list.len() <= 6);
+        assert_eq!(views.ownerless.len(), 4);
+        // 0 keeps them all.
+        for n in 40..60 {
+            kept(&mut views, placed(n), 0);
+        }
+        assert_eq!(views.index.len() + views.collided.len(), 1 + 4 + 20);
+        assert_eq!(views.ownerless.len(), 4 + 20);
+    }
+
+    /// The indexes keep digests: a view whose digest another view's entry
+    /// has is found all the same, until its resource goes, and so is the
+    /// other; shapes alike. New shapes count the words that made them new.
+    #[test]
+    fn views_of_a_taken_digest_are_kept_by_themselves() {
+        let mut views = Views::new();
+        let (a, b) = (View::Shader(0x10, None), View::Shader(0x20, None));
+        let [i, generation] = views.entry(a.clone(), digest(&a));
+        assert_eq!(views.entry_of(&a, digest(&a)), Some([i, generation]));
+        assert_eq!(views.entry_of(&b, digest(&b)), None);
+        // `b` asked for under the digest of `a`, as if the two had one.
+        let [j, _] = views.entry(b.clone(), digest(&a));
+        assert_ne!(i, j);
+        assert_eq!(views.collided.len(), 1);
+        assert_eq!(views.entry_at(&a, digest(&a)), Some(i));
+        assert_eq!(views.entry_at(&b, digest(&a)), Some(j));
+        assert_eq!(views.entry(b.clone(), digest(&a))[0], j, "no second entry");
+        // `a` goes; `b` is still found, then goes too.
+        assert_eq!(views.release(0x10), vec![i]);
+        assert_eq!(views.entry_at(&a, digest(&a)), None);
+        assert_eq!(views.entry_at(&b, digest(&a)), Some(j));
+        assert_eq!(views.release(0x20), vec![j]);
+        assert_eq!(views.entry_at(&b, digest(&a)), None);
+        assert!(views.collided.is_empty() && views.index.is_empty());
+        // A freed entry is used again under a new generation.
+        let [k, again] = views.entry(a.clone(), digest(&a));
+        assert!(k == i || k == j);
+        assert_ne!(again, generation);
+
+        let resource = [3, 0, 0, 0, 64, 0, 64, 0x1_0001, 98, 1, 0, 0x105, 0, 0];
+        let mut rest = [0u32; 14];
+        rest[1] = 4;
+        let first: Shape = (false, resource, rest);
+        let mut wider = first;
+        wider.1[4] = 128;
+        assert_eq!(views.shape(first, digest(&first)), Some(0));
+        assert_eq!(views.shape(wider, digest(&first)), Some(1));
+        assert_eq!(views.shapes_collided.len(), 1);
+        assert_eq!(views.shape_at(&first, digest(&first)), Some(0));
+        assert_eq!(views.shape_at(&wider, digest(&first)), Some(1));
+        assert_eq!(views.shape(wider, digest(&first)), Some(1), "no second shape");
+        let mut higher = wider;
+        higher.1[6] = 128;
+        assert_eq!(views.shape(higher, digest(&higher)), Some(2));
+        let mut varied = [0; 28];
+        (varied[4], varied[6]) = (1, 1);
+        assert_eq!(views.varied, varied);
+        assert_eq!(views.past_shapes, 0);
+    }
+
+    /// A null CBV description overwrites the slot (D3D12 null CBV), so a
+    /// later read does not see the previous view.
+    #[test]
+    fn null_cbv_clears_a_stale_view() {
+        let null = std::ptr::null();
+        let slots = [0u64; 2 * 4];
+        let a = slots.as_ptr() as u64;
+        create_cbv(null, &[0x1000, 1, 256, 0], a);
+        assert_eq!(view(a), Some(View::Constant(0x1_0000_1000, 256)));
+        create_cbv(null, std::ptr::null(), a);
+        assert_eq!(view(a), Some(View::Constant(0, 0)));
+        create_srv(null, null, std::ptr::null(), a);
+        assert_eq!(view(a), Some(View::Shader(0, None)));
+        create_cbv(null, std::ptr::null(), a);
+        assert_eq!(view(a), Some(View::Constant(0, 0)));
     }
 
     /// A released resource's views go stale; the same view of a new

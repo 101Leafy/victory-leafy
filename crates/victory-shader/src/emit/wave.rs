@@ -291,7 +291,8 @@ pub(crate) fn sections(p: &Program, block: usize) -> HashMap<usize, Section> {
                 && insts[j].read(Reg::S(saved_code(inst))) == Some(saved)
         });
         let Some(end) = end else {
-            break;
+            i += 1;
+            continue;
         };
         let (vec, uni) = simulate(&insts[i + 1..end], wave, saved);
         let mut reads = HashMap::new();
@@ -662,7 +663,10 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> Left {
             }
             ("v_permlanex16_b32", Some(a)) => {
                 // Lanes of each row read the other row of their half; lane
-                // i's pick is nibble i of {src2, src1}.
+                // i's pick is nibble i of {src2, src1}. A disabled source
+                // lane is read only with fetch-inactive (OP_SEL[0]); else
+                // the lane takes 0 with bound-control (OP_SEL[1]) or keeps
+                // its old value, as the lowering outside sections does.
                 let sel = |k: usize| match v.src.get(k) {
                     Some(&Operand::Const(c)) => crate::resource::inline(c),
                     Some(&Operand::Literal(x)) => Some(x),
@@ -675,7 +679,14 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> Left {
                             .map(|l| {
                                 let other = (l & !31) | ((l & 16) ^ 16);
                                 let pick = (s >> (4 * (l & 15)) & 15) as u32;
-                                a[(other | pick) as usize]
+                                let from = other | pick;
+                                if v.opsel & 1 != 0 || exec >> from & 1 != 0 {
+                                    a[from as usize]
+                                } else if v.opsel & 2 != 0 {
+                                    Sym::K(0)
+                                } else {
+                                    old[l as usize]
+                                }
                             })
                             .collect()
                     }
@@ -1232,6 +1243,42 @@ mod tests {
         assert_eq!(found, None);
     }
 
+    /// A wave32 OR whose cross-row step runs in the upper row alone: its sources, the
+    /// lower row, are disabled, so without fetch-inactive lane 31 keeps its old v2 (or
+    /// takes 0 with bound-control) and does not hold the whole wave's OR.
+    #[test]
+    fn a_permlane_from_disabled_lanes_reads_them_only_with_fetch_inactive() {
+        let shape = |permlane: u32| {
+            let mut w = vec![
+                sop1(4, 0x3D, 193), // s_or_saveexec_b32 s4, -1
+                0xD501_0001,
+                0x0012_0E80, // v_cndmask_b32 v1, 0, v7, s4
+            ];
+            w.extend_from_slice(&WAVE_OR_V7_TO_S7[3..11]); // each row's OR in its lanes
+            w.extend([
+                sop1(EXEC, 0x03, 255),
+                0xFFFF_0000, // s_mov_b32 exec_lo, 0xffff0000
+                permlane,
+                0x0201_0101, // v_permlanex16_b32 v2, v1, 0, 0
+                sop1(EXEC, 0x03, 193), // s_mov_b32 exec_lo, -1
+                0x3802_0302, // v_or_b32 v1, v2, v1
+                0xD760_0007,
+                0x0001_3F01, // v_readlane_b32 s7, v1, 31
+                sop1(EXEC, 0x03, 4), // s_mov_b32 exec_lo, s4
+            ]);
+            let p = build(&w, false);
+            let insts = &p.blocks[0].insts;
+            let saved = insts[0].write(Reg::S(4)).unwrap();
+            let v7 = p.inputs.iter().find_map(|&(r, v)| (r == Reg::V(7)).then_some(v)).unwrap();
+            let total = insts[insts.len() - 3].write(Reg::S(7)).unwrap();
+            (sections(&p, 0)[&0].shapes.get(&total).copied(), Shape::Active(Op::Or, v7, saved, 0))
+        };
+        let (found, whole) = shape(0xD778_0802); // op_sel:[1,0]: fetch inactive
+        assert_eq!(found, Some(whole));
+        assert_eq!(shape(0xD778_0002).0, None);
+        assert_eq!(shape(0xD778_1002).0, None); // op_sel:[0,1]: bound-control
+    }
+
     #[test]
     fn buddies_are_the_two_halves_of_an_aligned_run() {
         assert!(buddies(0b01, 0b10));
@@ -1334,5 +1381,23 @@ mod tests {
             bad_ident[0] = red(None, v0, m0, 1, 1);
             assert_eq!(per_lane(&bad_ident, all), None);
         }
+    }
+
+    #[test]
+    fn unmatched_saveexec_does_not_skip_later_wave_sections_in_block() {
+        // An unmatched `s_or_saveexec_b64 s[2:3], -1` earlier in the block (its
+        // EXEC restore in a later block) must not end the scan for the
+        // whole-wave sections after it.
+        let mut w = vec![0xBE82_25C1]; // s_or_saveexec_b64 s[2:3], -1
+        w.extend(WAVE_OR_V7_TO_S7);
+        let p = build(&w, true);
+        let insts = &p.blocks[0].insts;
+        let saved = insts[1].write(Reg::S(4)).unwrap();
+        let v7 = p.inputs.iter().find_map(|&(r, v)| (r == Reg::V(7)).then_some(v)).unwrap();
+        let total = insts[insts.len() - 3].write(Reg::S(7)).unwrap();
+        let secs = sections(&p, 0);
+        assert!(!secs.contains_key(&0), "unmatched saveexec should not form a section");
+        let sec = secs.get(&1).expect("later matched section in the same block must still be discovered");
+        assert_eq!(sec.shapes.get(&total).copied(), Some(Shape::Active(Op::Or, v7, saved, 0)));
     }
 }

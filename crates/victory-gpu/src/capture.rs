@@ -346,6 +346,45 @@ pub(crate) fn save_read_back(
     }
 }
 
+/// Saved frames go ahead with their present (`VICTORY_CAPTURE_AHEAD=1`, off
+/// until it wins an A/B; unset: the present thread sends a list of its own,
+/// waits for the card and writes the PNG, a drain every saved frame). A
+/// thread of ours writes the picture once the present's submission finished.
+pub(crate) fn ahead() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CAPTURE_AHEAD").is_some_and(|v| v == "1"))
+}
+
+/// Saves frame `frame`, read back into `buffer`, once submission `flown` has
+/// finished (0: it has).
+pub(crate) fn save_after(frame: u64, buffer: ID3D12Resource, footprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT, flown: u64) {
+    type Job = (u64, ID3D12Resource, D3D12_PLACED_SUBRESOURCE_FOOTPRINT, u64);
+    static THREAD: std::sync::OnceLock<Option<std::sync::mpsc::Sender<Job>>> = std::sync::OnceLock::new();
+    let to = THREAD.get_or_init(|| {
+        let (to, from) = std::sync::mpsc::channel::<Job>();
+        let saver = move || {
+            while let Ok((frame, buffer, footprint, flown)) = from.recv() {
+                while crate::host::submissions().1 < flown {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                save_read_back(frame, &buffer, &footprint);
+            }
+        };
+        std::thread::Builder::new().name("frame saver".into()).spawn(saver).ok().map(|_| to)
+    });
+    match to {
+        Some(to) => {
+            let _ = to.send((frame, buffer, footprint, flown));
+        }
+        None => {
+            while crate::host::submissions().1 < flown {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            save_read_back(frame, &buffer, &footprint);
+        }
+    }
+}
+
 /// With `VICTORY_DUMP_TARGETS` set: title textures the frames listed in
 /// `VICTORY_CAPTURE_FRAMES` render to or write, in first-use order, saved
 /// at that frame's present as `frame-<n>-<i>-<resource>-<w>x<h>-f<format>.png`

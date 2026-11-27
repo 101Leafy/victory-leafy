@@ -356,17 +356,27 @@ fn feature_levels(data: *mut c_void) -> HRESULT {
 /// - 0x218 (compute): the FSPX register packet, a second part, the code,
 ///   the metadata;
 /// - 0x1c8 (graphics): a register block, the input layout, then code and
-///   metadata for each of two stages.
+///   metadata for the pixel stage and then the vertex stage. A null pixel
+///   stage is a depth-only pipeline. The vertex code fetches its own
+///   vertices through buffer descriptors at the address in user data 0-1,
+///   which no metadata record names. Some descriptions (the 0x200 register
+///   block of call 15) leave the vertex stage null and fill a third pair
+///   instead, likely a mesh stage, so the log reads that one too.
 ///
 /// The metadata is the FSPX resource records behind a short header
 /// (`victory_shader::loose_metadata`). The first calls log every part and
 /// what parsing made of it. With `VICTORY_LOOSE_PIPELINES=1`, a 0x218 call
 /// whose parts make an FSPX program (`victory_shader::loose_compute`) gets
-/// a compute pipeline from that container.
-/// shortcut: graphics pipelines are not made (the register block and input
-/// layout are not decoded), nor compute ones by default: those calls fail
-/// as they always did, with `out` null. Answering `S_OK` without making
-/// the pipeline would hand the title whatever its stack held as an object.
+/// a compute pipeline from that container. With `VICTORY_LOOSE_GRAPHICS=1`,
+/// a 0x1c8 call whose parts make containers (`victory_shader::loose_graphics`)
+/// gets a graphics pipeline whose host pipelines are made at the first draw
+/// into each set of target formats.
+/// A compute container that does not translate is no answer either: the
+/// call fails, so the title builds the pipeline from its own DXBC
+/// container instead of drawing without that work (`loose_usable`).
+/// Neither is made by default: those calls fail as they always
+/// did, with `out` null. Answering `S_OK` without making the pipeline
+/// would hand the title whatever its stack held as an object.
 extern "system" fn unknown_pipeline<const SLOT: usize>(
     this: This,
     desc: *const u8,
@@ -375,14 +385,14 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
 ) -> HRESULT {
     use std::sync::atomic::{AtomicU32, Ordering};
     static CALLS: [AtomicU32; 2] = [const { AtomicU32::new(0) }; 2];
-    static MAKE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static MAKE: [std::sync::OnceLock<bool>; 2] = [const { std::sync::OnceLock::new() }; 2];
     let calls = CALLS[usize::from(SLOT == 0x218)].fetch_add(1, Ordering::Relaxed) + 1;
     if !out.is_null() {
         // SAFETY: the title's out pointer (a local of its own).
         unsafe { *out = std::ptr::null() };
     }
-    let make = SLOT == 0x218
-        && *MAKE.get_or_init(|| std::env::var("VICTORY_LOOSE_PIPELINES").as_deref() == Ok("1"));
+    let switch = if SLOT == 0x218 { "VICTORY_LOOSE_PIPELINES" } else { "VICTORY_LOOSE_GRAPHICS" };
+    let make = *MAKE[usize::from(SLOT == 0x218)].get_or_init(|| std::env::var(switch).as_deref() == Ok("1"));
     let log = calls <= 4 || calls.is_power_of_two();
     if !make && !log {
         return E_NOTIMPL;
@@ -396,17 +406,27 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
     };
     #[cfg(not(windows))]
     let read = |_: u64, _: u64| None::<Vec<u8>>;
-    let words: Vec<u64> = read(desc as u64, 128)
-        .map(|b| b.as_chunks::<8>().0.iter().map(|c| u64::from_le_bytes(*c)).collect())
-        .unwrap_or_default();
-    let pairs = if SLOT == 0x218 { 4 } else { 6 };
+    let mut bytes = read(desc as u64, 128).unwrap_or_default();
+    if SLOT == 0x1c8 && !bytes.is_empty() {
+        bytes.extend(read(desc as u64 + 128, 16).unwrap_or_default());
+    }
+    let words: Vec<u64> = bytes.as_chunks::<8>().0.iter().map(|c| u64::from_le_bytes(*c)).collect();
+    let pairs = if SLOT == 0x218 { 4 } else { 8 };
     let parts: Vec<Option<Vec<u8>>> = (0..pairs)
         .map(|i| words.get(1 + 2 * i..3 + 2 * i).and_then(|w| read(w[0], w[1])))
         .collect();
     let part = |i: usize| parts.get(i).and_then(|p| p.as_deref());
     let built = (SLOT == 0x218).then(|| match (part(0), part(2), part(3)) {
         (Some(packet), Some(code), Some(meta)) => {
-            victory_shader::loose_compute(packet, code, meta).map_err(|e| e.to_string())
+            let built = victory_shader::loose_compute(packet, code, meta).map_err(|e| e.to_string());
+            if make { loose_usable(built) } else { built }
+        }
+        _ => Err("a part is not readable".to_owned()),
+    });
+    let graphics = (SLOT == 0x1c8).then(|| match (part(0), part(1), part(4), part(5)) {
+        (Some(regs), Some(layout), Some(vs), Some(vs_meta)) => {
+            victory_shader::loose_graphics(regs, layout, (vs, vs_meta), part(2).zip(part(3)))
+                .map_err(|e| e.to_string())
         }
         _ => Err("a part is not readable".to_owned()),
     });
@@ -438,6 +458,10 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
             parts = format_args!("{:?}", parts.iter().map(|p| hex(p.as_deref())).collect::<Vec<_>>()),
             metadata = format_args!("{metadata:?}"),
             program = format_args!("{:?}", built.as_ref().map(|b| b.as_ref().map(Vec::len))),
+            graphics = format_args!(
+                "{:?}",
+                graphics.as_ref().map(|g| g.as_ref().map(|g| (g.vs.len(), g.ps.as_ref().map(Vec::len), g.inputs.len())))
+            ),
             make,
             "a pipeline made from loose parts"
         );
@@ -458,8 +482,19 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
             };
             pipeline::create_compute(this, (&raw const head).cast(), iid, out)
         }
-        _ => E_NOTIMPL,
+        _ => match &graphics {
+            #[cfg(windows)]
+            Some(Ok(g)) if make => pipeline::create_loose_graphics(g, iid, out),
+            _ => E_NOTIMPL,
+        },
     }
+}
+
+/// A loose compute container, if it translates. On play-i 820 of the 2,700
+/// built ones did not, and answering those with a pipeline left the start
+/// screen black: the title went without that compute work.
+fn loose_usable(built: Result<Vec<u8>, String>) -> Result<Vec<u8>, String> {
+    built.and_then(|c| crate::shader_cache::host_shader(&c).map(|_| c))
 }
 
 /// The host device's state: the console's device is removed when the host's is
@@ -660,5 +695,37 @@ mod tests {
         assert_eq!(query(&levels, 0x18), (S_OK, 0xc100));
         assert_eq!(query(&levels, 0x10).0, E_INVALIDARG);
         assert_eq!(query(&levels[4..], 0x18).0, UNSUPPORTED);
+    }
+
+    /// The parts of the title's first 0x218 call (victory-shader's
+    /// `loose_compute_takes_the_titles_parts`), with `code` for the code.
+    fn loose_container(code: &[u8]) -> Result<Vec<u8>, String> {
+        let packet = [
+            0x00, 0xcf, 0x05, 0x40, 0x02, 0x01, 0x09, 0x6c, 0x00, 0x00, 0x00, 0x00, 0x08, 0x00, 0x08, 0x00,
+            0x01, 0x00, 0x00, 0x00, 0x43, 0x03, 0x2c, 0x40, 0x8a, 0x0b, 0x00, 0x00,
+        ];
+        let mut meta = vec![0u8; 0x18];
+        meta[0..4].copy_from_slice(&0x403u32.to_le_bytes());
+        meta[0x14..0x18].copy_from_slice(&[0x40, 4, 0, 0]);
+        // The end record alone: no resources.
+        let mut end = vec![0u8; 0x20];
+        end[0] = 0x43;
+        end[0x18..0x1c].copy_from_slice(&u32::MAX.to_le_bytes());
+        meta.extend(end);
+        let size = (meta.len() - 0x14) as u32;
+        meta[4..8].copy_from_slice(&size.to_le_bytes());
+        victory_shader::loose_compute(&packet, code, &meta).map_err(|e| e.to_string())
+    }
+
+    #[test]
+    fn a_loose_container_that_does_not_translate_is_not_handed_out() {
+        let s_endpgm = 0xbf81_0000u32.to_le_bytes();
+        let ends = loose_container(&s_endpgm).unwrap();
+        assert_eq!(loose_usable(Ok(ends.clone())), Ok(ends));
+        // An encoding RDNA2 does not have, then the end.
+        let bad = [u32::MAX.to_le_bytes(), s_endpgm].concat();
+        let refused = loose_container(&bad).unwrap();
+        assert!(loose_usable(Ok(refused)).is_err());
+        assert!(loose_usable(Err("a part is not readable".to_owned())).is_err());
     }
 }

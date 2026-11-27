@@ -12,6 +12,26 @@ pub const SAMPLER_SPACE: u32 = 0;
 /// Where root CBVs and SRVs are bound: `b<root parameter index>` and
 /// `t<root parameter index>` in this space.
 pub const ROOT_CBV_SPACE: u32 = 1;
+/// The bytes of payload every translated mesh shader declares and never
+/// reads: 4 with `VICTORY_MESH_LAUNCH=1`, none otherwise (as before). With
+/// it the host puts an amplification shader of its own in front of the
+/// mesh shader (the launch of an indirect mesh record, `victory-gpu`'s
+/// `launch`), whose payload must have the size the mesh shader declares: a
+/// mesh shader that declares none is refused with one (the RTX 5080's
+/// driver returns `E_INVALIDARG`), and one that declares a payload is still
+/// taken without an amplification shader. Read here too so that the switch
+/// is part of the shader cache's key.
+pub fn mesh_payload_bytes() -> u32 {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ON.get_or_init(|| std::env::var_os("VICTORY_MESH_LAUNCH").is_some_and(|v| v == "1")) {
+        4
+    } else {
+        0
+    }
+}
+/// The register space the host's amplification shader binds in (`b0`,
+/// `t0`, `u0`): no translated shader binds there.
+pub const LAUNCH_SPACE: u32 = 9;
 
 /// The root SRV `t<SLOT_STRIDES>` in [`ROOT_CBV_SPACE`] of a shader that
 /// reads buffers through descriptors it picks from the view heap at an
@@ -94,10 +114,18 @@ pub const USER_ROOT_ADDRESS: u32 = 0x104;
 /// the group's width. Asked for by the structure builder's programs
 /// ([`crate::spill::is_spilled`]).
 pub const USER_DISPATCH_THREADS_X: u32 = 0x106;
+/// `RootType::Other` code of a user-data dword the host sets for each piece
+/// of a dispatch it splits: the number of the piece's first group along X,
+/// added to the group id the program reads (0 when not split). The host
+/// runs at most 65,535 groups a dimension; the console runs more.
+pub const USER_GROUP_BASE_X: u32 = 0x107;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
     pub const DOUBLES: u64 = 1 << 2;
+    /// `[earlydepthstencil]`: depth and stencil are tested before the
+    /// program runs (no feature bit).
+    pub const EARLY_DEPTH: u64 = 1 << 3;
     pub const RAW_BUFFERS: u64 = 1 << 4;
     pub const STENCIL_REF: u64 = 1 << 11;
     pub const TYPED_UAV_LOADS: u64 = 1 << 13;
@@ -244,15 +272,38 @@ pub(crate) struct Shader {
     pub ordered: bool,
     /// Heap handles made with a non-uniform index.
     pub nonuniform_handles: u32,
+    /// LDS accesses lowered with their bound (for tests).
+    pub lds_bounds: u32,
     /// A compute shader with this thread-group size.
     pub threads: Option<[u32; 3]>,
     /// The wave size a compute shader requires (`WaveSize`).
     pub wave_size: Option<u32>,
     /// Thread-group shared memory, in dwords.
     pub lds_dwords: u32,
+    /// The program's own LDS, without the dwords the lowering adds after it.
+    pub title_lds_dwords: u32,
     lds: Option<V>,
     main: V,
     pub entry: usize,
+    /// The `dx.op.*` declarations made so far: name, signature, attributes,
+    /// the function and its opcode constant. A program repeats the same few
+    /// operations, and declaring one costs a `format!`, a signature type and
+    /// four hashed lookups.
+    op_decls: Vec<OpDecl>,
+}
+
+/// The `dx.op` declarations kept: a program uses tens, and the scan of a
+/// declaration the cache dropped costs less than the declaration.
+const OP_DECLS: usize = 48;
+
+struct OpDecl {
+    name: String,
+    attr: Attr,
+    ret: Ty,
+    args: Vec<Ty>,
+    opcode: u32,
+    f: V,
+    code: V,
 }
 
 impl Shader {
@@ -301,12 +352,15 @@ impl Shader {
             flags: 0,
             ordered: false,
             nonuniform_handles: 0,
+            lds_bounds: 0,
             threads: None,
             wave_size: None,
             lds_dwords: 0,
+            title_lds_dwords: 0,
             lds: None,
             main,
             entry,
+            op_decls: Vec::new(),
         }
     }
 
@@ -332,15 +386,54 @@ impl Shader {
         opcode: u32,
         args: &[V],
     ) -> V {
-        let mut params = vec![self.t.i32];
-        params.extend(args.iter().map(|&a| self.m.type_of(a)));
-        let fty = self.m.func_ty(ret, params);
-        self.m.ptr(fty);
-        let f = self
-            .m
-            .function(&format!("dx.op.{name}"), fty, Some(attr), false);
-        let mut all = vec![self.m.i32(opcode)];
-        all.extend(args);
+        let declared = self.op_decls.iter().position(|d| {
+            d.name == name
+                && d.attr == attr
+                && d.ret == ret
+                && d.opcode == opcode
+                && d.args.len() == args.len()
+                && d.args
+                    .iter()
+                    .zip(args)
+                    .all(|(&t, &a)| t == self.m.type_of(a))
+        });
+        let (f, code) = match declared {
+            Some(i) => {
+                // The hot operations sit at the front, where the next scan
+                // starts.
+                self.op_decls[..=i].rotate_right(1);
+                (self.op_decls[0].f, self.op_decls[0].code)
+            }
+            None => {
+                let mut params = Vec::with_capacity(1 + args.len());
+                params.push(self.t.i32);
+                let types: Vec<Ty> = args.iter().map(|&a| self.m.type_of(a)).collect();
+                params.extend_from_slice(&types);
+                let fty = self.m.func_ty(ret, params);
+                self.m.ptr(fty);
+                let f = self
+                    .m
+                    .function(&format!("dx.op.{name}"), fty, Some(attr), false);
+                let code = self.m.i32(opcode);
+                let decl = OpDecl {
+                    name: name.into(),
+                    attr,
+                    ret,
+                    args: types,
+                    opcode,
+                    f,
+                    code,
+                };
+                if self.op_decls.len() == OP_DECLS {
+                    self.op_decls.pop();
+                }
+                self.op_decls.insert(0, decl);
+                (f, code)
+            }
+        };
+        let mut all = Vec::with_capacity(1 + args.len());
+        all.push(code);
+        all.extend_from_slice(args);
         self.m.call(block, f, all)
     }
 
@@ -860,7 +953,7 @@ impl Shader {
                         mesh.max_vertices,
                         mesh.max_primitives,
                         mesh.topology.into(),
-                        0,
+                        mesh_payload_bytes(),
                     ]
                     .map(|n| Some(i32c(&mut self, n)));
                     let mut node = vec![Some(t)];
@@ -889,9 +982,18 @@ impl Shader {
         let ident = self.m.md_str("victory");
         let ident = self.m.md_node(vec![Some(ident)]);
         self.m.named_md("llvm.ident", vec![ident]);
+        // Pixel shaders with wave operations run them over helper lanes
+        // too, as the console does (shader model 6.7), where the host can.
+        let helper_lanes =
+            self.pixel && self.flags & flags::WAVE_OPS != 0 && super::helper_lane_waves();
+        if helper_lanes {
+            self.m.set_function_attr(self.main, Attr::HelperLaneWaves);
+        }
+        let minor = if helper_lanes { 7 } else { 6 };
         let one = i32c(&mut self, 1);
         let six = i32c(&mut self, 6);
-        let version = self.m.md_node(vec![Some(one), Some(six)]);
+        let minor_c = i32c(&mut self, minor);
+        let version = self.m.md_node(vec![Some(one), Some(minor_c)]);
         self.m.named_md("dx.version", vec![version]);
         self.m.named_md("dx.valver", vec![version]);
         // Program kinds: 0 pixel, 1 vertex, 2 geometry, 5 compute, 13 mesh.
@@ -903,17 +1005,17 @@ impl Shader {
             (None, false) => ("vs", 1),
         };
         let name = self.m.md_str(name);
-        let sm = self.m.md_node(vec![Some(name), Some(six), Some(six)]);
+        let sm = self.m.md_node(vec![Some(name), Some(six), Some(minor_c)]);
         self.m.named_md("dx.shaderModel", vec![sm]);
         self.m.named_md("dx.entryPoints", vec![entry]);
 
         let bitcode = self.m.write();
         super::bitcode::census::note(&self.m, &bitcode);
         let mut dxil = Vec::with_capacity(24 + bitcode.len());
-        dxil.extend((kind << 16 | 0x66).to_le_bytes());
+        dxil.extend((kind << 16 | 0x60 | minor).to_le_bytes());
         dxil.extend((((24 + bitcode.len()) / 4) as u32).to_le_bytes());
         dxil.extend(b"DXIL");
-        dxil.extend(0x106u32.to_le_bytes());
+        dxil.extend((0x100 | minor).to_le_bytes());
         dxil.extend(16u32.to_le_bytes());
         dxil.extend((bitcode.len() as u32).to_le_bytes());
         dxil.extend(&bitcode);

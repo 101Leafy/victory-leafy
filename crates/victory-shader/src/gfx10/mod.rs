@@ -79,6 +79,81 @@ pub fn decode(code: &[u8]) -> Result<Vec<Instruction>, ShaderError> {
     if !code.len().is_multiple_of(4) {
         return Err(isa(code.len(), "code size is not a multiple of 4"));
     }
+    decode_aligned(code).unwrap_or_else(|| decode_any(code))
+}
+
+/// The most dwords an instruction takes (an image instruction with three
+/// dwords of extra address registers).
+const MAX_WORDS: usize = 5;
+
+/// [`decode`] while every offset it reaches is a dword's (None at the first
+/// that is not, which only a far jump's literal can give): what is found is
+/// kept in a table by dword, and put in order once, instead of in a tree
+/// per instruction.
+fn decode_aligned(code: &[u8]) -> Option<Result<Vec<Instruction>, ShaderError>> {
+    // Per dword: the index in `found` of the instruction starting there.
+    // It grows to the furthest dword reached, so bytes past the code (data,
+    // padding) cost nothing; room for short programs is made at once.
+    let mut at: Vec<u32> = Vec::with_capacity((code.len() / 4).min(4096));
+    let mut found: Vec<Instruction> = Vec::new();
+    let mut pending = vec![0usize];
+    while let Some(mut offset) = pending.pop() {
+        loop {
+            if !offset.is_multiple_of(4) {
+                return None;
+            }
+            if at.get(offset / 4).is_some_and(|&i| i != u32::MAX) {
+                break;
+            }
+            let inst = match instruction(code, offset) {
+                Ok(inst) => inst,
+                Err(e) => return Some(Err(e)),
+            };
+            let next = offset + 4 * inst.words.len();
+            // The instruction found last below `end`, as the tree has it,
+            // where it can end at `end` (all a far jump looks for): within
+            // the longest instruction's reach.
+            let before = |end: usize| {
+                (1..=MAX_WORDS.min(end / 4))
+                    .map(|k| at.get(end / 4 - k).copied().unwrap_or(u32::MAX))
+                    .find(|&i| i != u32::MAX)
+                    .map(|i| &found[i as usize])
+            };
+            let flow = match control(&inst, code.len(), before) {
+                Ok(flow) => flow,
+                Err(e) => return Some(Err(e)),
+            };
+            if at.len() <= offset / 4 {
+                at.resize(offset / 4 + 1, u32::MAX);
+            }
+            at[offset / 4] = found.len() as u32;
+            found.push(inst);
+            match flow {
+                Flow::Next => offset = next,
+                Flow::Stop => break,
+                Flow::Jump(target) => offset = target,
+                Flow::Branch(target) => {
+                    pending.push(target);
+                    offset = next;
+                }
+            }
+        }
+    }
+    found.sort_unstable_by_key(|i| i.offset);
+    if let Some(w) = found
+        .windows(2)
+        .find(|w| w[0].offset + 4 * w[0].words.len() > w[1].offset)
+    {
+        return Some(Err(isa(
+            w[1].offset,
+            "a branch lands inside an instruction",
+        )));
+    }
+    Some(Ok(found))
+}
+
+/// [`decode`] at any offsets.
+fn decode_any(code: &[u8]) -> Result<Vec<Instruction>, ShaderError> {
     let mut found = BTreeMap::new();
     let mut pending = vec![0usize];
     while let Some(mut offset) = pending.pop() {
@@ -217,7 +292,16 @@ fn instruction(code: &[u8], offset: usize) -> Result<Instruction, ShaderError> {
         // Literal constant, SDWA, DPP16, DPP8, DPP8 with fetch-inactive.
         let extra = usize::from(matches!(src0, 0xFF | 0xF9 | 0xFA | 0xE9 | 0xEA));
         match w >> 25 {
-            0x3F => (Encoding::Vop1, (w >> 9) & 0xFF, 1 + extra),
+            0x3F => {
+                let opcode = (w >> 9) & 0xFF;
+                // These VOP1s take no source, so the field is not a literal:
+                // the console's compiler stores a shader hash there, and where
+                // it fell on 0xFF/0xF9/0xFA/0xE9/0xEA the next instruction was
+                // taken for its literal and lost (ZigZagBoi1/ScarlettPort
+                // bc71157, PR #19).
+                let no_source = matches!(opcode, 0x000 | 0x01B | 0x041);
+                (Encoding::Vop1, opcode, if no_source { 1 } else { 1 + extra })
+            }
             0x3E => (Encoding::Vopc, (w >> 17) & 0xFF, 1 + extra),
             op => {
                 let mk_ak = name(Encoding::Vop2, op as u16).is_some_and(|n| {
@@ -379,6 +463,12 @@ mod tests {
     }
 
     #[test]
+    fn vop1_without_operands_has_no_extension_word() {
+        assert_eq!(summary(&[0x7E00_00FF, S_ENDPGM]), [(0, 1, "v_nop"), (4, 1, "s_endpgm")]);
+        assert_eq!(summary(&[0x7E00_36FF, S_ENDPGM]), [(0, 1, "v_pipeflush"), (4, 1, "s_endpgm")]);
+    }
+
+    #[test]
     fn tables_are_sorted() {
         for t in [
             opcodes::SOP2,
@@ -499,6 +589,69 @@ mod tests {
                 (24, "s_setpc_b64"),
             ]
         );
+    }
+
+    /// Instructions found by dword (`decode_aligned`) are the tree's
+    /// (`decode_any`): branches both ways, a loop, data after the end, far
+    /// jumps both ways and bad code. A far jump to an offset that is no
+    /// dword's leaves it to the tree.
+    #[test]
+    fn the_table_decodes_as_the_tree_does() {
+        let far = |literal: u32| {
+            [
+                0xBE88_1F00, // s_getpc_b64 s[8:9]
+                0x8008_FF08,
+                literal,     // s_add_u32 s8, s8, literal
+                0x8209_8009, // s_addc_u32 s9, s9, 0
+                0xBE80_2008, // s_setpc_b64 s[8:9]
+                0xFFFF_FFFF, // not code
+                S_ENDPGM,
+                S_ENDPGM,
+            ]
+        };
+        let programs: [&[u32]; 8] = [
+            &[
+                sopp(0x04, 1),
+                sopp(0x02, 1),
+                S_ENDPGM,
+                S_ENDPGM,
+                S_ENDPGM,
+                0xFFFF_FFFF,
+            ],
+            // A loop: a backward branch to an instruction already found.
+            &[
+                0x4A00_0081,
+                0xD52C_0001,
+                0x0002_0501,
+                sopp(0x04, -4),
+                S_ENDPGM,
+            ],
+            &far(20),
+            &[
+                sopp(0x02, 1),
+                S_ENDPGM,
+                0xBE88_1F00,
+                0x8008_FF08,
+                0xFFFF_FFF8,
+                0x8209_C109,
+                0xBE80_2008,
+            ],
+            &[sopp(0x04, 1), 0xBE80_03FF, S_ENDPGM, S_ENDPGM],
+            &[sopp(0x02, 100)],
+            &[0xBE80_03FF],
+            &far(21),
+        ];
+        for (n, code) in programs.iter().enumerate() {
+            let code = bytes(code);
+            let tree = format!("{:?}", decode_any(&code));
+            match decode_aligned(&code) {
+                Some(table) => assert_eq!(format!("{table:?}"), tree, "program {n}"),
+                None => {
+                    assert_eq!(n, 7, "only the unaligned far jump leaves it to the tree");
+                    assert_eq!(format!("{:?}", decode(&code)), tree);
+                }
+            }
+        }
     }
 
     #[test]

@@ -229,7 +229,12 @@ impl HostList {
                     };
                     unsafe {
                         self.list.CopyBufferRegion(&between, 0, &from.buffer, offset, len as u64);
-                        self.list.ResourceBarrier(&[transition(&between, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                        // The host copy was promoted to a copy's source: back
+                        // to common, to be promoted to its destination.
+                        self.list.ResourceBarrier(&[
+                            transition(&between, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                            transition(&from.buffer, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON),
+                        ]);
                         wait_for_all(host, &self.list);
                         self.list.CopyBufferRegion(&to.buffer, at, &between, 0, len as u64);
                     }
@@ -243,7 +248,15 @@ impl HostList {
             },
             (None, None) => return false,
         }
-        unsafe { wait_for_all(host, &self.list) };
+        // The destination was promoted to a copy's destination, a write
+        // state: no use after it in the list (the draws' root views read it,
+        // issue #350) could promote it again. Back to common, as the
+        // submission's lists expect the host copies.
+        // SAFETY: an open list; a live buffer.
+        unsafe {
+            self.list.ResourceBarrier(&[transition(&to.buffer, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON)]);
+            wait_for_all(host, &self.list);
+        }
         STATS[0].fetch_add(1, Ordering::Relaxed);
         STATS[1].fetch_add(len as u64, Ordering::Relaxed);
         to.gpu_writes(self, dst as u64, len as u64);
@@ -291,8 +304,301 @@ impl HostList {
     }
 }
 
+// From Grimkaaah/Victory-Grimkaaah f2586ef (audited clean by revisao-refs 27/11).
+/// Whether a fill of upload memory that flights in the air may write, and
+/// that stands behind a copy at its place of the same submission which puts
+/// all of its bytes, takes them from that copy instead (`VICTORY_FILL_FORWARD=1`;
+/// off by default; `VICTORY_AB` can switch it while the title runs).
+///
+/// Why: the title keeps small blocks of constants (0xb0 to 0xd60 bytes) in
+/// buffers it puts new values in each frame with a buffer copy out of its
+/// upload memory, and draws read them as constants, some ahead of the copy
+/// (the old values), some behind it (the new ones). The copy of the frame
+/// before is a flight's declared write there, so the fills wait for flights;
+/// done on the card in front of all lists they would read the old values
+/// behind the copy too, so the whole submission was refused
+/// (`card_steps`, "a copy at its place in a list writes what it reads") and
+/// stood until the card had run everything: 13 to 28 ms a frame with the
+/// ray-tracing structure builder on (runs trace and trace2: lists 11 and
+/// 13 behind the copy at list 11 step 313, lists 0, 7 and 11 ahead of the
+/// one at step 367).
+///
+/// What the fill reads then is what the card puts there: a copy whose source
+/// is taken on the CPU at submission ([`Placed::prepare`]) puts in its list's
+/// own upload memory (`from`) the bytes the card copies, before any step
+/// behind it is done. Only when nothing between the copy and the fill writes
+/// any of the fill's bytes (another copy, a buffer copy, a shader's declared
+/// write, a step of ours), and only for a fill that would wait otherwise.
+/// The fills ahead of the copy still read the old values, on the card with
+/// `VICTORY_PLACED_ORDER=1`, which takes what stands ahead of a copy at its
+/// place.
+pub(super) fn forwarding() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_FILL_FORWARD") {
+        return on;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_FILL_FORWARD"))
+}
+
+/// Since the last frame line: fills that took their bytes from a copy at its
+/// place ([`forward_fills`]).
+pub(super) static FORWARDED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// What [`forwards`] looks at of a step.
+#[derive(Clone, Copy, Debug)]
+enum View {
+    /// A copy at its place: where it puts its bytes, how many, and where its
+    /// list holds them if it took them on the CPU at submission.
+    Put { dst: usize, len: usize, from: Option<usize> },
+    /// A write of `[at, at + len)`: a buffer copy, a shader's declared write.
+    Writes { at: usize, len: usize },
+    /// A step of ours: it may write anything.
+    Run,
+    /// A fill of upload memory out of `[src, src + len)`.
+    Fill { src: usize, len: usize },
+    /// Reads alone.
+    Other,
+}
+
+impl View {
+    fn of(step: &Step) -> View {
+        match step {
+            Step::Placed(p) => View::Put { dst: p.dst, len: p.len, from: p.from },
+            &Step::Copy(dst, _, len) => View::Writes { at: dst, len },
+            &Step::GpuWrite(_, at, len) => View::Writes { at, len },
+            Step::Run(_) => View::Run,
+            &Step::Fill(_, src, len, _) => View::Fill { src, len },
+            _ => View::Other,
+        }
+    }
+}
+
+/// Which fills of `runs` (each: whether its list is named twice in the
+/// submission, its steps in order) take their bytes from a copy at its
+/// place ([`forwarding`]); `blocked` says which fills would wait for
+/// flights. Each: (the run's place, the step's place, where its bytes are).
+fn forwards(runs: &[(bool, Vec<View>)], blocked: impl Fn(usize, usize) -> bool) -> Vec<(usize, usize, usize)> {
+    // The copies whose bytes still stand: (where, how many, where held).
+    let mut puts: Vec<(usize, usize, usize)> = Vec::new();
+    let mut moves = Vec::new();
+    // What writes `[at, at + n)` leaves no copy's bytes standing there.
+    let wrote = |puts: &mut Vec<(usize, usize, usize)>, at: usize, n: usize| puts.retain(|p| !(at < p.0 + p.1 && p.0 < at + n));
+    for (k, (twice, steps)) in runs.iter().enumerate() {
+        for (i, step) in steps.iter().enumerate() {
+            match *step {
+                View::Put { dst, len, from } => {
+                    wrote(&mut puts, dst, len);
+                    if let Some(from) = from {
+                        puts.push((dst, len, from));
+                    }
+                }
+                View::Writes { at, len } => wrote(&mut puts, at, len),
+                View::Run => puts.clear(),
+                // (A list named twice in a submission does its steps twice:
+                // left alone.)
+                View::Fill { src, len } if !twice && len > 0 && blocked(src, len) => {
+                    if let Some(&(dst, _, from)) = puts.iter().rev().find(|p| p.0 <= src && src + len <= p.0 + p.1) {
+                        moves.push((k, i, from + (src - dst)));
+                    }
+                }
+                View::Fill { .. } | View::Other => {}
+            }
+        }
+    }
+    moves
+}
+
+/// [`forwarding`]: before anything looks at what the steps of `runs` read,
+/// with flights that write `written` in the air, the fills that can take
+/// their bytes from a copy at its place ahead of them read those instead.
+pub(super) fn forward_fills(runs: &[&HostList], written: &[(usize, usize)]) {
+    if written.is_empty() {
+        return;
+    }
+    let lists: Vec<usize> = runs.iter().map(|l| std::ptr::from_ref::<HostList>(l) as usize).collect();
+    // One list's lock at a time: a submission may name a list twice.
+    let views: Vec<(bool, Vec<View>)> = runs
+        .iter()
+        .enumerate()
+        .map(|(k, list)| {
+            let twice = lists.iter().filter(|&&l| l == lists[k]).count() > 1;
+            (twice, list.deferred().copies.iter().map(View::of).collect())
+        })
+        .collect();
+    let moves = forwards(&views, |src, len| read_blocked(written, src, len));
+    for &(k, i, from) in &moves {
+        if let Some(Step::Fill(_, src, ..)) = runs[k].deferred().copies.get_mut(i) {
+            *src = from;
+        }
+    }
+    FORWARDED.fetch_add(moves.len() as u64, Ordering::Relaxed);
+}
+
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    /// Title memory of `len` bytes with a host copy (not in place).
+    fn title_of(resource: usize, len: usize) -> (&'static mut [u8], usize, std::sync::Arc<Shadow>) {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+        const WRITE_WATCH: u32 = 0x20_0000;
+        // SAFETY: memory of our own, never freed.
+        let base = unsafe { VirtualAlloc(std::ptr::null(), len, MEM_RESERVE | MEM_COMMIT | WRITE_WATCH, PAGE_READWRITE) }.cast::<u8>();
+        assert!(!base.is_null());
+        crate::shadow::register(resource, base as u64, len as u64);
+        let shadow = crate::shadow::find(base as u64, 64).expect("a copy");
+        assert!(!shadow.in_place());
+        // SAFETY: `len` bytes just committed.
+        (unsafe { std::slice::from_raw_parts_mut(base, len) }, base as usize, shadow)
+    }
+
+    /// What the debug layer said (id, text), as it says it: the host's own
+    /// reading of its queue at each submission empties the queue.
+    static SAID: Mutex<Vec<(i32, String)>> = Mutex::new(Vec::new());
+
+    unsafe extern "system" fn heard(
+        _: D3D12_MESSAGE_CATEGORY,
+        _: D3D12_MESSAGE_SEVERITY,
+        id: D3D12_MESSAGE_ID,
+        text: windows::core::PCSTR,
+        _: *mut core::ffi::c_void,
+    ) {
+        // SAFETY: the layer's text, alive through the call.
+        let text = unsafe { text.to_string() }.unwrap_or_default();
+        SAID.lock().unwrap_or_else(|e| e.into_inner()).push((id.0, text));
+    }
+
+    /// Listens to the debug layer from now on; `false` without it.
+    fn listen(host: &Host) -> bool {
+        let Some(queue) = host.messages.as_ref().and_then(|q| q.cast::<ID3D12InfoQueue1>().ok()) else {
+            return false;
+        };
+        let mut cookie = 0;
+        // SAFETY: a function that lives as long as the process.
+        unsafe { queue.RegisterMessageCallback(Some(heard), D3D12_MESSAGE_CALLBACK_FLAG_NONE, std::ptr::null_mut(), &mut cookie) }.is_ok()
+    }
+
+    /// What the debug layer said since the last call.
+    fn messages() -> Vec<(i32, String)> {
+        std::mem::take(&mut *SAID.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    /// Reads at `read` as a root shader resource and writes at `write` as a
+    /// root unordered access view, as draws of the list do.
+    const ROOT_VIEWS: &str = r#"
+#define RS "SRV(t0), UAV(u0)"
+ByteAddressBuffer from : register(t0);
+RWByteAddressBuffer to : register(u0);
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main() { to.Store(0, from.Load(0) + 1u); }
+"#;
+
+    /// Issue #350: a copy at its place leaves its buffers where later root
+    /// views of the same list can take them (the debug layer said
+    /// "Resource state (0x400: COPY_DEST) (promoted from COMMON state) ... is
+    /// invalid for use as a root shader resource", id 538). Out of upload
+    /// memory, out of another host copy, within one; in the card's memory
+    /// and in the PC's. A diagnostics build with the debug layer:
+    /// `VICTORY_D3D12_DEBUG=1 cargo test -p victory-gpu --features diagnostics
+    /// --lib copies_in_place_leave -- --ignored`.
+    #[test]
+    #[ignore = "wants a diagnostics build, VICTORY_D3D12_DEBUG=1 and a process of its own"]
+    fn copies_in_place_leave_their_buffers_to_root_views() {
+        let Some(host) = super::host() else {
+            return; // no host GPU
+        };
+        assert!(listen(host), "a diagnostics build with VICTORY_D3D12_DEBUG=1");
+        assert!(on(), "copies at their place");
+        let code = compile(ROOT_VIEWS, windows::core::s!("main"), windows::core::s!("cs_5_1")).unwrap();
+        // SAFETY: the code lives through the calls; the root signature is in it.
+        let (root, pso) = unsafe {
+            let root: ID3D12RootSignature = host.device.CreateRootSignature(0, &code).unwrap();
+            let pso: ID3D12PipelineState = host
+                .device
+                .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&root),
+                    CS: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: code.as_ptr().cast(),
+                        BytecodeLength: code.len(),
+                    },
+                    ..Default::default()
+                })
+                .unwrap();
+            (root, pso)
+        };
+        let out = host.uav_buffer(1 << 16).unwrap();
+        let dispatch = |list: &HostList, read: u64, write: u64| {
+            // SAFETY: an open list; live buffers.
+            unsafe {
+                list.list.SetComputeRootSignature(&root);
+                list.list.SetPipelineState(&pso);
+                list.list.SetComputeRootShaderResourceView(0, read);
+                list.list.SetComputeRootUnorderedAccessView(1, write);
+                list.list.Dispatch(1, 1, 1);
+            }
+        };
+        // (In the card's memory from 4 MiB on, on a 16 GB card: the compare
+        // that follows the lists in the same call reads what shaders and
+        // these copies wrote as a root shader resource.)
+        let mut resource = 0x3500;
+        let mut wrong = Vec::new();
+        for len in [256usize << 10, 8 << 20] {
+            for case in 0..4 {
+                let _ = messages();
+                let compares = CARD_PASSES[2].load(Ordering::Relaxed);
+                let (title, start, to) = title_of(resource, len);
+                let (other, other_start, from) = title_of(resource + 1, len);
+                resource += 2;
+                title[..64].fill(1);
+                other[..64].fill(2);
+                let list = host.new_list().unwrap();
+                match case {
+                    // Out of upload memory: the title's CPU wrote the source.
+                    0 => assert!(list.place_copy(start + 4096, start, 64)),
+                    // Out of another host copy, which a shader writes.
+                    1 => {
+                        from.refresh(&list, other_start as u64, 64);
+                        from.gpu_writes(&list, other_start as u64, 64);
+                        assert!(list.place_copy(start + 4096, other_start, 64));
+                    }
+                    // Within one host copy that a shader writes.
+                    2 => {
+                        to.refresh(&list, start as u64, 64);
+                        to.gpu_writes(&list, start as u64, 64);
+                        assert!(list.place_copy(start + 4096, start, 64));
+                    }
+                    // As 0, and nothing of the list reads it after: only the
+                    // compare does, for a copy in the card's memory.
+                    _ => assert!(list.place_copy(start + 4096, start, 64)),
+                }
+                // As a draw's root view does (`VICTORY_ROOT_SRV_DIRECT=1`).
+                if case < 3 {
+                    dispatch(&list, to.gpu((start + 4096) as u64), out_gpu(&out));
+                }
+                list.close();
+                host.execute(&[&list]);
+                let said = messages();
+                let carded = to.carded();
+                let compared = CARD_PASSES[2].load(Ordering::Relaxed) - compares;
+                eprintln!("{len:#x} case {case}: carded {carded}, compares {compared}, {} messages", said.len());
+                for (id, text) in &said {
+                    eprintln!("{len:#x} case {case} (carded {carded}, compares {compared}): D3D12 {id}: {text}");
+                }
+                if !said.is_empty() {
+                    wrong.push((len, case, said.len()));
+                }
+                assert_eq!(title[4096], if case == 1 { 2 } else { 1 }, "the copy's bytes");
+            }
+        }
+        assert_eq!(wrong, Vec::new(), "(bytes, case, messages) the debug layer spoke of");
+    }
+
+    fn out_gpu(out: &ID3D12Resource) -> u64 {
+        // SAFETY: a live buffer.
+        unsafe { out.GetGPUVirtualAddress() }
+    }
     /// What copies with two sides cost to make (ignored: a measurement for
     /// `VICTORY_CARD_ALL`): buffers of 64 KiB on the card and in the PC's
     /// memory.
@@ -317,5 +623,63 @@ mod tests {
             after.saturating_sub(before)
         );
         drop((card, pc));
+    }
+}
+
+/// [`forwards`]: which fills take the bytes of a copy at its place ahead of
+/// them, and which keep reading title memory.
+#[cfg(test)]
+mod forward_tests {
+    use super::{View, forwards};
+
+    fn put(dst: usize, len: usize, from: usize) -> View {
+        View::Put { dst, len, from: Some(from) }
+    }
+
+    fn fill(src: usize, len: usize) -> View {
+        View::Fill { src, len }
+    }
+
+    #[test]
+    fn a_fill_behind_a_copy_takes_its_bytes() {
+        let runs = vec![(false, vec![put(0x1000, 0xd0, 0x9000), View::Other, fill(0x1020, 0xb0)])];
+        assert_eq!(forwards(&runs, |_, _| true), vec![(0, 2, 0x9020)]);
+        // In a later list too.
+        let runs = vec![(false, vec![put(0x1000, 0xd0, 0x9000)]), (false, vec![View::Other, fill(0x1000, 0xd0)])];
+        assert_eq!(forwards(&runs, |_, _| true), vec![(1, 1, 0x9000)]);
+    }
+
+    #[test]
+    fn fills_ahead_of_the_copy_keep_the_old_bytes() {
+        let runs = vec![(false, vec![fill(0x1000, 0x20)]), (false, vec![fill(0x1040, 0x20), put(0x1000, 0xd0, 0x9000)])];
+        assert!(forwards(&runs, |_, _| true).is_empty());
+    }
+
+    #[test]
+    fn the_last_copy_ahead_of_the_fill_is_the_one_taken() {
+        let runs = vec![(false, vec![put(0x1000, 0xd0, 0x9000), put(0x1000, 0xd0, 0xa000), fill(0x1010, 0x10)])];
+        assert_eq!(forwards(&runs, |_, _| true), vec![(0, 2, 0xa010)]);
+        // One that puts only part of the first leaves neither standing there.
+        let runs = vec![(false, vec![put(0x1000, 0xd0, 0x9000), put(0x1080, 0x10, 0xa000), fill(0x1000, 0x10)])];
+        assert!(forwards(&runs, |_, _| true).is_empty());
+    }
+
+    #[test]
+    fn anything_that_may_change_the_bytes_leaves_the_fill_alone() {
+        let alone = |steps: Vec<View>, twice: bool, blocked: bool| forwards(&[(twice, steps)], |_, _| blocked).is_empty();
+        // A shader's declared write or a buffer copy in between.
+        assert!(alone(vec![put(0x1000, 0xd0, 0x9000), View::Writes { at: 0x10cc, len: 4 }, fill(0x1000, 0xd0)], false, true));
+        // A step of ours in between.
+        assert!(alone(vec![put(0x1000, 0xd0, 0x9000), View::Run, fill(0x1000, 0xd0)], false, true));
+        // A fill that reaches past the copy's bytes.
+        assert!(alone(vec![put(0x1000, 0xd0, 0x9000), fill(0x1000, 0xe0)], false, true));
+        // A copy that did not take its bytes on the CPU (out of a host copy).
+        assert!(alone(vec![View::Put { dst: 0x1000, len: 0xd0, from: None }, fill(0x1000, 0xd0)], false, true));
+        // A list named twice in the submission.
+        assert!(alone(vec![put(0x1000, 0xd0, 0x9000), fill(0x1000, 0xd0)], true, true));
+        // A fill that would not wait for flights: as before.
+        assert!(alone(vec![put(0x1000, 0xd0, 0x9000), fill(0x1000, 0xd0)], false, false));
+        // A write elsewhere leaves it standing.
+        assert!(!alone(vec![put(0x1000, 0xd0, 0x9000), View::Writes { at: 0x10d0, len: 4 }, fill(0x1000, 0xd0)], false, true));
     }
 }

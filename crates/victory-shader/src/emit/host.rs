@@ -2,6 +2,8 @@
 //! tests, drawing a full-screen triangle and reading the target back.
 
 use std::ffi::CString;
+#[cfg(test)]
+use std::os::windows::ffi::OsStrExt;
 
 use windows::Win32::Graphics::Direct3D::*;
 use windows::Win32::Graphics::Direct3D12::*;
@@ -58,13 +60,57 @@ fn target_format(e: &SigElement) -> DXGI_FORMAT {
     }
 }
 
+/// Tests on Windows 10, whose own D3D12 stops at shader model 6.5: the
+/// Agility SDK in `VICTORY_D3D12_DIR` is made the process's runtime, as
+/// victory.exe does with its `D3D12\` folder.
+#[cfg(test)]
+fn agility() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let Some(dir) = std::env::var_os("VICTORY_D3D12_DIR").filter(|v| !v.is_empty()) else { return };
+        let dir = std::path::absolute(std::path::PathBuf::from(dir)).unwrap();
+        let dll: Vec<u16> = dir.join("D3D12Core.dll").as_os_str().encode_wide().chain([0]).collect();
+        let mut path = dir.to_string_lossy().into_owned();
+        if !path.ends_with('\\') {
+            path.push('\\');
+        }
+        path.push('\0');
+        // SAFETY: NUL-terminated names; the export is a u32; the factory is
+        // kept for the life of the process, since the global state refers to it.
+        unsafe {
+            use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+            let module = LoadLibraryW(dll.as_ptr());
+            assert!(!module.is_null(), "no D3D12Core.dll in {}", dir.display());
+            let version = GetProcAddress(module, c"D3D12SDKVersion".as_ptr().cast()).expect("D3D12SDKVersion");
+            let version = *(version as *const u32);
+            let mut config: Option<ID3D12SDKConfiguration1> = None;
+            D3D12GetInterface(&CLSID_D3D12SDKConfiguration, &mut config).unwrap();
+            let factory: ID3D12DeviceFactory =
+                config.unwrap().CreateDeviceFactory(version, PCSTR(path.as_ptr())).unwrap();
+            factory.SetFlags(D3D12_DEVICE_FACTORY_FLAG_ALLOW_RETURNING_EXISTING_DEVICE).unwrap();
+            factory.ApplyToGlobalState().unwrap();
+            std::mem::forget(factory);
+        }
+    });
+}
+
 fn err(e: windows::core::Error) -> String {
     e.message().to_string()
+}
+
+/// Root constants to set: `data`, or one zero where it is empty. The
+/// parameter declares at least one value (`root_signature_for`), and an
+/// empty slice's pointer is dangling: NVIDIA's driver reads it even for a
+/// count of 0 (an access violation at 0x4).
+fn constants(data: &[u32]) -> &[u32] {
+    if data.is_empty() { &[0] } else { data }
 }
 
 impl Host {
     /// The default adapter, or WARP with `warp` (or `VICTORY_WARP=1`).
     pub fn new(warp: bool) -> Result<Self, String> {
+        #[cfg(test)]
+        agility();
         let warp = warp || std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
         // SAFETY: plain D3D12/DXGI calls with valid out pointers.
         unsafe {
@@ -113,6 +159,19 @@ impl Host {
                     size_of_val(&sm) as u32,
                 )
                 .map_err(err)?;
+            let mut sm67 = D3D12_FEATURE_DATA_SHADER_MODEL {
+                HighestShaderModel: D3D_SHADER_MODEL_6_7,
+            };
+            super::set_helper_lane_waves(
+                device
+                    .CheckFeatureSupport(
+                        D3D12_FEATURE_SHADER_MODEL,
+                        (&raw mut sm67).cast(),
+                        size_of_val(&sm67) as u32,
+                    )
+                    .is_ok()
+                    && sm67.HighestShaderModel.0 >= D3D_SHADER_MODEL_6_7.0,
+            );
             if sm.HighestShaderModel.0 < D3D_SHADER_MODEL_6_6.0 {
                 return Err(format!(
                     "the device supports SM {:#x} only",
@@ -273,6 +332,23 @@ impl Host {
         };
         // SAFETY: the description points at live data.
         unsafe { self.device.CreateComputePipelineState(&desc) }.map_err(|e| self.explained(e))
+    }
+
+    /// The wave sizes this device runs, fewest and most lanes
+    /// (`D3D12_FEATURE_D3D12_OPTIONS1`); a program declaring a wave size
+    /// outside them is refused.
+    pub fn wave_lanes(&self) -> Result<(u32, u32), String> {
+        let mut o = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+        // SAFETY: the feature query writes the structure of the given size.
+        unsafe {
+            self.device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS1,
+                (&raw mut o).cast(),
+                size_of_val(&o) as u32,
+            )
+        }
+        .map_err(err)?;
+        Ok((o.WaveLaneCountMin, o.WaveLaneCountMax))
     }
 
     /// The error with the debug layer's messages since the last call, if
@@ -657,6 +733,17 @@ impl Host {
         pso: &ID3D12PipelineState,
         d: &Draw,
     ) -> Result<Vec<[f32; 4]>, String> {
+        self.draw_repeated(root, pso, d, 1).map(|(out, _)| out)
+    }
+
+    pub(super) fn draw_repeated(
+        &self,
+        root: &ID3D12RootSignature,
+        pso: &ID3D12PipelineState,
+        d: &Draw,
+        repeats: u32,
+    ) -> Result<(Vec<[f32; 4]>, f64), String> {
+        assert!(repeats > 0 && (repeats == 1 || d.mesh_groups == 0));
         let dev = &self.device;
         let (w, h) = d.size;
         // SAFETY: D3D12 calls with descriptions that outlive them; resources
@@ -851,12 +938,10 @@ impl Host {
             list.SetGraphicsRootSignature(root);
             for (param, arg) in &d.roots {
                 match arg {
-                    Root::Constants(data) => list.SetGraphicsRoot32BitConstants(
-                        *param,
-                        data.len() as u32,
-                        data.as_ptr().cast(),
-                        0,
-                    ),
+                    Root::Constants(data) => {
+                        let data = constants(data);
+                        list.SetGraphicsRoot32BitConstants(*param, data.len() as u32, data.as_ptr().cast(), 0)
+                    }
                     Root::Table { sampler, index } => {
                         let (heap, size) = if *sampler {
                             (&sampler_heap, sampler_size)
@@ -893,11 +978,36 @@ impl Host {
                     }]),
                 );
             }
+            let stamps = if repeats > 1 {
+                let mut heap: Option<ID3D12QueryHeap> = None;
+                dev.CreateQueryHeap(&D3D12_QUERY_HEAP_DESC {
+                    Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP,
+                    Count: 2,
+                    NodeMask: 0,
+                }, &mut heap).map_err(err)?;
+                let heap = heap.ok_or("timestamp query heap")?;
+                let back = make(
+                    D3D12_HEAP_TYPE_READBACK,
+                    &buf_desc(16),
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    None,
+                )?;
+                list.EndQuery(&heap, D3D12_QUERY_TYPE_TIMESTAMP, 0);
+                Some((heap, back))
+            } else {
+                None
+            };
             if d.mesh_groups > 0 {
                 let list6: ID3D12GraphicsCommandList6 = list.cast().map_err(err)?;
                 list6.DispatchMesh(d.mesh_groups, 1, 1);
             } else {
-                list.DrawInstanced(3, 1, 0, 0);
+                for _ in 0..repeats {
+                    list.DrawInstanced(3, 1, 0, 0);
+                }
+            }
+            if let Some((heap, back)) = &stamps {
+                list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, 1);
+                list.ResolveQueryData(heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, 2, back, 0);
             }
             list.ResourceBarrier(&[transition(
                 &target,
@@ -963,7 +1073,20 @@ impl Host {
             }
             readback.Unmap(0, None);
             drop(keep);
-            Ok(out)
+            let us = if let Some((_, back)) = stamps {
+                let mut p = std::ptr::null_mut();
+                back.Map(0, None, Some(&mut p)).map_err(err)?;
+                let [start, end] = *p.cast::<[u64; 2]>();
+                back.Unmap(0, Some(&D3D12_RANGE::default()));
+                if end <= start {
+                    return Err("draw timestamps did not advance".into());
+                }
+                (end - start) as f64 * 1e6 / queue.GetTimestampFrequency().map_err(err)? as f64
+                    / f64::from(repeats)
+            } else {
+                0.0
+            };
+            Ok((out, us))
         }
     }
 }
@@ -1380,12 +1503,10 @@ impl Host {
             list.SetComputeRootSignature(root);
             for (param, arg) in &d.roots {
                 match arg {
-                    Root::Constants(data) => list.SetComputeRoot32BitConstants(
-                        *param,
-                        data.len() as u32,
-                        data.as_ptr().cast(),
-                        0,
-                    ),
+                    Root::Constants(data) => {
+                        let data = constants(data);
+                        list.SetComputeRoot32BitConstants(*param, data.len() as u32, data.as_ptr().cast(), 0)
+                    }
                     Root::Table { sampler, index } => {
                         let (h, size) = if *sampler {
                             (&samplers, sampler_size)
