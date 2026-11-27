@@ -657,27 +657,100 @@ pub(super) struct Taken {
 /// steps took: 88 ms a frame against 94 without the check, and 95 without card
 /// steps (the frame waits on the card; runs at one place, within their
 /// spread). `VICTORY_CARD_STEPS_LEARN=0`: not.
+///
+/// A page learned in loading stays learned (leafy-0314: 11 pages from 09:17
+/// on, three submissions a frame waiting on them, 137 ms). With
+/// `VICTORY_LEARN_FORGET=N` a submission refused for a learned page keeps
+/// what its fills there read when it was refused; once the wait is over that
+/// is compared with title memory, and a page found the same N times running
+/// is forgotten. A difference starts its count again. A forgotten page is
+/// back on the card, compared at landing, and learned again if it differs.
 mod late {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Mutex, OnceLock};
 
     const PAGE: usize = 4096;
 
-    static PAGES: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
+    /// Learned pages, and how many waits running each was found the same
+    /// after ([`waited`]).
+    static PAGES: Mutex<Option<std::collections::HashMap<usize, u32>>> = Mutex::new(None);
+    /// Pages forgotten ([`waited`]), for counting the ones learned again.
+    static FORGOTTEN: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
+    /// What the refused submission's fills of learned pages read (place,
+    /// bytes) when it was refused.
+    static HELD: Mutex<Vec<(usize, Vec<u8>)>> = Mutex::new(Vec::new());
     /// Fills done on the card compared, found written again, submissions
     /// refused for a learned page; pages learned in all; fills done on the CPU
-    /// compared, found written again.
-    pub(super) static COUNTS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+    /// compared, found written again; fills of learned pages compared after a
+    /// wait, found written; pages forgotten in all, learned again in all.
+    pub(super) static COUNTS: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
 
     pub(super) fn on() -> bool {
         static ON: OnceLock<bool> = OnceLock::new();
         *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_STEPS_LEARN").is_none_or(|v| v != "0"))
     }
 
+    /// `VICTORY_LEARN_FORGET`: the waits a learned page is found the same
+    /// after before it is forgotten; 0 never.
+    pub(super) fn forget() -> u32 {
+        static N: OnceLock<u32> = OnceLock::new();
+        *N.get_or_init(|| std::env::var("VICTORY_LEARN_FORGET").ok().and_then(|v| v.parse().ok()).unwrap_or(0))
+    }
+
     /// Whether the title was found writing a page of `[from, to)` late.
     pub(super) fn written(from: usize, to: usize) -> bool {
         let pages = PAGES.lock().unwrap_or_else(|e| e.into_inner());
-        pages.as_ref().is_some_and(|p| (from / PAGE..to.div_ceil(PAGE)).any(|page| p.contains(&page)))
+        pages.as_ref().is_some_and(|p| (from / PAGE..to.div_ceil(PAGE)).any(|page| p.contains_key(&page)))
+    }
+
+    /// A submission is refused for a learned page: what its fill of
+    /// `[src, src + len)` reads now is kept for [`waited`].
+    pub(super) fn hold(src: usize, len: usize) {
+        let mut now = vec![0; len];
+        if crate::host::read_into(src as *const u8, &mut now) {
+            HELD.lock().unwrap_or_else(|e| e.into_inner()).push((src, now));
+        }
+    }
+
+    /// The refused submission's wait is over (`waited`), or it did not wait:
+    /// what [`hold`] kept compared with title memory now.
+    pub(super) fn waited(waited: bool) {
+        let held = std::mem::take(&mut *HELD.lock().unwrap_or_else(|e| e.into_inner()));
+        if !waited || held.is_empty() {
+            return;
+        }
+        let n = forget();
+        let mut now = Vec::new();
+        let mut pages = PAGES.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(pages) = pages.as_mut() else { return };
+        for (src, then) in held {
+            now.clear();
+            now.resize(then.len(), 0);
+            if !crate::host::read_into(src as *const u8, &mut now) {
+                continue;
+            }
+            COUNTS[6].fetch_add(1, Ordering::Relaxed);
+            let same = now == then;
+            if !same {
+                COUNTS[7].fetch_add(1, Ordering::Relaxed);
+            }
+            for page in src / PAGE..(src + then.len()).div_ceil(PAGE) {
+                let Some(clean) = pages.get_mut(&page) else { continue };
+                *clean = if same { *clean + 1 } else { 0 };
+                if *clean < n {
+                    continue;
+                }
+                pages.remove(&page);
+                FORGOTTEN.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).insert(page);
+                COUNTS[8].fetch_add(1, Ordering::Relaxed);
+                tracing::info!(
+                    page = format_args!("{:#x}", page * PAGE),
+                    fill = format_args!("{src:#x}+{:#x}", then.len()),
+                    "card steps: a learned page was found the same after {n} waits running (VICTORY_LEARN_FORGET); \
+                     fills there go on the card again"
+                );
+            }
+        }
     }
 
     /// The submission has landed: what the fills of `sent` (place, length,
@@ -744,12 +817,18 @@ mod late {
         let mut pages = PAGES.lock().unwrap_or_else(|e| e.into_inner());
         let pages = pages.get_or_insert_with(Default::default);
         for page in from / PAGE..to.div_ceil(PAGE) {
-            if pages.insert(page) {
+            if pages.insert(page, 0).is_none() {
                 COUNTS[3].fetch_add(1, Ordering::Relaxed);
+                let mut forgotten = FORGOTTEN.lock().unwrap_or_else(|e| e.into_inner());
+                let again = forgotten.as_mut().is_some_and(|f| f.remove(&page));
+                if again {
+                    COUNTS[9].fetch_add(1, Ordering::Relaxed);
+                }
                 tracing::info!(
                     page = format_args!("{:#x}", page * PAGE),
                     fill = format_args!("{from:#x}+{:#x}", to - from),
                     by,
+                    again,
                     "card steps: the title wrote a constant buffer after the submission that reads it was sent; fills \
                      there wait from now on"
                 );
@@ -760,6 +839,14 @@ mod late {
 
 /// Why a submission is refused for [`late`].
 const WRITTEN_LATE: &str = "a fill reads a place the title was found writing after sending";
+
+/// The submission [`Host::card_steps`] gave nothing for is past its wait
+/// for flights (`waited`), or did not wait ([`late`]).
+pub(super) fn waited(waited: bool) {
+    if late::on() && late::forget() > 0 {
+        late::waited(waited);
+    }
+}
 
 impl Taken {
     pub(super) fn list(&self) -> &HostList {
@@ -837,6 +924,15 @@ impl Host {
             && does.iter().any(|d| matches!(*d, Does::Fill { src, len, .. } if late::written(src, src + len)))
         {
             late::COUNTS[2].fetch_add(1, Ordering::Relaxed);
+            if late::forget() > 0 {
+                for d in &does {
+                    if let Does::Fill { src, len, .. } = *d
+                        && late::written(src, src + len)
+                    {
+                        late::hold(src, len);
+                    }
+                }
+            }
             return Err(WRITTEN_LATE);
         }
         if chosen.is_empty() {
@@ -1109,7 +1205,7 @@ pub(super) fn log(frames: f64) {
         let c: Vec<f64> = late::COUNTS
             .iter()
             .enumerate()
-            .map(|(i, c)| if i == 3 { 0.0 } else { c.swap(0, Ordering::Relaxed) as f64 / frames })
+            .map(|(i, c)| if matches!(i, 3 | 8 | 9) { 0.0 } else { c.swap(0, Ordering::Relaxed) as f64 / frames })
             .collect();
         tracing::info!(
             "card steps, places the title writes after sending (VICTORY_CARD_STEPS_LEARN), per frame: {:.1} fills on the card \
@@ -1122,6 +1218,17 @@ pub(super) fn log(frames: f64) {
             c[2],
             late::COUNTS[3].load(Ordering::Relaxed)
         );
+        if late::forget() > 0 {
+            tracing::info!(
+                "card steps, learned pages let go (VICTORY_LEARN_FORGET={}), per frame: {:.2} fills of learned pages \
+                 compared after their wait, {:.2} found written; in all {} pages forgotten, {} learned again",
+                late::forget(),
+                c[6],
+                c[7],
+                late::COUNTS[8].load(Ordering::Relaxed),
+                late::COUNTS[9].load(Ordering::Relaxed)
+            );
+        }
     }
     #[cfg(feature = "diagnostics")]
     {

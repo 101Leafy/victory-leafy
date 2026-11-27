@@ -6506,6 +6506,9 @@ impl Host {
             } else {
                 self.settle(&mut submitted, why);
             }
+            card_steps::waited(true);
+        } else if own.is_none() {
+            card_steps::waited(false);
         }
         #[cfg(feature = "diagnostics")]
         ahead.part(13);
