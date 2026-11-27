@@ -3454,6 +3454,9 @@ mod atomic_tests {
     }
 }
 
+#[cfg(all(test, windows))]
+mod helper_lane_tests;
+
 #[cfg(test)]
 mod barycentric_tests {
     use super::container::SigElement;
@@ -3476,7 +3479,7 @@ mod barycentric_tests {
         3 << 25 | dst << 17 | b << 9 | (256 + a)
     }
 
-    fn element(name: &str, kind: u8, row: u32) -> SigElement {
+    pub(super) fn element(name: &str, kind: u8, row: u32) -> SigElement {
         SigElement {
             name: name.into(),
             index: 0,
@@ -3497,7 +3500,7 @@ mod barycentric_tests {
         pixel_of(words, input_addr, false, Vec::new(), Vec::new())
     }
 
-    fn pixel_with_inputs(words: &[u32], input_addr: u32, inputs: &[container::SigElement]) -> Result<HostShader, ShaderError> {
+    pub(super) fn pixel_with_inputs(words: &[u32], input_addr: u32, inputs: &[container::SigElement]) -> Result<HostShader, ShaderError> {
         pixel_full(words, input_addr, inputs, false, Vec::new(), Vec::new())
     }
 
