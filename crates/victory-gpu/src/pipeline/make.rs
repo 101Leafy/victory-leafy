@@ -481,6 +481,19 @@ fn wait_every_frame() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_WAIT_EVERY_FRAME").is_some_and(|v| v == "1"))
 }
 
+/// Whether a draw waits only for a pipeline a worker can make now: one
+/// being made, or one queued while a worker is free. In main-own-r1's
+/// world entry (game 41-66 s) every worker was in a driver compile of
+/// about 10 s, 250 requested pipelines queued behind them, and each new
+/// one met took the frame's whole 500 ms before its draws were dropped:
+/// 2 to 3 fps for 25 s. Its draws are dropped from the first frame on,
+/// as they were after the wait. Passes over the screen keep waiting.
+/// `VICTORY_PIPELINE_WAIT_FREE=1`: on.
+fn wait_free_only() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_WAIT_FREE").is_some_and(|v| v == "1"))
+}
+
 /// Claims `frame` as the one in which draws wait for `p`: whether it is (or
 /// already was) that frame.
 fn claim_wait(p: &Pending, frame: u64) -> bool {
@@ -502,6 +515,13 @@ fn wait(p: &Pending, frame: u64) {
     }
     let budget = if screen { screen_budget() } else { wait_budget() };
     if budget.is_zero() {
+        return;
+    }
+    if !screen
+        && wait_free_only()
+        && p.queue_state.load(Ordering::Relaxed) != MAKING
+        && GENERAL_BUSY.load(Ordering::Relaxed) >= workers_wanted() as u64
+    {
         return;
     }
     // The frame the budget belongs to, and what was waited of it (or is
@@ -935,11 +955,17 @@ fn workers() -> bool {
                             crate::cores::hold_on_fast_cores(true);
                         }
                         BUSY.fetch_add(1, Ordering::Relaxed);
+                        if !screens_only {
+                            GENERAL_BUSY.fetch_add(1, Ordering::Relaxed);
+                        }
                         {
                             let _slot = ComputeSlot(p.graphics.is_none());
                             p.make();
                         }
                         BUSY.fetch_sub(1, Ordering::Relaxed);
+                        if !screens_only {
+                            GENERAL_BUSY.fetch_sub(1, Ordering::Relaxed);
+                        }
                         if long && raise {
                             set(priority);
                         }
@@ -996,6 +1022,9 @@ impl Drop for ComputeSlot {
 
 /// Workers making a pipeline now.
 static BUSY: AtomicU64 = AtomicU64::new(0);
+
+/// Of them, workers that take any pipeline (not passes over the screen alone).
+static GENERAL_BUSY: AtomicU64 = AtomicU64::new(0);
 
 /// The lists' lengths and the busy workers, for the workers' summary line.
 fn queues() -> super::spent::Queues {
