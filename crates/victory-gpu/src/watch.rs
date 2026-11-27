@@ -2979,13 +2979,6 @@ fn taken(from: usize, to: usize) {
     }
 }
 
-/// `VICTORY_GUARD_FRAMES=1`, for the log: whether the blocks made read-only
-/// are the same frame after frame, and how many guard faults land on those.
-/// In Leafy's run (leafy-0314) 400 blocks a frame were made read-only, with
-/// 282 guard faults and 264 waits for the guards' lock (91 ms) over all
-/// threads. A block guarded and written every frame costs a fault and two
-/// protection changes each time for nothing.
-#[cfg(feature = "diagnostics")]
 /// Write watch askings cut at reservation ends (`VICTORY_ASK_SPANS=1`), and
 /// the counts of its log line, kept with the switch off too.
 ///
@@ -3214,6 +3207,13 @@ pub(crate) mod ask_spans {
     }
 }
 
+/// `VICTORY_GUARD_FRAMES=1`, for the log: whether the blocks made read-only
+/// are the same frame after frame, and how many guard faults land on those.
+/// In Leafy's run (leafy-0314) 400 blocks a frame were made read-only, with
+/// 282 guard faults and 264 waits for the guards' lock (91 ms) over all
+/// threads. A block guarded and written every frame costs a fault and two
+/// protection changes each time for nothing.
+#[cfg(feature = "diagnostics")]
 pub(crate) mod guard_frames {
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
