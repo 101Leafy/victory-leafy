@@ -824,6 +824,36 @@ unsafe extern "system" fn compiler_crashed(
     }
 }
 
+/// How this thread's host pipeline came about, over the library calls of
+/// one make ([`came_of`]): the most telling of them (a compile tells more
+/// than a load).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Came {
+    /// No library call (refused before, a pipeline on the bad list).
+    Nothing,
+    /// Loaded from the library.
+    Loaded,
+    /// Created by the driver (not in the library, or no library).
+    Compiled,
+}
+
+thread_local! {
+    /// Within [`came_of`]: what the library calls did so far.
+    static CAME: std::cell::Cell<Came> = const { std::cell::Cell::new(Came::Nothing) };
+}
+
+fn came(c: Came) {
+    CAME.with(|v| v.set(v.get().max(c)));
+}
+
+/// Runs `make` (a host pipeline's make on this thread) and says how it came
+/// about.
+pub(crate) fn came_of<R>(make: impl FnOnce() -> R) -> (R, Came) {
+    let before = CAME.replace(Came::Nothing);
+    let made = make();
+    (made, CAME.replace(before))
+}
+
 /// The pipeline named `name`: loaded from the library by `load` if it is
 /// there with the same description, else made by `create` and stored.
 pub(crate) fn pipeline(
@@ -842,6 +872,7 @@ pub(crate) fn pipeline(
     let wide = HSTRING::from(name);
     let Some(library) = library() else {
         MADE.fetch_add(1, Ordering::Relaxed);
+        came(Came::Compiled);
         let began = std::time::Instant::now();
         let pso = create();
         super::spent::add(|p| {
@@ -866,6 +897,7 @@ pub(crate) fn pipeline(
         Ok(pso) => {
             LOADED.fetch_add(1, Ordering::Relaxed);
             super::spent::add(|p| p.loaded += 1);
+            came(Came::Loaded);
             crate::host::trail(|| {
                 let label = LABEL.with(|l| l.borrow().clone());
                 format!("pipeline library: loaded {label} in {:.1} ms", began.elapsed().as_secs_f64() * 1e3)
@@ -879,6 +911,7 @@ pub(crate) fn pipeline(
         load(&other.library, PCWSTR(wide.as_ptr())).ok()
     }) {
         LOADED_OTHER.fetch_add(1, Ordering::Relaxed);
+        came(Came::Loaded);
         if OTHER_DIRS.get().is_some_and(|(_, keep)| *keep) {
             let _all = one_call();
             let _stores = library.saving.read().unwrap_or_else(|e| e.into_inner());
@@ -886,6 +919,7 @@ pub(crate) fn pipeline(
         }
         return Ok(pso);
     }
+    came(Came::Compiled);
     // Compiles take up to seconds. Keep only this name held.
     let pso = {
         let _call = call("make", name);
@@ -1165,13 +1199,57 @@ pub(crate) fn slow_ms(key: &str) -> u64 {
     slow_ones().as_ref().and_then(|s| s.get(key).copied()).unwrap_or(0)
 }
 
-/// The title pipeline with `key` took `ms` to make.
-pub(crate) fn note_time(key: &str, ms: u64) {
-    if ms < SLOW_MS {
+/// Keys put on the slow list and taken off it in this run.
+pub(crate) static SLOW_ADDED: AtomicU64 = AtomicU64::new(0);
+pub(crate) static SLOW_REMOVED: AtomicU64 = AtomicU64::new(0);
+
+/// Whether the slow list holds compile times only: a load from the library
+/// neither puts a key on it nor takes one off, and a compile under
+/// [`SLOW_MS`] takes it off. The list is there for the compiles that hold
+/// every worker for tens of seconds, but any make of a second went on it,
+/// loads too, and nothing came off: 1,817 of 3,224 early keys were on it in
+/// one cache, most of them loads that met a cold page of the mapped
+/// library, and they waited behind the others in the slow queue.
+/// On by default (a fix of what is counted); `VICTORY_PIPELINE_SLOW_LIST=0`:
+/// every make of a second is added, nothing removed, as before.
+fn compiles_only() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_SLOW_LIST").is_none_or(|v| v != "0"))
+}
+
+/// What a make of `ms` that came about as `came` does to the slow list:
+/// `Some(true)` adds (or raises) the key, `Some(false)` takes it off.
+fn slow_change(ms: u64, came: Came, compiles_only: bool) -> Option<bool> {
+    if !compiles_only {
+        return (ms >= SLOW_MS).then_some(true);
+    }
+    match came {
+        Came::Compiled => Some(ms >= SLOW_MS),
+        Came::Nothing | Came::Loaded => None,
+    }
+}
+
+/// The title pipeline with `key` took `ms` to make, and came about as `came`.
+pub(crate) fn note_time(key: &str, ms: u64, came: Came) {
+    let Some(add) = slow_change(ms, came, compiles_only()) else { return };
+    let mut slow = slow_ones();
+    let slow = slow.get_or_insert_default();
+    if !add {
+        if slow.remove(key).is_some() {
+            SLOW_REMOVED.fetch_add(1, Ordering::Relaxed);
+            // With the next save of the early list.
+            USED_CHANGED.store(true, Ordering::Relaxed);
+        }
         return;
     }
-    let mut slow = slow_ones();
-    let known = slow.get_or_insert_default().entry(key.to_owned()).or_insert(0);
+    let mut new = false;
+    let known = slow.entry(key.to_owned()).or_insert_with(|| {
+        new = true;
+        0
+    });
+    if new {
+        SLOW_ADDED.fetch_add(1, Ordering::Relaxed);
+    }
     if ms > *known {
         *known = ms;
         // With the next save of the early list.
@@ -1228,6 +1306,56 @@ mod tests {
     fn a_save_buffer_the_host_cannot_give_is_refused() {
         assert!(zeroed(usize::MAX / 2).is_none());
         assert_eq!(zeroed(100).as_deref(), Some(&[0u8; 100][..]));
+    }
+
+    /// Only compiles go on the slow list or come off it; with the switch
+    /// off, as before, any make of a second goes on and nothing comes off.
+    #[test]
+    fn the_slow_list_counts_compiles_only() {
+        assert_eq!(slow_change(SLOW_MS, Came::Compiled, true), Some(true));
+        assert_eq!(slow_change(SLOW_MS - 1, Came::Compiled, true), Some(false));
+        for came in [Came::Loaded, Came::Nothing] {
+            assert_eq!(slow_change(5 * SLOW_MS, came, true), None, "{came:?}");
+            assert_eq!(slow_change(1, came, true), None, "{came:?}");
+        }
+        assert_eq!(slow_change(SLOW_MS, Came::Loaded, false), Some(true));
+        assert_eq!(slow_change(SLOW_MS - 1, Came::Compiled, false), None);
+    }
+
+    #[test]
+    fn a_slow_key_that_compiles_quickly_comes_off_the_list() {
+        let key = "slow-list-test-key";
+        let before = SLOW_REMOVED.load(Ordering::Relaxed);
+        note_time(key, 2 * SLOW_MS, Came::Compiled);
+        assert!(slow(key));
+        // A quick load says nothing of the compile.
+        note_time(key, 10, Came::Loaded);
+        assert!(slow(key));
+        note_time(key, 10, Came::Compiled);
+        assert!(!slow(key));
+        assert!(SLOW_REMOVED.load(Ordering::Relaxed) > before);
+        // Loads alone never put one on.
+        note_time(key, 5 * SLOW_MS, Came::Loaded);
+        assert!(!slow(key));
+    }
+
+    /// What a make's library calls did, the most telling of them, kept
+    /// apart from an enclosing make's.
+    #[test]
+    fn came_of_tells_the_most_telling_call() {
+        let ((), c) = came_of(|| {
+            came(Came::Loaded);
+            came(Came::Compiled);
+            came(Came::Loaded);
+        });
+        assert_eq!(c, Came::Compiled);
+        let ((), outer) = came_of(|| {
+            came(Came::Loaded);
+            let ((), inner) = came_of(|| came(Came::Compiled));
+            assert_eq!(inner, Came::Compiled);
+        });
+        assert_eq!(outer, Came::Loaded);
+        assert_eq!(came_of(|| ()).1, Came::Nothing);
     }
 
     #[test]
