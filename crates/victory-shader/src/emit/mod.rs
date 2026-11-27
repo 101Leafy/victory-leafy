@@ -617,6 +617,25 @@ pub fn wave_wide_only(hash: &str) -> bool {
     only.iter().any(|o| hash.starts_with(o.as_str()))
 }
 
+/// `VICTORY_WAVE_WIDE_SCENE=1`: the wave-wide form for four programs known by digest, in
+/// groups of one console wave: the two kernels the NVIDIA fork widens by default, and the
+/// volumetric light's two tiled programs (`CS_TransmissionVolumetrics_Tiled` and
+/// `_Tiled_LocalLights`, GTA VI 1.0.2.1). Those two have an LDS read and write in one
+/// lane-branch region, so no other form translates them on a 32-lane host and their
+/// dispatches are dropped: no volumetric light or fog. Off by default, as the form is.
+fn scene_wide(c: &Container, native: &NativeProgram) -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_WIDE_SCENE").is_some_and(|v| v == "1"))
+        && matches!(native.io, crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 64)
+        && matches!(
+            c.digest,
+            [0x58, 0x1d, 0xab, 0x2c, 0xd8, 0xbc, 0xf2, 0x2e, 0x5c, 0x96, 0x4b, 0x98, 0xe9, 0x03, 0x48, 0xd1]
+                | [0x24, 0x31, 0xbb, 0xe7, 0xdc, 0x15, 0x4a, 0xd7, 0x59, 0xd2, 0x0b, 0xc9, 0x54, 0x82, 0x9c, 0x1c]
+                | [0x24, 0x12, 0x6c, 0x14, 0xdc, 0x76, 0x19, 0xb0, 0x82, 0xef, 0x57, 0x12, 0x96, 0x03, 0x88, 0x90]
+                | [0x70, 0x99, 0xa5, 0x7f, 0xde, 0xd1, 0x42, 0x61, 0x3b, 0x44, 0xf4, 0x10, 0x46, 0x3d, 0x6b, 0xe6]
+        )
+}
+
 /// Runs `f` (a translation on this thread) with the wave-wide form on when `on`
 /// ([`wave_wide_only`]).
 pub fn with_wave_wide<T>(on: bool, f: impl FnOnce() -> T) -> T {
@@ -851,7 +870,7 @@ fn emit_forms(
     if native.stage == HwStage::Cs && std::env::var_os("VICTORY_SCALAR_SPLITS").is_none_or(|v| v != "0") {
         let splits = lower::scalar_splits(p, st).unwrap_or_default();
         let halves = native.wave64 && lower::host_max_wave() == 32;
-        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1") || WIDE_HERE.get();
+        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1") || WIDE_HERE.get() || scene_wide(c, native);
         if !splits.is_empty() && (!halves || wide_on) {
             let why = std::env::var_os("VICTORY_WAVE_WHY").is_some();
             match widen(c, native, p, &splits, why, false) {
@@ -939,7 +958,7 @@ fn emit_forms(
         // lost the card in a submission of two programs that had just moved to it
         // (`ptfx_CS_lightAtlas_Sprite` and `_Trail`). The 32-lane programs' form below, which
         // has no barrier, stays on.
-        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1") || WIDE_HERE.get();
+        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1") || WIDE_HERE.get() || scene_wide(c, native);
         // A single guest wave can iterate an active-lane loop until both host
         // halves have finished. The precise latch and convergence conditions
         // for the driver compute route are checked by widen().
