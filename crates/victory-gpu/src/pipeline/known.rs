@@ -301,14 +301,39 @@ pub fn fingerprint() -> String {
     h.finalize().to_hex()[..16].to_owned()
 }
 
-/// The translations of earlier runs are in `dir` (the pipeline library is
-/// not used: what is made here is the driver's to keep).
+/// The translations of earlier runs are in `dir`.
 pub fn use_translations(dir: PathBuf) {
     crate::shader_cache::use_shader_cache(dir);
 }
 
-/// Makes the host pipelines of those of `which` (numbers in the file) and
-/// lets each go again: the driver's cache on disk keeps them. `each` is told
+/// Keeps what [`make`] makes in the pipeline library of the folder `part`,
+/// and takes what the run's library in `main` already holds from there. The
+/// driver's own cache on disk is not enough: a warm of 4,420 pipelines left
+/// the next run 191 to make again at 16 to 18 s each, and runs load from the
+/// library. Each warm process keeps its own part, since a library's save
+/// replaces the file and two processes cannot add to one; [`merge`] puts
+/// the parts into the run's library.
+pub fn keep_in(part: PathBuf, main: PathBuf) {
+    super::library::use_pipeline_cache(part);
+    super::library::use_other_libraries(vec![main], false);
+}
+
+/// For [`make`] in the last warm process: the run's library is the one in
+/// `main`, and the pipelines found in the libraries of `parts` go into it.
+pub fn merge(main: PathBuf, parts: Vec<PathBuf>) {
+    super::library::use_pipeline_cache(main);
+    super::library::use_other_libraries(parts, true);
+}
+
+/// Writes the library of [`keep_in`] or [`merge`]; how many pipelines this
+/// process stored in it.
+pub fn save() -> u64 {
+    super::library::save(true);
+    super::library::STORED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Makes the host pipelines of those of `which` (numbers in the file), or
+/// loads them from a library, and lets each go again. `each` is told
 /// the number before, and what came of it after: milliseconds and whether
 /// there is one.
 pub fn make(dir: &Path, which: &[usize], mut each: impl FnMut(usize, Option<(f64, bool)>)) {

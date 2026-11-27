@@ -1,5 +1,7 @@
 //! `victory warm`: host pipelines made ahead of a run (`known_pipelines`), in
 //! processes of their own: a compiler that crashes or hangs costs one pipeline.
+//! Each process keeps what it makes in a library of its own under
+//! `warm-parts`, and a last one puts those into the run's library.
 
 use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Write};
@@ -26,15 +28,46 @@ fn folder() -> Result<PathBuf> {
     Ok(cfg.cache_subdir("shaders")?.with_file_name("pipelines"))
 }
 
-pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, these: Option<String>) -> Result<()> {
+/// The folder of the run's library, as the runs find it.
+fn library_dir(dir: &Path) -> PathBuf {
+    std::env::var_os("VICTORY_LIBRARY_DIR").filter(|v| !v.is_empty()).map_or_else(|| dir.to_owned(), PathBuf::from)
+}
+
+/// The libraries of the warm processes, `warm-parts/<n>` beside the run's
+/// library, and the numbers each holds.
+const PARTS: &str = "warm-parts";
+const PART_MADE: &str = "made.txt";
+
+fn parts(dir: &Path) -> PathBuf {
+    library_dir(dir).join(PARTS)
+}
+
+pub fn run(
+    jobs: Option<usize>,
+    limit: Option<usize>,
+    again: bool,
+    used: bool,
+    these: Option<String>,
+    part: Option<PathBuf>,
+    merge: bool,
+) -> Result<()> {
     let dir = folder()?;
+    if merge {
+        return merge_parts(&dir);
+    }
     if let Some(these) = these {
-        return make(&dir, &these);
+        return make(&dir, &these, part);
     }
     let began = Instant::now();
+    // A warm stopped before its last process: its parts first.
+    if parts(&dir).exists() {
+        merge_child(&dir);
+    }
     victory_hle::known_pipelines::use_translations(dir.with_file_name("shaders"));
     let fingerprint = known::fingerprint();
-    let done_file = dir.join("warm-done.txt");
+    // Not `warm-done.txt`: those were left to the driver's cache and are
+    // not in the library.
+    let done_file = library_dir(&dir).join("warm-kept.txt");
     let bad_file = dir.join("warm-bad.txt");
     let keys = known::keys(&dir);
     let listed = std::fs::read_to_string(&done_file).unwrap_or_default();
@@ -70,6 +103,7 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
     );
     let chunks: Vec<&[usize]> = all.chunks(AT_ONCE).collect();
     let next = AtomicUsize::new(0);
+    let slot = AtomicUsize::new(0);
     let state = Mutex::new((Vec::<f64>::new(), 0usize, 0usize));
     let done_out = Mutex::new(std::fs::OpenOptions::new().create(true).append(true).open(&done_file)?);
     // (Read back by the runs: these are made beside the others, not before.)
@@ -78,10 +112,12 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
     std::thread::scope(|s| {
         for _ in 0..jobs.min(chunks.len()) {
             s.spawn(|| {
+                // One process at a time adds to a part.
+                let part = parts(&dir).join(slot.fetch_add(1, Ordering::Relaxed).to_string());
                 while let Some(&chunk) = chunks.get(next.fetch_add(1, Ordering::Relaxed)) {
                     let mut rest = chunk;
                     while !rest.is_empty() {
-                        let (made, ended) = child(rest, |n, ms, there| {
+                        let (made, ended) = child(rest, &part, |n, ms, there| {
                             if ms >= SLOW_MS {
                                 let _ = writeln!(lock(&slow_out), "\n{} {ms:.0}", keys[n]);
                             }
@@ -111,6 +147,9 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
             });
         }
     });
+    if parts(&dir).exists() {
+        merge_child(&dir);
+    }
     let (mut times, refused, crashed) = state.into_inner().unwrap_or_else(|e| e.into_inner());
     times.sort_by(f64::total_cmp);
     let at = |q: f64| times.get((times.len() as f64 * q) as usize).copied().unwrap_or(0.0);
@@ -131,14 +170,19 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Has a process make `these`; how many it made, and how it ended if not well.
-fn child(these: &[usize], mut each: impl FnMut(usize, f64, bool)) -> (usize, Option<String>) {
+/// Has a process make `these` into the library in `part`; how many it made,
+/// and how it ended if not well.
+fn child(these: &[usize], part: &Path, mut each: impl FnMut(usize, f64, bool)) -> (usize, Option<String>) {
     let list: Vec<String> = these.iter().map(usize::to_string).collect();
     let spawned = std::env::current_exe().and_then(|exe| {
         use std::os::windows::process::CommandExt;
         const IDLE_PRIORITY_CLASS: u32 = 0x40;
         Command::new(exe)
             .args(["warm", "--these", &list.join(",")])
+            .arg("--part")
+            .arg(part)
+            // Its library is the part's.
+            .env_remove("VICTORY_LIBRARY_DIR")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -193,23 +237,86 @@ fn child(these: &[usize], mut each: impl FnMut(usize, f64, bool)) -> (usize, Opt
     (made, Some(why))
 }
 
-/// What such a process does.
-fn make(dir: &Path, these: &str) -> Result<()> {
+/// What such a process does. Without `part` the pipelines are only made,
+/// as before the parts.
+fn make(dir: &Path, these: &str, part: Option<PathBuf>) -> Result<()> {
     let these: Vec<usize> = these.split(',').map(|n| n.parse().context("--these")).collect::<Result<_>>()?;
     let cfg = victory_core::Config::load()?;
     victory_hle::known_pipelines::use_translations(cfg.cache_subdir("shaders")?);
+    if let Some(part) = &part {
+        std::fs::create_dir_all(part)?;
+        // `<the run's library>/warm-parts/<n>` (this process has no VICTORY_LIBRARY_DIR).
+        let main = part.parent().and_then(Path::parent).map_or_else(|| library_dir(dir), Path::to_owned);
+        known::keep_in(part.clone(), main);
+    }
     let mut out = std::io::stdout();
+    let mut made = String::new();
     known::make(dir, &these, |n, came| {
         let told = match came {
             None => writeln!(out, "at {n}"),
-            Some((ms, there)) => writeln!(out, "made {n} {ms:.2} {}", u8::from(there)),
+            Some((ms, there)) => {
+                if there {
+                    made += &format!("{n}\n");
+                }
+                writeln!(out, "made {n} {ms:.2} {}", u8::from(there))
+            }
         };
         if told.and_then(|()| out.flush()).is_err() {
             // Whoever asked is gone.
             std::process::exit(1);
         }
     });
-    // Without what a run's end does (nothing to save, the host's threads).
+    if let Some(part) = &part {
+        known::save();
+        std::fs::OpenOptions::new().create(true).append(true).open(part.join(PART_MADE))?.write_all(made.as_bytes())?;
+    }
+    // Without what a run's end does (the host's threads).
     let _ = out.flush();
+    std::process::exit(0)
+}
+
+/// Has a last process put the parts into the run's library, and lets them
+/// go if it did.
+fn merge_child(dir: &Path) {
+    let began = Instant::now();
+    let ran = std::env::current_exe()
+        .and_then(|exe| Command::new(exe).args(["warm", "--merge"]).stdin(Stdio::null()).stderr(Stdio::null()).output());
+    let failed = match &ran {
+        Ok(o) => {
+            let out = String::from_utf8_lossy(&o.stdout);
+            match out.lines().last() {
+                Some(said) if o.status.success() && said.starts_with("kept ") => {
+                    println!("{said}, in {:.0} s", began.elapsed().as_secs_f64());
+                    if let Err(e) = std::fs::remove_dir_all(parts(dir)) {
+                        println!("{PARTS} left: {e}");
+                    }
+                    return;
+                }
+                _ => o.status.to_string(),
+            }
+        }
+        Err(e) => e.to_string(),
+    };
+    println!("the pipelines of {PARTS} were not put into the library ({failed}); the next warm tries again");
+}
+
+/// What that process does.
+fn merge_parts(dir: &Path) -> Result<()> {
+    let cfg = victory_core::Config::load()?;
+    victory_hle::known_pipelines::use_translations(cfg.cache_subdir("shaders")?);
+    let mut found = Vec::new();
+    let mut these = std::collections::BTreeSet::new();
+    for entry in std::fs::read_dir(parts(dir))?.flatten() {
+        let listed = std::fs::read_to_string(entry.path().join(PART_MADE)).unwrap_or_default();
+        these.extend(listed.lines().filter_map(|l| l.parse::<usize>().ok()));
+        found.push(entry.path());
+    }
+    known::merge(library_dir(dir), found);
+    let these: Vec<usize> = these.into_iter().collect();
+    let mut there = 0;
+    known::make(dir, &these, |_, came| there += usize::from(came.is_some_and(|(_, t)| t)));
+    let stored = known::save();
+    println!("kept {stored} new pipelines of {} in the library ({there} made or loaded)", these.len());
+    let _ = std::io::stdout().flush();
     std::process::exit(0)
 }

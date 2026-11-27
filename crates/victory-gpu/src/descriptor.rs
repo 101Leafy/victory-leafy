@@ -104,6 +104,12 @@ impl Heap {
             .as_ref()
     }
 
+    /// The host heap if it is made already ([`Heap::host`] makes it).
+    #[cfg(windows)]
+    pub(crate) fn host_made(&self) -> Option<&host::HostHeap> {
+        self.host.get().and_then(Option::as_ref)
+    }
+
     /// The handle of descriptor `index` of this heap.
     #[cfg(windows)]
     pub(crate) fn handle(&self, index: u32) -> Option<u64> {
