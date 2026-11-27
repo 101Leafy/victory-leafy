@@ -194,26 +194,161 @@ pub(super) fn copies(line: &Line) -> Vec<Writer> {
         shadow: w.shadow.clone(),
         ..*w
     });
-    flying.flat_map(Taken::copied).chain(landing).collect()
+    // (In the order they were sent: those being landed first.)
+    landing.chain(flying.flat_map(Taken::copied)).collect()
 }
 
 /// Whether `runs` refresh another host copy of a destination in `copies`,
 /// or read it in a step that flights are not waited for otherwise
 /// (`Step::Host`): that reads title memory, where the copy is not yet.
 pub(super) fn copied_read(copies: &[Writer], runs: &[&HostList]) -> bool {
-    if copies.is_empty() {
-        return false;
-    }
-    runs.iter().any(|list| {
-        list.deferred().copies.iter().any(|step| match step {
-            Step::Refresh(shadow, at, len) => copies
-                .iter()
-                .any(|w| w.from < *at + *len && *at < w.to && w.shadow.as_ref().is_none_or(|s| !Arc::ptr_eq(s, shadow))),
-            Step::Host(_, (from, to)) => copies.iter().any(|w| w.from < *to && *from < w.to),
-            _ => false,
-        })
-    })
+    copied_reads(copies, runs, None).is_some()
 }
+
+/// Whether a copy done on the card that has not landed is refreshed through
+/// another host copy (`VICTORY_CARD_FORWARD=1`; off by default): the bytes
+/// are copied on the card from the host copy the copy wrote into the other
+/// one, in the list in front of the submission ([`Forward`]), and the
+/// submission does not wait for the copy's flight.
+///
+/// Why: in Leafy's run leafy-0314 such a refresh was the first reason
+/// submissions waited for flights in play, 68 ms a frame of a 225 ms frame
+/// (the fill at +0x50 that came first in the submission was named for it).
+///
+/// Why that is what the CPU would have read after the wait. The other
+/// host copy is brought up to date on the CPU while the submission is
+/// prepared, from title memory, where the copy is not yet. Our list runs
+/// after the copy's flight on the queue and before the submission's lists,
+/// and puts the copy's bytes over it; after the landing title memory holds
+/// the same bytes. Nothing is declared written there: what the CPU knows of
+/// the other host copy is older than what it holds, and its next refresh
+/// after the landing finds title memory changed and copies the same bytes,
+/// or finds nothing and leaves them. A later submission that refreshes it
+/// before the copy has landed gets the same done again. Not: a host copy in
+/// the card's memory (its CPU side goes up apart from our list), title
+/// memory in place, or a range shaders of a flight may be writing in the
+/// other host copy (the old wait).
+fn forward_on() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_CARD_FORWARD") {
+        return on;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_CARD_FORWARD"))
+}
+
+/// A copy of an earlier flight brought on the card from the host copy it
+/// wrote into another that the submission refreshes ([`forward_on`]):
+/// title memory `[at, end)`.
+pub(super) struct Forward {
+    from: Arc<Shadow>,
+    to: Arc<Shadow>,
+    at: usize,
+    end: usize,
+}
+
+/// What [`copied_reads`] found in the way: whether by a step that reads on
+/// the CPU, the span of the host copy the copy wrote, and the span of the
+/// one refreshed (none for a read on the CPU).
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct Seen {
+    host: bool,
+    copy: (u64, u64),
+    other: (u64, u64),
+}
+
+/// Why a submission is refused for [`Seen`].
+const REFRESHED: &str = "a copy done on the card is refreshed through another host copy";
+const READ_ON_CPU: &str = "a copy done on the card is read on the CPU by a step of ours (rectangle vertices)";
+
+impl Seen {
+    fn why(&self) -> &'static str {
+        if self.host { READ_ON_CPU } else { REFRESHED }
+    }
+
+    /// The same with both spans, once for each.
+    #[cfg(feature = "diagnostics")]
+    fn named(&self) -> &'static str {
+        static NAMED: Mutex<Option<std::collections::HashMap<Seen, &'static str>>> = Mutex::new(None);
+        let mut named = NAMED.lock().unwrap_or_else(|e| e.into_inner());
+        let named = named.get_or_insert_with(Default::default);
+        if let Some(why) = named.get(self) {
+            return why;
+        }
+        if named.len() >= 256 {
+            return self.why();
+        }
+        let (start, len) = self.copy;
+        let why = if self.host {
+            format!("{READ_ON_CPU}; the copy into {start:#x}+{len:#x}")
+        } else {
+            let (other, other_len) = self.other;
+            format!("{REFRESHED}; the copy into {start:#x}+{len:#x}, the one refreshed {other:#x}+{other_len:#x}")
+        };
+        let why: &'static str = Box::leak(why.into_boxed_str());
+        named.insert(*self, why);
+        why
+    }
+}
+
+/// [`copied_read`]: the first such read. With `forwards` a refresh that can
+/// be given the copy's bytes on the card ([`forward_on`]) is not one, and is
+/// added to them.
+fn copied_reads(copies: &[Writer], runs: &[&HostList], mut forwards: Option<&mut Vec<Forward>>) -> Option<Seen> {
+    if copies.is_empty() {
+        return None;
+    }
+    let span = |w: &Writer| w.shadow.as_ref().map_or((0, 0), |s| s.span());
+    for list in runs {
+        for step in list.deferred().copies.iter() {
+            match step {
+                Step::Refresh(shadow, at, len) => {
+                    for w in copies.iter().filter(|w| meet((w.from, w.to), (*at, *at + *len))) {
+                        if w.shadow.as_ref().is_some_and(|s| Arc::ptr_eq(s, shadow)) {
+                            continue;
+                        }
+                        let (start, size) = shadow.span();
+                        let (from, to) = (w.from.max(*at).max(start as usize), w.to.min(*at + *len).min((start + size) as usize));
+                        if let (Some(forwards), Some(copy)) = (forwards.as_deref_mut(), &w.shadow)
+                            && (from >= to || (!shadow.carded() && !shadow.in_place() && !shadow.writes_pending_in(from, to)))
+                        {
+                            if from < to {
+                                forwards.push(Forward {
+                                    from: copy.clone(),
+                                    to: shadow.clone(),
+                                    at: from,
+                                    end: to,
+                                });
+                            }
+                            continue;
+                        }
+                        return Some(Seen {
+                            host: false,
+                            copy: span(w),
+                            other: (start, size),
+                        });
+                    }
+                }
+                Step::Host(_, (from, to)) => {
+                    if let Some(w) = copies.iter().find(|w| meet((w.from, w.to), (*from, *to))) {
+                        return Some(Seen {
+                            host: true,
+                            copy: span(w),
+                            other: (0, 0),
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    None
+}
+
+/// Since the last frame-rate line: submissions refused for a copy done on
+/// the card refreshed through another host copy, for one read on the CPU;
+/// copies brought into another host copy ([`forward_on`]), their bytes.
+static COPIED: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
 /// What a step of a submission does to title memory, as the plan sees it.
 /// `asked`: flights in the air stop it from being done on the CPU now.
@@ -630,6 +765,8 @@ pub(super) struct Taken {
     own: Own,
     steps: std::collections::HashSet<(usize, usize), std::hash::BuildHasherDefault<AddressHash>>,
     copied: Vec<(Arc<Shadow>, usize, usize)>,
+    /// Copies of earlier flights it brought into other host copies.
+    forwards: Vec<Forward>,
     /// The fills' places, lengths and places in the buffer between
     /// ([`late`]).
     sent: Vec<(usize, usize, u64)>,
@@ -1047,25 +1184,32 @@ impl Host {
             }
             (line.written.clone(), copies(&line))
         };
-        blocked_by(&written, runs, false)?;
-        let taken = if copied_read(&copies, runs) {
-            Err("a copy done on the card is read through another host copy")
-        } else {
-            self.take_steps(&written, runs)
+        let blocked = blocked_by(&written, runs, false).is_some();
+        let mut forwards = Vec::new();
+        let seen = copied_reads(&copies, runs, forward_on().then_some(&mut forwards));
+        if let Some(seen) = seen {
+            COPIED[usize::from(seen.host)].fetch_add(1, Ordering::Relaxed);
+        }
+        if !blocked && seen.is_none() && forwards.is_empty() {
+            return None;
+        }
+        let taken = match seen {
+            Some(seen) => Err(seen.why()),
+            None => self.take_steps(&written, runs, forwards),
         };
         match taken {
             Ok(taken) => taken,
             Err(why) => {
                 DONE[3].fetch_add(1, Ordering::Relaxed);
                 #[cfg(feature = "diagnostics")]
-                refused(why);
+                refused(seen.map_or(why, |seen| seen.named()));
                 let _ = why;
                 None
             }
         }
     }
 
-    fn take_steps(&self, written: &[(usize, usize)], runs: &[&HostList]) -> Result<Option<Taken>, &'static str> {
+    fn take_steps(&self, written: &[(usize, usize)], runs: &[&HostList], forwards: Vec<Forward>) -> Result<Option<Taken>, &'static str> {
         let mut spent = crate::timeline::span("steps on the card: chosen");
         let (does, steps) = does_of(written, runs);
         let chosen = plan(&does, stage(), placed_order(), &mut None)?;
@@ -1097,7 +1241,7 @@ impl Host {
             }
             return Err(WRITTEN_LATE);
         }
-        if chosen.is_empty() {
+        if chosen.is_empty() && forwards.is_empty() {
             return Ok(None);
         }
         spent.next("steps on the card: what holds their bytes");
@@ -1187,6 +1331,17 @@ impl Host {
                 to,
             });
         }
+        // Copies of earlier flights brought into another host copy
+        // ([`forward_on`]): their places in the buffer between.
+        let mut forwarded = Vec::with_capacity(forwards.len());
+        for f in &forwards {
+            let len = (f.end - f.at) as u64;
+            if end + len > BETWEEN {
+                return Err("too much at once");
+            }
+            forwarded.push(end);
+            end = (end + len).next_multiple_of(256);
+        }
         spent.next("steps on the card: the list");
         let Some(own) = self.own_list() else {
             return Err("no host list or buffer for it");
@@ -1220,11 +1375,24 @@ impl Host {
             }
         }
         #[cfg(feature = "diagnostics")]
-        own.list.note_op(|| format!("{} copies of title memory done on the card, {end} bytes (VICTORY_CARD_STEPS)", ops.len()));
+        own.list.note_op(|| {
+            format!(
+                "{} copies of title memory done on the card and {} brought into other host copies, {end} bytes (VICTORY_CARD_STEPS)",
+                ops.len(),
+                forwards.len()
+            )
+        });
         let levels = ops.iter().map(|op| op.level).max().unwrap_or(0);
         for level in 0..=levels {
             let mut reads = Vec::new();
             let mut writes = Vec::new();
+            // Those first: what the submission's copies write over them
+            // comes after.
+            for (f, &at) in forwards.iter().zip(&forwarded).filter(|_| level == 0) {
+                let len = (f.end - f.at) as u64;
+                reads.push((&f.from.buffer, f.from.offset(f.at as u64), at, len));
+                writes.push((&f.to.buffer, f.to.offset(f.at as u64), at, len));
+            }
             for op in ops.iter().filter(|op| op.level == level) {
                 let len = op.len as u64;
                 let read = (&op.from.0.buffer, op.from.0.offset(op.from.1 as u64), op.at, len);
@@ -1280,6 +1448,8 @@ impl Host {
         DONE[0].fetch_add((ops.len() - copies) as u64, Ordering::Relaxed);
         DONE[1].fetch_add(copies as u64, Ordering::Relaxed);
         DONE[2].fetch_add(ops.iter().map(|op| op.len as u64).sum(), Ordering::Relaxed);
+        COPIED[2].fetch_add(forwards.len() as u64, Ordering::Relaxed);
+        COPIED[3].fetch_add(forwards.iter().map(|f| (f.end - f.at) as u64).sum(), Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
         noted(&ops);
         spent.end();
@@ -1312,6 +1482,7 @@ impl Host {
             own,
             steps,
             copied,
+            forwards,
             sent,
             cpu,
             put_off: later,
@@ -1371,6 +1542,17 @@ pub(super) fn log(frames: f64) {
         d[3],
         d[4],
     );
+    let c: Vec<f64> = COPIED.iter().map(|c| c.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+    if stage() >= 2 {
+        tracing::info!(
+            "card steps, copies done on the card read before they landed, per frame (VICTORY_CARD_FORWARD={}): {:.2}              submissions refused for a refresh of another host copy, {:.2} for a read on the CPU; {:.2} brought into the              other host copy on the card, {:.1} KB",
+            u8::from(forward_on()),
+            c[0],
+            c[1],
+            c[2],
+            c[3] / 1024.0,
+        );
+    }
     if late::on() {
         // (Index 3 counts in all, the others since the last line.)
         let c: Vec<f64> = late::COUNTS
