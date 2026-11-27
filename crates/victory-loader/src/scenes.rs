@@ -9,6 +9,10 @@
 //! opening scenes run through in a moment. VIctory hands the title no
 //! command line, so here the argc test becomes the store: the flag is set
 //! every launch and the function returns.
+//!
+//! `VICTORY_SKIP_TO_IIS=all` also drops the bit 0 test at both places the
+//! update reads it (+0x2348f7b and +0x2348fdb), so every scene it plays runs
+//! at rate 100, marked or not.
 
 use crate::frame_rate::Patched;
 use crate::resolution::Site;
@@ -24,8 +28,18 @@ pub const ARGV_TEST: Site = Site {
 pub const SKIP_FLAG: usize = 0x74fc238;
 pub const EPILOGUE: usize = 0x2216283;
 
+/// `test byte [rsi+0x7c], 1 ; je +0x10`, before each rate 100 call.
+pub const MARK_TESTS: [Site; 2] = [
+    Site { at: 0x2348f7b, what: "-skipToIIS for every scene", bytes: &[0xf6, 0x46, 0x7c, 0x01, 0x74, 0x10] },
+    Site { at: 0x2348fdb, what: "-skipToIIS for every scene", bytes: &[0xf6, 0x46, 0x7c, 0x01, 0x74, 0x10] },
+];
+
 pub fn asked() -> bool {
-    std::env::var_os("VICTORY_SKIP_TO_IIS").is_some_and(|v| v == "1")
+    std::env::var_os("VICTORY_SKIP_TO_IIS").is_some_and(|v| v == "1" || v == "all")
+}
+
+pub fn every_scene() -> bool {
+    std::env::var_os("VICTORY_SKIP_TO_IIS").is_some_and(|v| v == "all")
 }
 
 /// `mov byte [flag], 1 ; jmp epilogue`, nine bytes like the test it replaces.
@@ -57,6 +71,16 @@ pub unsafe fn apply_asked(base: usize, size: usize) {
         Patched::Failed(why) => tracing::warn!(site = %offset, why, "scenes: -skipToIIS not set"),
     }
     println!("scenes: -skipToIIS at title+{offset}: {done:?}");
+    if !every_scene() {
+        return;
+    }
+    for site in &MARK_TESTS {
+        let mut code = site.bytes.to_vec();
+        code[4..].fill(0x90);
+        // SAFETY: the caller's promise.
+        let done = unsafe { crate::resolution::write(base, size, site, &code) };
+        println!("scenes: every scene at rate 100, title+{:#x}: {done:?}", site.at);
+    }
 }
 
 #[cfg(test)]
