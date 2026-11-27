@@ -1,7 +1,7 @@
 @echo off
 setlocal EnableExtensions DisableDelayedExpansion
 rem ---------------------------------------------------------------------------
-rem Play-VIctory-8GB.cmd [1080p|720p|540p|1440p|4k]: the settings that fit a
+rem Play-VIctory-8GB.cmd [4k|1440p|1080p|936p|720p|540p]: the settings that fit a
 rem card that is short of memory, and a ladder of output sizes to find out
 rem whether a frame is spent on pixels or on preparation.
 rem
@@ -36,12 +36,13 @@ if not defined profile set "profile=1080p"
 
 if /i "%profile%"=="540p" set "lowres=1"
 if /i "%profile%"=="540p" set "pixels=960x540"
+if /i "%profile%"=="936p" set "pixels=1664x936"
 if /i "%profile%"=="720p" set "pixels=1280x720"
 if /i "%profile%"=="1080p" set "pixels=1920x1080"
 if /i "%profile%"=="1440p" set "pixels=2560x1440"
 if /i "%profile%"=="4k" set "pixels=3840x2160"
 if not defined pixels (
-  echo Unknown size "%profile%": use 540p, 720p, 1080p, 1440p or 4k. 1>&2
+  echo Unknown size "%profile%": use 540p, 720p, 936p, 1080p, 1440p or 4k. 1>&2
   exit /b 2
 )
 
@@ -54,6 +55,19 @@ if not exist "%VICTORY_GAME_DIR%\game_scarlett_master.exe" (
   exit /b 2
 )
 set "runner=%~dp0target\release\victory.exe"
+rem The frame CSV is behind the `diagnostics` feature (victory-gpu, host.rs:
+rem `#[cfg(feature = "diagnostics")] mod frames;`), so a plain release build
+rem writes no file and no line about it - which is what happened on the first
+rem 8 GiB run: VICTORY_FRAMES was set and nothing appeared. A diag build is
+rem release code generation with that feature on, at target\diag.
+if defined VICTORY_FRAMES if not "%VICTORY_FRAMES%"=="0" (
+  if exist "%~dp0target\diag\victory.exe" (
+    set "runner=%~dp0target\diag\victory.exe"
+  ) else (
+    echo VIctory: VICTORY_FRAMES is set and there is no target\diag build: a release build writes no frame CSV.
+    echo          cargo build --profile diag -p victory --features diagnostics
+  )
+)
 if not exist "%runner%" (
   echo Build it first: cargo build --release --locked -p victory 1>&2
   exit /b 2
@@ -79,6 +93,16 @@ rem size did not take, the log's "presenting to a window" line still reports
 rem 3840x2160 and drawn_of_the_screen stays at 2.025.
 if defined lowres if not defined VICTORY_TEST_LOWRES set "VICTORY_TEST_LOWRES=1"
 if not defined VICTORY_OUTPUT set "VICTORY_OUTPUT=%pixels%"
+rem
+rem 540p is the one rung the title may not take. On an 8 GiB laptop it asked
+rem for 960x540 and the title presented 1280x720 (Logan-Gaillard, 2026-11-27),
+rem so the size the window line reports is the size you got. 936p is one of
+rem the title's own modes, so it cannot be clamped: 1.56 MP, between 720p
+rem (0.92 MP) and 1080p (2.07 MP), and it is the low rung to trust.
+if defined lowres (
+  echo VIctory: 540p asks for 960x540 through VICTORY_TEST_LOWRES; the title may clamp it to 1280x720.
+  echo          Read the log's "presenting to a window" line before comparing this run to another.
+)
 
 rem Card memory: mip levels take card memory only for the levels the title
 rem holds, which the continuation measures at up to 3 GiB on this title, and
@@ -86,10 +110,13 @@ rem small buffers are kept at 64 KiB rather than 16 MiB apiece.
 if not defined VICTORY_LEVELS_ON_DEMAND set "VICTORY_LEVELS_ON_DEMAND=1"
 if not defined VICTORY_CARD_BUFFERS_MIN_KB set "VICTORY_CARD_BUFFERS_MIN_KB=64"
 
-rem Never hold a frame waiting for a pipeline that is still being made: a
-rem 500 ms stall measured on exactly this kind of card, over and over while a
-rem scene loads its shaders.
-if not defined VICTORY_PIPELINE_WAIT_MS set "VICTORY_PIPELINE_WAIT_MS=0"
+rem VICTORY_PIPELINE_WAIT_MS=0 is NOT set here, though an earlier version of
+rem this file set it. On an 8 GiB laptop it dropped 5 643 draws over 728
+rem pipelines ("draws dropped for pipelines not made yet") and the scene was
+rem not drawn at all (Logan-Gaillard, 2026-11-27): the frame got fast because
+rem its draws were gone. A frame that is fast because it was not drawn is not
+rem a frame to measure. Set it yourself if you want the stall gone, and look at
+rem the picture before you look at the clock.
 
 rem Two preparing experiments, off by default in the engine and NOT measured by
 rem anyone on your card. Note what the engine already does for itself: on a
@@ -158,6 +185,7 @@ if not defined VICTORY_JOIN_PARTS set "VICTORY_JOIN_PARTS=0"
 if not defined VICTORY_CACHE_DIR set "VICTORY_CACHE_DIR=%LOCALAPPDATA%\VIctory\cache-8gb"
 if not defined VICTORY_LOG if not defined RUST_LOG set "VICTORY_LOG=warn"
 
-echo VIctory: %profile% [VICTORY_OUTPUT=%VICTORY_OUTPUT%]
+echo VIctory: %profile% [VICTORY_OUTPUT=%VICTORY_OUTPUT%] runner=%runner%
+if defined VICTORY_FRAMES echo VIctory: frames to %VICTORY_FRAMES%
 "%runner%" run "%VICTORY_GAME_DIR%\game_scarlett_master.exe" --console series-x --execute
 exit /b %errorlevel%
