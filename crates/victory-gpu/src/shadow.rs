@@ -2176,8 +2176,16 @@ fn wide(jobs: Vec<Job>) {
         }
         return;
     }
-    let workers = workers();
     let _wide = crate::timeline::span("work spread over threads");
+    drop(Beside(Some(queued(jobs))));
+}
+
+/// Jobs left of those [`queued`] put on the kept threads' queue.
+type Left = Arc<(Mutex<usize>, std::sync::Condvar)>;
+
+/// Puts `jobs` on the kept threads' queue and wakes them.
+fn queued(jobs: Vec<Job>) -> Left {
+    let workers = workers();
     let left = Arc::new((Mutex::new(jobs.len()), std::sync::Condvar::new()));
     {
         let mut queue = workers.jobs.lock().unwrap_or_else(|e| e.into_inner());
@@ -2195,21 +2203,50 @@ fn wide(jobs: Vec<Job>) {
         }
     }
     workers.more.notify_all();
-    loop {
-        let job = workers.jobs.lock().unwrap_or_else(|e| e.into_inner()).pop_front();
-        match job {
-            Some(job) => {
-                workers.there.fetch_sub(1, Ordering::AcqRel);
-                job()
+    left
+}
+
+/// Copies going on on the kept threads while this one does other work.
+/// Dropping it waits for them, this thread taking jobs off the queue
+/// meanwhile.
+pub(crate) struct Beside(Option<Left>);
+
+impl Beside {
+    /// Waits for the copies.
+    pub(crate) fn join(self) {}
+}
+
+impl Drop for Beside {
+    fn drop(&mut self) {
+        let Some(left) = self.0.take() else {
+            return;
+        };
+        let workers = workers();
+        loop {
+            let job = workers.jobs.lock().unwrap_or_else(|e| e.into_inner()).pop_front();
+            match job {
+                Some(job) => {
+                    workers.there.fetch_sub(1, Ordering::AcqRel);
+                    job()
+                }
+                None => break,
             }
-            None => break,
+        }
+        spin(|| left.0.try_lock().is_ok_and(|n| *n == 0));
+        let mut n = left.0.lock().unwrap_or_else(|e| e.into_inner());
+        while *n > 0 {
+            n = left.1.wait(n).unwrap_or_else(|e| e.into_inner());
         }
     }
-    spin(|| left.0.try_lock().is_ok_and(|n| *n == 0));
-    let mut n = left.0.lock().unwrap_or_else(|e| e.into_inner());
-    while *n > 0 {
-        n = left.1.wait(n).unwrap_or_else(|e| e.into_inner());
+}
+
+/// `copies` (from, to, bytes: apart) begun on the kept threads; the copies
+/// are done when the result is dropped.
+pub(crate) fn copy_beside(copies: Vec<(usize, usize, usize)>) -> Beside {
+    if copies.is_empty() {
+        return Beside(None);
     }
+    Beside(Some(queued(copy_jobs(copies, WIDE_JOB))))
 }
 
 /// [`wide`], for the host's own work on host copies (a submission's
@@ -2301,6 +2338,13 @@ pub(crate) fn take_snapshots() {
         return;
     }
     wide(copy_jobs(snaps, WIDE_JOB));
+}
+
+/// [`take_snapshots`] begun on the kept threads: the snapshots noted so far
+/// are taken by the time the result is dropped. Snapshots noted after this
+/// call are the next call's.
+pub(crate) fn snapshots_beside() -> Beside {
+    copy_beside(std::mem::take(&mut *SNAPS.lock().unwrap_or_else(|e| e.into_inner())))
 }
 
 /// `copies` (from, to, bytes) as pieces of work of about `job` bytes each:

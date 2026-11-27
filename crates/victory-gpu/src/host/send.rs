@@ -205,6 +205,21 @@ struct Copy {
 pub(super) struct Own {
     memory: Memory,
     copies: Vec<Copy>,
+    /// The long runs, still being copied on the kept threads
+    /// ([`beside`]); [`Own::copied`] waits for them.
+    copying: std::sync::Mutex<Option<crate::shadow::Beside>>,
+}
+
+/// Whether a submission's long runs are copied into its memory on the kept
+/// threads while the submitting thread records the list that sends them,
+/// and waited for before that list is handed to the card
+/// (`VICTORY_SEND_BESIDE=1`; off by default). In Leafy's play run of
+/// 2026-11-27 they were 29 MB a frame in about 230 runs, under a MiB a
+/// submission, so `copy_all` did them on this thread: 6.4-8.4 ms a frame
+/// with the card idle.
+fn beside() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_SEND_BESIDE"))
 }
 
 /// Runs whose pairs are one piece of work.
@@ -291,15 +306,18 @@ pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, us
     STATS[0].fetch_add(moves.iter().map(|m| m.2 as u64).sum(), Ordering::Relaxed);
     STATS[1].fetch_add(moves.len() as u64, Ordering::Relaxed);
     STATS[2].fetch_add(copies.iter().map(|c| u64::from(c.pairs.1)).sum(), Ordering::Relaxed);
-    let copying = std::time::Instant::now();
-    if wide() {
+    let copy_began = std::time::Instant::now();
+    let mut copying = None;
+    if beside() {
+        copying = Some(crate::shadow::copy_beside(moves));
+    } else if wide() {
         crate::shadow::copy_in_pieces(moves, PIECE);
     } else {
         crate::shadow::copy_all(moves);
     }
-    STATS[4].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
+    STATS[4].fetch_add(copy_began.elapsed().as_micros() as u64, Ordering::Relaxed);
     STATS[3].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
-    Some(Own { memory, copies })
+    Some(Own { memory, copies, copying: std::sync::Mutex::new(copying) })
 }
 
 impl Own {
@@ -371,8 +389,20 @@ impl Own {
         }
     }
 
+    /// Waits for the long runs still being copied into the memory; its time
+    /// is counted with taking them.
+    pub(super) fn copied(&self) {
+        let copying = self.copying.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(copying) = copying {
+            let began = std::time::Instant::now();
+            copying.join();
+            STATS[3].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
+        }
+    }
+
     /// The memory, to be kept until the submission has run.
     pub(super) fn memory(self) -> Memory {
+        self.copied();
         self.memory
     }
 }

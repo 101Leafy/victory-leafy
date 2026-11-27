@@ -4531,6 +4531,19 @@ fn free_cut(runs: &[&HostList]) -> Option<usize> {
     Some(cut)
 }
 
+/// Whether a submission's snapshots ([`crate::shadow::take_snapshots`]) are
+/// taken on the kept threads while the submitting thread brings the copies
+/// in the card's memory up to date, and waited for before anything writes
+/// the copies again (`VICTORY_SNAP_BESIDE=1`; off by default). In Leafy's
+/// play run of 2026-11-27 the two came one after the other on this thread
+/// while the card stood idle: 5.5 and 11.5 ms a frame. They touch other
+/// copies (no snapshots of copies in the card's memory), and only read the
+/// copies' CPU sides.
+fn snap_beside() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_SNAP_BESIDE"))
+}
+
 /// Lists and the order they run in.
 type Run<T> = (Vec<T>, Vec<usize>);
 
@@ -6009,6 +6022,9 @@ impl Host {
                     #[cfg(feature = "diagnostics")]
                     crate::sidetime::end(list, side);
                     list.Close()?;
+                    if let Some(own) = &own {
+                        own.copied();
+                    }
                     before_send(&self.queue);
                     self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
                     Ok(())
@@ -7727,13 +7743,28 @@ impl Host {
         // The snapshots of the ranges shaders may write, if they were left
         // for now (`crate::shadow::wide_back`): the refreshes are done, the
         // lists have not gone to the card.
-        {
-            #[cfg(feature = "diagnostics")]
-            let snapshots = std::time::Instant::now();
+        // (With `VICTORY_SNAP_BESIDE=1` on the kept threads, while this one
+        // goes on to the copies in the card's memory.)
+        #[cfg(feature = "diagnostics")]
+        let snapshots = std::time::Instant::now();
+        let mut snapping = None;
+        if snap_beside() {
+            snapping = Some(crate::shadow::snapshots_beside());
+        } else {
             crate::shadow::take_snapshots();
-            #[cfg(feature = "diagnostics")]
-            crate::copystat::add(crate::copystat::C::SnapshotUs, snapshots.elapsed().as_micros() as u64);
         }
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::SnapshotUs, snapshots.elapsed().as_micros() as u64);
+        // Waits for the snapshots; its time is counted with theirs.
+        let snapped = |snapping: &mut Option<crate::shadow::Beside>| {
+            if let Some(snapping) = snapping.take() {
+                #[cfg(feature = "diagnostics")]
+                let waiting = std::time::Instant::now();
+                snapping.join();
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::SnapshotUs, waiting.elapsed().as_micros() as u64);
+            }
+        };
         #[cfg(feature = "diagnostics")]
         split.part(3);
         stage.next("submit: copies in the card's memory");
@@ -7742,6 +7773,7 @@ impl Host {
         // write follows them in the same submission.
         let flown = late && relay();
         if flown && self.card_results_low() {
+            snapped(&mut snapping);
             let settling = std::time::Instant::now();
             self.settle(&mut submitted, WHY_MOST);
             settled += settling.elapsed();
@@ -7756,6 +7788,8 @@ impl Host {
         }
         let declared = declared_writes(runs);
         let card = self.card_before(&declared, &picked, flown);
+        // (Before anything writes the copies again.)
+        snapped(&mut snapping);
         // The sends are taken: from here on the references hold what the
         // copies in the lists put.
         for (shadow, at, bytes) in batch.placed.drain(..) {
