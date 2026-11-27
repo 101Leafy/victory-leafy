@@ -141,6 +141,6 @@ if not defined VICTORY_JOIN_PARTS set "VICTORY_JOIN_PARTS=0"
 if not defined VICTORY_CACHE_DIR set "VICTORY_CACHE_DIR=%LOCALAPPDATA%\VIctory\cache-8gb"
 if not defined VICTORY_LOG if not defined RUST_LOG set "VICTORY_LOG=warn"
 
-echo VIctory: %profile% (VICTORY_OUTPUT=%VICTORY_OUTPUT%)
+echo VIctory: %profile% [VICTORY_OUTPUT=%VICTORY_OUTPUT%]
 "%runner%" run "%VICTORY_GAME_DIR%\game_scarlett_master.exe" --console series-x --execute
 exit /b %errorlevel%
