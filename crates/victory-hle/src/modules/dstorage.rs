@@ -544,6 +544,12 @@ struct Lanes {
     staging: u64,
     /// A start waited for staging space since the last finish.
     starved: bool,
+    /// Host bytes the running requests may buffer, and the limit
+    /// (`VICTORY_DSTORAGE_IN_FLIGHT_MB`, unset for none).
+    in_flight: u64,
+    in_flight_cap: u64,
+    /// Starts that waited for that limit since the last summary.
+    held_back: u64,
     /// Weighted round robin: each class's virtual time (bytes × cost), and
     /// the time of the last start; within a class, the lane clock of the
     /// last start.
@@ -588,6 +594,7 @@ struct Job {
     request: Request,
     note: Note,
     staging: u64,
+    host: u64,
 }
 
 // SAFETY: as for `Lane`.
@@ -608,6 +615,9 @@ fn scheduler() -> Option<&'static Scheduler> {
                     staged: 0,
                     staging: STAGING,
                     starved: false,
+                    in_flight: 0,
+                    in_flight_cap: in_flight_cap(),
+                    held_back: 0,
                     clock: [0; 3],
                     now: 0,
                     lane_now: [0; 3],
@@ -635,8 +645,7 @@ fn scheduler() -> Option<&'static Scheduler> {
                         // SAFETY: a plain call on our own thread.
                         unsafe {
                             use windows_sys::Win32::System::Threading::*;
-                            let _ =
-                                SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+                            let _ = SetThreadPriority(GetCurrentThread(), worker_priority());
                         }
                         work(scheduler)
                     })
@@ -782,11 +791,54 @@ pub(crate) mod stream_log {
 /// which go to the log at info instead of debug.
 mod stats {
     use std::sync::OnceLock;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
     pub(super) fn on() -> bool {
         static ON: OnceLock<bool> = OnceLock::new();
-        *ON.get_or_init(|| std::env::var_os("VICTORY_DSTORAGE_STATS").is_some_and(|v| v == "1"))
+        *ON.get_or_init(|| {
+            let on = std::env::var_os("VICTORY_DSTORAGE_STATS").is_some_and(|v| v == "1");
+            if on {
+                let _ = std::thread::Builder::new().name("dstorage memory".into()).spawn(memory);
+            }
+            on
+        })
+    }
+
+    /// Bytes the workers' buffers hold between requests.
+    pub(super) static HELD: AtomicI64 = AtomicI64::new(0);
+    /// Host bytes the running requests may buffer ([`super::host_bytes`]),
+    /// now and the most since the last memory line.
+    static IN_FLIGHT: AtomicU64 = AtomicU64::new(0);
+    static IN_FLIGHT_MOST: AtomicU64 = AtomicU64::new(0);
+
+    pub(super) fn in_flight(bytes: u64) {
+        IN_FLIGHT.store(bytes, Ordering::Relaxed);
+        IN_FLIGHT_MOST.fetch_max(bytes, Ordering::Relaxed);
+    }
+
+    /// Every 5 s, the process's commit and working set (now and the most
+    /// so far) beside what DirectStorage holds, so a run shows memory as
+    /// well as time even while nothing streams.
+    fn memory() {
+        use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        let gb = |n: usize| format!("{:.2}", n as f64 / 1e9);
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            let mut c = PROCESS_MEMORY_COUNTERS { cb: size_of::<PROCESS_MEMORY_COUNTERS>() as u32, ..Default::default() };
+            // SAFETY: our own process and a sized structure.
+            unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) };
+            let most = IN_FLIGHT_MOST.swap(IN_FLIGHT.load(Ordering::Relaxed), Ordering::Relaxed);
+            tracing::info!(
+                commit_gb = gb(c.PagefileUsage),
+                peak_commit_gb = gb(c.PeakPagefileUsage),
+                working_set_gb = gb(c.WorkingSetSize),
+                peak_working_set_gb = gb(c.PeakWorkingSetSize),
+                held_mb = HELD.load(Ordering::Relaxed) / 1_000_000,
+                in_flight_most_mb = most / 1_000_000,
+                "dstorage: memory"
+            );
+        }
     }
 
     #[derive(Clone, Copy)]
@@ -889,6 +941,25 @@ mod stats {
     }
 }
 
+/// `VICTORY_DSTORAGE_WORKER_PRIORITY=normal` (or `above`): the workers'
+/// thread priority, below normal unless set. In the opening the title
+/// waits on reads that sit 10-30 ms before a free worker takes them.
+#[cfg(windows)]
+fn worker_priority() -> i32 {
+    use windows_sys::Win32::System::Threading::*;
+    static PRIORITY: OnceLock<i32> = OnceLock::new();
+    *PRIORITY.get_or_init(|| {
+        let set = std::env::var("VICTORY_DSTORAGE_WORKER_PRIORITY").unwrap_or_default();
+        let priority = match set.trim() {
+            "normal" => THREAD_PRIORITY_NORMAL,
+            "above" => THREAD_PRIORITY_ABOVE_NORMAL,
+            _ => THREAD_PRIORITY_BELOW_NORMAL,
+        };
+        tracing::info!(priority, "dstorage: worker priority (VICTORY_DSTORAGE_WORKER_PRIORITY)");
+        priority
+    })
+}
+
 /// A worker: runs the next read of the most deserving queue.
 fn work(scheduler: &'static Scheduler) {
     let mut scratch = WorkerScratch::new();
@@ -945,6 +1016,7 @@ impl Lanes {
                     mb_per_s = format_args!("{:.1}", *bytes as f64 / elapsed.as_secs_f64() / 1e6),
                     busy_workers = format_args!("{:.2}", busy.as_secs_f64() / elapsed.as_secs_f64()),
                     staging_waits = self.refused,
+                    in_flight_waits = std::mem::take(&mut self.held_back),
                     waiting,
                     stages = %stats::take(elapsed.as_secs_f64()),
                     "dstorage: last {:.1} s",
@@ -987,9 +1059,17 @@ impl Lanes {
             self.refused += 1;
             return None;
         }
+        let host = host_bytes(&request);
+        if self.in_flight > 0 && self.in_flight + host > self.in_flight_cap {
+            self.starved = true;
+            self.held_back += 1;
+            return None;
+        }
         lane.reads.pop_front();
         lane.running.insert(seq);
         self.staged += staging;
+        self.in_flight += host;
+        stats::in_flight(self.in_flight);
         let size = u64::from(request.destination_size.max(request.source_size)).max(1);
         self.now = self.clock[class];
         self.clock[class] += size * COST[class];
@@ -1001,11 +1081,14 @@ impl Lanes {
             request,
             note,
             staging,
+            host,
         })
     }
 
     fn finish(&mut self, job: &Job, result: Result<(), HRESULT>) {
         self.staged -= job.staging;
+        self.in_flight -= job.host;
+        stats::in_flight(self.in_flight);
         if let Some(lane) = self.lanes.get_mut(&job.lane) {
             lane.running.remove(&job.seq);
             if let Err(hr) = result {
@@ -1112,6 +1195,34 @@ fn staging_bytes(request: &Request) -> u64 {
     } else {
         0
     }
+}
+
+/// Host memory a request may buffer while it runs: a file source it
+/// decodes, zlib's output before BCPack, and a page destination's buffer
+/// (none when its pages take the bytes in place, which is not known yet).
+fn host_bytes(request: &Request) -> u64 {
+    let o = request.options;
+    let mut bytes = 0;
+    if o & (ZLIB | BCPACK) != 0 && o & MEMORY_SOURCE == 0 {
+        bytes += u64::from(request.source_size);
+    }
+    if o & ZLIB != 0 && o & BCPACK != 0 {
+        bytes += u64::from(request.intermediate_size);
+    }
+    if o & PAGE_DESTINATION != 0 {
+        bytes += u64::from(request.destination_size);
+    }
+    bytes
+}
+
+/// `VICTORY_DSTORAGE_IN_FLIGHT_MB`: at most this many MB of
+/// [`host_bytes`] among the running requests (one always runs), so a burst
+/// of big reads cannot grow the commit; unset or 0 for no limit.
+fn in_flight_cap() -> u64 {
+    let mb = std::env::var("VICTORY_DSTORAGE_IN_FLIGHT_MB").ok().and_then(|v| v.trim().parse::<u64>().ok());
+    let cap = mb.filter(|&mb| mb > 0).map_or(u64::MAX, |mb| mb << 20);
+    tracing::info!(mb, "dstorage: host bytes in flight, at most (VICTORY_DSTORAGE_IN_FLIGHT_MB)");
+    cap
 }
 
 /// Ends a queue: what was not started is dropped, and this waits for the
@@ -1521,6 +1632,8 @@ const SCRATCH_RETAIN_CAP: usize = 8 * 1024 * 1024;
 struct WorkerScratch {
     source: Vec<u8>,
     intermediate: Vec<u8>,
+    /// What these and [`OUT`] held when last counted in [`stats::HELD`].
+    counted: usize,
 }
 
 impl WorkerScratch {
@@ -1528,6 +1641,7 @@ impl WorkerScratch {
         Self {
             source: Vec::new(),
             intermediate: Vec::new(),
+            counted: 0,
         }
     }
 
@@ -1538,7 +1652,57 @@ impl WorkerScratch {
         if self.intermediate.capacity() > SCRATCH_RETAIN_CAP {
             self.intermediate = Vec::new();
         }
+        let out = OUT.with(|out| {
+            let mut out = out.borrow_mut();
+            if out.capacity() > SCRATCH_RETAIN_CAP {
+                *out = Vec::new();
+            }
+            out.capacity()
+        });
+        if stats::on() {
+            let now = self.source.capacity() + self.intermediate.capacity() + out;
+            stats::HELD.fetch_add(now as i64 - self.counted as i64, Ordering::Relaxed);
+            self.counted = now;
+        }
     }
+}
+
+/// `VICTORY_DSTORAGE_REUSE=1`: a page destination's buffer and a refused
+/// read's bounce buffer come from a buffer each worker keeps ([`OUT`])
+/// instead of a new zeroed one per request.
+fn reuse() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_DSTORAGE_REUSE").is_some_and(|v| v == "1");
+        tracing::info!(on, "dstorage: workers keep their write buffers (VICTORY_DSTORAGE_REUSE)");
+        on
+    })
+}
+
+thread_local! {
+    /// A worker's buffer for [`with_buffer`].
+    static OUT: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Runs `f` on a buffer of `len` bytes: the worker's own ([`reuse`]),
+/// whose bytes are whatever an earlier request left, or a new zeroed one.
+fn with_buffer<T>(len: usize, f: impl FnOnce(&mut [u8]) -> T) -> T {
+    let mut f = Some(f);
+    if reuse() {
+        let kept = OUT.with(|out| {
+            let mut out = out.try_borrow_mut().ok()?;
+            if out.len() < len {
+                out.resize(len, 0);
+            }
+            let f = f.take()?;
+            Some(f(&mut out[..len]))
+        });
+        if let Some(result) = kept {
+            return result;
+        }
+    }
+    let f = f.take().expect("not run yet");
+    f(&mut vec![0; len])
 }
 
 /// Reads, inflates and/or unpacks, and writes one request.
@@ -1579,6 +1743,7 @@ fn execute(request: &Request, scratch: &mut WorkerScratch) -> Result<(), HRESULT
     let WorkerScratch {
         source: source_buf,
         intermediate,
+        ..
     } = scratch;
     let source = read_source(request, source_buf).map_err(|hr| fail(hr, "reading the source"))?;
     // The console's order: zlib first, then BCPack.
@@ -1738,14 +1903,16 @@ fn copy_through_buffer(request: &Request, size: usize, hr: HRESULT) -> Result<()
     if stats::on() {
         stats::add(stats::Stage::Bounce, 0, size);
     }
-    let mut data = vec![0u8; size];
-    read_into(request, &mut data)?;
-    // SAFETY: the title's destination holds `destination_size` bytes, at
-    // least `size`, committed (checked above) and written by nothing else
-    // until completion; a guarded block faults into the guard's handler.
-    unsafe {
-        std::ptr::copy_nonoverlapping(data.as_ptr(), request.destination.cast::<u8>(), size);
-    }
+    with_buffer(size, |data| {
+        read_into(request, data)?;
+        // SAFETY: the title's destination holds `destination_size` bytes, at
+        // least `size`, committed (checked above) and written by nothing else
+        // until completion; a guarded block faults into the guard's handler.
+        unsafe {
+            std::ptr::copy_nonoverlapping(data.as_ptr(), request.destination.cast::<u8>(), size);
+        }
+        Ok::<(), HRESULT>(())
+    })?;
     static RETRIED: AtomicU32 = AtomicU32::new(0);
     let n = RETRIED.fetch_add(1, Ordering::Relaxed);
     if n.is_power_of_two() || n == 0 {
@@ -1915,48 +2082,49 @@ fn into_pages(
         });
         return filled;
     }
-    let mut data = vec![0; len];
-    let n = fill(&mut data)?;
-    let buffered = stats::on().then(std::time::Instant::now);
-    // A page the title has just made, or a view the host refuses for a moment (commit
-    // or address space short while a load maps many at once), can come right a little
-    // later: tried again before the request fails (`VICTORY_DSTORAGE_RETRIES`, default 12,
-    // about 1.5 s in all).
-    static RETRIES: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    let retries = *RETRIES.get_or_init(|| {
-        std::env::var("VICTORY_DSTORAGE_RETRIES").ok().and_then(|v| v.parse().ok()).unwrap_or(12)
-    });
-    let mut written = super::xmem::write_physical(pages, offset, &data[..n]);
-    let mut tries = 0;
-    while !written && tries < retries {
-        std::thread::sleep(std::time::Duration::from_millis((2u64 << tries.min(6)).min(128)));
-        tries += 1;
-        written = super::xmem::write_physical(pages, offset, &data[..n]);
-    }
-    if let Some(started) = buffered {
-        stats::add(stats::Stage::Buffer, started.elapsed().as_nanos() as u64, n);
-    }
-    if written {
-        super::xmem::pages_written(pages, offset, n);
-        if tries > 0 {
-            tracing::info!(offset, len, tries, "dstorage: a destination's physical pages written after a retry");
+    with_buffer(len, |data| {
+        let n = fill(data)?;
+        let buffered = stats::on().then(std::time::Instant::now);
+        // A page the title has just made, or a view the host refuses for a moment (commit
+        // or address space short while a load maps many at once), can come right a little
+        // later: tried again before the request fails (`VICTORY_DSTORAGE_RETRIES`, default 12,
+        // about 1.5 s in all).
+        static RETRIES: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+        let retries = *RETRIES.get_or_init(|| {
+            std::env::var("VICTORY_DSTORAGE_RETRIES").ok().and_then(|v| v.parse().ok()).unwrap_or(12)
+        });
+        let mut written = super::xmem::write_physical(pages, offset, &data[..n]);
+        let mut tries = 0;
+        while !written && tries < retries {
+            std::thread::sleep(std::time::Duration::from_millis((2u64 << tries.min(6)).min(128)));
+            tries += 1;
+            written = super::xmem::write_physical(pages, offset, &data[..n]);
         }
-        Ok(())
-    } else {
-        let known = super::xmem::pages_known(pages, offset, len);
-        tracing::warn!(known, last_error = std::io::Error::last_os_error().raw_os_error(), "dstorage: retries used up");
-        // Said aloud: the title never reads a request's result
-        // (it only polls for completion), so a destination left unwritten
-        // is a model or texture that silently holds whatever its pages
-        // held before.
-        tracing::warn!(
-            offset,
-            len,
-            pages = pages.len(),
-            "dstorage: a destination's physical pages could not be written (unknown page or a host failure); its request fails"
-        );
-        Err(E_INVALIDARG)
-    }
+        if let Some(started) = buffered {
+            stats::add(stats::Stage::Buffer, started.elapsed().as_nanos() as u64, n);
+        }
+        if written {
+            super::xmem::pages_written(pages, offset, n);
+            if tries > 0 {
+                tracing::info!(offset, len, tries, "dstorage: a destination's physical pages written after a retry");
+            }
+            Ok(())
+        } else {
+            let known = super::xmem::pages_known(pages, offset, len);
+            tracing::warn!(known, last_error = std::io::Error::last_os_error().raw_os_error(), "dstorage: retries used up");
+            // Said aloud: the title never reads a request's result
+            // (it only polls for completion), so a destination left unwritten
+            // is a model or texture that silently holds whatever its pages
+            // held before.
+            tracing::warn!(
+                offset,
+                len,
+                pages = pages.len(),
+                "dstorage: a destination's physical pages could not be written (unknown page or a host failure); its request fails"
+            );
+            Err(E_INVALIDARG)
+        }
+    })
 }
 
 /// The page numbers `list` holds now, one per 64 KiB of destination.
@@ -2475,6 +2643,9 @@ mod tests {
             staged: 0,
             staging,
             starved: false,
+            in_flight: 0,
+            in_flight_cap: u64::MAX,
+            held_back: 0,
             clock: [0; 3],
             now: 0,
             lane_now: [0; 3],
@@ -2537,6 +2708,24 @@ mod tests {
         assert!(l.start().is_none());
         l.finish(&second, Ok(()));
         assert!(l.start().is_some());
+    }
+
+    #[test]
+    fn the_in_flight_cap_holds_back_page_buffers_too() {
+        let mut l = lanes(STAGING);
+        l.in_flight_cap = 100;
+        l.lanes.insert(0, Lane::new(0, 64));
+        read(&mut l, 0, PAGE_DESTINATION, 60);
+        read(&mut l, 0, ZLIB | PAGE_DESTINATION, 30);
+        read(&mut l, 0, 0, 1000); // raw: no host bytes
+        l.submit(0, false);
+        let first = l.start().unwrap();
+        assert!(l.start().is_none(), "60 + 30 + 30 > 100");
+        assert_eq!((first.host, l.held_back), (60, 1));
+        l.finish(&first, Ok(()));
+        let second = l.start().unwrap();
+        let raw = l.start().unwrap();
+        assert_eq!((second.host, raw.host, l.in_flight), (60, 0, 60));
     }
 
     #[test]
