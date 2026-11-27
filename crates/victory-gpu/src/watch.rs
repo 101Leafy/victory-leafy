@@ -2648,7 +2648,7 @@ pub(crate) mod guard_frames {
             let seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
             seen.iter()
                 .flatten()
-                .filter(|(_, &(at, run, _))| at + 1 >= frame && run >= RUNNING)
+                .filter(|&(_, &(at, run, _))| at + 1 >= frame && run >= RUNNING)
                 .map(|(&block, &(_, run, faults))| (block, run, faults))
                 .collect()
         };
