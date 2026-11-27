@@ -43,21 +43,33 @@ use crate::frame_rate::Patched;
 /// Sizes the title has a display mode for (its own list, +0x615c0c0).
 pub const MODES: [(u32, u32); 5] = [(1280, 720), (1664, 936), (1920, 1080), (2560, 1440), (3840, 2160)];
 
-/// `VICTORY_OUTPUT=<w>x<h>`: one of [`MODES`]. `None` if unset or not one
-/// (said why).
+/// `VICTORY_OUTPUT=<w>x<h>`: one of [`MODES`], or with `VICTORY_TEST_LOWRES=1`
+/// a smaller test size (see [`test_size`]). `None` if unset or neither (said
+/// why).
 pub fn asked_output() -> Option<(u32, u32)> {
     let spec = std::env::var("VICTORY_OUTPUT").ok()?;
-    let size = parse_output(&spec);
+    let lowres = std::env::var("VICTORY_TEST_LOWRES").is_ok_and(|v| v == "1");
+    let size = parse_output(&spec).or_else(|| lowres.then(|| parse_size(&spec).filter(|&s| test_size(s))).flatten());
     if size.is_none() {
-        eprintln!("VIctory: VICTORY_OUTPUT={spec}: expected one of the title's modes: 1920x1080, 2560x1440, 1280x720, 1664x936, 3840x2160");
+        eprintln!("VIctory: VICTORY_OUTPUT={spec}: expected one of the title's modes: 1920x1080, 2560x1440, 1280x720, 1664x936, 3840x2160 (smaller test sizes need VICTORY_TEST_LOWRES=1)");
     }
     size
 }
 
 pub fn parse_output(spec: &str) -> Option<(u32, u32)> {
+    parse_size(spec).filter(|s| MODES.contains(s))
+}
+
+fn parse_size(spec: &str) -> Option<(u32, u32)> {
     let (w, h) = spec.trim().split_once(['x', 'X'])?;
-    let size = (w.trim().parse().ok()?, h.trim().parse().ok()?);
-    MODES.contains(&size).then_some(size)
+    Some((w.trim().parse().ok()?, h.trim().parse().ok()?))
+}
+
+/// Test runs only (bug repros, two games at once): under 1280x720, at
+/// least 256x144, both even. The title has no display mode for these, but
+/// the size is written past its mode list (see [`OUTPUT`]).
+pub fn test_size((w, h): (u32, u32)) -> bool {
+    (256..1280).contains(&w) && (144..720).contains(&h) && w % 2 == 0 && h % 2 == 0
 }
 
 /// The title's render scale: the output size, so nothing is upscaled.
@@ -283,6 +295,10 @@ mod tests {
         assert_eq!(parse_output(" 2560X1440 "), Some((2560, 1440)));
         assert_eq!(parse_output("1600x900"), None);
         assert_eq!(parse_output("1080p"), None);
+        assert_eq!(parse_output("426x240"), None);
+        assert!(test_size((426, 240)));
+        assert!(!test_size((1280, 720)));
+        assert!(!test_size((425, 240)));
         assert_eq!(parse_render_scale("0.67"), Some(0.67));
         assert_eq!(parse_render_scale("0.5"), Some(0.5));
         assert_eq!(parse_render_scale("1"), Some(1.0));
