@@ -345,6 +345,46 @@ pub(crate) fn resident(device: &ID3D12Device, object: &impl Interface) -> window
     made
 }
 
+/// Whether memory of the card that shaders use every frame is made with the
+/// highest residency priority (`VICTORY_RESIDENCY_HIGH=1`; off by default):
+/// card buffers (card sides of title buffers and windows, hash buffers) and
+/// render targets, depth, and unordered-access textures and their twins.
+/// Plain textures keep the normal priority. When the card's budget runs short
+/// the system moves memory into the PC's, and with this it moves plain
+/// textures first. Same-settings runs step once into frames 40% slower at
+/// 167-240 s and stay there, the card busy at low power, as if something it
+/// reads every frame went to the PC's memory (test-cycle, 2026-11-27).
+fn residency_high() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RESIDENCY_HIGH").is_some_and(|v| v == "1"))
+}
+
+/// Gives new card memory shaders use every frame the highest residency
+/// priority, with [`residency_high`].
+pub(crate) fn hot(device: &ID3D12Device, object: &impl Interface) {
+    if !residency_high() {
+        return;
+    }
+    let (Ok(device), Ok(object)) = (device.cast::<ID3D12Device1>(), object.cast::<ID3D12Pageable>()) else {
+        return;
+    };
+    // SAFETY: a live heap or resource of the device's, one object and one priority.
+    let set = unsafe { device.SetResidencyPriority(1, &Some(object), &D3D12_RESIDENCY_PRIORITY_MAXIMUM) };
+    let n = HOT[0].fetch_add(1, Ordering::Relaxed) + 1;
+    if set.is_err() {
+        HOT[1].fetch_add(1, Ordering::Relaxed);
+    }
+    if n == 1 || n.is_multiple_of(1000) {
+        tracing::info!(
+            "card memory shaders use every frame kept on the card before textures (VICTORY_RESIDENCY_HIGH), since the start: {n} allocations, {} refused",
+            HOT[1].load(Ordering::Relaxed)
+        );
+    }
+}
+
+/// Allocations [`hot`] gave the highest priority, and those the system refused.
+static HOT: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
 /// Times, microseconds and the longest of [`resident`].
 static RESIDENT: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
@@ -10490,6 +10530,7 @@ impl Host {
                 .and_then(|()| {
                     let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
                     resident(&self.device, b)?;
+                    hot(&self.device, b);
                     mapped(&self.device)?;
                     b.Map(0, None, Some(&mut data))
                 })
@@ -10543,6 +10584,11 @@ impl Host {
             crate::book::made(b, || "an unordered access buffer".into());
         }
         let made = made.and_then(|()| buffer.as_ref().map_or(Ok(()), |b| resident(&self.device, b))).and_then(|()| mapped(&self.device));
+        if made.is_ok()
+            && let Some(b) = &buffer
+        {
+            hot(&self.device, b);
+        }
         match made {
             Ok(()) => buffer,
             Err(e) => {
