@@ -10789,7 +10789,40 @@ impl Host {
                 .cast::<IDXGISwapChain3>()?;
             let copy = self.new_list()?;
             copy.close();
-            tracing::info!(width, height, format = format.0, "presenting to a window");
+            // What the title draws against what the screen shows. A title that
+            // renders 3840x2160 for a 2560x1600 panel pays 2.25 times the
+            // pixels, and 9 times for a 1280x720 one; a run reported as slow
+            // that draws the console's size while the mode it was given was
+            // the screen's own needs this line to say so, since nothing else
+            // in the log compares the two.
+            //
+            // Of the switches on this path none lowers it, and a reader who
+            // takes the ratio for a switch to turn is misled:
+            // `VICTORY_DISPLAY_HOST` and `VICTORY_DISPLAY_MODE` name the mode
+            // the title is given, and a title that ignores the mode renders
+            // its own targets anyway (the first 5070 Laptop run reported
+            // 3840x2160 either way); `VICTORY_WINDOW_MAX` fits the window to
+            // the screen without changing the title's render targets
+            // (`victory_hle::modules::lifecycle::fit`).
+            //
+            // The switch that does lower it is not here: `VICTORY_OUTPUT`
+            // (`victory_loader::resolution`, added after this branch's base as
+            // 1994d7d) changes the title's own settings at load, so the size
+            // it renders into is the size asked for, and this line then
+            // reports the smaller one. Without that patch a ratio well above 1
+            // is a diagnosis of a slow run, not a lever.
+            let screen = crate::dxgi::host_display_size();
+            let drawn_of_the_screen = screen.map(|(w, h)| {
+                (f64::from(width) * f64::from(height)) / (f64::from(w) * f64::from(h))
+            });
+            tracing::info!(
+                width,
+                height,
+                screen = ?screen,
+                drawn_of_the_screen,
+                format = format.0,
+                "presenting to a window"
+            );
             self.log_video_memory("right after the swap chain is made");
             Ok(Presenter {
                 swap_chain,
