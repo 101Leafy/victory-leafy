@@ -136,6 +136,17 @@ pub(crate) fn available_physical_ram() -> Option<u64> {
     ok.then_some(m.ullAvailPhys)
 }
 
+/// Physical RAM of the host in bytes, from `GlobalMemoryStatusEx`.
+pub(crate) fn total_physical_ram() -> Option<u64> {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    // SAFETY: plain data the call fills in.
+    let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+    // SAFETY: a sized structure.
+    let ok = unsafe { GlobalMemoryStatusEx(&mut m) } != 0;
+    ok.then_some(m.ullTotalPhys)
+}
+
 /// How long host copies of textures the title fills must have been idle to
 /// be let go, in milliseconds, and how many bytes of them go at most (the
 /// longest idle first): none but those of ten minutes while what is in use
@@ -422,7 +433,7 @@ pub(crate) fn ram_idle_ms(avail_phys: Option<u64>) -> u64 {
 /// does not either: with a 48 GB page file it is 80 GB, far past where
 /// paging starts. Past the mark the shorter idle times by free RAM apply.
 /// A failed query changes nothing.
-fn near_commit_limit() -> bool {
+pub(crate) fn near_commit_limit() -> bool {
     use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
     // SAFETY: plain data the call fills in.
     let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
@@ -554,7 +565,7 @@ pub(crate) fn retire_resource(object: ID3D12Resource) {
 /// were page faults in memory nothing of ours named any more, at no command
 /// in particular. Objects let go while nothing runs wait as well: lists
 /// recorded and not yet sent may name them. `VICTORY_BURY_LAG=0`: not.
-fn bury_lag() -> u64 {
+pub(crate) fn bury_lag() -> u64 {
     static LAG: OnceLock<u64> = OnceLock::new();
     *LAG.get_or_init(|| std::env::var("VICTORY_BURY_LAG").ok().and_then(|v| v.parse().ok()).unwrap_or(64))
 }
