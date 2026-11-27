@@ -4165,6 +4165,10 @@ fn inflight_regions_landed(plans: &[&CardPlan]) {
     }
 }
 
+/// Waits for landings given up with the line empty ([`relay_wait`]), since
+/// the start.
+static RELAY_IDLE_WAITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Of the line's things in order (a flight: the value signalled on the
 /// host's fence behind it; a write or a signal behind a flight: `None`):
 /// how many, from the front, can be landed when the card has reached
@@ -5296,6 +5300,17 @@ fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) {
         _ => "waiting for landings: another reason",
     });
     while !done(&line) {
+        // Nothing left to land: no landing would wake this again (a range
+        // still pending that no flight in the line holds). The caller
+        // falls back to its own settle.
+        if line.line.is_empty() && !line.settling {
+            static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            RELAY_IDLE_WAITS.fetch_add(1, Ordering::Relaxed);
+            if !SAID.swap(true, Ordering::Relaxed) {
+                tracing::warn!(why, "a wait for landings found the line empty and its wait not met; given up (counted in idle waits)");
+            }
+            break;
+        }
         line = LINE_LANDED.wait(line).unwrap_or_else(|e| e.into_inner());
     }
     drop(line);
@@ -5583,6 +5598,10 @@ fn late_line(frames: f64) {
                 i[2],
                 i[3],
             );
+        }
+        let idle = RELAY_IDLE_WAITS.load(Ordering::Relaxed);
+        if idle > 0 {
+            tracing::info!("waits for landings given up with nothing left to land: {idle} since the start");
         }
         if send::own() {
             let t: Vec<f64> = send::STATS.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
