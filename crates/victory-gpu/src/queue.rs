@@ -863,7 +863,9 @@ impl Written {
             }
             // The title may wait on the address.
             #[cfg(windows)]
-            windows_sys::Win32::System::Threading::WakeByAddressAll(at.cast());
+            if crate::fence::block() {
+                windows_sys::Win32::System::Threading::WakeByAddressAll(at.cast());
+            }
         }
         crate::watch::told(&[(at as usize, bytes)]);
     }
