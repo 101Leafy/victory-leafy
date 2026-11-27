@@ -459,6 +459,10 @@ pub(crate) enum C {
     TexForcedBytes,
     TexForcedSame,
     TexForcedSameBytes,
+    /// Entries of tables not made afresh (`draw.rs` table_entry), and those of
+    /// them left as they were (`VICTORY_TABLE_SAME=1`).
+    TableEntries,
+    TableEntriesSame,
 }
 const COUNTERS: usize = 256;
 
@@ -517,6 +521,7 @@ pub(crate) const NAMES: [&str; 243] = [
     "WaitsQuiet", "WaitsGroupsRead", "WaitsGroupsTexture",
     "TexPartialWritten", "TexPartialSkipped",
     "TexUploadBytes", "TexForced", "TexForcedBytes", "TexForcedSame", "TexForcedSameBytes",
+    "TableEntries", "TableEntriesSame",
 ];
 /// One of some sets of counters, each in lines of the processor's memory of
 /// its own: a set for all threads had them wait for each other's lines at
@@ -895,7 +900,7 @@ mod command_tests {
     #[test]
     fn every_counter_is_named() {
         use super::{C, COUNTERS, NAMES};
-        assert_eq!(C::TexForcedSameBytes as usize + 1, NAMES.len());
+        assert_eq!(C::TableEntriesSame as usize + 1, NAMES.len());
         assert_eq!(NAMES[C::Frames as usize], "Frames");
         assert!(NAMES.len() <= COUNTERS);
     }

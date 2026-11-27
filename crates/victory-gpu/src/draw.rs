@@ -130,7 +130,16 @@ thread_local! {
     /// milliseconds and the bytes that run may take, in place of the
     /// pass's own per frame.
     static PASS_BUDGET: std::cell::Cell<Option<(u64, u64)>> = const { std::cell::Cell::new(None) };
+    /// Entries of tables not made afresh that the list of this epoch
+    /// ([`HostList::epoch`]) brought up to date, and whether that read the
+    /// tested depth target ([`table_same`]).
+    static SAME_ENTRIES: std::cell::RefCell<(u64, Vec<(SameEntry, bool)>)> =
+        const { std::cell::RefCell::new((0, Vec::new())) };
 }
+
+/// A table entry as [`SAME_ENTRIES`] knows it: its handle, the heap, read as
+/// what, the record, the depth target the draw only tests.
+type SameEntry = (u64, usize, ResourceType, [u64; 4], usize);
 
 /// The milliseconds of every frame the pass that uploads textures picked
 /// by index takes before a shader that picks by index has asked for it
@@ -4260,6 +4269,37 @@ impl State {
         let (Some(host), Some(index)) = (heap.host(), heap.index(handle)) else {
             return;
         };
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::TableEntries, 1);
+        // The same entry brought up to date in this list for the same
+        // reader, with nothing changed in the list since: done already.
+        let key: Option<SameEntry> = (table_same() && u.kind != ResourceType::Uav).then(|| {
+            // SAFETY: a descriptor slot in title memory.
+            let record = unsafe { (handle as *const [u64; 4]).read_unaligned() };
+            (handle, std::ptr::from_ref(heap) as usize, u.kind, record, TESTED_DEPTH.get().0)
+        });
+        if let Some(key) = &key {
+            let epoch = list.epoch();
+            let known = SAME_ENTRIES.with_borrow_mut(|(at, seen)| {
+                if *at != epoch {
+                    *at = epoch;
+                    seen.clear();
+                }
+                seen.iter().find(|(k, _)| k == key).map(|&(_, depth)| depth)
+            });
+            if let Some(depth) = known {
+                if depth {
+                    TESTED_DEPTH.set((key.4, true));
+                }
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::TableEntriesSame, 1);
+                return;
+            }
+        }
+        let depth_before = TESTED_DEPTH.get();
+        if key.is_some() {
+            TESTED_DEPTH.set((depth_before.0, false));
+        }
         if let Some(view) = host.mirror(index, handle, true) {
             readable(list, u.kind, &view);
             // Up to date by this draw: not the texture pass's to make.
@@ -4268,6 +4308,24 @@ impl State {
             } else {
                 host.slot_tabled(index);
             }
+            if let Some(key) = key {
+                let depth = TESTED_DEPTH.get().1;
+                TESTED_DEPTH.set((depth_before.0, depth_before.1 || depth));
+                // (The epoch as it is now: what this entry changed itself it
+                // need not do again.)
+                let epoch = list.epoch();
+                SAME_ENTRIES.with_borrow_mut(|(at, seen)| {
+                    if *at != epoch {
+                        *at = epoch;
+                        seen.clear();
+                    }
+                    if seen.len() < 256 {
+                        seen.push((key, depth));
+                    }
+                });
+            }
+        } else if key.is_some() {
+            TESTED_DEPTH.set(depth_before);
         }
     }
 
@@ -5645,6 +5703,19 @@ struct FreshTable {
 /// through again at every draw).
 fn ready_once() -> bool {
     crate::toggled!("VICTORY_READY_ONCE")
+}
+
+/// Whether an entry of a table not made afresh, read again in a list for the
+/// same reader with nothing changed in the list since, is left as it is
+/// (`VICTORY_TABLE_SAME=1`; off by default: every entry is gone through again
+/// at every draw). Not entries read as unordered access.
+fn table_same() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_TABLE_SAME") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_TABLE_SAME"))
 }
 
 /// Whether a table made afresh with no constant views in it is used as it
