@@ -10587,12 +10587,14 @@ impl HostList {
                     }
                     crate::port::filled(src, len);
                     if let Some(f) = batch.forwards.iter().find(|f| f.fill == (n, i))
-                        && let Some((_, from)) = batch.kept.iter().find(|k| k.0 == f.copy)
+                        && let Some(from) = batch.kept.iter().find(|k| k.0 == f.copy).and_then(|k| k.1.get(f.at..f.at + len))
                     {
                         let started = std::time::Instant::now();
-                        // SAFETY: the fill's upload memory, `len` bytes; its
-                        // bytes lie inside the copy's.
-                        unsafe { std::ptr::copy_nonoverlapping(from[f.at..f.at + len].as_ptr(), dst as *mut u8, len) };
+                        // (A kept copy too short for the fill, as an earlier
+                        // submission's was in bp5-wg, is not taken: the fill
+                        // reads title memory below.)
+                        // SAFETY: the fill's upload memory, `len` bytes.
+                        unsafe { std::ptr::copy_nonoverlapping(from.as_ptr(), dst as *mut u8, len) };
                         place::STATS[4].fetch_add(1, Ordering::Relaxed);
                         (started, len)
                     } else if wide_fills() {
