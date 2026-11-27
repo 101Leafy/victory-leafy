@@ -5544,7 +5544,7 @@ fn kin(old: &View, new: &View) -> Kin {
 /// description placed elsewhere ([`Kin::Moved`]) is kept only when both
 /// memories begin and end with the same 4 KiB.
 fn keep_shown() -> u8 {
-    #[cfg(feature = "diagnostics")]
+    #[cfg(any(feature = "diagnostics", feature = "ab"))]
     if let Some(on) = crate::ab::pick("VICTORY_KEEP_SHOWN") {
         return if on { 2 } else { 0 };
     }

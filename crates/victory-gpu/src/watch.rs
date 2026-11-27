@@ -415,7 +415,7 @@ fn journal_mut() -> std::sync::RwLockWriteGuard<'static, Journal> {
 /// holding them, and no holder of a part waits for anything else: no two
 /// wait for each other. Tests: `port7_tests`.
 pub(crate) fn port_journal() -> bool {
-    #[cfg(feature = "diagnostics")]
+    #[cfg(any(feature = "diagnostics", feature = "ab"))]
     if let Some(on) = crate::ab::pick("VICTORY_PORT_JOURNAL") {
         return on;
     }

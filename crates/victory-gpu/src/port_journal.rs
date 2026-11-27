@@ -127,7 +127,7 @@ pub(crate) fn heaps_waited(ns: u64, on: bool) {
 
 /// Whether the switch is on, or changes in this run (`VICTORY_AB`).
 fn named() -> bool {
-    #[cfg(feature = "diagnostics")]
+    #[cfg(any(feature = "diagnostics", feature = "ab"))]
     if crate::ab::bit("VICTORY_PORT_JOURNAL").is_some() {
         return true;
     }

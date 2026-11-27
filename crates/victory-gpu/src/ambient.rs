@@ -175,7 +175,7 @@ fn reflect() -> f32 {
         }
         held
     });
-    #[cfg(feature = "diagnostics")]
+    #[cfg(any(feature = "diagnostics", feature = "ab"))]
     if let Some(on) = crate::ab::pick("VICTORY_AMBIENT_REFLECT") {
         return if !on { 0.0 } else if held > 0.0 { held } else { REFLECT };
     }
