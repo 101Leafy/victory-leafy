@@ -657,14 +657,60 @@ fn dynamic_slots(heap: usize, host: &crate::descriptor::host::HostHeap, n: u32) 
         Ok("2") => 2,
         _ => 1,
     });
-    if mode == 0 || mode == 1 && !settle_due(&SETTLED, crate::frame::current()) {
+    let frame = crate::frame::current();
+    let most = settle_backoff();
+    if most > 0 && SHORT_AT.swap(frame, Ordering::Relaxed).saturating_add(1) < frame {
+        // A frame went by with room for every table: the scene changed.
+        SETTLE_AFTER.store(0, Ordering::Relaxed);
+        SETTLE_WAIT.store(0, Ordering::Relaxed);
+    }
+    let held = mode == 1 && frame < SETTLE_AFTER.load(Ordering::Relaxed);
+    if mode == 0 || held || mode == 1 && !settle_due(&SETTLED, frame) {
         DYNAMIC_SHORT[1].fetch_add(1, Ordering::Relaxed);
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::SettlesHeld, u64::from(held));
         return None;
     }
+    let (before, all) = host.dynamic_free();
     crate::host::settle_for_tables();
     let found = host.dynamic(n);
     DYNAMIC_SHORT[usize::from(found.is_none())].fetch_add(1, Ordering::Relaxed);
+    if most > 0 && mode == 1 {
+        let got = (host.dynamic_free().0 + found.map_or(0, |_| n)).saturating_sub(before);
+        if found.is_none() || got < all / 64 {
+            let wait = (SETTLE_WAIT.load(Ordering::Relaxed) * 2).clamp(8, most);
+            SETTLE_WAIT.store(wait, Ordering::Relaxed);
+            SETTLE_AFTER.store(frame + wait, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::SettlesBare, 1);
+        } else {
+            SETTLE_WAIT.store(0, Ordering::Relaxed);
+        }
+    }
     found
+}
+
+/// The last frame a dynamic ask found no slots, and the frame before which
+/// no settle for tables is made, the settles having come back with too few
+/// ([`dynamic_slots`]); and the frames held back the last time.
+static SHORT_AT: AtomicU64 = AtomicU64::new(0);
+static SETTLE_AFTER: AtomicU64 = AtomicU64::new(0);
+static SETTLE_WAIT: AtomicU64 = AtomicU64::new(0);
+
+/// The most frames a settle for tables is held back after settles that
+/// freed fewer than one slot in 64 of the pool (`VICTORY_SETTLE_BACKOFF=1`:
+/// 120; a number: that many; unset or 0: never held back). The first wait
+/// is 8 frames and each bare settle doubles it; a settle that frees enough,
+/// or a frame with room for every table, ends it. In base-d the pool stayed
+/// full from 283 s on and the settle each frame waited 92 to 153 ms for the
+/// card to free next to nothing.
+fn settle_backoff() -> u64 {
+    static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| match std::env::var("VICTORY_SETTLE_BACKOFF").as_deref().map(str::trim) {
+        Ok("1") => 120,
+        Ok(v) => v.parse().unwrap_or(0),
+        Err(_) => 0,
+    })
 }
 
 /// Whether frame `frame` has not settled for tables yet ([`dynamic_slots`]);
