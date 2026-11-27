@@ -445,6 +445,8 @@ struct Lower<'a> {
     /// With `exchange`: VGPR values every lane holds alike ([`lane_uniform`]); a first-lane
     /// read of one needs nothing from the other host wave.
     uniform: HashSet<Value>,
+    /// Guarded instructions [`lane_uniform`] lowers in every lane, by block and index.
+    ungated: HashSet<(usize, usize)>,
     /// With `exchange`: the wave ORs that only steer a loop over each lane's own bits, which
     /// a host wave takes over its own lanes wherever they stand ([`super::own_bits`]).
     own_bits: super::own_bits::OwnBits,
@@ -1048,11 +1050,12 @@ fn need(block: usize) {
 /// wave-uniform data in VGPRs and fetches it with `v_readfirstlane`.
 /// shortcut: a value joined by a phi counts only where every predecessor is a block all lanes
 /// run (no lane branch can have split the arriving lanes); loop-carried values never do.
-/// With [`uniform_loads_on`] a buffer load's result counts too.
-fn lane_uniform(p: &Program, st: &Structured, all: &[bool], ordered_lds: bool) -> HashSet<Value> {
+/// With [`uniform_loads_on`] a buffer load's result counts too. With [`guarded_uniform_on`] so
+/// does a guarded write's (the instructions are the second set), lowered without its guard.
+fn lane_uniform(p: &Program, st: &Structured, all: &[bool], ordered_lds: bool) -> (HashSet<Value>, HashSet<(usize, usize)>) {
     let is_mask = |v: Value| st.masks.contains_key(&v) || st.highs.contains_key(&v);
-    let mut same: HashSet<Value> = HashSet::new();
     let loads = uniform_loads_on();
+    let ungate = guarded_uniform_on();
     let writes = |inst: &Inst| {
         matches!(inst.fields, Fields::Buffer { .. } | Fields::Image { .. } | Fields::Flat { .. })
             && (inst.name().contains("store") || inst.name().contains("atomic"))
@@ -1109,79 +1112,219 @@ fn lane_uniform(p: &Program, st: &Structured, all: &[bool], ordered_lds: bool) -
             break;
         }
     }
-    for b in order {
-        let block = &p.blocks[b];
-        let whole = block.preds.iter().all(|&q| all.get(q).copied().unwrap_or(false));
-        let mut dirty = block.preds.iter().any(|&q| wrote[q]);
-        for phi in &block.phis {
-            if matches!(phi.reg, Reg::V(_)) && whole && phi.args.iter().all(|a| same.contains(a)) {
-                same.insert(phi.value);
+    let mut barred: HashSet<(usize, usize)> = HashSet::new();
+    loop {
+        let mut same: HashSet<Value> = HashSet::new();
+        let mut ungated: HashSet<(usize, usize)> = HashSet::new();
+        for &b in &order {
+            let block = &p.blocks[b];
+            let whole = block.preds.iter().all(|&q| all.get(q).copied().unwrap_or(false));
+            let mut dirty = block.preds.iter().any(|&q| wrote[q]);
+            for phi in &block.phis {
+                if matches!(phi.reg, Reg::V(_)) && whole && phi.args.iter().all(|a| same.contains(a)) {
+                    same.insert(phi.value);
+                }
+            }
+            for (i, inst) in block.insts.iter().enumerate() {
+                let name = inst.name();
+                let wrote_before = dirty;
+                dirty |= writes(inst);
+                let ops: Vec<Operand> = match &inst.fields {
+                    Fields::Valu(v)
+                        if v.dpp.is_none()
+                            && v.sdwa.is_none()
+                            && !name.starts_with("v_mbcnt")
+                            && !name.starts_with("v_cmpx")
+                            && !name.contains("lane") =>
+                    {
+                        v.src.clone()
+                    }
+                    // the two host waves of a console wave load at different times: the same bytes
+                    // only from a slot nothing here writes, before this wave's own writes, not glc
+                    Fields::Buffer { addr, rsrc, soffset, offen, idxen, lds: false, tfe: false, cache, .. }
+                        if loads
+                            && !wrote_before
+                            && !cache.glc
+                            && !blind
+                            && name.starts_with("buffer_load")
+                            && slot(inst, rsrc).is_some_and(|s| !slots.contains(&s)) =>
+                    {
+                        let mut ops = vec![*rsrc, *soffset];
+                        if *offen || *idxen {
+                            ops.push(*addr);
+                        }
+                        ops
+                    }
+                    Fields::Ds {
+                        addr: Some(Operand::Vector { reg, dwords: 1 }),
+                        gds: false,
+                        ..
+                    } if ordered_lds && name == "ds_read_b32" && st.guards[b][i].is_none() => {
+                        if inst.read(Reg::V(*reg)).is_some_and(|a| same.contains(&a)) {
+                            same.extend(inst.writes.iter().map(|w| w.1));
+                        }
+                        continue;
+                    }
+                    _ => continue,
+                };
+                let guarded = st.guards[b][i].is_some();
+                if guarded
+                    && !(ungate
+                        && matches!(inst.fields, Fields::Valu(_))
+                        && !barred.contains(&(b, i))
+                        && inst.writes.iter().all(|w| matches!(w.0, Reg::V(_))))
+                {
+                    continue; // lanes outside EXEC keep another value
+                }
+                let alike = ops.iter().all(|op| match *op {
+                    // a guarded write also reads its old value: only the operand's own dwords
+                    Operand::Vector { reg, dwords } if guarded => (reg..reg.saturating_add(dwords.max(1)))
+                        .all(|x| inst.read(Reg::V(x)).is_some_and(|x| same.contains(&x))),
+                    Operand::Vector { reg, .. } => {
+                        // every dword of the operand the instruction reads from that register on
+                        let read: Vec<Value> =
+                            inst.reads.iter().filter(|r| matches!(r.0, Reg::V(x) if x >= reg)).map(|r| r.1).collect();
+                        !read.is_empty() && read.iter().all(|x| same.contains(x))
+                    }
+                    // a scalar is one value; a lane mask is not, unless a compare of such values made it
+                    Operand::Scalar { code, .. } if code != NULL => {
+                        inst.read(Reg::S(code)).is_none_or(|x| !is_mask(x) || same.contains(&x))
+                    }
+                    _ => true,
+                });
+                if alike {
+                    same.extend(inst.writes.iter().filter(|w| w.0 != Reg::Scc).map(|w| w.1));
+                    if guarded {
+                        ungated.insert((b, i));
+                    }
+                }
             }
         }
-        for (i, inst) in block.insts.iter().enumerate() {
-            let name = inst.name();
-            let wrote_before = dirty;
-            dirty |= writes(inst);
-            let ops: Vec<Operand> = match &inst.fields {
-                Fields::Valu(v)
-                    if v.dpp.is_none()
-                        && v.sdwa.is_none()
-                        && !name.starts_with("v_mbcnt")
-                        && !name.starts_with("v_cmpx")
-                        && !name.contains("lane") =>
-                {
-                    v.src.clone()
-                }
-                // the two host waves of a console wave load at different times: the same bytes
-                // only from a slot nothing here writes, before this wave's own writes, not glc
-                Fields::Buffer { addr, rsrc, soffset, offen, idxen, lds: false, tfe: false, cache, .. }
-                    if loads
-                        && !wrote_before
-                        && !cache.glc
-                        && !blind
-                        && name.starts_with("buffer_load")
-                        && slot(inst, rsrc).is_some_and(|s| !slots.contains(&s)) =>
-                {
-                    let mut ops = vec![*rsrc, *soffset];
-                    if *offen || *idxen {
-                        ops.push(*addr);
-                    }
-                    ops
-                }
-                Fields::Ds {
-                    addr: Some(Operand::Vector { reg, dwords: 1 }),
-                    gds: false,
-                    ..
-                } if ordered_lds && name == "ds_read_b32" && st.guards[b][i].is_none() => {
-                    if inst.read(Reg::V(*reg)).is_some_and(|a| same.contains(&a)) {
-                        same.extend(inst.writes.iter().map(|w| w.1));
-                    }
-                    continue;
-                }
-                _ => continue,
-            };
-            if st.guards[b][i].is_some() {
-                continue; // lanes outside EXEC keep another value
-            }
-            let alike = ops.iter().all(|op| match *op {
-                Operand::Vector { reg, .. } => {
-                    // every dword of the operand the instruction reads from that register on
-                    let read: Vec<Value> =
-                        inst.reads.iter().filter(|r| matches!(r.0, Reg::V(x) if x >= reg)).map(|r| r.1).collect();
-                    !read.is_empty() && read.iter().all(|x| same.contains(x))
-                }
-                // a scalar is one value; a lane mask is not, unless a compare of such values made it
-                Operand::Scalar { code, .. } if code != NULL => {
-                    inst.read(Reg::S(code)).is_none_or(|x| !is_mask(x) || same.contains(&x))
-                }
-                _ => true,
-            });
-            if alike {
-                same.extend(inst.writes.iter().filter(|w| w.0 != Reg::Scc).map(|w| w.1));
+        if ungated.is_empty() {
+            return (same, ungated);
+        }
+        let bad = misread(p, st, &ungated);
+        if bad.is_empty() {
+            return (same, ungated);
+        }
+        barred.extend(bad);
+    }
+}
+
+/// Of the guarded writes `ungated` (lowered without their guard: every lane gets the value the
+/// lanes in EXEC get), those some lane outside their EXEC could read. A reader is fine when its
+/// own EXEC lies within the write's and it keeps to its lane, or is a `v_readfirstlane_b32` in a
+/// block some lane of its EXEC is known to reach (a wide `s_cbranch_execz` not taken, say):
+/// with no lane in EXEC it would read lane 0's old value. Phis, cross-lane reads and guarded
+/// rewrites of the same register keep their guard.
+fn misread(p: &Program, st: &Structured, ungated: &HashSet<(usize, usize)>) -> Vec<(usize, usize)> {
+    let lane_exec = |inst: &Inst| inst.read(Reg::S(EXEC)).and_then(|e| st.masks.get(&e).copied());
+    let mut from: HashMap<Value, (usize, usize, Bool)> = HashMap::new();
+    let mut bad: HashSet<(usize, usize)> = HashSet::new();
+    for &(b, i) in ungated {
+        let inst = &p.blocks[b].insts[i];
+        match lane_exec(inst) {
+            Some(m) => from.extend(inst.writes.iter().map(|w| (w.1, (b, i, m)))),
+            None => {
+                bad.insert((b, i));
             }
         }
     }
-    same
+    let known = some_lane(p, st);
+    // a phi counts as a reader only where something reads it
+    let mut live: HashSet<Value> = HashSet::new();
+    for block in &p.blocks {
+        for inst in &block.insts {
+            live.extend(inst.reads.iter().map(|r| r.1));
+        }
+    }
+    loop {
+        let more: Vec<Value> = p
+            .blocks
+            .iter()
+            .flat_map(|b| &b.phis)
+            .filter(|phi| live.contains(&phi.value))
+            .flat_map(|phi| phi.args.iter().copied())
+            .filter(|a| !live.contains(a))
+            .collect();
+        if more.is_empty() {
+            break;
+        }
+        live.extend(more);
+    }
+    for block in &p.blocks {
+        for phi in block.phis.iter().filter(|phi| live.contains(&phi.value)) {
+            bad.extend(phi.args.iter().filter_map(|a| from.get(a)).map(|&(b, i, _)| (b, i)));
+        }
+    }
+    for (ub, block) in p.blocks.iter().enumerate() {
+        for (ui, inst) in block.insts.iter().enumerate() {
+            for &(reg, v) in &inst.reads {
+                let Some(&(b, i, m)) = from.get(&v) else { continue };
+                if inst.write(reg).is_some() {
+                    // the old value of a write: unread where every arriving lane writes
+                    if st.guards[ub][ui].is_some() {
+                        bad.insert((b, i));
+                    }
+                    continue;
+                }
+                let name = inst.name();
+                let lane_wise = match &inst.fields {
+                    Fields::Valu(x) => {
+                        x.dpp.is_none() && !name.starts_with("v_movrel") && !name.contains("lane")
+                            || name == "v_readfirstlane_b32"
+                    }
+                    Fields::Buffer { .. } | Fields::Image { .. } | Fields::Flat { .. } => true,
+                    Fields::Ds { .. } => !name.contains("permute") && !name.contains("swizzle"),
+                    _ => false,
+                };
+                let ok = lane_wise
+                    && lane_exec(inst).is_some_and(|u| {
+                        !st.bools.meet(&[(u, true), (m, false)])
+                            && (name != "v_readfirstlane_b32"
+                                || known[ub].iter().any(|&(f, pol)| !st.bools.meet(&[(f, pol), (u, false)])))
+                    });
+                if !ok {
+                    bad.insert((b, i));
+                }
+            }
+        }
+    }
+    bad.into_iter().collect()
+}
+
+/// Per block: lane conditions some lane of the wave meets on entry. A wide branch on a lane mask
+/// (the whole wave goes one way) sends the wave to a block of its own only when some lane's
+/// `when` holds (`s_cbranch_execnz`) or some lane's fails (`s_cbranch_execz` not taken); what
+/// a block knows its dominated blocks know too, the condition being over values defined before.
+fn some_lane(p: &Program, st: &Structured) -> Vec<Vec<(Bool, bool)>> {
+    let n = p.blocks.len();
+    let mut own: Vec<Vec<(Bool, bool)>> = vec![Vec::new(); n];
+    for &b in &st.wide {
+        let (LaneExit::Branch { when, taken, not_taken }, Some(any)) = (&st.exits[b], st.wave_any[b]) else {
+            continue;
+        };
+        let t = if any { *taken } else { *not_taken };
+        if taken != not_taken && p.blocks[t].preds.len() == 1 && p.blocks[t].preds[0] == b {
+            own[t].push((*when, any));
+        }
+    }
+    let order = crate::ir::reverse_postorder(&p.blocks);
+    let mut index = vec![usize::MAX; n];
+    for (k, &b) in order.iter().enumerate() {
+        index[b] = k;
+    }
+    let idom = crate::ir::idoms(&p.blocks, &order, &index);
+    let mut known: Vec<Vec<(Bool, bool)>> = vec![Vec::new(); n];
+    for &b in &order {
+        let mut k = match idom[b] {
+            d if d != b && d != usize::MAX => known[d].clone(),
+            _ => Vec::new(),
+        };
+        k.append(&mut own[b]);
+        known[b] = k;
+    }
+    known
 }
 
 /// `VICTORY_UNIFORM_LOADS=1`: [`lane_uniform`] also takes what a buffer load reads from an
@@ -1193,6 +1336,16 @@ fn lane_uniform(p: &Program, st: &Structured, all: &[bool], ordered_lds: bool) -
 fn uniform_loads_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_UNIFORM_LOADS").is_some_and(|v| v == "1"))
+}
+
+/// `VICTORY_GUARDED_UNIFORM=1`: [`lane_uniform`] also takes a VALU result written under a guard
+/// from values every lane holds alike, where only lanes of that guard's EXEC read it
+/// ([`misread`]). It is then lowered in every lane with no select of the old value, and a
+/// `v_readfirstlane_b32` of it (the guarded division in 14264103, say) is the host wave's own
+/// first lane: no exchange of a flag and the value. Off by default until a game run has tried it.
+fn guarded_uniform_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_GUARDED_UNIFORM").is_some_and(|v| v == "1"))
 }
 
 /// The paired form: scalar values each console lane has its own of in the lowering, a waterfall
@@ -2147,6 +2300,12 @@ impl<'a> Lower<'a> {
                 }
             }
         }
+        let (uniform, ungated) = match &exchange {
+            Some((_, false, all)) if !LOCAL_WAVES.get() => {
+                lane_uniform(p, x.st, all, split_lds && super::group_sync() != 0 && super::wave32_lowering())
+            }
+            _ => (HashSet::new(), HashSet::new()),
+        };
         Lower {
             s,
             x,
@@ -2219,12 +2378,8 @@ impl<'a> Lower<'a> {
             local: exchange.is_some() && LOCAL_WAVES.get(),
             local_ok: false,
             local_any: LOCAL_ANY.get(),
-            uniform: match &exchange {
-                Some((_, false, all)) if !LOCAL_WAVES.get() => {
-                    lane_uniform(p, x.st, all, split_lds && super::group_sync() != 0 && super::wave32_lowering())
-                }
-                _ => HashSet::new(),
-            },
+            uniform,
+            ungated,
             own_bits: match &exchange {
                 Some((_, false, _)) if !LOCAL_WAVES.get() && own_bits_on() => {
                     super::own_bits::find(p, x.st, std::env::var_os("VICTORY_WAVE_WHY").is_some())
@@ -5577,7 +5732,9 @@ impl<'a> Lower<'a> {
     }
 
     fn guard(&mut self, b: usize, i: usize) -> Result<Option<V>, Why> {
-        if self.spec.is_some_and(|(sb, start, end)| sb == b && (start..end).contains(&i)) {
+        if self.spec.is_some_and(|(sb, start, end)| sb == b && (start..end).contains(&i))
+            || self.ungated.contains(&(b, i))
+        {
             return Ok(None);
         }
         match self.x.st.guards[b][i] {
@@ -5681,10 +5838,11 @@ impl<'a> Lower<'a> {
         self.spec = None;
         r?;
         let mut before: HashMap<Reg, Option<Value>> = HashMap::new();
-        for inst in &p.blocks[b].insts[start..end] {
+        for (at, inst) in p.blocks[b].insts[start..end].iter().enumerate() {
             for &(reg, w) in &inst.writes {
                 let old = *before.entry(reg).or_insert_with(|| inst.read(reg));
-                if self.last_read.get(&w).is_some_and(|k| k.is_some_and(|k| k < end))
+                if self.ungated.contains(&(b, start + at))
+                    || self.last_read.get(&w).is_some_and(|k| k.is_some_and(|k| k < end))
                     || matches!(self.vals.get(&w), None | Some(Val::Missing(_)))
                 {
                     continue;

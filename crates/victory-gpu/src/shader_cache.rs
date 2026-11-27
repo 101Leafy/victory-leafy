@@ -94,6 +94,7 @@ fn build(translator: &str) -> [u8; 32] {
             "VICTORY_HELPER_OWN",
             "VICTORY_FIRSTLANE_OWN",
             "VICTORY_UNIFORM_LOADS",
+            "VICTORY_GUARDED_UNIFORM",
             "VICTORY_FIRST_HALF",
             "VICTORY_STRICT_JOINS",
             "VICTORY_MESH_OUTPUT_STRICT",
