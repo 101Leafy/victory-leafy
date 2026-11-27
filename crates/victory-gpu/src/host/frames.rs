@@ -26,6 +26,13 @@ pub(super) static ROWS: AtomicU64 = AtomicU64::new(0);
 /// 0 with the frame-rate line.
 const COUNTERS: &[(&str, fn() -> u64)] = &[
     ("worked_us", super::worked),
+    // Of the card's clock (`super::CARD_CLOCK_US`), and worth reading right:
+    // the first is the time the card sat with nothing sent; the second is how
+    // much of that time our own submission thread spent working, so the card
+    // was idle *behind us* and not waiting for us - it is not idle time and a
+    // spreadsheet column called `card_idle_behind_us` reads as one; the third
+    // is how long that thread stood waiting for the card, which is the same
+    // fact as the card being busy, seen from the CPU side.
     ("card_idle_us", || get(&super::CARD_CLOCK_US[0])),
     ("card_idle_behind_us", || get(&super::CARD_CLOCK_US[1])),
     ("stood_waiting_us", || get(&super::CARD_CLOCK_US[2])),
