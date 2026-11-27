@@ -219,6 +219,7 @@ pub(crate) fn land(back: &Back) {
     if !crate::host::read_into(at as *const u8, &mut tiled) {
         return;
     }
+    let title = same().then(|| tiled.clone());
     let mut data = std::ptr::null_mut();
     // SAFETY: our read-back buffer, written by the list that has run.
     unsafe {
@@ -243,12 +244,45 @@ pub(crate) fn land(back: &Back) {
     }
     // SAFETY: mapped above.
     unsafe { back.buffer.Unmap(0, None) };
-    crate::host::copy_mapped(at as *mut u8, tiled.as_ptr(), size, true);
-    crate::watch::told(&[(at, size)]);
+    // With `same`: only from the first to the last byte that differs from
+    // title memory, and nothing when none does.
+    let (from, to) = match &title {
+        Some(title) => match tiled.iter().zip(title).position(|(a, b)| a != b) {
+            Some(first) => (first, size - tiled.iter().zip(title).rev().position(|(a, b)| a != b).unwrap_or(0)),
+            None => (0, 0),
+        },
+        None => (0, size),
+    };
+    if to > from {
+        crate::host::copy_mapped((at + from) as *mut u8, tiled[from..].as_ptr(), to - from, true);
+        crate::watch::told(&[(at + from, to - from)]);
+    }
+    PUT.fetch_add((to - from) as u64, Ordering::Relaxed);
+    if to == from {
+        SAME.fetch_add(1, Ordering::Relaxed);
+    }
     let copied = COPIED.fetch_add(1, Ordering::Relaxed) + 1;
     if copied == 1 || copied.is_multiple_of(128) {
-        tracing::info!(copied, bytes = size, "texture readback landed");
+        if same() {
+            let (put, unchanged) = (PUT.load(Ordering::Relaxed), SAME.load(Ordering::Relaxed));
+            tracing::info!(copied, bytes = size, unchanged, put_mb = put as f64 / 1e6, "texture readback landed (VICTORY_TEXBACK_SAME=1)");
+        } else {
+            tracing::info!(copied, bytes = size, "texture readback landed");
+        }
     }
+}
+
+/// Bytes put into title memory, and landings that put none.
+static PUT: AtomicU64 = AtomicU64::new(0);
+static SAME: AtomicU64 = AtomicU64::new(0);
+
+/// Whether a landing puts only the bytes that differ from title memory
+/// (`VICTORY_TEXBACK_SAME=1`; off by default). In the boat window about 19
+/// land a frame, 5 MB, each tiled, written and told to the journal before
+/// the title is told its submission ran.
+fn same() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_TEXBACK_SAME"))
 }
 
 
