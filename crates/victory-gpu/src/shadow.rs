@@ -3241,7 +3241,7 @@ fn same_bytes() {
         };
         BUFFERS.read().unwrap_or_else(|e| e.into_inner()).values().filter_map(|e| e.shadow.as_ref()).for_each(&mut take);
         LOOSE.read().unwrap_or_else(|e| e.into_inner()).values().for_each(&mut take);
-        EXACT.lock().unwrap_or_else(|e| e.into_inner()).1.values().for_each(|(s, _)| take(s));
+        EXACT.read().unwrap_or_else(|e| e.into_inner()).values().for_each(|(s, _)| take(s));
     }
     copies.retain(|s| s.place.is_none());
     let mapped = copies.iter().filter(|s| s.mapped).count();
