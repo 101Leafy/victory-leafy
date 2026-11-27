@@ -4270,6 +4270,7 @@ enum Late {
     Signal(usize, u64),
 }
 
+#[cfg_attr(test, derive(Default))]
 struct Line {
     line: Vec<Late>,
     /// The title memory the flights' shaders and texture readbacks may write
@@ -5508,6 +5509,7 @@ mod place;
 pub(crate) mod pstats;
 mod send;
 mod settle_room;
+pub(crate) mod slot_wait;
 
 /// Whether what goes up to copies in the card's memory goes from memory of
 /// its own (`send::own`).
@@ -12080,6 +12082,7 @@ impl Meter {
         crate::shadow::exact_line(frames);
         crate::descriptor::sync_line(frames);
         late_line(frames);
+        slot_wait::log(frames);
         crate::queue::behind_line(frames);
         card_clock_line(frames, ms);
         if place::forwarding() {
