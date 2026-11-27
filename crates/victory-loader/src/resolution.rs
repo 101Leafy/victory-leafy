@@ -37,8 +37,18 @@
 //!   That constant is set to 1.0, so the title renders at the output size
 //!   and nothing is upscaled. `VICTORY_RENDER_SCALE` (pull request #53) is
 //!   still read, and only 1.0 is taken.
+//! - **Interface.** Its layouts name a stretch mode for each panel, looked up
+//!   by name hash in a table at +0x630ff10 (fill 1, uniform 2, uniform to
+//!   fill 3, dynamic 4). Dynamic keeps the 4K pixel size whatever the
+//!   output, so at 720p and under the subtitles and prompts come out three
+//!   or more times too big. With any `VICTORY_OUTPUT` under 3840x2160 the
+//!   dynamic entry reads uniform, which scales the panel with the output
+//!   (`viewbox`); `VICTORY_UI_VIEWBOX=0` leaves the table alone.
 
 use crate::frame_rate::Patched;
+
+#[cfg(any(windows, test))]
+mod viewbox;
 
 /// Sizes the title has a display mode for (its own list, +0x615c0c0).
 pub const MODES: [(u32, u32); 5] = [(1280, 720), (1664, 936), (1920, 1080), (2560, 1440), (3840, 2160)];
@@ -266,6 +276,12 @@ pub unsafe fn apply_asked(base: usize, size: usize) {
     let mut asked: Vec<(&Site, Vec<u8>, String)> = Vec::new();
     if let Some((w, h)) = asked_output() {
         asked.push((&OUTPUT, output_code(w, h), format!("{w}x{h}")));
+        if viewbox::requested((w, h), std::env::var_os("VICTORY_UI_VIEWBOX").as_deref())
+            // SAFETY: the mapped image is live and the output override has not been applied.
+            && unsafe { matches(base, size, &OUTPUT) } == Patched::Done
+        {
+            asked.push((&viewbox::SITE, viewbox::FITTED.to_vec(), format!("{w}x{h}")));
+        }
         asked.push((&POOL_LEFT, vec![0xeb, 0x01], "skipped".into()));
     }
     asked_render_scale();
