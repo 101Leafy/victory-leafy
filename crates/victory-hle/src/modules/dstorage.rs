@@ -715,8 +715,10 @@ fn walls_request(request: &Request, result: &Result<(), HRESULT>, started: std::
 /// status entry written (`S`: array, number, when enqueued, when written),
 /// the title's first look at it after (`P`: array, when written, when
 /// seen), every file opened (`F`), and each second what the title's mapping
-/// calls cost (`M`, `xmem::map_costs`). Times are milliseconds since the
-/// Unix epoch.
+/// calls cost (`M`, `xmem::map_costs`) and, by thread, their copies and
+/// the reads of title memory that waited on them (`A`,
+/// `victory_gpu::mapping_costs`). Times are milliseconds since the Unix
+/// epoch.
 pub(crate) mod stream_log {
     use super::*;
     use std::io::Write;
@@ -733,6 +735,10 @@ pub(crate) mod stream_log {
                     std::thread::sleep(std::time::Duration::from_secs(1));
                     if let Some(costs) = super::super::xmem::map_costs() {
                         line(format_args!("M\t{}\t{costs}", now()));
+                    }
+                    #[cfg(windows)]
+                    if let Some(costs) = victory_gpu::mapping_costs() {
+                        line(format_args!("A\t{}\t{costs}", now()));
                     }
                     if let Some(log) = log() {
                         let _ = log.lock().unwrap_or_else(|e| e.into_inner()).flush();

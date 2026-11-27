@@ -1326,6 +1326,8 @@ extern "system" fn copy_page_mappings(
         return E_INVALIDARG;
     }
     let _called = crate::timeline::span("the title's CopyPageMappings");
+    let started = std::time::Instant::now();
+    let mut bytes = 0;
     let batches = (count > 0).then(|| {
         // SAFETY: the title passes `count` batches.
         unsafe { std::slice::from_raw_parts(batches, count as usize) }
@@ -1351,6 +1353,9 @@ extern "system" fn copy_page_mappings(
             let len = u64::from(r.count) * PAGE;
             let inside = |pages: u32| r.start.checked_add(pages).is_some_and(|e| e <= pool_pages);
             let source = pool + u64::from(r.start) * PAGE;
+            if r.kind != 3 {
+                bytes += len;
+            }
             ok &= match r.kind {
                 0 if inside(r.count) => map(at, source, len),
                 1 if inside(1) => (0..u64::from(r.count)).all(|k| map(at + k * PAGE, source, PAGE)),
@@ -1364,6 +1369,8 @@ extern "system" fn copy_page_mappings(
     if let Some(many) = many {
         ok &= many(&gathered);
     }
+    #[cfg(windows)]
+    crate::watch::mapping_cost("copy", started.elapsed().as_nanos() as u64, bytes);
     if !ok {
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| tracing::warn!(pool = format_args!("{pool:#x}"), "a page mapping failed"));

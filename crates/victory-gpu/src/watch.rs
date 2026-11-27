@@ -3833,7 +3833,15 @@ pub struct Reading(#[allow(dead_code)] std::sync::RwLockReadGuard<'static, ()>);
 /// Not to be taken twice by one thread, nor held across anything that
 /// maps title memory.
 pub fn title_memory_reading() -> Reading {
-    Reading(MAPPING.read().unwrap_or_else(|e| e.into_inner()))
+    match MAPPING.try_read() {
+        Ok(guard) => return Reading(guard),
+        Err(std::sync::TryLockError::Poisoned(e)) => return Reading(e.into_inner()),
+        Err(std::sync::TryLockError::WouldBlock) => {}
+    }
+    let started = std::time::Instant::now();
+    let guard = MAPPING.read().unwrap_or_else(|e| e.into_inner());
+    mapping_cost("wait", started.elapsed().as_nanos() as u64, 0);
+    Reading(guard)
 }
 
 /// [`title_memory_reading`] if it can be had at once: `None` while the
@@ -3843,8 +3851,41 @@ pub fn title_memory_reading_now() -> Option<Reading> {
     match MAPPING.try_read() {
         Ok(guard) => Some(Reading(guard)),
         Err(std::sync::TryLockError::Poisoned(e)) => Some(Reading(e.into_inner())),
-        Err(std::sync::TryLockError::WouldBlock) => None,
+        Err(std::sync::TryLockError::WouldBlock) => {
+            mapping_cost("miss", 0, 0);
+            None
+        }
     }
+}
+
+/// By kind and thread: how often, nanoseconds in all, the longest, bytes.
+/// Kinds: `wait`, a read of title memory in place that waited for a change
+/// of mapping; `miss`, one that would have waited and went another way;
+/// `copy`, the title's CopyPageMappings (bytes mapped and unmapped).
+static MAPPING_COSTS: Mutex<BTreeMap<(&'static str, String), [u64; 4]>> = Mutex::new(BTreeMap::new());
+
+pub(crate) fn mapping_cost(kind: &'static str, ns: u64, bytes: u64) {
+    let thread = std::thread::current();
+    let name = thread.name().map_or_else(|| format!("{:?}", thread.id()), str::to_owned);
+    let mut costs = MAPPING_COSTS.lock().unwrap_or_else(|e| e.into_inner());
+    let n = costs.entry((kind, name)).or_default();
+    n[0] += 1;
+    n[1] += ns;
+    n[2] = n[2].max(ns);
+    n[3] += bytes;
+}
+
+/// What [`mapping_cost`] counted since the last call, one tab-separated
+/// entry each: kind, count, microseconds in all, the longest, bytes, thread.
+pub fn mapping_costs() -> Option<String> {
+    let costs = std::mem::take(&mut *MAPPING_COSTS.lock().unwrap_or_else(|e| e.into_inner()));
+    (!costs.is_empty()).then(|| {
+        let all: Vec<String> = costs
+            .iter()
+            .map(|((kind, thread), n)| format!("{kind},{},{},{},{},{thread}", n[0], n[1] / 1000, n[2] / 1000, n[3]))
+            .collect();
+        all.join("\t")
+    })
 }
 
 /// The runtime mapped title memory `[at, at + len)`: what it shows is new,
