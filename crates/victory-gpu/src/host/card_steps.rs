@@ -578,6 +578,7 @@ fn record(
         } else {
             list.ResourceBarrier(&[transition(between, constants, dest)]);
         }
+        DONE[4].fetch_add((reads.len() + writes.len()) as u64, Ordering::Relaxed);
         for &(buffer, offset, at, len) in reads {
             list.CopyBufferRegion(between, at, buffer, offset, len);
         }
@@ -608,8 +609,10 @@ unsafe impl Send for Own {}
 static POOL: Mutex<Vec<Own>> = Mutex::new(Vec::new());
 
 /// Since the last frame-rate line: fills and copies done on the card, their
-/// bytes, and submissions that waited instead, refused by a check.
-static DONE: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+/// bytes, submissions that waited instead, refused by a check, and the
+/// buffer copies recorded for them (a fill into a slot reads a place shared
+/// with others, and writes nothing).
+static DONE: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 
 /// What [`Host::card_steps`] took off a submission: the list that does it,
 /// for the submission to run first, and the steps the CPU leaves out (their
@@ -930,6 +933,9 @@ impl Host {
         let Some(own) = self.own_list() else {
             return Err("no host list or buffer for it");
         };
+        #[cfg(feature = "diagnostics")]
+        // SAFETY: the list is open.
+        let side = unsafe { crate::sidetime::begin(&self.device, &self.queue, &own.list.list, crate::sidetime::STEPS) };
         // First every refresh, then the writes: the bytes compared with are
         // the title's. (One step for each host copy, over all that is read of
         // it: a flush brings a copy up to date from the first range asked for
@@ -991,6 +997,9 @@ impl Host {
                 }
             }
         }
+        #[cfg(feature = "diagnostics")]
+        // SAFETY: the list begun with, still open.
+        unsafe { crate::sidetime::end(&own.list.list, side) };
         own.list.close();
         // SAFETY: a live buffer.
         let gpu = unsafe { own.between.GetGPUVirtualAddress() };
@@ -1087,12 +1096,13 @@ pub(super) fn log(frames: f64) {
     let d: Vec<f64> = DONE.iter().map(|d| d.swap(0, Ordering::Relaxed) as f64 / frames).collect();
     tracing::info!(
         "steps done on the card instead of waiting for flights, per frame (VICTORY_CARD_STEPS={}): {:.2} fills, {:.2} buffer \
-         copies, {:.1} KB; {:.2} submissions refused and waited",
+         copies, {:.1} KB; {:.2} submissions refused and waited; {:.1} buffer copies recorded",
         stage(),
         d[0],
         d[1],
         d[2] / 1024.0,
         d[3],
+        d[4],
     );
     if late::on() {
         // (Index 3 counts in all, the others since the last line.)
