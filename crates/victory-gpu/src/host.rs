@@ -8625,6 +8625,11 @@ static FLUSHES: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::
 #[cfg(feature = "diagnostics")]
 static FRONT: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
+/// As [`FRONT`], of the flushes among the steps with more than a few
+/// refreshes ([`flush_sift`]).
+#[cfg(feature = "diagnostics")]
+static AMONG: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
 /// Counts into [`SPLIT`].
 #[cfg(feature = "diagnostics")]
 struct Split(std::cell::Cell<std::time::Instant>);
@@ -8754,6 +8759,15 @@ fn split_line(frames: f64) {
         r[3],
         r[2] / 1e6,
         if front_sift() { "on" } else { "off" },
+    );
+    let r: Vec<f64> = AMONG.iter().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+    tracing::info!(
+        "refreshes among the steps per frame, flushes of many: {:.2} ms sifting, {:.2} asking the write watch ahead over {:.0}          ranges, {:.2} copying on the threads (VICTORY_FLUSH_SIFT is {})",
+        r[0] / 1e6,
+        r[1] / 1e6,
+        r[3],
+        r[2] / 1e6,
+        if flush_sift() { "on" } else { "off" },
     );
     tracing::info!(
         "asking about title memory per frame, all threads: {:.0} kernel askings over {:.0} MB ({:.1} ms, {:.0} pages of 4 KiB found \
@@ -9013,6 +9027,38 @@ fn sift_front(spans: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>)
     let left: Vec<_> = spans.into_iter().zip(keep.iter()).filter(|(_, k)| k.load(Ordering::Relaxed)).map(|(s, _)| s).collect();
     #[cfg(feature = "diagnostics")]
     FLUSHES[2].fetch_add((keep.len() - left.len()) as u64, Ordering::Relaxed);
+    left
+}
+
+/// As [`front_sift`], at a flush among the steps: with very many refreshes
+/// (the heap's buffer views once a frame), those known to copy nothing are
+/// sifted out on all threads before the write watch is asked ahead.
+fn flush_sift() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_FLUSH_SIFT"))
+}
+
+/// [`flush_sift`]: the refreshes that may copy something, in their order,
+/// each with its ranges that copy nothing left out.
+fn sift_refreshes(refreshes: Vec<Refresh>) -> Vec<Refresh> {
+    use std::sync::atomic::AtomicBool;
+    let refreshes = std::sync::Arc::new(refreshes);
+    let keep: std::sync::Arc<Vec<AtomicBool>> = std::sync::Arc::new((0..refreshes.len()).map(|_| AtomicBool::new(false)).collect());
+    let (r, k) = (refreshes.clone(), keep.clone());
+    crate::shadow::wide_each(refreshes.len(), move |i| {
+        let shadow = &r[i].0;
+        if ranges(&r[i]).any(|(from, to)| !shadow.nothing_new(from, to - from)) {
+            k[i].store(true, Ordering::Relaxed);
+        }
+    });
+    let refreshes = std::sync::Arc::try_unwrap(refreshes).unwrap_or_else(|a| (*a).clone());
+    #[cfg(feature = "diagnostics")]
+    let all = refreshes.len();
+    let mut left: Vec<_> = refreshes.into_iter().zip(keep.iter()).filter(|(_, k)| k.load(Ordering::Relaxed)).map(|(r, _)| r).collect();
+    // Few are left: their other ranges are sifted here.
+    left.retain_mut(keep_new);
+    #[cfg(feature = "diagnostics")]
+    FLUSHES[2].fetch_add((all - left.len()) as u64, Ordering::Relaxed);
     left
 }
 
@@ -9550,6 +9596,20 @@ impl Batch {
             #[cfg(feature = "diagnostics")]
             FLUSHES[2].fetch_add((all - self.refreshes.len()) as u64, Ordering::Relaxed);
         }
+        let many = light && self.refreshes.len() > FEW;
+        #[cfg(feature = "diagnostics")]
+        let mut lap = std::time::Instant::now();
+        let sifted = many && flush_sift();
+        if sifted {
+            let started = std::time::Instant::now();
+            self.refreshes = sift_refreshes(std::mem::take(&mut self.refreshes));
+            PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        }
+        #[cfg(feature = "diagnostics")]
+        if many {
+            AMONG[0].fetch_add(lap.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            lap = std::time::Instant::now();
+        }
         // One write-watch asking for the copies that lie close together,
         // not one per copy.
         let ahead = self.refreshes.len() > 1;
@@ -9561,8 +9621,17 @@ impl Batch {
                 .filter(|r| r.0.asked_ahead())
                 .flat_map(ranges)
                 .collect();
+            #[cfg(feature = "diagnostics")]
+            if many {
+                AMONG[3].fetch_add(ranges.len() as u64, Ordering::Relaxed);
+            }
             crate::watch::ask_ahead(&ranges);
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        }
+        #[cfg(feature = "diagnostics")]
+        if many {
+            AMONG[1].fetch_add(lap.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            lap = std::time::Instant::now();
         }
         if wide_refresh() && self.refreshes.len() >= 4 {
             // Each copy on its own, several at a time: a copy's refresh
@@ -9578,7 +9647,7 @@ impl Batch {
                 crate::shadow::wide_each(refreshes.len(), move |i| {
                     let shadow = &refreshes[i].0;
                     for (from, to) in ranges(&refreshes[i]) {
-                        if refreshes.len() > FEW && shadow.nothing_new(from, to - from) {
+                        if refreshes.len() > FEW && !sifted && shadow.nothing_new(from, to - from) {
                             #[cfg(feature = "diagnostics")]
                             FLUSHES[2].fetch_add(1, Ordering::Relaxed);
                             continue;
@@ -9603,6 +9672,10 @@ impl Batch {
             for r in self.refreshes.drain(..) {
                 ranges(&r).for_each(|(from, to)| Self::update(&r.0, from, to));
             }
+        }
+        #[cfg(feature = "diagnostics")]
+        if many {
+            AMONG[2].fetch_add(lap.elapsed().as_nanos() as u64, Ordering::Relaxed);
         }
         if ahead {
             crate::watch::ask_ahead_done();
