@@ -514,6 +514,9 @@ struct Lower<'a> {
     /// The program tests rays against tree nodes (`image_bvh*`): its loops
     /// are cut at [`TRACE_LOOP_LIMIT`].
     traces: bool,
+    /// Back edges per entry of the loops whose count the code fixes
+    /// (`super::trips`), by IR header: their limit is that count.
+    trips: HashMap<usize, u32>,
     /// The block a loop stopped by [`LOOP_LIMIT`] leaves the program from.
     abort: Option<usize>,
     /// The loops closed by a plain jump that test the limit at their own exits instead.
@@ -575,6 +578,17 @@ pub(super) const LOOP_LIMIT: u32 = 1 << 20;
 /// runs of the opening of the gameplay, RTX 5090); a ray stopped either way
 /// leaves the program as killed, as before.
 pub(super) const TRACE_LOOP_LIMIT: u32 = 1 << 10;
+
+/// A loop's iteration limit: the stage's, or for a loop whose count the
+/// code fixes (`trips` back edges per entry) just above that count, so the
+/// loop runs to its end. A limit named by `VICTORY_SHADER_LOOP_LIMIT` is
+/// kept as named.
+pub(super) fn counted_limit(stage: u32, switch: u32, trips: Option<u32>) -> u32 {
+    match trips {
+        Some(n) if switch == LOOP_LIMIT => stage.max(n.saturating_add(1)),
+        _ => stage,
+    }
+}
 
 /// Lane masks read as numbers (`s_bcnt1`, `s_ff1`, `v_mbcnt`, scalar
 /// compares, bit tests) are ballots of the lanes' booleans, taken where the
@@ -2495,6 +2509,7 @@ impl<'a> Lower<'a> {
             edges: HashMap::new(),
             exported: vec![false; p.blocks.len()],
             rpo: vec![usize::MAX; p.blocks.len()],
+            trips: HashMap::new(),
             tail: vec![None; p.blocks.len()],
             writes_uavs,
             src0: None,
@@ -3326,6 +3341,7 @@ impl<'a> Lower<'a> {
                 self.s.m.new_block()
             });
         }
+        self.trips = super::trips::trips(p, &self.rpo);
         // Loop headers count iterations (`LOOP_LIMIT`).
         for &b in &order {
             let header = p.blocks[b]
@@ -14124,7 +14140,7 @@ impl<'a> Lower<'a> {
                 // (`LimitExits`).
                 for h in self.limit.tests.get(&b).cloned().unwrap_or_default() {
                     let Some(&(count, _)) = self.counters.get(&h) else { continue };
-                    let last = self.s.m.i32(self.iteration_limit() - 1);
+                    let last = self.s.m.i32(self.iteration_limit(h) - 1);
                     cond = if self.limit.bodies[&h].contains(&taken) {
                         let under = self.s.m.cmp(self.cur, pred::IULT, count, last);
                         self.s.m.tag(under, Tag::Counter);
@@ -14181,7 +14197,7 @@ impl<'a> Lower<'a> {
     /// [`LOOP_LIMIT`] by `p` (below: go on; at or above: stop).
     fn count_iteration(&mut self, to: usize, p: u8) -> V {
         let next = self.next_iteration(to);
-        let limit = self.s.m.i32(self.iteration_limit());
+        let limit = self.s.m.i32(self.iteration_limit(to));
         let over = self.s.m.cmp(self.cur, p, next, limit);
         self.s.m.tag(over, Tag::Counter);
         over
@@ -14204,7 +14220,7 @@ impl<'a> Lower<'a> {
     }
 
     /// The iterations a lane makes of a loop it entered before it is taken out of it.
-    fn iteration_limit(&self) -> u32 {
+    fn iteration_limit(&self, to: usize) -> u32 {
         // Per stage unless the switch names one: a loop that never meets its
         // exit (a count read from a buffer the host has not got yet, say)
         // runs to the limit in every lane. A million iterations a pixel
@@ -14216,13 +14232,14 @@ impl<'a> Lower<'a> {
         // 14-25 frames in, in a minimap or shadow mesh draw; with every
         // loop cut at 64 it ran 90 frames. Raise them again once shaders
         // stop reading data that is not there yet.)
-        match super::loop_limit() {
+        let stage = match super::loop_limit() {
             LOOP_LIMIT if self.s.pixel => 1 << 7,
             LOOP_LIMIT if self.s.mesh.is_some() || self.s.threads.is_none() => 1 << 8,
             LOOP_LIMIT if self.traces => TRACE_LOOP_LIMIT,
             LOOP_LIMIT => 1 << 12,
             named => named,
-        }
+        };
+        counted_limit(stage, super::loop_limit(), self.trips.get(&to).copied())
     }
 
     /// The block a lane stopped by [`LOOP_LIMIT`] leaves through.
