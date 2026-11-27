@@ -351,6 +351,11 @@ static CARDED: Mutex<Vec<std::sync::Weak<Shadow>>> = Mutex::new(Vec::new());
 /// it took no lock of the copies it passed over.
 static TOUCHED: Mutex<Vec<std::sync::Weak<Shadow>>> = Mutex::new(Vec::new());
 
+/// Pieces of copies in the card's memory to be hashed again before the next
+/// submission, with nothing sent ([`Shadow::rehash_later`]): the copy, and the
+/// offsets the piece's hash covers.
+static REHASH: Mutex<Vec<(std::sync::Weak<Shadow>, usize, usize)>> = Mutex::new(Vec::new());
+
 /// A copy just made in the card's memory: listed in [`CARDED`], and in
 /// [`TOUCHED`] if it is made touched. Copies that are gone are taken off
 /// [`CARDED`] here, each time its length reaches a power of two.
@@ -861,6 +866,43 @@ pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)
         if !ranges.is_empty() {
             out.push((shadow, ranges));
         }
+    }
+    out
+}
+
+/// With [`send_changed`]: the pieces of copies in the card's memory that a
+/// compare flagged and whose fetch found what the CPU's side holds
+/// ([`Shadow::rehash_later`]), each copy with their offsets, in order and
+/// joined where they touch. They are taken: the caller hashes them again on
+/// the card before the next submission's lists (`Host::card_before`) and
+/// sends nothing of them.
+pub(crate) fn card_rehash() -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)> {
+    if !send_changed() {
+        return Vec::new();
+    }
+    take_rehash()
+}
+
+/// [`card_rehash`], whatever the switch says.
+fn take_rehash() -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)> {
+    let mut all = std::mem::take(&mut *REHASH.lock().unwrap_or_else(|e| e.into_inner()));
+    all.sort_unstable_by_key(|(weak, from, _)| (weak.as_ptr() as usize, *from));
+    let mut out: Vec<(Arc<Shadow>, Vec<(usize, usize)>)> = Vec::new();
+    for (weak, from, to) in all {
+        match out.last_mut() {
+            Some((shadow, ranges)) if std::ptr::eq(Arc::as_ptr(shadow), weak.as_ptr()) => {
+                ranges.push((from, to))
+            }
+            // (A copy let go meanwhile has nothing to hash.)
+            _ => {
+                if let Some(shadow) = weak.upgrade() {
+                    out.push((shadow, vec![(from, to)]));
+                }
+            }
+        }
+    }
+    for (_, ranges) in &mut out {
+        *ranges = joined(std::mem::take(ranges));
     }
     out
 }
@@ -2420,6 +2462,77 @@ pub(crate) fn wide_each(n: usize, work: impl Fn(usize) + Send + Sync + 'static) 
     wide(jobs);
 }
 
+/// `VICTORY_WIDE_CHUNK=<n>` (1, the default: as before): a submission's
+/// refreshes of copies go to the kept threads `n` at a time, and a thread is
+/// woken for every `n` of them ([`wide_each_from`]).
+///
+/// Why: 9,584 refreshes a frame in 38 flushes, 8,438 of them known to copy
+/// nothing and 9,086 of them told so on the threads (session 2026-11-28
+/// 00:45): each took its number from one counter all the threads share, and
+/// a flush of a few small ones woke as many threads as it had pieces.
+pub(crate) fn wide_chunk() -> usize {
+    static CHUNK: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CHUNK.get_or_init(|| {
+        let chunk =
+            std::env::var("VICTORY_WIDE_CHUNK").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(1usize).clamp(1, 256);
+        if chunk > 1 {
+            tracing::info!(chunk, "refreshes of copies go to the kept threads several at a time (VICTORY_WIDE_CHUNK)");
+        }
+        chunk
+    })
+}
+
+/// [`wide_each`] for many small pieces behind a few long ones: the numbers
+/// under `single` go one at a time (the long pieces: each may be a thread's
+/// whole share), the others `chunk` at a time, and no more threads take part
+/// than there are such shares. With `chunk` 1 it is [`wide_each`].
+pub(crate) fn wide_each_from(n: usize, single: usize, chunk: usize, work: impl Fn(usize) + Send + Sync + 'static) {
+    let (single, chunk) = (single.min(n), chunk.max(1));
+    if chunk == 1 {
+        return wide_each(n, work);
+    }
+    let threads = (wide_threads() + 1).min(shares(n, single, chunk));
+    if threads < 2 {
+        (0..n).for_each(work);
+        return;
+    }
+    let next = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let work = Arc::new(work);
+    let jobs = (0..threads)
+        .map(|_| {
+            let (next, work) = (next.clone(), work.clone());
+            Box::new(move || {
+                while let Some((from, to)) = claim(&next, n, single, chunk) {
+                    (from..to).for_each(|i| work(i));
+                }
+            }) as Job
+        })
+        .collect();
+    wide(jobs);
+}
+
+/// How many shares [`claim`] cuts `n` numbers into.
+fn shares(n: usize, single: usize, chunk: usize) -> usize {
+    let single = single.min(n);
+    single + (n - single).div_ceil(chunk.max(1))
+}
+
+/// The next numbers under `n` for one thread, counted on in `next`: one while
+/// they are under `single`, then up to `chunk`. `None`: all are taken.
+fn claim(next: &std::sync::atomic::AtomicUsize, n: usize, single: usize, chunk: usize) -> Option<(usize, usize)> {
+    let mut from = next.load(Ordering::Relaxed);
+    loop {
+        if from >= n {
+            return None;
+        }
+        let to = if from < single { from + 1 } else { (from + chunk).min(n) };
+        match next.compare_exchange_weak(from, to, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return Some((from, to)),
+            Err(now) => from = now,
+        }
+    }
+}
+
 /// About this many bytes to a piece of work for [`wide`].
 const WIDE_JOB: usize = 1 << 20;
 
@@ -3566,6 +3679,85 @@ mod landing_tests {
         copy.take_landed(from, from + 100);
         copy.take_landed(from, to);
         assert_eq!(copy.take_dirty(), []);
+        drop(room);
+    }
+}
+
+#[cfg(test)]
+mod rehash_tests {
+    use super::{ID3D12Resource, PIECE, Shadow, send_changed, take_rehash};
+    use std::sync::Arc;
+
+    /// The pieces of `copy` that [`take_rehash`] gives (another test's copies
+    /// may be on the list too).
+    fn rehashed(copy: &Arc<Shadow>) -> Vec<(usize, usize)> {
+        take_rehash()
+            .into_iter()
+            .filter(|(s, _)| Arc::ptr_eq(s, copy))
+            .flat_map(|(_, r)| r)
+            .collect()
+    }
+
+    /// A piece the fetch found the same as the CPU's side is hashed again,
+    /// with nothing sent, if every byte its hash covers was fetched; one in
+    /// which a shader wrote is merged and sent up, as before.
+    #[test]
+    fn a_piece_fetched_unchanged_is_hashed_again() {
+        // Three whole pieces and 100 bytes of a fourth.
+        let len = 3 * PIECE + 100;
+        let room: Vec<u8> = (0..len + PIECE).map(|i| (i % 251) as u8).collect();
+        let title = (room.as_ptr() as usize).next_multiple_of(PIECE);
+        // SAFETY: inside `room`.
+        let mut side = unsafe { std::slice::from_raw_parts(title as *const u8, len) }.to_vec();
+        let copy = Shadow::unbacked(title as u64, side.as_mut_ptr(), len as u64, true);
+        let card = copy.card.as_ref().unwrap();
+        // No hashes on the card: nothing to make again.
+        copy.rehash_later(0, PIECE);
+        assert_eq!(rehashed(&copy), []);
+        // SAFETY: an interface pointer nothing calls; nothing lets it go, as
+        // the copy is never let go.
+        let none = unsafe { std::mem::transmute::<usize, ID3D12Resource>(8) };
+        *card.before.lock().unwrap() = Some(none);
+        // Not in an `Arc` the list knows of yet.
+        copy.rehash_later(0, PIECE);
+        assert_eq!(rehashed(&copy), []);
+        let _ = card.me.set(Arc::downgrade(&copy));
+        copy.rehash_later(PIECE, PIECE);
+        copy.rehash_later(0, PIECE);
+        // Part of a piece, and the last piece, whose hash covers 12 bytes
+        // past the copy: left flagged.
+        copy.rehash_later(2 * PIECE + 16, PIECE - 16);
+        copy.rehash_later(3 * PIECE, 100);
+        assert_eq!(rehashed(&copy), [(0, 2 * PIECE)]);
+        copy.rehash_later(2 * PIECE, PIECE);
+        assert_eq!(rehashed(&copy), [(2 * PIECE, 3 * PIECE)]);
+        assert_eq!(rehashed(&copy), []);
+
+        // The merge: the card holds what the CPU's side does.
+        let mut scratch = Vec::new();
+        let gpu = side[PIECE..2 * PIECE].to_vec();
+        assert_eq!(copy.card_merge(PIECE, &gpu, &mut scratch), 0);
+        assert_eq!(copy.take_dirty(), [], "nothing goes up");
+        let wanted: &[(usize, usize)] = if send_changed() {
+            &[(PIECE, 2 * PIECE)]
+        } else {
+            &[]
+        };
+        assert_eq!(rehashed(&copy), wanted);
+        // A shader wrote a dword (values the pattern never holds): merged
+        // into title memory and the CPU's side, and sent up (its hash is
+        // made with that).
+        let mut gpu = side[..PIECE].to_vec();
+        gpu[400..404].copy_from_slice(&[251, 252, 253, 254]);
+        assert_eq!(copy.card_merge(0, &gpu, &mut scratch), 4);
+        assert_eq!(copy.take_dirty(), [(400, 404)]);
+        assert_eq!(rehashed(&copy), []);
+        assert_eq!(&side[400..404], [251, 252, 253, 254]);
+        // SAFETY: inside `room`.
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts((title + 400) as *const u8, 4) },
+            [251, 252, 253, 254]
+        );
         drop(room);
     }
 }
@@ -5547,6 +5739,9 @@ impl Shadow {
         // thread writes it.
         let old = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), gpu.len()) };
         let Some(first) = first_difference(gpu, old) else {
+            if send_changed() {
+                self.rehash_later(at, gpu.len());
+            }
             return 0;
         };
         let last = last_difference(gpu, old).unwrap_or(first);
@@ -5580,6 +5775,50 @@ impl Shadow {
         // The card's side and its "before" take the result.
         self.card_changed(at, at + n);
         written
+    }
+
+    /// [`Shadow::card_merge`] found offsets `[at, at + len)` of a piece the
+    /// same on the card's side as on the CPU's, with [`send_changed`]: if
+    /// they are all that the piece's hash covers, the piece is hashed again
+    /// before the next submission, and nothing of it is sent ([`card_rehash`]).
+    ///
+    /// The compare after the lists (without the relay) leaves the hashes as
+    /// they are: a piece's hash is made again only when something of it goes
+    /// up, and until then every compare that holds the piece flags it and
+    /// has it fetched. Where the fetch finds nothing new (a copy the list made
+    /// at its place, whose bytes the CPU's side took at submission:
+    /// [`Shadow::placed_copy`]; a shader that wrote what was there) nothing
+    /// goes up from the merge. Without the switch the copy's pages, which it
+    /// wrote into title memory at submission, go up whole with the next
+    /// refresh, and the hash is made with them. With it that refresh sends
+    /// only the dwords that differ from the CPU's side, and there are none:
+    /// the piece stayed flagged for good, and every piece the copies ever
+    /// reached was fetched after every submission (64 MB a frame in the
+    /// memory bench at 64 MB, against 1.5 MB without the switch).
+    ///
+    /// Only a piece fetched whole: a byte its hash covers that was not
+    /// compared here may be one a shader wrote and nobody declared, which a
+    /// new hash would hide from the next declared range that holds it.
+    fn rehash_later(&self, at: usize, len: usize) {
+        let Some(card) = &self.card else {
+            return;
+        };
+        let Some(me) = card.me.get() else {
+            return;
+        };
+        let hashed = {
+            let before = card.before.lock().unwrap_or_else(|e| e.into_inner());
+            before.is_some()
+        };
+        if len == 0 || !hashed {
+            return;
+        }
+        let (lo, hi) = self.card_hashed(self.card_piece_of(at));
+        if lo < at || hi > at + len {
+            return;
+        }
+        let mut all = REHASH.lock().unwrap_or_else(|e| e.into_inner());
+        all.push((me.clone(), lo, hi));
     }
 
     /// [`relay`], for a copy in the card's memory: `gpu` is what the
@@ -7867,5 +8106,44 @@ mod wide_threads_tests {
         assert_eq!(wide_threads_for(Some("32"), Some(24)), 16);
         assert_eq!(wide_threads_for(Some("0"), Some(24)), 6);
         assert_eq!(wide_threads_for(Some("bad"), Some(16)), 4);
+    }
+}
+
+#[cfg(test)]
+mod wide_chunk_tests {
+    use super::{claim, shares, wide_each_from};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+
+    /// The long pieces go one at a time, the others by the chunk, each
+    /// number once.
+    #[test]
+    fn numbers_are_claimed_once_each_the_single_ones_first() {
+        let next = AtomicUsize::new(0);
+        let mut got = Vec::new();
+        while let Some(range) = claim(&next, 23, 3, 8) {
+            got.push(range);
+        }
+        assert_eq!(got, [(0, 1), (1, 2), (2, 3), (3, 11), (11, 19), (19, 23)]);
+        assert_eq!(shares(23, 3, 8), 6);
+        // More single ones named than there are numbers.
+        assert_eq!(shares(2, 5, 8), 2);
+        assert_eq!(shares(0, 0, 8), 0);
+        assert_eq!(shares(7, 0, 8), 1);
+        assert!(claim(&AtomicUsize::new(0), 0, 0, 8).is_none());
+        assert_eq!(claim(&AtomicUsize::new(0), 2, 5, 8), Some((0, 1)));
+    }
+
+    /// Every number is worked once, whatever the chunk and however few.
+    #[test]
+    fn every_number_is_worked_once_whatever_the_chunk() {
+        for (n, single, chunk) in [(0, 0, 8), (1, 0, 8), (7, 0, 8), (100, 0, 8), (1000, 3, 16), (300, 300, 4), (257, 1, 1), (9, 2, 256)] {
+            let worked: Arc<Vec<AtomicU32>> = Arc::new((0..n).map(|_| AtomicU32::new(0)).collect());
+            let counted = worked.clone();
+            wide_each_from(n, single, chunk, move |i| {
+                counted[i].fetch_add(1, Ordering::Relaxed);
+            });
+            assert!(worked.iter().all(|w| w.load(Ordering::Relaxed) == 1), "n {n}, single {single}, chunk {chunk}");
+        }
     }
 }

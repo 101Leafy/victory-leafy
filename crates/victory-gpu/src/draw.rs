@@ -979,6 +979,9 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
         crate::book::root(gpu, len);
         return Some(gpu);
     }
+    if let Some((_, gpu)) = list.place_constant(address as usize, len as usize) {
+        return Some(gpu);
+    }
     list.fill_scratch(address as *const u8, len)
 }
 
@@ -4936,6 +4939,10 @@ impl State {
                         if let Some((buffer, gpu)) = list.place_constants(address as usize, size as usize) {
                             host.constant_at(index, &buffer, gpu, size);
                             constants = true;
+                            continue;
+                        }
+                        if let Some((buffer, gpu)) = list.place_constant(address as usize, size as usize) {
+                            host.constant_at(index, &buffer, gpu, size);
                             continue;
                         }
                         let Some((buffer, gpu, to)) = list.scratch_held(u64::from(size)) else {
