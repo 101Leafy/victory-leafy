@@ -1035,6 +1035,8 @@ pub(crate) fn page_written(at: usize, len: usize) {
     if end <= SPANNED[0].load(Relaxed) || start >= SPANNED[1].load(Relaxed) {
         return;
     }
+    #[cfg(feature = "diagnostics")]
+    crate::texture::audit::told(at, len, 2);
     let mut ranges = PAGE_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
     PAGE_WRITES[0].fetch_add(1, Relaxed);
     let joined = record_range(&mut ranges, start, end, MOST);
@@ -1094,6 +1096,8 @@ pub(crate) fn remapped(at: usize, len: usize) {
     if end <= SPANNED[0].load(Relaxed) || start >= SPANNED[1].load(Relaxed) {
         return;
     }
+    #[cfg(feature = "diagnostics")]
+    crate::texture::audit::told(at, len, 1);
     let mut ranges = REMAPPED.lock().unwrap_or_else(|e| e.into_inner());
     STALE[1].fetch_add(1, Relaxed);
     let joined = record_range(&mut ranges, start, end, MOST);
@@ -2309,6 +2313,8 @@ impl HostHeap {
     /// `crate::texture` ([`page_settle`], `VICTORY_TABLED_REREAD`).
     /// Counted either way; returns how many slots it made due.
     fn texture_slots_page_written(&self, frame: u64) -> usize {
+        #[cfg(feature = "diagnostics")]
+        crate::texture::audit::check(frame);
         let ranges = std::mem::take(&mut *PAGE_WRITTEN.lock().unwrap_or_else(|e| e.into_inner()));
         // Not in this file's tests: texture.rs's own test settles textures
         // on a made-up clock, which the real one here would run past.
