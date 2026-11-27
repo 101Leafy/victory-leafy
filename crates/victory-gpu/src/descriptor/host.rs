@@ -1816,6 +1816,9 @@ fn capped_dynamic_slots(count: u32, null: u32, set: Option<u32>) -> u32 {
 impl Drop for HostHeap {
     fn drop(&mut self) {
         FLIPS.lock().unwrap_or_else(|e| e.into_inner()).remove(&self.id);
+        if !self.sampler {
+            crate::draw::forget_heap_ranges(self.id);
+        }
     }
 }
 
