@@ -1550,17 +1550,33 @@ impl State {
             return;
         }
         self.host_targets = Some(now);
-        let rtvs: Vec<_> = views.iter().map(|(texture, desc)| host.rtv(*texture, desc.as_ref())).collect();
         let dsv = dsv.map(|(texture, record)| host.dsv(texture, record.depth_desc().as_ref()));
-        // SAFETY: an open list; the views were just made.
-        unsafe {
-            list.list.OMSetRenderTargets(
-                rtvs.len() as u32,
-                (!rtvs.is_empty()).then_some(rtvs.as_ptr()),
-                false,
-                dsv.as_ref().map(std::ptr::from_ref),
-            )
-        };
+        if views.len() <= 8 {
+            let mut rtvs = [D3D12_CPU_DESCRIPTOR_HANDLE::default(); 8];
+            for (dst, &(texture, ref desc)) in rtvs.iter_mut().zip(views.iter()) {
+                *dst = host.rtv(texture, desc.as_ref());
+            }
+            // SAFETY: an open list; the views were just made.
+            unsafe {
+                list.list.OMSetRenderTargets(
+                    views.len() as u32,
+                    (!views.is_empty()).then_some(rtvs.as_ptr()),
+                    false,
+                    dsv.as_ref().map(std::ptr::from_ref),
+                )
+            };
+        } else {
+            let rtvs: Vec<_> = views.iter().map(|(texture, desc)| host.rtv(*texture, desc.as_ref())).collect();
+            // SAFETY: an open list; the views were just made.
+            unsafe {
+                list.list.OMSetRenderTargets(
+                    rtvs.len() as u32,
+                    (!rtvs.is_empty()).then_some(rtvs.as_ptr()),
+                    false,
+                    dsv.as_ref().map(std::ptr::from_ref),
+                )
+            };
+        }
     }
 
     /// Viewports, scissors, the blend factor and the stencil reference: set
