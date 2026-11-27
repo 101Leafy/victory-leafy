@@ -146,6 +146,20 @@ rem AnyXboxX#337, with barriers standing in for the cuts). A frame that
 rem hands the card 58 pieces, which is what the card-span columns measured on
 rem an 8 GiB laptop, is 58 ExecuteCommandLists calls to pay for.
 if not defined VICTORY_JOIN_ONE_CALL set "VICTORY_JOIN_ONE_CALL=1"
+rem
+rem The pair that costs the least for what it gives: a copy at its place in a
+rem list writes a few hundred bytes into the title's constants ring, and a
+rem fill that reads it ahead of the copy made the whole submission wait for
+rem the card to run everything - 13 to 28 ms a frame in runs trace and
+rem trace2, 40 to 60 ms in run n19, which is the `stood_waiting_us` column.
+rem VICTORY_FILL_FORWARD takes a waiting fill's bytes from the copy at its
+rem place instead, and VICTORY_PLACED_ORDER keeps the fills ahead of the copy
+rem on the old values, which is what the pair is documented for. Both are off
+rem in the engine and this is the only place they are turned on. If constants
+rem look wrong (camera, lighting, a smeared sky), set BOTH to 0 before
+rem launching and say so: that is a real finding, not a user error.
+if not defined VICTORY_FILL_FORWARD set "VICTORY_FILL_FORWARD=1"
+if not defined VICTORY_PLACED_ORDER set "VICTORY_PLACED_ORDER=1"
 
 rem Keeping the card's clocks up between submissions, and the submission
 rem stages the continuation keeps on for this profile.
