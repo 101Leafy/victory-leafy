@@ -3224,6 +3224,8 @@ impl State {
         #[cfg(feature = "diagnostics")]
         crate::copystat::lap(crate::copystat::C::DrawDriverNs, began);
         #[cfg(feature = "diagnostics")]
+        list.noted_done();
+        #[cfg(feature = "diagnostics")]
         let began = std::time::Instant::now();
         self.after_compute_dispatch(pipeline_stores(p));
         #[cfg(feature = "diagnostics")]
@@ -3598,6 +3600,8 @@ impl State {
                         // SAFETY: an open list with everything set.
                         None => unsafe { l6.DispatchMesh(x.min(65_535), 1, 1) },
                     }
+                    #[cfg(feature = "diagnostics")]
+                    list.noted_done();
                     self.drew(crate::pipeline::host_pipeline(self.pipeline as This));
                     self.mesh_scissor(list, false);
                     DRAWN.fetch_add(1, Ordering::Relaxed);
@@ -4367,6 +4371,8 @@ impl State {
             #[cfg(feature = "diagnostics")]
             crate::copystat::lap(crate::copystat::C::DrawDriverNs, began);
             #[cfg(feature = "diagnostics")]
+            list.noted_done();
+            #[cfg(feature = "diagnostics")]
             let began = std::time::Instant::now();
             self.drew(crate::pipeline::host_pipeline(self.pipeline as This));
             #[cfg(feature = "diagnostics")]
@@ -4479,6 +4485,8 @@ impl State {
             };
             #[cfg(feature = "diagnostics")]
             crate::copystat::lap(crate::copystat::C::DrawDriverNs, began);
+            #[cfg(feature = "diagnostics")]
+            list.noted_done();
             #[cfg(feature = "diagnostics")]
             let began = std::time::Instant::now();
             self.drew(crate::pipeline::host_pipeline(self.pipeline as This));
@@ -4879,6 +4887,8 @@ impl State {
         };
         #[cfg(feature = "diagnostics")]
         crate::copystat::lap(crate::copystat::C::IndirectDriverNs, began);
+        #[cfg(feature = "diagnostics")]
+        list.noted_done();
         if split.is_some() {
             // Root arguments a command signature sets are undefined after it.
             self.host_pipeline = 0;
