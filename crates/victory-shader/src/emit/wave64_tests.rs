@@ -2092,6 +2092,7 @@ fn a_backward_permute_reads_within_the_lanes_half() {
         }
     }
     eprintln!("ran on the hardware device (threads, host wave): {ran:?}");
+}
 
 /// The wave size `native` lowers to on a host of 32-lane waves.
 fn flag_wave(native: &NativeProgram) -> Option<u32> {

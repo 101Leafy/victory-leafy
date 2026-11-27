@@ -1,8 +1,7 @@
 //! Two presented planes as one image: the console's display puts the second
 //! (the interface) over the first (the scene), each scaled to the screen.
-//! Grand Theft Auto VI presents so on Series S. `VICTORY_TWO_PLANES=1`:
-//! a present's second plane is put over its first; else only the first is
-//! shown.
+//! Grand Theft Auto VI presents so on Series S. A present's second plane is
+//! put over its first; `VICTORY_TWO_PLANES=0` shows only the first.
 
 use std::sync::OnceLock;
 
@@ -14,10 +13,10 @@ use windows::core::{PCSTR, s};
 
 use crate::host::Host;
 
-/// Whether a present's second plane is shown (`VICTORY_TWO_PLANES=1`).
+/// Whether a present's second plane is shown (`VICTORY_TWO_PLANES=0` turns it off).
 pub(crate) fn on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("VICTORY_TWO_PLANES").is_ok_and(|v| v.trim() == "1"))
+    *ON.get_or_init(|| !std::env::var("VICTORY_TWO_PLANES").is_ok_and(|v| v.trim() == "0"))
 }
 
 const SOURCE: &str = r#"
