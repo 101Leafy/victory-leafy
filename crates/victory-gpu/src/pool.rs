@@ -395,6 +395,10 @@ unsafe impl Send for Upload {}
 
 static TEXTURES: Mutex<Pool<ID3D12Heap>> = Mutex::new(Pool::new(SPARE_KEPT));
 static STAGING: Mutex<Pool<Upload>> = Mutex::new(Pool::new(STAGING_KEPT));
+static SHARED: Mutex<Pool<ID3D12Heap>> = Mutex::new(Pool::new(SHARED_KEPT));
+
+/// Empty blocks of shared buffers kept at most (system memory).
+const SHARED_KEPT: usize = 16;
 
 fn lock<T>(m: &'static Mutex<T>) -> std::sync::MutexGuard<'static, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -402,6 +406,8 @@ fn lock<T>(m: &'static Mutex<T>) -> std::sync::MutexGuard<'static, T> {
 
 /// Bytes of the pieces textures hold now.
 static HELD: AtomicU64 = AtomicU64::new(0);
+/// The same for shared buffers.
+static SHARED_HELD: AtomicU64 = AtomicU64::new(0);
 
 /// Bytes of the texture blocks no texture holds: the card's memory in use
 /// by us that new textures take first.
@@ -476,6 +482,8 @@ struct Reclaim {
     methods: &'static [*const (); 3],
     references: AtomicU32,
     piece: Piece,
+    pool: &'static Mutex<Pool<ID3D12Heap>>,
+    held: &'static AtomicU64,
 }
 
 struct Methods([*const (); 3]);
@@ -512,8 +520,8 @@ unsafe extern "system" fn release(this: *mut c_void) -> u32 {
         let left = (*this.cast::<Reclaim>()).references.fetch_sub(1, Ordering::AcqRel) - 1;
         if left == 0 {
             let gone = Box::from_raw(this.cast::<Reclaim>());
-            HELD.fetch_sub(gone.piece.len, Ordering::Relaxed);
-            lock(&TEXTURES).give(gone.piece, now());
+            gone.held.fetch_sub(gone.piece.len, Ordering::Relaxed);
+            lock(gone.pool).give(gone.piece, now());
         }
         left
     }
@@ -538,10 +546,13 @@ fn made_now(texture: &ID3D12Resource) {
     recent.push_back((texture.as_raw() as usize, now));
 }
 
-/// Makes `texture` give `piece` back when the last reference to it goes.
-fn give_back_with(texture: &ID3D12Resource, piece: Piece) {
+/// Makes `texture` give `piece` back to `pool` when the last reference to
+/// it goes.
+fn give_back_with(texture: &ID3D12Resource, piece: Piece, pool: &'static Mutex<Pool<ID3D12Heap>>, held: &'static AtomicU64) {
     const KEY: GUID = GUID::from_u128(0x6f0e2f0c_5a59_4b1e_9a3f_7f4d2c9be713);
-    let made = Box::into_raw(Box::new(Reclaim { methods: &RECLAIM.0, references: AtomicU32::new(1), piece }));
+    held.fetch_add(piece.len, Ordering::Relaxed);
+    let made =
+        Box::into_raw(Box::new(Reclaim { methods: &RECLAIM.0, references: AtomicU32::new(1), piece, pool, held }));
     // SAFETY: a COM object of ours with one reference, which this takes and
     // drops at the end; the texture takes its own.
     unsafe {
@@ -608,8 +619,7 @@ pub(crate) unsafe fn texture(
     let result = unsafe { device.CreatePlacedResource(&heap, piece.start, &d, state, None, &mut made) };
     match (result, made) {
         (Ok(()), Some(made)) => {
-            HELD.fetch_add(piece.len, Ordering::Relaxed);
-            give_back_with(&made, piece);
+            give_back_with(&made, piece, &TEXTURES, &HELD);
             made_now(&made);
             #[cfg(feature = "diagnostics")]
             {
@@ -633,6 +643,107 @@ pub(crate) unsafe fn texture(
         }
         _ => {
             lock(&TEXTURES).give(piece, now());
+            None
+        }
+    }
+}
+
+/// Whether the host copies of title buffers that shaders write are cut
+/// from blocks too (`VICTORY_SHARED_POOL=1`; off: each its own allocation,
+/// as before).
+///
+/// Each was made not resident, made resident and waited for, and its
+/// mapping waited for ([`crate::host::resident`], [`crate::host::mapped`]):
+/// 0.3 to 2.2 ms a buffer whatever its size. In Leafy's play run of
+/// 2026-11-27 the first world frame made 4,648 of them (2,383 MB, half a
+/// megabyte each) among 5,800 such waits, 3.3 s of its 4.9; a block is
+/// waited for once.
+fn shared_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SHARED_POOL").is_some_and(|v| v == "1"))
+}
+
+/// Shared buffers cut from blocks so far.
+static SHARED_CUT: AtomicU64 = AtomicU64::new(0);
+
+/// A buffer of `size` bytes in system memory that the CPU maps (write-back)
+/// and shaders read and write, all zeros, in a block, and its mapping, as
+/// [`crate::host::Host::shared_buffer`] makes; `None`: not pooled, or the
+/// host refused.
+pub(crate) fn shared(device: &ID3D12Device, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+    if !shared_on() {
+        return None;
+    }
+    let align = u64::from(D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT);
+    let bytes = size.max(1).next_multiple_of(align);
+    let properties = D3D12_HEAP_PROPERTIES {
+        Type: D3D12_HEAP_TYPE_CUSTOM,
+        CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
+        MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
+        ..Default::default()
+    };
+    let (piece, heap, again) = lock(&SHARED).take_ripe(bytes, align, now(), Ripe::now(), fullest(), || {
+        let desc = D3D12_HEAP_DESC {
+            SizeInBytes: BLOCK,
+            Properties: properties,
+            Alignment: 0,
+            Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS | crate::host::not_resident(),
+        };
+        let mut heap: Option<ID3D12Heap> = None;
+        // SAFETY: plain creation.
+        if let Err(e) = unsafe { device.CreateHeap(&desc, &mut heap) } {
+            tracing::warn!(error = %e, "no block of shared buffers");
+        }
+        if let Some(h) = &heap
+            && let Err(e) = crate::host::resident(device, h).and_then(|()| crate::host::mapped(device))
+        {
+            tracing::warn!(error = %e, "a block of shared buffers is not resident");
+            return None;
+        }
+        heap
+    })?;
+    let desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+        Width: size.max(1),
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+        Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+        ..Default::default()
+    };
+    let mut made: Option<ID3D12Resource> = None;
+    let mut data = std::ptr::null_mut();
+    // SAFETY: the piece is no one else's; the heap lives while a piece of
+    // it is taken.
+    let result = unsafe {
+        device.CreatePlacedResource(&heap, piece.start, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut made).and_then(|()| {
+            made.as_ref().ok_or_else(windows::core::Error::empty)?.Map(0, None, Some(&mut data))
+        })
+    };
+    match (result, made) {
+        (Ok(()), Some(made)) => {
+            give_back_with(&made, piece, &SHARED, &SHARED_HELD);
+            if again {
+                // A piece used before holds what its last buffer left.
+                // SAFETY: the mapping covers the buffer, which is ours alone.
+                unsafe { std::ptr::write_bytes(data.cast::<u8>(), 0, size as usize) };
+            }
+            let n = SHARED_CUT.fetch_add(1, Ordering::Relaxed) + 1;
+            if n.is_power_of_two() && n >= 64 {
+                tracing::info!(
+                    "shared buffers cut from blocks: {n}, {} blocks, {} MiB held",
+                    lock(&SHARED).blocks(),
+                    SHARED_HELD.load(Ordering::Relaxed) >> 20
+                );
+            }
+            #[cfg(feature = "diagnostics")]
+            crate::book::made(&made, || "a shared buffer in a block".into());
+            Some((made, data.cast()))
+        }
+        _ => {
+            lock(&SHARED).give(piece, now());
             None
         }
     }

@@ -12118,6 +12118,9 @@ impl Host {
     pub(crate) fn shared_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         MADE[2].fetch_add(1, Ordering::Relaxed);
         MADE[3].fetch_add(size, Ordering::Relaxed);
+        if let Some(made) = crate::pool::shared(&self.device, size) {
+            return Some(made);
+        }
         let heap = D3D12_HEAP_PROPERTIES {
             Type: D3D12_HEAP_TYPE_CUSTOM,
             CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
