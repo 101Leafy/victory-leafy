@@ -112,6 +112,13 @@ rem default: what shaders wrote, fetched and then merged one piece after
 rem another on the thread that settles (about 630 pieces and 40 MB a frame),
 rem taken instead by eight threads an eighth each.
 if not defined VICTORY_WIDE_MERGE set "VICTORY_WIDE_MERGE=1"
+rem
+rem The parts of one submission go to the queue in one call instead of one
+rem call a part (VICTORY_JOIN_ONE_CALL, off by default; Skyfrye's
+rem AnyXboxX#337, with barriers standing in for the cuts). A frame that
+rem hands the card 58 pieces, which is what the card-span columns measured on
+rem an 8 GiB laptop, is 58 ExecuteCommandLists calls to pay for.
+if not defined VICTORY_JOIN_ONE_CALL set "VICTORY_JOIN_ONE_CALL=1"
 
 rem Keeping the card's clocks up between submissions, and the submission
 rem stages the continuation keeps on for this profile.
