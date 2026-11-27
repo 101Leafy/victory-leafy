@@ -1161,7 +1161,7 @@ impl<'a> Tracer<'a> {
         let mut known = Vec::new();
         if let Some(l) = self.lanes {
             known.push((l.reach[at.0], true));
-            if let Some(guard) = l.guards[at.0][at.1] {
+            if let Some(guard) = l.guards[at.0][at.1].filter(|_| crate::emit::guarded_descriptors()) {
                 known.push((guard, true));
             }
         }
@@ -1317,7 +1317,7 @@ impl<'a> Tracer<'a> {
             return t;
         };
         let mut known = vec![(lanes.reach[at.0], true)];
-        if let Some(guard) = lanes.guards[at.0][at.1] {
+        if let Some(guard) = lanes.guards[at.0][at.1].filter(|_| crate::emit::guarded_descriptors()) {
             known.push((guard, true));
         }
         for _ in 0..MAX_JOINS {
@@ -4130,7 +4130,9 @@ pub(crate) mod tests {
         let p = crate::ir::build(&code, false, 256).unwrap();
         let structured = lanes(&p).expect("structured form");
         assert!(structured.guards[2][0].is_some(), "join access must carry an EXEC guard");
+        crate::emit::test_guarded_descriptors(Some(true));
         let r = track(&p, &[param(Table, 0, 1)], HwStage::Cs, Some(&structured)).unwrap();
+        crate::emit::test_guarded_descriptors(None);
         assert!(
             r.descriptors
                 .iter()
