@@ -112,6 +112,9 @@ pub(crate) fn check(frame: u64) {
         let now = blocks(&buffer);
         compared += 1;
         bytes += len as u64;
+        // (Before `READS`: a refresh holds its texture's lock as it reads.)
+        let staging = super::staged_under(memory, memory + 1).into_iter().find(|s| s.memory() == (memory, len));
+        let partly = staging.as_ref().and_then(|s| s.last.try_lock().ok().map(|last| last.partial.is_some()));
         let mut reads = READS.lock().unwrap_or_else(|e| e.into_inner());
         let Some(read) = reads.get_mut(&(memory, len)) else {
             continue;
@@ -128,7 +131,7 @@ pub(crate) fn check(frame: u64) {
         }
         read.logged = true;
         let zero = buffer[first * BLOCK..].iter().take(BLOCK).all(|&b| b == 0);
-        let staged = super::staged_under(memory, memory + 1).iter().any(|s| s.memory() == (memory, len));
+        let staged = staging.is_some();
         let told = read.told.map(|(at, how)| format!("{} frames ago ({})", frame - at, if how == 1 { "announced" } else { "behind the guards" }));
         tracing::warn!(
             address = format_args!("{memory:#x}"),
@@ -140,6 +143,7 @@ pub(crate) fn check(frame: u64) {
             last_changed = last,
             first_changed_zero = zero,
             staged,
+            partly_mapped = partly.unwrap_or(false),
             told = told.as_deref().unwrap_or("never since its read"),
             "texture audit: title memory changed since the texture was last read"
         );
