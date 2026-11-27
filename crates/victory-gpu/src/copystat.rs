@@ -404,11 +404,16 @@ pub(crate) enum C {
     /// them (`draw.rs` `refresh_tail`).
     RootTailAsked,
     RootTailCovered,
+    /// Settles for tables that came back with too few slots, and the asks
+    /// refused without one while the settles are held back after such a
+    /// settle (`draw.rs` `dynamic_slots`, `VICTORY_SETTLE_BACKOFF`).
+    SettlesBare,
+    SettlesHeld,
 }
 const COUNTERS: usize = 256;
 
 /// The counters' names, in the order of [`C`], for the frame recorder's columns.
-pub(crate) const NAMES: [&str; 213] = [
+pub(crate) const NAMES: [&str; 215] = [
     "Submissions", "Copies", "CopyBytes", "Refreshes", "RefreshBytes", "Skipped", "SkippedBytes", "Runs",
     "RunUs", "Queries", "QueryUs", "MoveUs", "Unmapped", "Watches", "WatchUs", "Checked", "Unchanged",
     "Fallbacks", "GuardFaults", "TexWatched", "TexHashed", "TexChanged", "TexHot", "Frames", "RecordCalls",
@@ -453,6 +458,7 @@ pub(crate) const NAMES: [&str; 213] = [
     "TexRowsDetiled", "PlacedUavRefused",
     "HeapTexMirrorNs", "HeapTexHostNs", "HeapTexPrintNs",
     "RootTailAsked", "RootTailCovered",
+    "SettlesBare", "SettlesHeld",
 ];
 /// One of some sets of counters, each in lines of the processor's memory of
 /// its own: a set for all threads had them wait for each other's lines at
@@ -831,7 +837,7 @@ mod command_tests {
     #[test]
     fn every_counter_is_named() {
         use super::{C, COUNTERS, NAMES};
-        assert_eq!(C::RootTailCovered as usize + 1, NAMES.len());
+        assert_eq!(C::SettlesHeld as usize + 1, NAMES.len());
         assert_eq!(NAMES[C::Frames as usize], "Frames");
         assert!(NAMES.len() <= COUNTERS);
     }
