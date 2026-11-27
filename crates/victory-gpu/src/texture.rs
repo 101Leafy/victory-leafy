@@ -1784,6 +1784,11 @@ impl Staging {
         size
     }
 
+    /// Whether this staging buffer is detiled on the card (`VICTORY_GPU_DETILE`).
+    pub(super) fn is_gpu(&self) -> bool {
+        self.gpu.is_some()
+    }
+
     /// The buffer the list copies the texture's subresources from.
     fn copy_source(&self) -> &ID3D12Resource {
         self.gpu.as_ref().map_or(&self.buffer, |g| &g.linear)
