@@ -415,23 +415,174 @@ pub extern "C" fn __p___argv() -> *mut *mut *mut c_char {
 /// host's scheduler took pity, and the loading that waits for it with it
 /// (run stream-3: loads seen to be done 1.1 s late on average, 4.8 s at
 /// worst). `VICTORY_TITLE_PRIORITIES=0`: as the title sets them.
-fn title_priority(asked: i32) -> i32 {
+///
+/// `VICTORY_STARTUP_PRIORITIES=<seconds>` (off by default) raises them for
+/// the first seconds of the run only, while the title loads beside the
+/// pipeline library's loads, and gives them back what they asked for after
+/// (with `VICTORY_TITLE_PRIORITIES=0`; without it they stay raised). It
+/// also holds every title thread at normal at most, for the whole run: the
+/// process runs above normal, and a title thread at "highest" or "time
+/// critical" would be level with or above the normal threads of a program
+/// in the high class (a stream recorder) that must not wait for us.
+fn title_priority(asked: i32, raise: bool, cap: bool) -> i32 {
     const IDLE: i32 = -15;
     const LOWEST: i32 = -2;
     const BELOW_NORMAL: i32 = -1;
+    const NORMAL: i32 = 0;
+    const TIME_CRITICAL: i32 = 15;
     match asked {
-        IDLE..=LOWEST => BELOW_NORMAL,
+        IDLE..=LOWEST if raise => BELOW_NORMAL,
+        1..=TIME_CRITICAL if cap => NORMAL,
         other => other,
     }
 }
 
-/// [`title_priority`].
+/// Whether idle and lowest asks are raised, and asks above normal held at
+/// normal, `elapsed` into the run: see [`title_priority`].
+fn priority_rules(
+    as_set: bool,
+    startup: Option<std::time::Duration>,
+    elapsed: std::time::Duration,
+) -> (bool, bool) {
+    match startup {
+        None => (!as_set, false),
+        Some(window) => (!as_set || elapsed < window, true),
+    }
+}
+
+/// `VICTORY_STARTUP_PRIORITIES`, in seconds.
+fn startup_window() -> Option<std::time::Duration> {
+    static WINDOW: std::sync::OnceLock<Option<std::time::Duration>> = std::sync::OnceLock::new();
+    *WINDOW.get_or_init(|| {
+        let window = std::env::var("VICTORY_STARTUP_PRIORITIES")
+            .ok()?
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .filter(|s| s.is_finite() && *s > 0.0)
+            .map(std::time::Duration::from_secs_f64)?;
+        tracing::info!(
+            seconds = window.as_secs_f64(),
+            "title threads raised at startup, and held at normal at most"
+        );
+        std::thread::Builder::new()
+            .name("startup-priorities".into())
+            .spawn(move || {
+                std::thread::sleep(window.saturating_sub(run_time()));
+                give_back_startup_raises();
+            })
+            .ok();
+        Some(window)
+    })
+}
+
+/// How long the process has run.
+fn run_time() -> std::time::Duration {
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::SystemInformation::GetSystemTimeAsFileTime;
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
+    let ticks = |t: FILETIME| (u64::from(t.dwHighDateTime) << 32) | u64::from(t.dwLowDateTime);
+    let zero = FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
+    let [mut created, mut exited, mut kernel, mut user, mut now] = [zero; 5];
+    // SAFETY: plain calls on our own process, into locals.
+    let ok = unsafe {
+        GetSystemTimeAsFileTime(&mut now);
+        GetProcessTimes(
+            GetCurrentProcess(),
+            &mut created,
+            &mut exited,
+            &mut kernel,
+            &mut user,
+        )
+    } != 0;
+    if !ok {
+        return std::time::Duration::ZERO;
+    }
+    std::time::Duration::from_nanos(ticks(now).saturating_sub(ticks(created)) * 100)
+}
+
+/// Title threads raised only by `VICTORY_STARTUP_PRIORITIES`, each with the
+/// priority it asked for; `None` once they were given it back.
+static STARTUP_RAISED: std::sync::Mutex<Option<Vec<(usize, i32)>>> =
+    std::sync::Mutex::new(Some(Vec::new()));
+
+/// Ends the startup raise: each thread it raised gets what it asked for.
+fn give_back_startup_raises() {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    let Some(raised) = STARTUP_RAISED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+    else {
+        return;
+    };
+    let threads = raised.len();
+    for (thread, asked) in raised {
+        // SAFETY: our own duplicate of the thread's handle, closed once.
+        unsafe {
+            windows_sys::Win32::System::Threading::SetThreadPriority(thread as _, asked);
+            CloseHandle(thread as _);
+        }
+    }
+    tracing::info!(
+        threads,
+        at = run_time().as_secs_f64(),
+        "startup raise of title threads ended"
+    );
+}
+
+/// [`title_priority`]. Each value the title asks for is logged once.
 pub extern "system" fn SetThreadPriority(thread: *mut c_void, priority: i32) -> i32 {
+    use windows_sys::Win32::Foundation::{DUPLICATE_SAME_ACCESS, DuplicateHandle};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
     static AS_SET: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let as_set = *AS_SET.get_or_init(|| std::env::var_os("VICTORY_TITLE_PRIORITIES").is_some_and(|v| v == "0"));
-    let priority = if as_set { priority } else { title_priority(priority) };
+    static ASKED: std::sync::Mutex<Vec<i32>> = std::sync::Mutex::new(Vec::new());
+    let as_set = *AS_SET
+        .get_or_init(|| std::env::var_os("VICTORY_TITLE_PRIORITIES").is_some_and(|v| v == "0"));
+    let startup = startup_window();
+    let (mut raise, cap) = priority_rules(as_set, startup, run_time());
+    if raise
+        && as_set
+        && title_priority(priority, true, cap) != title_priority(priority, false, cap)
+    {
+        // Raised for startup only: kept to be given back, unless that was
+        // done already.
+        let mut raised = STARTUP_RAISED.lock().unwrap_or_else(|e| e.into_inner());
+        let mut kept = std::ptr::null_mut();
+        // SAFETY: a duplicate of the title's handle (a real one also for
+        // the current thread's pseudo handle), closed when given back.
+        raise = raised.is_some()
+            && unsafe {
+                DuplicateHandle(
+                    GetCurrentProcess(),
+                    thread,
+                    GetCurrentProcess(),
+                    &mut kept,
+                    0,
+                    0,
+                    DUPLICATE_SAME_ACCESS,
+                )
+            } != 0;
+        if let Some(raised) = raised.as_mut().filter(|_| raise) {
+            raised.push((kept as usize, priority));
+        }
+    }
+    let given = title_priority(priority, raise, cap);
+    let mut asked = ASKED.lock().unwrap_or_else(|e| e.into_inner());
+    if !asked.contains(&priority) {
+        asked.push(priority);
+        tracing::info!(
+            asked = priority,
+            given,
+            "a title thread asks for this priority (logged once per value)"
+        );
+    }
+    drop(asked);
     // SAFETY: the title passes a thread handle.
-    unsafe { windows_sys::Win32::System::Threading::SetThreadPriority(thread, priority) }
+    unsafe { windows_sys::Win32::System::Threading::SetThreadPriority(thread, given) }
 }
 
 pub(crate) fn module() -> HleModule {
@@ -687,7 +838,10 @@ mod tests {
     /// it sets them.
     #[test]
     fn no_title_thread_waits_for_idle_processors() {
-        let given: Vec<i32> = [-15, -2, -1, 0, 1, 2, 15].into_iter().map(title_priority).collect();
+        let given: Vec<i32> = [-15, -2, -1, 0, 1, 2, 15]
+            .into_iter()
+            .map(|p| title_priority(p, true, false))
+            .collect();
         assert_eq!(given, [-1, -1, -1, 0, 1, 2, 15]);
         use windows_sys::Win32::System::Threading::{GetCurrentThread, GetThreadPriority};
         std::thread::spawn(|| {
@@ -699,6 +853,32 @@ mod tests {
         })
         .join()
         .unwrap();
+    }
+
+    /// Idle, lowest, normal, highest and time critical asks under each
+    /// setting of `VICTORY_TITLE_PRIORITIES` and `VICTORY_STARTUP_PRIORITIES`
+    /// (during and after its seconds): no title thread above normal while
+    /// the startup switch is on.
+    #[test]
+    fn startup_priorities_raise_then_give_back_and_never_pass_normal() {
+        use std::time::Duration;
+        let asks = [-15, -2, 0, 2, 15];
+        let window = Some(Duration::from_secs(220));
+        let given = |as_set, startup, elapsed: u64| -> Vec<i32> {
+            let (raise, cap) = priority_rules(as_set, startup, Duration::from_secs(elapsed));
+            asks.iter()
+                .map(|&p| title_priority(p, raise, cap))
+                .collect()
+        };
+        // Neither switch: raised, the rest as asked.
+        assert_eq!(given(false, None, 10), [-1, -1, 0, 2, 15]);
+        // VICTORY_TITLE_PRIORITIES=0: as asked.
+        assert_eq!(given(true, None, 10), [-15, -2, 0, 2, 15]);
+        // With the startup switch, during its seconds and after.
+        assert_eq!(given(true, window, 10), [-1, -1, 0, 0, 0]);
+        assert_eq!(given(true, window, 300), [-15, -2, 0, 0, 0]);
+        assert_eq!(given(false, window, 10), [-1, -1, 0, 0, 0]);
+        assert_eq!(given(false, window, 300), [-1, -1, 0, 0, 0]);
     }
 
     #[test]

@@ -347,6 +347,69 @@ unsafe fn apply_longest_step_at(
     done
 }
 
+// `VICTORY_LONGEST_STEP_UNTIL=<game seconds>` (with VICTORY_LONGEST_STEP):
+// the title's own 1/15 s again once its game time passes that, so a longer
+// step can hurry the opening scenes (4-5 frames a second) and leave what
+// comes after as the title plays it. Game time is the second of [`TIMERS`],
+// the one gametime.py reads.
+
+/// The game time the longest step goes back at, in milliseconds (`None` if
+/// unset or malformed: said why).
+pub fn asked_step_until_ms() -> Option<u32> {
+    let spec = std::env::var("VICTORY_LONGEST_STEP_UNTIL").ok()?;
+    let ms = spec.trim().parse::<f32>().ok().filter(|s| s.is_finite() && *s > 0.0 && *s < 4e6).map(|s| (s * 1e3) as u32);
+    if ms.is_none() {
+        eprintln!("VIctory: VICTORY_LONGEST_STEP_UNTIL={spec}: expected game seconds");
+    }
+    ms
+}
+
+/// The title's game time in milliseconds.
+///
+/// # Safety
+/// The image of `size` bytes at `base` stays mapped.
+pub unsafe fn game_ms(base: usize, size: usize) -> Option<u32> {
+    let at = TIMERS[1];
+    // SAFETY: inside the mapped image (checked), title data.
+    (at + 4 <= size).then(|| unsafe { ((base + at) as *const u32).read_volatile() })
+}
+
+/// Puts the load of the ceiling back on the title's 1/15 s while the title
+/// runs. Only the four bytes of its displacement change, in one store inside
+/// one cache line, so a thread running it reads the old constant or the new.
+///
+/// # Safety
+/// The image of `size` bytes at `base` stays mapped and its load was changed
+/// by [`apply_longest_step`] to read `target`.
+#[cfg(windows)]
+pub unsafe fn restore_longest_step(base: usize, size: usize, target: usize) -> Patched {
+    use windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache;
+    use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READWRITE, VirtualProtect};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let at = STEP_LOAD_AT + 4;
+    if at + 4 > size {
+        return Patched::Failed("outside the image");
+    }
+    let p = (base + at) as *mut u32;
+    let ours = i32::from_le_bytes(step_load(target)[4..].try_into().unwrap()) as u32;
+    let own = u32::from_le_bytes(STEP_LOAD[4..].try_into().unwrap());
+    // SAFETY: inside the mapped image (checked).
+    if unsafe { p.read_unaligned() } != ours {
+        return Patched::Differs;
+    }
+    let mut old = 0;
+    // SAFETY: the load's displacement, made writable for this and put back.
+    unsafe {
+        if VirtualProtect(p as *const _, 4, PAGE_EXECUTE_READWRITE, &mut old) == 0 {
+            return Patched::Failed("Windows would not make it writable");
+        }
+        p.write_unaligned(own);
+        VirtualProtect(p as *const _, 4, old, &mut old);
+        FlushInstructionCache(GetCurrentProcess(), p as *const _, 4);
+    }
+    Patched::Done
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -510,6 +510,7 @@ fn twin_texture(
         return None;
     };
     let _ = crate::host::resident(&host.device, &texture);
+    crate::host::hot(&host.device, &texture);
     crate::host::name(&texture, || {
         format!("depth twin {}x{} f{}", d.width, d.height, d.format)
     });
@@ -571,6 +572,7 @@ fn twin_texture(
         }
         texture.map(|texture| {
             let _ = crate::host::resident(&host.device, &texture);
+            crate::host::hot(&host.device, &texture);
             crate::host::name(&texture, || {
                 format!("depth plane twin {}x{} f{}", d.width, d.height, d.format)
             });
@@ -1297,21 +1299,31 @@ fn base_level(desc: &ResourceDesc, first: u32) -> u32 {
     base
 }
 
+#[cfg(windows)]
+thread_local! {
+    /// [`placed_bytes_from`]'s answers, by description without its filler
+    /// and first level. Never trimmed: bounded by the distinct descriptions
+    /// without filler a thread asks about (a title has a few thousand), times
+    /// the first levels its callers pass (`first_mip`: at most 16).
+    static PLACED_SIZES: std::cell::RefCell<std::collections::HashMap<([u32; 14], u32), Option<u64>>> =
+        std::cell::RefCell::default();
+}
+
 /// The bytes of title memory a placed texture with the resource description
 /// `desc` is read from for a view that starts at level `first`; `None` as
 /// [`placed_bytes`]. Remembered: asked for every slot that is looked at.
 #[cfg(windows)]
 pub(crate) fn placed_bytes_from(desc: &[u32; 14], first: u32) -> Option<u64> {
-    if first == 0 || !held_only() {
-        return placed_bytes(desc);
-    }
-    type Known = std::collections::HashMap<([u32; 14], u32), Option<u64>>;
-    thread_local! {
-        static KNOWN: std::cell::RefCell<Known> = std::cell::RefCell::default();
-    }
-    KNOWN.with(|known| {
+    // The size is a function of the description's fields alone, never of
+    // its filler words, so they are left out of the key.
+    let desc = &without_filler(desc);
+    let first = if held_only() { first } else { 0 };
+    PLACED_SIZES.with(|known| {
         *known.borrow_mut().entry((*desc, first)).or_insert_with(|| {
             let whole = placed_bytes(desc)?;
+            if first == 0 {
+                return Some(whole);
+            }
             // SAFETY: 56 bytes in the description's layout.
             let d = unsafe { desc.as_ptr().cast::<ResourceDesc>().read_unaligned() };
             let Some(t) = texture_layout(&d).filter(|t| t.planes.len() == 1) else {
@@ -2510,6 +2522,15 @@ pub(crate) fn host_resource<'a>(
     Some(unsafe { &*std::ptr::from_ref(&host.texture) })
 }
 
+/// Whether `this` is one of our resources (read safely: the title's
+/// pointer may be anything).
+#[cfg(windows)]
+pub(crate) fn is_resource(this: This) -> bool {
+    let mut table = [0; size_of::<usize>()];
+    crate::host::read_into(this.cast(), &mut table)
+        && usize::from_ne_bytes(table) == RESOURCE_FUNCTIONS.0.as_ptr() as usize
+}
+
 /// A title texture's host copy, shared, for a list to hold.
 #[cfg(windows)]
 pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
@@ -2708,6 +2729,9 @@ fn host_texture_as(
         crate::host::name(t, || {
             format!("texture {}x{} f{} flags {:#x}", d.width, d.height, d.format, d.flags)
         });
+        if !reserved && d.flags & (TARGET | DEPTH | UNORDERED) != 0 {
+            crate::host::hot(&host.device, t);
+        }
     }
     texture
 }
@@ -3110,21 +3134,58 @@ static PLACED_TEXTURES: std::sync::Mutex<std::collections::BTreeMap<(u64, [u32; 
     std::sync::Mutex::new(std::collections::BTreeMap::new());
 
 /// The placed textures asked for with filler words set, as asked
-/// (address and description): for [`PLACED_TWINS`].
-#[cfg(windows)]
+/// (address and description): for [`PLACED_TWINS`]. At most
+/// [`twin_room`] entries: past that, new twins go uncounted.
+#[cfg(all(windows, feature = "diagnostics"))]
 static PLACED_RAW: std::sync::Mutex<std::collections::BTreeSet<(u64, [u32; 14])>> =
     std::sync::Mutex::new(std::collections::BTreeSet::new());
 
 /// Placed textures asked for a second time with other filler words in
 /// their description: each was a second resource and host copy before the
 /// filler was left out of the key ([`texture_at`]).
-#[cfg(windows)]
+#[cfg(all(windows, feature = "diagnostics"))]
 static PLACED_TWINS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// See [`PLACED_TWINS`].
-#[cfg(windows)]
+#[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn placed_filler_twins() -> u64 {
     PLACED_TWINS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Whether [`PLACED_RAW`] holding `len` entries takes one more.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn twin_room(len: usize) -> bool {
+    len < 65_536
+}
+
+/// Counts in [`PLACED_TWINS`] a placed texture at `address` asked for with
+/// the filler words `raw` when another set of them was seen for `key`.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn count_twin(address: u64, raw: &[u32; 14], key: &[u32; 14]) {
+    if raw == key {
+        return;
+    }
+    let mut seen = PLACED_RAW.lock().unwrap_or_else(|e| e.into_inner());
+    if !twin_room(seen.len()) || !seen.insert((address, *raw)) {
+        return;
+    }
+    let others = seen
+        .range((address, [0; 14])..=(address, [u32::MAX; 14]))
+        .filter(|(_, r)| without_filler(r) == *key);
+    if others.count() > 1 {
+        PLACED_TWINS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// `desc` with words 1 and 13, the filler of its layout, zeroed: what the
+/// title leaves there is not part of what a texture is ([`texture_at`]).
+/// The padding of [`ResourceDesc`] after `dimension` and after `flags`.
+#[cfg(windows)]
+pub(crate) fn without_filler(desc: &[u32; 14]) -> [u32; 14] {
+    let mut d = *desc;
+    d[1] = 0;
+    d[13] = 0;
+    d
 }
 
 /// Width, height and format of texture `this` (`None` for a buffer), for
@@ -3203,30 +3264,17 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
     // that fills at world entry. They are not part of what a texture is.
     // `VICTORY_PLACED_FILLER=1`: kept in the key, as before.
     static KEPT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let raw = *desc;
     let mut key = *desc;
     if !*KEPT.get_or_init(|| std::env::var_os("VICTORY_PLACED_FILLER").is_some_and(|v| v == "1")) {
         key[1] = 0;
         key[13] = 0;
     }
-    let desc = &key;
-    let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
     // How many resources the filler alone would have added (a count for
     // the log: `placed_filler_twins`).
-    if raw != key {
-        let mut seen = PLACED_RAW.lock().unwrap_or_else(|e| e.into_inner());
-        if seen.insert((address, raw)) {
-            let others = seen.range((address, [0; 14])..=(address, [u32::MAX; 14])).filter(|(_, r)| {
-                let mut blank = *r;
-                blank[1] = 0;
-                blank[13] = 0;
-                blank == key
-            });
-            if others.count() > 1 {
-                PLACED_TWINS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
-        }
-    }
+    #[cfg(feature = "diagnostics")]
+    count_twin(address, desc, &key);
+    let desc = &key;
+    let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(&r) = map.get(&(address, *desc)) {
         return Some(r as This);
     }
@@ -3249,6 +3297,17 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
         return None;
     }
     map.insert((address, *desc), out as usize);
+    tracing::debug!(
+        address = format_args!("{address:#x}"),
+        width = d.width,
+        height = d.height,
+        depth_or_array = d.depth_or_array_size,
+        mips = d.mip_levels,
+        format = d.format,
+        flags = format_args!("{:#x}", d.flags),
+        layout = format_args!("{:#x}", d.layout),
+        "placed texture from a view"
+    );
     crate::texture::placed_in_host_written(address, desc);
     resource(out)
         .host
@@ -4971,5 +5030,34 @@ float4 lit() : SV_Target { return 1.0; }
         assert_eq!(slot::<Release>(target, 0x10)(target), 1);
         drop(held);
         assert_eq!(alias_of(placed), None);
+    }
+
+    /// The filler words of a placed texture's description change neither
+    /// its size nor what is remembered of it.
+    #[cfg(windows)]
+    #[test]
+    fn placed_sizes_leave_out_the_filler() {
+        let desc = [3u32, 0, 0, 0, 256, 0, 256, 0x9_0001, 98, 1, 0, 0x105, 0, 0];
+        let mut junk = desc;
+        junk[1] = 0xdead_beef;
+        junk[13] = 0x1234_5678;
+        assert_eq!(without_filler(&junk), desc);
+        assert_eq!(placed_bytes_from(&desc, 0), placed_bytes(&desc));
+        for first in [0, 2] {
+            assert_eq!(placed_bytes_from(&junk, first), placed_bytes_from(&desc, first));
+        }
+        let known = PLACED_SIZES.with(|k| k.borrow().len());
+        for first in [0, 2] {
+            assert!(placed_bytes_from(&junk, first).is_some());
+        }
+        assert_eq!(PLACED_SIZES.with(|k| k.borrow().len()), known);
+    }
+
+    #[cfg(all(windows, feature = "diagnostics"))]
+    #[test]
+    fn placed_twins_stop_at_the_cap() {
+        assert!(twin_room(0));
+        assert!(twin_room(65_535));
+        assert!(!twin_room(65_536));
     }
 }
