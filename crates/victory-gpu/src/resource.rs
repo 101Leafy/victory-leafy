@@ -1768,7 +1768,7 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
         // world makes in its first frame ([`targets_room_kept`]) counts as
         // used.
         Some([budget, used, ..]) => {
-            used.saturating_sub(free_room()) + crate::shadow::card_room_kept() + targets_room_kept()
+            used.saturating_sub(free_room()) + crate::shadow::card_room_kept() + targets_room_kept(memory)
                 < budget / 100 * room_percent()
         }
         None => filled < WITHOUT_BUDGET,
@@ -1793,18 +1793,38 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
 /// their room kept, the queue stops that much earlier while the world
 /// loads and gets it back as the targets are made.
 #[cfg(windows)]
-pub(crate) fn targets_room_kept() -> u64 {
+pub(crate) fn targets_room_kept(memory: Option<[u64; 4]>) -> u64 {
     use std::sync::atomic::Ordering::Relaxed;
-    static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    let most = *MOST.get_or_init(|| {
+    static ASKED: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    let asked = *ASKED.get_or_init(|| {
         std::env::var("VICTORY_CARD_ROOM_FOR_TARGETS_MB")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
-            .map_or(3072 << 20, |mb| mb.min(8192) << 20)
     });
+    let most = targets_room_most(memory.map(|[budget, ..]| budget), asked);
     // Every host texture's bytes less those of the copies the title fills.
     let targets = HOST_TEXTURES[1].load(Relaxed).saturating_sub(KINDS[1].load(Relaxed));
     most.saturating_sub(targets)
+}
+
+/// The reserve [`targets_room_kept`] keeps before what the targets hold now:
+/// the switch's megabytes when it names any, else 3 GiB capped at **a quarter
+/// of the card's budget**.
+///
+/// A reserve is a share of a card, not a number of gigabytes. The figures in
+/// [`targets_room_kept`] were taken on 24 GiB, where 3 GiB is an eighth; the
+/// same 3 GiB on the 8 GiB card of the first real outside run is more than a
+/// third, and it is held out of the texture queue's reach for targets that
+/// may never need it - the queue then stops uploading while the title's
+/// textures have nowhere to go, which is refused uploads re-asked every
+/// frame. A quarter of the budget is 3 GiB at 12 GiB and up, so nothing
+/// below the figures above moves there.
+#[cfg(windows)]
+fn targets_room_most(budget: Option<u64>, asked: Option<u64>) -> u64 {
+    if let Some(mb) = asked {
+        return mb.min(8192) << 20;
+    }
+    (3072 << 20).min(budget.map_or(u64::MAX, |budget| budget / 4))
 }
 
 /// [`room`] as it was at most a tenth of a second ago, for a question
@@ -2121,7 +2141,7 @@ pub(crate) fn let_go_idle() {
         Some([budget, used, ..]) if keep => {
             let used = used.saturating_sub(free_room())
                 + crate::shadow::card_room_kept()
-                + targets_room_kept();
+                + targets_room_kept(memory);
             crate::host::vram_keep(budget, used)
         }
         _ => (crate::host::vram_idle_ms(memory), u64::MAX),
@@ -4970,6 +4990,26 @@ float4 lit() : SV_Target { return 1.0; }
         assert_eq!(texture_floor_bytes(Some(12 * GIB)), 2 * GIB);
         assert_eq!(texture_floor_bytes(Some(24 * GIB)), 2 * GIB);
         assert_eq!(texture_floor_bytes(Some(32 * GIB)), 2 * GIB);
+    }
+
+    /// The reserve kept for render targets follows the card's budget, so that
+    /// a small card is not asked to hold a share of a large one.
+    #[cfg(windows)]
+    #[test]
+    fn the_reserve_for_targets_is_a_share_of_the_card() {
+        const GIB: u64 = 1 << 30;
+        let mb = |n: u64| n << 20;
+        // The card the figures were taken on, and bigger ones: unchanged.
+        assert_eq!(targets_room_most(Some(24 * GIB), None), mb(3072));
+        assert_eq!(targets_room_most(Some(16 * GIB), None), mb(3072));
+        // 12 GiB is where a quarter falls to 3 GiB exactly.
+        assert_eq!(targets_room_most(Some(12 * GIB), None), mb(3072));
+        // The 8 GiB laptop card of the first outside run keeps 2, a 4 GiB one 1.
+        assert_eq!(targets_room_most(Some(8 * GIB), None), mb(2048));
+        assert_eq!(targets_room_most(Some(4 * GIB), None), mb(1024));
+        // A budget that could not be read, and the switch as it always was.
+        assert_eq!(targets_room_most(None, None), mb(3072));
+        assert_eq!(targets_room_most(Some(8 * GIB), Some(3072)), mb(3072));
     }
 
     /// A placed texture viewed from a later level has a host copy of that
