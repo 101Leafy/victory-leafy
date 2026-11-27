@@ -589,6 +589,9 @@ fn kernel_written(first: usize, last: usize) -> Option<Vec<(usize, u16)>> {
         crate::copystat::add(crate::copystat::C::AskSkipped, 1);
         return None;
     }
+    if ask_spans::on() && ask_spans::skip(first, last) {
+        return None;
+    }
     FOUND.with(|found| {
         let mut found = found.borrow_mut();
         let mut count = (last - first) * PAGE / KERNEL_PAGE;
@@ -609,6 +612,7 @@ fn kernel_written(first: usize, last: usize) -> Option<Vec<(usize, u16)>> {
                 &mut granularity,
             )
         } != 0;
+        ask_spans::told(first, last, failed);
         #[cfg(feature = "diagnostics")]
         {
             tally(10, u64::from(failed));
@@ -733,6 +737,8 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
         return;
     }
     let _all = Asking::hold_all();
+    let spans = ask_spans::on();
+    let bases = if spans { ask_spans::bases(&mut pieces) } else { Vec::new() };
     let (mut asked, mut written) = (Vec::new(), Vec::new());
     let mut i = 0;
     while i < pieces.len() {
@@ -742,11 +748,12 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
         while k < pieces.len()
             && pieces[k].0 <= last + AHEAD_GAP
             && last.max(pieces[k].1) - first <= AHEAD_MAX
+            && (!spans || bases[k] == bases[i])
         {
             last = last.max(pieces[k].1);
             k += 1;
         }
-        ask_run(&pieces[i..k], &mut asked, &mut written);
+        ask_run(&pieces[i..k], false, &mut asked, &mut written);
         i = k;
     }
     note_hot(&written);
@@ -967,8 +974,10 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
         return;
     }
     ask_once_end();
+    let before = ask_spans::mark();
     ask_ahead(ranges);
     ask_rest(ranges);
+    ask_spans::submitted(ranges, before);
 }
 
 /// [`ask_once`] after its [`ask_ahead`]: what that left to `writes`, and the
@@ -1111,21 +1120,28 @@ fn elsewhere(at: usize, len: usize) -> Vec<(usize, Vec<usize>)> {
 /// One kernel asking for `pieces` (page ranges in order); by halves if it
 /// fails, as a run across two reservations or into memory that is not
 /// write-watched does. A piece alone is left to [`writes`]. Adds what was
-/// asked to `asked` and the pages found written to `written`.
-fn ask_run(pieces: &[(usize, usize)], asked: &mut Vec<(usize, usize)>, written: &mut Vec<(usize, u16)>) {
+/// asked to `asked` and the pages found written to `written`. With
+/// [`ask_spans`] on a run lies in one reservation and is not split.
+fn ask_run(pieces: &[(usize, usize)], split: bool, asked: &mut Vec<(usize, usize)>, written: &mut Vec<(usize, u16)>) {
     if pieces.len() < 2 {
         return;
     }
     let first = pieces[0].0;
     let last = pieces.iter().map(|p| p.1).max().unwrap_or(first);
+    if split {
+        ask_spans::split();
+    }
     if let Some(pages) = kernel_written(first, last) {
         written.extend(pages);
         asked.push((first, last));
         return;
     }
+    if ask_spans::on() {
+        return;
+    }
     let (a, b) = pieces.split_at(pieces.len() / 2);
-    ask_run(a, asked, written);
-    ask_run(b, asked, written);
+    ask_run(a, true, asked, written);
+    ask_run(b, true, asked, written);
 }
 
 /// What [`writes`] would say of `[start, end)` from the journal alone, if
@@ -2566,6 +2582,234 @@ fn taken(from: usize, to: usize) {
 /// threads. A block guarded and written every frame costs a fault and two
 /// protection changes each time for nothing.
 #[cfg(feature = "diagnostics")]
+/// Write watch askings cut at reservation ends (`VICTORY_ASK_SPANS=1`), and
+/// the counts of its log line, kept with the switch off too.
+///
+/// `ask_ahead` joined a submission's ranges into runs without knowing where
+/// one reservation ends: a run across two, or holding a view, was refused
+/// whole and asked again by halves, each half paying the 30-70 microseconds
+/// of a call again (leafy-play: 205 askings a frame, 115 of them refused).
+/// With the switch on a run stays in one reservation (VirtualQuery,
+/// remembered for the frame, as the title maps and unmaps between frames),
+/// views are not asked (they go to the guards, as a refusal sends them), a
+/// reservation the kernel refused is not asked again that frame, and
+/// nothing is split.
+pub(crate) mod ask_spans {
+    use std::cell::Cell;
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    use super::PAGE;
+
+    pub(crate) fn on() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("VICTORY_ASK_SPANS").is_some_and(|v| v == "1"))
+    }
+
+    const ANSWERED: usize = 0;
+    const REFUSED_ACROSS: usize = 1;
+    const REFUSED_ONE: usize = 2;
+    const REFUSED_VIEW: usize = 3;
+    const NOT_ACROSS: usize = 4;
+    const NOT_VIEW: usize = 5;
+    const NOT_REFUSED: usize = 6;
+    const SPLITS: usize = 7;
+    const SUBMISSIONS: usize = 8;
+    const RESERVATIONS: usize = 9;
+    const ASKINGS: usize = 10;
+    const ASKED: usize = 11;
+    const RANGES: usize = 12;
+    const QUERIES: usize = 13;
+    static COUNTS: [AtomicU64; 14] = [const { AtomicU64::new(0) }; 14];
+
+    /// This frame's regions by start (end, reservation base, view), and the
+    /// reservations the kernel refused.
+    struct Frame {
+        frame: u64,
+        regions: BTreeMap<usize, (usize, usize, bool)>,
+        refused: BTreeSet<usize>,
+    }
+    static FRAME: Mutex<Frame> = Mutex::new(Frame { frame: 0, regions: BTreeMap::new(), refused: BTreeSet::new() });
+
+    thread_local! {
+        /// Kernel askings made on this thread, and the bytes they covered.
+        static CALLS: Cell<(u64, u64)> = const { Cell::new((0, 0)) };
+    }
+
+    fn frame() -> MutexGuard<'static, Frame> {
+        let now = crate::frame::current();
+        let mut f = FRAME.lock().unwrap_or_else(|e| e.into_inner());
+        if f.frame != now {
+            f.frame = now;
+            f.regions.clear();
+            f.refused.clear();
+        }
+        f
+    }
+
+    /// The region holding `at`: start, end, reservation base, view.
+    fn region(f: &mut Frame, at: usize) -> Option<(usize, usize, usize, bool)> {
+        if let Some((&start, &(end, base, view))) = f.regions.range(..=at).next_back()
+            && at < end
+        {
+            return Some((start, end, base, view));
+        }
+        use windows_sys::Win32::System::Memory::{MEM_FREE, MEM_MAPPED, MEMORY_BASIC_INFORMATION, VirtualQuery};
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+        COUNTS[QUERIES].fetch_add(1, Relaxed);
+        if n == 0 || info.State == MEM_FREE {
+            return None;
+        }
+        let start = info.BaseAddress as usize;
+        let end = start.saturating_add(info.RegionSize);
+        let base = info.AllocationBase as usize;
+        let view = info.Type == MEM_MAPPED;
+        f.regions.insert(start, (end, base, view));
+        Some((start, end, base, view))
+    }
+
+    /// The reservation pages `[first, last)` lie in, by its base, and
+    /// whether any of them is a view; `None` across reservations or into
+    /// free memory.
+    fn reservation(f: &mut Frame, first: usize, last: usize) -> Option<(usize, bool)> {
+        let end = last * PAGE;
+        let (_, mut to, base, mut view) = region(f, first * PAGE)?;
+        while to < end {
+            let (_, next, b, v) = region(f, to)?;
+            if b != base {
+                return None;
+            }
+            view |= v;
+            to = next;
+        }
+        Some((base, view))
+    }
+
+    /// Whether pages `[first, last)` are left unasked: across reservations,
+    /// holding a view, or in a reservation refused this frame.
+    pub(super) fn skip(first: usize, last: usize) -> bool {
+        let mut f = frame();
+        let why = match reservation(&mut f, first, last) {
+            None => NOT_ACROSS,
+            Some((_, true)) => NOT_VIEW,
+            Some((base, false)) if f.refused.contains(&base) => NOT_REFUSED,
+            Some(_) => return false,
+        };
+        COUNTS[why].fetch_add(1, Relaxed);
+        true
+    }
+
+    /// The kernel answered or refused an asking of pages `[first, last)`.
+    pub(super) fn told(first: usize, last: usize, failed: bool) {
+        CALLS.with(|c| {
+            let (n, bytes) = c.get();
+            c.set((n + 1, bytes + ((last - first) * PAGE) as u64));
+        });
+        if !failed {
+            COUNTS[ANSWERED].fetch_add(1, Relaxed);
+            return;
+        }
+        let mut f = frame();
+        let slot = match reservation(&mut f, first, last) {
+            None => REFUSED_ACROSS,
+            Some((_, true)) => REFUSED_VIEW,
+            Some((base, false)) => {
+                if on() {
+                    f.refused.insert(base);
+                }
+                REFUSED_ONE
+            }
+        };
+        COUNTS[slot].fetch_add(1, Relaxed);
+    }
+
+    /// An asking made by splitting a refused run.
+    pub(super) fn split() {
+        COUNTS[SPLITS].fetch_add(1, Relaxed);
+    }
+
+    /// Keeps the pieces (page ranges in order) that lie in one reservation,
+    /// holding no view, not refused this frame, and gives each one's base.
+    pub(super) fn bases(pieces: &mut Vec<(usize, usize)>) -> Vec<usize> {
+        let mut f = frame();
+        let mut bases = Vec::with_capacity(pieces.len());
+        pieces.retain(|&(first, last)| {
+            let why = match reservation(&mut f, first, last) {
+                None => NOT_ACROSS,
+                Some((_, true)) => NOT_VIEW,
+                Some((base, false)) if f.refused.contains(&base) => NOT_REFUSED,
+                Some((base, false)) => {
+                    bases.push(base);
+                    return true;
+                }
+            };
+            COUNTS[why].fetch_add(1, Relaxed);
+            false
+        });
+        let distinct: BTreeSet<usize> = bases.iter().copied().collect();
+        COUNTS[RESERVATIONS].fetch_add(distinct.len() as u64, Relaxed);
+        bases
+    }
+
+    /// This thread's askings so far, for [`submitted`].
+    pub(super) fn mark() -> (u64, u64) {
+        CALLS.with(Cell::get)
+    }
+
+    /// A submission's asking ([`super::ask_once`]) is done: its askings,
+    /// the bytes they covered, and the bytes of its ranges themselves.
+    pub(super) fn submitted(ranges: &[(usize, usize)], before: (u64, u64)) {
+        let (n, bytes) = mark();
+        let mut pages: Vec<(usize, usize)> = ranges
+            .iter()
+            .filter(|r| r.0 < r.1)
+            .map(|&(start, end)| (start / PAGE, end.div_ceil(PAGE)))
+            .collect();
+        pages.sort_unstable();
+        let (mut sum, mut to) = (0, 0);
+        for (first, last) in pages {
+            let first = first.max(to);
+            if last > first {
+                sum += last - first;
+                to = last;
+            }
+        }
+        COUNTS[SUBMISSIONS].fetch_add(1, Relaxed);
+        COUNTS[ASKINGS].fetch_add(n - before.0, Relaxed);
+        COUNTS[ASKED].fetch_add(bytes - before.1, Relaxed);
+        COUNTS[RANGES].fetch_add((sum * PAGE) as u64, Relaxed);
+    }
+
+    pub(crate) fn line(frames: f64) -> String {
+        let c: [f64; 14] = std::array::from_fn(|i| COUNTS[i].swap(0, Relaxed) as f64 / frames);
+        let each = |v: f64| if c[SUBMISSIONS] > 0.0 { v / c[SUBMISSIONS] } else { 0.0 };
+        format!(
+            "{:.0} answered, {:.0} refused across reservations, {:.0} refused in one reservation, {:.0} refused on views; \
+             not asked: {:.0} across reservations, {:.0} on views, {:.0} in reservations refused before; \
+             {:.0} askings made by splitting; {:.1} submissions asked ahead, {:.1} reservations each (switch on only), {:.1} askings each; \
+             {:.0} MB asked over ranges of {:.0} MB; {:.0} VirtualQuery calls",
+            c[ANSWERED],
+            c[REFUSED_ACROSS],
+            c[REFUSED_ONE],
+            c[REFUSED_VIEW],
+            c[NOT_ACROSS],
+            c[NOT_VIEW],
+            c[NOT_REFUSED],
+            c[SPLITS],
+            c[SUBMISSIONS],
+            each(c[RESERVATIONS]),
+            each(c[ASKINGS]),
+            c[ASKED] / 1048576.0,
+            c[RANGES] / 1048576.0,
+            c[QUERIES]
+        )
+    }
+}
+
 pub(crate) mod guard_frames {
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicU64, Ordering::Relaxed};

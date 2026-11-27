@@ -1810,6 +1810,11 @@ pub(crate) fn log(frames: f64) {
         "waits for the write trackers' locks per frame, all threads (number, time): {}",
         crate::watch::lock_waits(frames as f64)
     );
+    tracing::info!(
+        "write watch askings by reservation, per frame (VICTORY_ASK_SPANS={}): {}",
+        if crate::watch::ask_spans::on() { "1" } else { "0" },
+        crate::watch::ask_spans::line(frames as f64)
+    );
     if crate::watch::guard_frames::on() {
         tracing::info!(
             "guards frame by frame, per frame (VICTORY_GUARD_FRAMES=1): {}",
