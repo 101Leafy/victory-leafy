@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering::Relaxed};
 
 /// Counters since the last line.
 pub(crate) enum C {
@@ -275,11 +275,191 @@ pub(crate) enum C {
     FreshNs,
     FreshShared,
     FreshSharedSlots,
+    /// The bytes of the read-back buffers made (`ReadBacksMade`), after
+    /// rounding.
+    ReadBacksMadeBytes,
+    /// Slots the heap pass planned under a freed table entry.
+    HeapDueFreed,
+    /// Held slots it planned in the sweep's part of 256.
+    HeapDueSweepPart,
+    /// Held slots out of that part it planned for a changed record.
+    HeapDueSweepChanged,
+    /// Orphan slots it planned in the sweep's part of 16.
+    HeapDueOrphanPart,
+    /// Orphan slots out of that part it planned for a changed record.
+    HeapDueOrphanChanged,
+    /// Slots it planned more than once in a plan.
+    HeapDueTwice,
+    /// Looks that found the same copy and range as the last one.
+    HeapAgainShows,
+    /// Looks at an orphan that found it still left for later.
+    HeapAgainLater,
+    /// Of those, the ones left because a draw's table copies it.
+    HeapAgainTabled,
+    /// Looks at a slot neither held nor orphaned that found no buffer
+    /// view of ours again.
+    HeapAgainNothing,
+    /// Draws and dispatches by step (`draw.rs`): textures picked by index,
+    /// descriptor tables, title memory by address, user data and root
+    /// views, vertex and index buffers, target states, and the argument
+    /// refresh and clamp of indirect calls.
+    DrawEarlyNs,
+    DrawTablesNs,
+    DrawMemoryNs,
+    DrawRootsNs,
+    DrawBuffersNs,
+    DrawStatesNs,
+    IndirectArgsNs,
+    /// The whole of `bind` (the steps above plus heaps, root signature,
+    /// pipeline state and twins), the driver's draw, dispatch and
+    /// `ExecuteIndirect` calls, and what follows a draw (`drew`,
+    /// `buffers_written`).
+    DrawBindNs,
+    DrawDriverNs,
+    DrawAfterNs,
+    /// Indirect calls: buffer lookups and signature before the clamp, the
+    /// prepare or bind call, and the driver's `ExecuteIndirect`.
+    IndirectFindNs,
+    IndirectPrepareNs,
+    IndirectDriverNs,
+    /// The texture part of the heap pass (`draw.rs` heap_textures) by
+    /// step: slots held while the card was full, slots of remapped memory,
+    /// of textures short of memory, views made again, flips, uploads left
+    /// waiting, and the due list with the card's accounting.
+    HeapTexRoomNs,
+    HeapTexRemappedNs,
+    HeapTexShortNs,
+    HeapTexRemadeNs,
+    HeapTexFlipNs,
+    HeapTexWaitingNs,
+    HeapTexDueNs,
+    /// The loop over the due slots, and the slots it looked at.
+    HeapTexLoopNs,
+    HeapTexLooks,
+    /// Inside the loop: the look at an uploaded texture's bytes, asking
+    /// how much of a placed texture is mapped, the check that the host
+    /// copy holds the same bytes, and the upload.
+    HeapTexCheckNs,
+    HeapTexMappedNs,
+    HeapTexSameNs,
+    HeapTexUploadNs,
+    /// Settles for lists in the air, by cause: dynamic descriptor slots run
+    /// out (`settle_for_tables`), the card compare result area full
+    /// (`card_results_low`), and too many lists out (`late_most`).
+    SettleTablesNs,
+    SettleResultsNs,
+    SettleListsNs,
+    /// The submission lock held by others than the submitting thread: the
+    /// late thread's settle once the card is done (`WHY_CARD_DONE`), and
+    /// `settle_now` (a present, a fence, descriptor slots run out).
+    SubmitLockDoneNs,
+    SubmitLockSettleNs,
+    /// Read-back buffers: the wait for the pool's lock, and the making of
+    /// the ones the pool had none idle for.
+    ReadBackPoolNs,
+    ReadBacksMadeNs,
+    /// Of `FreshShared`: tables found parked, made by a list that had run
+    /// already, and their slots.
+    FreshRevived,
+    FreshRevivedSlots,
+    /// The most dynamic descriptor slots held at once in the frame, and the
+    /// most wanted: held when an ask was refused, plus the slots of the
+    /// frame's refused asks so far ([`most`], not sums).
+    DynamicHeldMost,
+    DynamicWantedMost,
+    /// Slots of refused asks, and refused asks with fewer slots free than
+    /// asked (the rest of `DynamicFull` met a longest free run too short).
+    DynamicRefusedSlots,
+    DynamicShortOfFree,
+    /// The heap pass's once-a-frame look at known holes
+    /// (`watch::look_at_holes`), whole; and inside it, the waits for the
+    /// guards' lock and the time it is held.
+    HolesNs,
+    HolesWaitNs,
+    HolesHoldNs,
+    /// Tables that found no dynamic slots and read instead a run another
+    /// list made this frame from the same records at another table
+    /// (`VICTORY_SAME_TABLES`), and their slots: draws that would have
+    /// been dropped.
+    FreshSameUsed,
+    FreshSameUsedSlots,
+    /// The batched clamps' passes on the card (`indirect::batch::Stamps`),
+    /// counted when their list is reset after it ran.
+    ClampPassNs,
+    ClampPasses,
+    /// Bytes of texture memory read for the rows a watched write touched
+    /// (`texture::Staging::detile_written`).
+    TexRowsDetiled,
+    /// Unordered views of textures the title placed itself that the device
+    /// refused, left null (`descriptor::host`'s placed arm).
+    PlacedUavRefused,
+    /// Inside `HeapTexLoopNs`: making the due slots' views
+    /// (`HostHeap::mirror`), finding their host textures, and the
+    /// fingerprints taken after an upload for the looks that follow.
+    HeapTexMirrorNs,
+    HeapTexHostNs,
+    HeapTexPrintNs,
+    /// Bytes of host copy the root SRV tables asked to be brought up to
+    /// date, and of those left out as an earlier tail of the list covered
+    /// them (`draw.rs` `refresh_tail`).
+    RootTailAsked,
+    RootTailCovered,
+    /// Settles for tables that came back with too few slots, and the asks
+    /// refused without one while the settles are held back after such a
+    /// settle (`draw.rs` `dynamic_slots`, `VICTORY_SETTLE_BACKOFF`).
+    SettlesBare,
+    SettlesHeld,
+    /// Tables kept from an earlier frame (`draw.rs` `SharedTables`,
+    /// `VICTORY_TABLE_CACHE`): found and used as they are, asked for and not
+    /// kept, found but made afresh as another host heap asked or texture
+    /// views were made again, or as a view's host copy or shadow changed,
+    /// and runs given back unused or for room.
+    TableCacheHit,
+    TableCacheHitSlots,
+    TableCacheMiss,
+    TableCacheStale,
+    TableCacheChanged,
+    TableCacheRetired,
+    TableCacheRetiredSlots,
+    /// Constant views of tables made afresh, and of them those whose address
+    /// is a multiple of 256 (a host constant view could read the title's
+    /// memory in place), with their bytes; tables holding constant views,
+    /// those whose constant views all are, and their slots; slots of tables
+    /// asked again this frame whose constant views all are.
+    CbvViews,
+    CbvAligned,
+    CbvBytes,
+    CbvAlignedBytes,
+    CbvTables,
+    CbvTablesAligned,
+    CbvTablesAlignedSlots,
+    CbvAgainAlignedSlots,
+    /// Windows given their side on the card late (`shadow.rs`
+    /// `card_late_windows`, `VICTORY_CARD_WINDOWS_LATE`), and their bytes;
+    /// and the times one due found no room.
+    CardLateMoved,
+    CardLateMovedBytes,
+    CardLateRefused,
+    /// Full waits with nothing written since the last one (`crate::draw::State::wait_needed`).
+    WaitsQuiet,
+    /// Bytes of partly mapped textures read before their 30 frames were up
+    /// as the guards saw a write, and of those passed over until then
+    /// (`texture::partial_due`).
+    TexPartialWritten,
+    TexPartialSkipped,
+    /// Bytes of the texture uploads recorded; uploads recorded only because
+    /// the texture was hot and their bytes; and of those the ones whose
+    /// refresh detiled nothing new, which copied what the host texture held.
+    TexUploadBytes,
+    TexForced,
+    TexForcedBytes,
+    TexForcedSame,
+    TexForcedSameBytes,
 }
-const COUNTERS: usize = 160;
+const COUNTERS: usize = 256;
 
 /// The counters' names, in the order of [`C`], for the frame recorder's columns.
-pub(crate) const NAMES: [&str; 149] = [
+pub(crate) const NAMES: [&str; 241] = [
     "Submissions", "Copies", "CopyBytes", "Refreshes", "RefreshBytes", "Skipped", "SkippedBytes", "Runs",
     "RunUs", "Queries", "QueryUs", "MoveUs", "Unmapped", "Watches", "WatchUs", "Checked", "Unchanged",
     "Fallbacks", "GuardFaults", "TexWatched", "TexHashed", "TexChanged", "TexHot", "Frames", "RecordCalls",
@@ -304,7 +484,35 @@ pub(crate) const NAMES: [&str; 149] = [
     "CopyTexSlow",
     "GuardPartFaults", "GuardPartWhole", "GuardPartAliased", "GuardPartBlocks", "GuardPartParts",
     "FreshMade", "FreshMadeSlots", "FreshAgainSlots", "FreshAgainCbvSlots", "FreshSame", "FreshSameSlots",
-    "FreshNs", "FreshShared", "FreshSharedSlots",
+    "FreshNs", "FreshShared", "FreshSharedSlots", "ReadBacksMadeBytes",
+    "HeapDueFreed", "HeapDueSweepPart", "HeapDueSweepChanged", "HeapDueOrphanPart", "HeapDueOrphanChanged",
+    "HeapDueTwice", "HeapAgainShows", "HeapAgainLater", "HeapAgainTabled", "HeapAgainNothing",
+    "DrawEarlyNs", "DrawTablesNs", "DrawMemoryNs", "DrawRootsNs", "DrawBuffersNs", "DrawStatesNs",
+    "IndirectArgsNs", "DrawBindNs", "DrawDriverNs", "DrawAfterNs", "IndirectFindNs", "IndirectPrepareNs",
+    "IndirectDriverNs",
+    "HeapTexRoomNs", "HeapTexRemappedNs", "HeapTexShortNs", "HeapTexRemadeNs", "HeapTexFlipNs", "HeapTexWaitingNs",
+    "HeapTexDueNs", "HeapTexLoopNs", "HeapTexLooks", "HeapTexCheckNs", "HeapTexMappedNs", "HeapTexSameNs",
+    "HeapTexUploadNs",
+    "SettleTablesNs", "SettleResultsNs", "SettleListsNs",
+    "SubmitLockDoneNs", "SubmitLockSettleNs",
+    "ReadBackPoolNs", "ReadBacksMadeNs",
+    "FreshRevived", "FreshRevivedSlots",
+    "DynamicHeldMost", "DynamicWantedMost", "DynamicRefusedSlots", "DynamicShortOfFree",
+    "HolesNs", "HolesWaitNs", "HolesHoldNs",
+    "FreshSameUsed", "FreshSameUsedSlots",
+    "ClampPassNs", "ClampPasses",
+    "TexRowsDetiled", "PlacedUavRefused",
+    "HeapTexMirrorNs", "HeapTexHostNs", "HeapTexPrintNs",
+    "RootTailAsked", "RootTailCovered",
+    "SettlesBare", "SettlesHeld",
+    "TableCacheHit", "TableCacheHitSlots", "TableCacheMiss", "TableCacheStale",
+    "TableCacheChanged", "TableCacheRetired", "TableCacheRetiredSlots",
+    "CbvViews", "CbvAligned", "CbvBytes", "CbvAlignedBytes",
+    "CbvTables", "CbvTablesAligned", "CbvTablesAlignedSlots", "CbvAgainAlignedSlots",
+    "CardLateMoved", "CardLateMovedBytes", "CardLateRefused",
+    "WaitsQuiet",
+    "TexPartialWritten", "TexPartialSkipped",
+    "TexUploadBytes", "TexForced", "TexForcedBytes", "TexForcedSame", "TexForcedSameBytes",
 ];
 /// One of some sets of counters, each in lines of the processor's memory of
 /// its own: a set for all threads had them wait for each other's lines at
@@ -336,8 +544,19 @@ pub(crate) fn add(c: C, n: u64) {
     COUNT[bank()].0[c as usize].fetch_add(n, Relaxed);
 }
 
+/// `c` becomes `n` if `n` is more: a high mark for the frame, kept in the
+/// first set only so the sum of the sets is the mark.
+pub(crate) fn most(c: C, n: u64) {
+    COUNT[0].0[c as usize].fetch_max(n, Relaxed);
+}
+
 /// The counter, all sets together, as it is now (it goes back to 0 with
 /// [`log`]).
+/// The nanoseconds since `began`, added to `c`.
+pub(crate) fn lap(c: C, began: std::time::Instant) {
+    add(c, began.elapsed().as_nanos() as u64);
+}
+
 pub(crate) fn peek(c: C) -> u64 {
     let i = c as usize;
     COUNT.iter().map(|b| b.0[i].load(Relaxed)).sum()
@@ -363,8 +582,9 @@ pub(crate) fn mode() -> u8 {
     })
 }
 
-/// Per source range (start, length): copies, bytes, microseconds, memory type.
-type Ranges = HashMap<(usize, usize), (u64, u64, u64, u32)>;
+/// Per source range (start, length): copies, bytes looked at (the ranges'
+/// lengths), microseconds, memory type, bytes copied.
+type Ranges = HashMap<(usize, usize), (u64, u64, u64, u32, u64)>;
 static RANGES: Mutex<Option<Ranges>> = Mutex::new(None);
 
 /// Per range copied whole because its memory is not watched (start,
@@ -398,11 +618,32 @@ static COMMANDS_BY_WORK: Mutex<Option<HashMap<String, (u64, u64, u64)>>> = Mutex
 /// kind and size first, then the pipeline in brackets, then what it binds.
 pub(crate) fn command_took(op: &str, ms: f64) {
     let us = (ms * 1e3) as u64;
+    let key = command_key(op);
+    let mut sizes = COMMAND_SIZES.lock().unwrap_or_else(|e| e.into_inner());
+    let e = sizes.get_or_insert_with(HashMap::new).entry(key.clone()).or_default();
+    let e = e.entry(command_size(op)).or_insert((0, 0));
+    e.0 += 1;
+    e.1 += us;
+    drop(sizes);
     let mut by = COMMANDS_BY_WORK.lock().unwrap_or_else(|e| e.into_inner());
-    let e = by.get_or_insert_with(HashMap::new).entry(command_key(op)).or_insert((0, 0, 0));
+    let e = by.get_or_insert_with(HashMap::new).entry(key).or_insert((0, 0, 0));
     e.0 += 1;
     e.1 += us;
     e.2 = e.2.max(us);
+}
+
+/// The commands of each key of [`COMMANDS_BY_WORK`] by their size (a
+/// dispatch's groups, a draw's counts, an indirect command's kind and
+/// most records): how many, and their microseconds.
+static COMMAND_SIZES: Mutex<Option<HashMap<String, HashMap<String, (u64, u64)>>>> = Mutex::new(None);
+
+/// The size in a command's note: the words after the first, up to the
+/// pipeline, without an address.
+fn command_size(op: &str) -> String {
+    let head = op.split(" | ").next().unwrap_or(op);
+    let head = head.split('[').next().unwrap_or(head);
+    let head = head.split(" at ").next().unwrap_or(head);
+    head.split(' ').skip(1).filter(|w| !w.is_empty()).collect::<Vec<_>>().join(" ")
 }
 
 /// What a command's note is summed under: its pipeline (`[compute ...]`,
@@ -448,16 +689,49 @@ pub(crate) fn card_waited(us: u64, what: impl FnOnce() -> String) {
 /// for `groups` (the title's barrier groups record no wait for earlier
 /// shader writes), bit 1 for `indirect` (the pass that bounds an indirect
 /// command runs without its two such waits; its state changes stay), both
-/// bits for `both`. For timing only: without the waits a shader may read
-/// what another has not finished writing.
+/// bits for `both`. `cycle` runs off, groups, indirect and both in turn,
+/// `VICTORY_BARRIER_TEST_SECS` (90) each, changing only where a counter line
+/// is logged, so each line was counted under the one mode it names. For
+/// timing only: without the waits a shader may read what another has not
+/// finished writing.
 pub(crate) fn barrier_test() -> u8 {
-    static TEST: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-    *TEST.get_or_init(|| match std::env::var("VICTORY_BARRIER_TEST").as_deref() {
-        Ok("groups") => 1,
-        Ok("indirect") => 2,
-        Ok("both") => 3,
-        _ => 0,
+    barrier_cycle();
+    BARRIER_TEST.load(Relaxed)
+}
+
+static BARRIER_TEST: AtomicU8 = AtomicU8::new(0);
+
+/// The seconds each mode of `VICTORY_BARRIER_TEST=cycle` runs, and the
+/// fixed mode set otherwise.
+fn barrier_cycle() -> Option<u64> {
+    static CYCLE: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *CYCLE.get_or_init(|| {
+        let mode = match std::env::var("VICTORY_BARRIER_TEST").as_deref() {
+            Ok("groups") => 1,
+            Ok("indirect") => 2,
+            Ok("both") => 3,
+            Ok("cycle") => {
+                let secs = std::env::var("VICTORY_BARRIER_TEST_SECS").ok().and_then(|v| v.parse().ok());
+                return Some(secs.unwrap_or(90).max(1));
+            }
+            _ => 0,
+        };
+        BARRIER_TEST.store(mode, Relaxed);
+        None
     })
+}
+
+/// After a counter line: the mode the next lines run under, for `cycle`.
+fn barrier_next() {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let Some(secs) = barrier_cycle() else {
+        return;
+    };
+    let start = *START.get_or_init(std::time::Instant::now);
+    let mode = (start.elapsed().as_secs() / secs % 4) as u8;
+    if BARRIER_TEST.swap(mode, Relaxed) != mode {
+        tracing::info!("barrier experiment {mode} from here (cycle of {secs} s each)");
+    }
 }
 
 /// Per range compared after a submission (start, length): times, and the
@@ -473,16 +747,18 @@ pub(crate) fn compared(src: usize, len: usize, written: usize) {
     e.1 += written as u64;
 }
 
-/// A copy of `len` bytes from `src` (memory type `kind`) took `us`.
-pub(crate) fn range(src: usize, len: usize, us: u64, kind: u32) {
+/// A refresh of `len` bytes from `src` (memory type `kind`) that copied
+/// `copied` of them (the pages written since) took `us`.
+pub(crate) fn range(src: usize, len: usize, copied: usize, us: u64, kind: u32) {
     let mut map = RANGES.lock().unwrap_or_else(|e| e.into_inner());
     let e = map
         .get_or_insert_with(HashMap::new)
         .entry((src, len))
-        .or_insert((0, 0, 0, kind));
+        .or_insert((0, 0, 0, kind, 0));
     e.0 += 1;
     e.1 += len as u64;
     e.2 += us;
+    e.4 += copied as u64;
 }
 
 /// Our own allocations alive now, by size of block (under 4 KiB, to 64 KiB,
@@ -615,7 +891,7 @@ mod command_tests {
     #[test]
     fn every_counter_is_named() {
         use super::{C, COUNTERS, NAMES};
-        assert_eq!(C::FreshSharedSlots as usize + 1, NAMES.len());
+        assert_eq!(C::TexForcedSameBytes as usize + 1, NAMES.len());
         assert_eq!(NAMES[C::Frames as usize], "Frames");
         assert!(NAMES.len() <= COUNTERS);
     }
@@ -980,6 +1256,19 @@ fn log_memory() {
     {
         let [textures, staging] = crate::pool::memory();
         tracing::info!("memory in blocks (VICTORY_TEXTURE_POOL=0 turns them off): {textures} MB of textures, {staging} MB of their staging buffers");
+        let (blocks, free, let_go, fullest) = crate::pool::fill();
+        tracing::info!(
+            "texture blocks by how much is taken (VICTORY_POOL_FULLEST={}): {} empty, {} under a quarter with {} MB free, {} under half with {} MB free, {} half or more with {} MB free; {} let go so far",
+            u8::from(fullest),
+            blocks[0],
+            blocks[1],
+            free[1],
+            blocks[2],
+            free[2],
+            blocks[3],
+            free[3],
+            let_go
+        );
     }
     let targets = crate::resource::targets_census();
     tracing::info!(
@@ -997,6 +1286,46 @@ fn log_memory() {
         targets[8],
         mb(targets[9]),
     );
+    {
+        use std::sync::atomic::Ordering::Relaxed;
+        let gone = &crate::resource::UNMAPPED_GONE;
+        tracing::info!(
+            "host copies of placed textures let go 1.5 s after their title memory was not mapped (VICTORY_SWEEP_UNMAPPED=0: as the rest), since the start: {} of {:.0} MB, {} title textures asked about",
+            gone[0].load(Relaxed),
+            mb(gone[1].load(Relaxed)),
+            gone[2].load(Relaxed)
+        );
+    }
+    {
+        let sides = crate::shadow::card_sides_census();
+        tracing::info!(
+            "the CPU's sides of copies in the card's memory, as big as their card sides: {} written by shaders {:.0} MB, {} sending changed dwords only {:.0} MB, {} passing title memory on {:.0} MB, of them nothing sent for 10 s {} {:.0} MB, for 60 s {} {:.0} MB",
+            sides[0],
+            mb(sides[1]),
+            sides[2],
+            mb(sides[3]),
+            sides[4],
+            mb(sides[5]),
+            sides[6],
+            mb(sides[7]),
+            sides[8],
+            mb(sides[9])
+        );
+        let w = crate::shadow::windows_by_use();
+        tracing::info!(
+            "windows outside buffers by use (idle: no draw for 10 s, no list or slot): on the card {} in use {:.0} MB, {} idle {:.0} MB; in the PC's memory {} in use {:.0} MB, {} idle {:.0} MB; turned away from the card since the start {} {:.0} MB (VICTORY_CARD_WINDOWS_IDLE_MS lets idle ones on the card go sooner)",
+            w[0],
+            mb(w[1]),
+            w[2],
+            mb(w[3]),
+            w[4],
+            mb(w[5]),
+            w[6],
+            mb(w[7]),
+            w[8],
+            mb(w[9])
+        );
+    }
     tracing::info!(
         "memory let go since the start: {} windows outside buffers {:.0} MB, {} staging buffers \
          {:.0} MB; of the windows alive, {:.0} MB lie between the lowest and highest address \
@@ -1118,6 +1447,54 @@ fn log_memory() {
         mb(copies[3]),
         mb(crate::shadow::window_cover()),
         lists[3],
+    );
+    // Round 4: what makes new shapes of placed views, and what became of
+    // the views past the last shape a record can number.
+    let (past, collided, varied) = crate::descriptor::shapes_new();
+    let words: Vec<String> = varied
+        .iter()
+        .enumerate()
+        .filter(|&(_, &n)| n > 0)
+        .map(|(k, n)| match k {
+            0..14 => format!("r{k} {n}"),
+            14..24 => format!("v{} {n}", k - 14),
+            _ => format!("v{} {n}", k - 12),
+        })
+        .collect();
+    tracing::info!(
+        "memory, shapes: placed views made table entries because the shapes were full: {}; views \
+         and shapes kept by themselves because another had their digest: {}; words of new shapes \
+         that differed from the last new shape of their kind (r: resource description, v: view): {}",
+        past,
+        collided,
+        if words.is_empty() { "none".to_string() } else { words.join(", ") },
+    );
+    let [taken, not_made, below, below_unsized, above] = crate::shadow::window_trim();
+    tracing::info!(
+        "memory, windows cut nearer: {taken} asks of draws took a longer window of their cell instead of \
+         making the cell's own ({:.0} MB not made, since the start); of the windows alive, {:.0} MB lie \
+         below the lowest ask's 256 KiB step ({:.0} MB of them in windows asked for without a length: \
+         VICTORY_WINDOW_TAILS=1) and {:.0} MB past the highest ask's 1 MiB line in windows only asked for \
+         with a length (VICTORY_WINDOW_KB=1024)",
+        mb(not_made),
+        mb(below),
+        mb(below_unsized),
+        mb(above),
+    );
+    let [ownerless, cap, freed] = crate::descriptor::ownerless_kept();
+    tracing::info!(
+        "memory, view entries no resource owns: {} kept (at most {}, 0: all; VICTORY_OWNERLESS_VIEWS), \
+         {} of them freed under the cap so far",
+        ownerless,
+        cap,
+        freed,
+    );
+    tracing::info!(
+        "placed texture views: slots showing an older texture now {}, made null for want of room so far {} \
+         (VICTORY_KEPT_VIEWS_YIELD=1: {})",
+        crate::descriptor::host::KEEPING_NOW.load(std::sync::atomic::Ordering::Relaxed),
+        crate::descriptor::host::KEPT_YIELDED.load(std::sync::atomic::Ordering::Relaxed),
+        if crate::descriptor::host::kept_views_yield() { "on" } else { "off" },
     );
 }
 
@@ -1399,6 +1776,36 @@ pub(crate) fn log(frames: f64) {
         "guards over several views of a page, since the start: {together} blocks guarded with their other views, \
          {written} views opened by a write through another, {mapped} ranges opened because a view of them was mapped"
     );
+    let [runs, in_runs, one_by_one] =
+        [0, 1, 2].map(|n| crate::watch::OPENS[n].load(std::sync::atomic::Ordering::Relaxed));
+    tracing::info!(
+        "guarded blocks opened, since the start: {runs} runs with one call each, {in_runs} blocks in them; {one_by_one} blocks one call each"
+    );
+    let [loose, to_lock, taken] =
+        [0, 1, 2].map(|n| crate::watch::LOOSE_OPENS[n].load(std::sync::atomic::Ordering::Relaxed));
+    tracing::info!(
+        "write faults that opened their block with no lock (VICTORY_LOOSE_FAULTS=0 for none), since the start: {loose}; \
+         {to_lock} went on to the lock; {taken} taken into the notes after"
+    );
+    let [runs, blocks, reopened, failed] =
+        [0, 1, 2, 3].map(|n| crate::watch::LATER[n].load(std::sync::atomic::Ordering::Relaxed));
+    tracing::info!(
+        "guarded runs made read-only with the guards' lock let go (VICTORY_PROTECT_LATER=0 for none), since the start: \
+         {runs} runs, {blocks} blocks; {reopened} blocks opened meanwhile and made writable again; \
+         {failed} runs guarded under the lock after (block by block with it let go: VICTORY_GUARD_FALLBACK_LATER=1)"
+    );
+    let [aliases, failed] = [0, 1].map(|n| crate::watch::ALIAS_LATER[n].load(std::sync::atomic::Ordering::Relaxed));
+    tracing::info!(
+        "other views of guarded pages made read-only with the guards' lock let go (VICTORY_ALIAS_LATER=1), \
+         since the start: {aliases}; {failed} failed or opened meanwhile"
+    );
+    let [blocks, bytes, freed] =
+        [0, 1, 2].map(|n| crate::watch::GRAPHICS_BLOCKS[n].load(std::sync::atomic::Ordering::Relaxed));
+    tracing::info!(
+        "graphics blocks given write-watched memory of their own (VICTORY_XMEM_WATCHED=0 for none), since the start: \
+         {blocks} blocks, {} MB; {freed} given back",
+        bytes >> 20
+    );
     tracing::info!(
         "waits for the write trackers' locks per frame, all threads (number, time): {}",
         crate::watch::lock_waits(frames as f64)
@@ -1446,6 +1853,19 @@ pub(crate) fn log(frames: f64) {
         c[C::HostLists as usize],
         c[C::HostListNs as usize] / 1e6,
         c[C::PartsTogether as usize],
+    );
+    tracing::info!(
+        "texture uploads per frame: {:.0} recorded {:.1} MB; {:.0} of them only because the texture \
+         was hot {:.1} MB, {:.0} of those {:.1} MB after a refresh that found nothing new; partly \
+         mapped textures {:.1} MB read early as written, {:.1} MB passed over",
+        c[C::TexUploads as usize],
+        mb(c[C::TexUploadBytes as usize]),
+        c[C::TexForced as usize],
+        mb(c[C::TexForcedBytes as usize]),
+        c[C::TexForcedSame as usize],
+        mb(c[C::TexForcedSameBytes as usize]),
+        mb(c[C::TexPartialWritten as usize]),
+        mb(c[C::TexPartialSkipped as usize]),
     );
     // What is copied whole, largest first: memory nobody tells us about.
     let whole = WHOLE.lock().unwrap_or_else(|e| e.into_inner()).take();
@@ -1524,23 +1944,43 @@ pub(crate) fn log(frames: f64) {
             text.join(", ")
         );
     }
-    for (what, (n, us, longest)) in by.into_iter().take(40) {
+    let mut sizes = COMMAND_SIZES.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
+    for (i, (what, (n, us, longest))) in by.into_iter().take(40).enumerate() {
         tracing::info!(
             "  the card's time by command (timing run): {:.2} ms a frame in {:.1} commands a frame, the longest {:.2} ms: {what}",
             us as f64 / 1e3 / frames,
             n as f64 / frames,
             longest as f64 / 1e3
         );
+        // The sizes of the ten heaviest: is one pass heavy for its size, or
+        // asked for more groups than the others?
+        let Some(by_size) = sizes.remove(&what).filter(|_| i < 10) else {
+            continue;
+        };
+        let mut by_size: Vec<_> = by_size.into_iter().collect();
+        by_size.sort_by_key(|&(_, (_, us))| std::cmp::Reverse(us));
+        let text: Vec<String> = by_size
+            .iter()
+            .take(6)
+            .map(|(size, (n, us))| {
+                format!("{size}: {:.1}x {:.2} ms", *n as f64 / frames, *us as f64 / 1e3 / frames)
+            })
+            .collect();
+        tracing::info!("    by size, {} sizes: {}", by_size.len(), text.join(", "));
     }
+    #[cfg(feature = "diagnostics")]
+    crate::host::pstats::report(frames);
     tracing::info!(
         "  waits for every earlier shader write, per frame: {:.0} for the title's barrier groups, {:.0} \
          for its barriers on buffers; {:.0} indirect commands bounded (a dispatch of ours between two \
-         such waits each); barrier experiment {}",
+         such waits each); {:.0} of all these after nothing that writes; barrier experiment {}",
         c[C::WaitsForGroups as usize],
         c[C::WaitsForBuffers as usize],
         c[C::IndirectBounded as usize],
+        c[C::WaitsQuiet as usize],
         barrier_test()
     );
+    barrier_next();
     // What is compared after submissions, largest first, and how much of
     // it shaders had written.
     let compared = COMPARED.lock().unwrap_or_else(|e| e.into_inner()).take();
@@ -1584,8 +2024,8 @@ pub(crate) fn log(frames: f64) {
     log_memory();
     let ranges = RANGES.lock().unwrap_or_else(|e| e.into_inner()).take();
     let mut ranges: Vec<_> = ranges.into_iter().flatten().collect();
-    ranges.sort_by_key(|&(_, (_, bytes, _, _))| std::cmp::Reverse(bytes));
-    for ((src, len), (n, bytes, us, _)) in ranges.into_iter().take(10) {
+    ranges.sort_by_key(|&(_, (_, bytes, ..))| std::cmp::Reverse(bytes));
+    for ((src, len), (n, bytes, us, _, copied)) in ranges.into_iter().take(10) {
         use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
         // SAFETY: plain data filled in by the query.
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
@@ -1593,9 +2033,11 @@ pub(crate) fn log(frames: f64) {
         unsafe { VirtualQuery(src as *const _, &mut info, size_of_val(&info)) };
         let kind = info.Type;
         tracing::info!(
-            "  copied from {src:#x}+{len:#x} (memory {kind:#x}): {:.1}x/frame, {:.2} MB/frame, {:.2} ms/frame",
+            "  copied from {src:#x}+{len:#x} (memory {kind:#x}): {:.1}x/frame, {:.2} MB/frame looked at, {:.2} MB/frame copied, \
+             {:.2} ms/frame",
             n as f64 / frames,
             bytes as f64 / 1e6 / frames,
+            copied as f64 / 1e6 / frames,
             us as f64 / 1e3 / frames
         );
     }

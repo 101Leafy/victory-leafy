@@ -65,6 +65,12 @@ pub fn warm_shader(container: &[u8]) -> Result<bool, String> {
     }
 }
 
+/// Starts making the host GPU while the title loads (`victory_gpu::start_host`).
+pub fn start_host() {
+    #[cfg(windows)]
+    victory_gpu::start_host();
+}
+
 /// Keeps the host's translations of the title's shaders in `dir` (a
 /// folder of the cache) across runs, and its compiled pipelines beside it
 /// (`pipelines`).

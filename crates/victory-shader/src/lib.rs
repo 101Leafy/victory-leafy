@@ -10,6 +10,7 @@ pub mod bvh;
 pub mod dxbc;
 pub mod dxil;
 pub mod emit;
+mod fx;
 pub mod gfx10;
 pub mod io;
 pub mod ir;
@@ -22,7 +23,8 @@ pub use dxbc::{Container, FourCC, Part};
 pub use dxil::{DxilProgram, ShaderKind, XboxExtras};
 pub use native::{
     HwStage, LooseMetadata, NativeProgram, ResourceType, RootParam, RootType, UsedResource,
-    loose_compute, loose_metadata, native_programs,
+    InputElement, LooseGraphics, VERTEX_FETCH, loose_compute, loose_graphics, loose_input_layout,
+    loose_metadata, native_programs,
 };
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]

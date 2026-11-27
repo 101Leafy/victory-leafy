@@ -17,7 +17,6 @@
 //! through derivatives.
 
 use std::collections::{HashMap, HashSet};
-use std::hash::{BuildHasherDefault, Hasher};
 
 use crate::ShaderError;
 use crate::gfx10::{Fields, NULL, Operand};
@@ -67,35 +66,7 @@ pub struct Bools {
 }
 
 /// The tables below have small integer keys; SipHash dominated run time.
-type Map<K, V> = HashMap<K, V, BuildHasherDefault<Fx>>;
-
-/// FxHash's multiply-rotate step.
-#[derive(Default)]
-struct Fx(u64);
-
-impl Hasher for Fx {
-    fn finish(&self) -> u64 {
-        self.0
-    }
-
-    fn write(&mut self, bytes: &[u8]) {
-        for &b in bytes {
-            self.write_u64(u64::from(b));
-        }
-    }
-
-    fn write_u32(&mut self, n: u32) {
-        self.write_u64(u64::from(n));
-    }
-
-    fn write_u64(&mut self, n: u64) {
-        self.0 = (self.0.rotate_left(5) ^ n).wrapping_mul(0x517c_c1b7_2722_0a95);
-    }
-
-    fn write_usize(&mut self, n: usize) {
-        self.write_u64(n as u64);
-    }
-}
+type Map<K, V> = crate::fx::Map<K, V>;
 
 const TERMINAL: u32 = u32::MAX;
 const MAX_NODES: usize = 1 << 21;
@@ -443,6 +414,9 @@ pub struct Structured {
     /// SCC values a mask operation sets when some lane's bit of its result is set, with that
     /// lane bit: as data such an SCC is "some lane of the wave has it".
     pub scc_some: HashMap<Value, Bool>,
+    /// The source mask of each `s_wqm` result, by its low dword ([`Atom::Quad`]): a pixel
+    /// program lowers the quad's bit from it.
+    pub quad_inputs: HashMap<Value, Bool>,
     /// EXEC on entry is not every lane but the lanes the dispatch launched
     /// ([`with_launched_exec`]): an [`Atom::Opaque`] of the input EXEC pair, which lowering
     /// gives as the console wave's launched lanes.
@@ -541,6 +515,8 @@ struct Lanes<'a> {
     /// For branches: SCC of a mask operation ("some lane is set") as the
     /// lane's own bit.
     scc_lane: Map<Value, Bool>,
+    /// See [`Structured::quad_inputs`].
+    quad_inputs: Map<Value, Bool>,
     /// Joins resolved to a constant, to check once all edges are known.
     joins: Vec<Join>,
     /// [`Atom::Phi`] joins created in the current pass, resolved in
@@ -631,6 +607,7 @@ impl<'a> Lanes<'a> {
             other: Map::default(),
             seen: Vec::new(),
             scc_lane: Map::default(),
+            quad_inputs: Map::default(),
             joins: Vec::new(),
             phi_joins: Vec::new(),
             phi_join_ids: HashSet::new(),
@@ -649,6 +626,7 @@ impl<'a> Lanes<'a> {
         self.other.clear();
         self.seen.clear();
         self.scc_lane.clear();
+        self.quad_inputs.clear();
         self.scc_every.clear();
         self.wave_any.fill(None);
         self.joins.clear();
@@ -896,6 +874,7 @@ impl<'a> Lanes<'a> {
                 .filter(|(scc, _)| !self.scc_every.contains(scc))
                 .map(|(&scc, &m)| (scc, m))
                 .collect(),
+            quad_inputs: self.quad_inputs.iter().map(|(&v, &m)| (v, m)).collect(),
             phi_masks,
             bools: self.b,
             exits,
@@ -1129,6 +1108,7 @@ impl<'a> Lanes<'a> {
                 let lo = dst.or(exec_out)?.0;
                 let born = self.born(lo);
                 let q = self.b.atom(Atom::Quad(lo), born);
+                self.quad_inputs.insert(lo, a);
                 let r = self.b.or(a, q);
                 (r, Some(r))
             }

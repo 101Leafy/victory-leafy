@@ -110,7 +110,7 @@ pub extern "system" fn CreateWindowExW(
     instance: HINSTANCE,
     param: *const c_void,
 ) -> HWND {
-    let (x, y, width, height) = fit(parent, x, y, width, height);
+    let (x, y, width, height) = fit(parent, style, ex_style, x, y, width, height);
     // SAFETY: the title's own arguments, forwarded (the size fitted).
     let hwnd = unsafe {
         wm::CreateWindowExW(
@@ -136,7 +136,7 @@ pub extern "system" fn CreateWindowExA(
     instance: HINSTANCE,
     param: *const c_void,
 ) -> HWND {
-    let (x, y, width, height) = fit(parent, x, y, width, height);
+    let (x, y, width, height) = fit(parent, style, ex_style, x, y, width, height);
     // SAFETY: the title's own arguments, forwarded (the size fitted).
     let hwnd = unsafe {
         wm::CreateWindowExA(
@@ -149,25 +149,75 @@ pub extern "system" fn CreateWindowExA(
 
 /// A console title sizes its window to its render target (
 /// the title: 3840x2160 on a Series X), which can exceed the host's screen.
-/// A top-level window larger than the work area is shrunk to fit, keeping
-/// its proportions, and centred; what it shows is scaled to it (the swap
-/// chain stretches). `VICTORY_WINDOW_MAX=WIDTHxHEIGHT` applies a smaller
-/// limit without changing the title's render targets.
-fn fit(parent: HWND, x: i32, y: i32, width: i32, height: i32) -> (i32, i32, i32, i32) {
+/// That size is what the picture needs, so it becomes the window's client
+/// area: the frame (title bar, borders) goes around it rather than eating into
+/// it, or the swap chain, which stretches to the client area, squashes the
+/// picture. A frameless (popup) style gets no frame. A top-level window larger
+/// than the work area is shrunk to fit, keeping the client area's proportions,
+/// and centred. `VICTORY_WINDOW_MAX=WIDTHxHEIGHT` applies a smaller limit to
+/// the client area without changing the title's render targets.
+fn fit(
+    parent: HWND,
+    style: u32,
+    ex_style: u32,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+) -> (i32, i32, i32, i32) {
+    if !parent.is_null() || width <= 0 || height <= 0 {
+        return (x, y, width, height);
+    }
     let mut area = RECT::default();
     // SAFETY: `area` receives the primary monitor's work area.
     let known =
         unsafe { wm::SystemParametersInfoW(wm::SPI_GETWORKAREA, 0, (&raw mut area).cast(), 0) };
-    let limit = window_limit();
-    let fitted = fit_with_limit(&area, width, height, limit);
-    if !parent.is_null() || known == 0 || fitted == (width, height) {
-        return (x, y, width, height);
+    let mut frame = RECT::default();
+    // SAFETY: `frame` is a plain rectangle the call grows by the frame's size.
+    let framed = unsafe { wm::AdjustWindowRectEx(&mut frame, style, 0, ex_style) };
+    let frame = if framed == 0 {
+        (0, 0)
+    } else {
+        (frame.right - frame.left, frame.bottom - frame.top)
+    };
+    if known == 0 {
+        return (x, y, width + frame.0, height + frame.1);
     }
-    tracing::info!(width, height, to = ?fitted, ?limit, "title window fitted to the screen");
-    let (w, h) = fitted;
+    let limit = window_limit();
+    let (fits, w, h) = framed_fit(&area, frame, width, height, limit);
+    if fits {
+        return (x, y, w, h);
+    }
+    tracing::info!(
+        width,
+        height,
+        to = ?(w - frame.0, h - frame.1),
+        ?limit,
+        "title window fitted to the screen"
+    );
     let left = area.left + (area.right - area.left - w) / 2;
     let top = area.top + (area.bottom - area.top - h) / 2;
     (left, top, w, h)
+}
+
+/// The outer size of a window whose client area is `width` x `height`
+/// (scaled down, proportions kept, until the window with its `frame` fits
+/// `area` and the client area fits `limit`), and whether it fitted unscaled.
+fn framed_fit(
+    area: &RECT,
+    frame: (i32, i32),
+    width: i32,
+    height: i32,
+    limit: Option<(i32, i32)>,
+) -> (bool, i32, i32) {
+    let inner = RECT {
+        left: area.left,
+        top: area.top,
+        right: area.right - frame.0,
+        bottom: area.bottom - frame.1,
+    };
+    let (w, h) = fit_with_limit(&inner, width, height, limit);
+    ((w, h) == (width, height), w + frame.0, h + frame.1)
 }
 
 fn parse_window_limit(value: &str) -> Option<(i32, i32)> {
@@ -260,6 +310,23 @@ extern "system" fn window_proc(
     // menu. The mouse still opens it from the title bar.
     if message == wm::WM_SYSCOMMAND && wparam & 0xFFF0 == wm::SC_KEYMENU as usize {
         return 0;
+    }
+    // The window shows the system's white (the title's class brush) from
+    // its creation until our first present, a second or more at start.
+    // It is black instead, as a console's screen is before its first frame.
+    if message == wm::WM_ERASEBKGND {
+        use windows_sys::Win32::Graphics::Gdi;
+        let mut rect = RECT::default();
+        // SAFETY: the device context the message hands over, for our window.
+        unsafe {
+            wm::GetClientRect(hwnd, &mut rect);
+            Gdi::FillRect(
+                wparam as Gdi::HDC,
+                &rect,
+                Gdi::GetStockObject(Gdi::BLACK_BRUSH) as Gdi::HBRUSH,
+            );
+        }
+        return 1;
     }
     // The mouse cursor for keyboard and mouse play (`gameinput::cursor`):
     // hidden over the window while captured, captured by a click, freed when
@@ -528,6 +595,37 @@ mod tests {
             bottom: 1440,
         };
         assert_eq!(fit_with_limit(&area, 1600, 1200, Some((1920, 1080))), (1440, 1080));
+    }
+
+    #[test]
+    fn the_frame_goes_around_the_picture_not_into_it() {
+        // 1536x816 is a 1080p work area at 125% scaling; 16x39 an overlapped frame.
+        let area = RECT {
+            left: 0,
+            top: 0,
+            right: 1536,
+            bottom: 816,
+        };
+        let (fits, w, h) = framed_fit(&area, (16, 39), 3840, 2160, None);
+        assert!(!fits);
+        let (cw, ch) = (w - 16, h - 39);
+        assert!(h <= 816 && w <= 1536);
+        assert!(((cw as f64 / ch as f64) - 16.0 / 9.0).abs() < 0.01, "{cw}x{ch}");
+        assert_eq!(framed_fit(&area, (16, 39), 1280, 720, None), (true, 1296, 759));
+    }
+
+    #[test]
+    fn the_window_limit_caps_the_client_area_not_the_frame() {
+        let area = RECT {
+            left: 0,
+            top: 0,
+            right: 2560,
+            bottom: 1400,
+        };
+        let limit = Some((1280, 720));
+        assert_eq!(framed_fit(&area, (16, 39), 3840, 2160, limit), (false, 1296, 759));
+        // A frameless window is the client area alone.
+        assert_eq!(framed_fit(&area, (0, 0), 3840, 2160, limit), (false, 1280, 720));
     }
 
     #[test]

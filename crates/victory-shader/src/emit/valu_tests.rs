@@ -586,6 +586,53 @@ fn v_permlane16_and_x16_read_the_lanes_their_selectors_pick() {
     }
 }
 
+/// VOP2 `op vdst, vsrc0, vsrc1` with a DPP16 dword (all rows and banks on).
+const fn vop2_dpp16(op: u8, vdst: u8, vsrc0: u8, vsrc1: u8, ctrl: u16) -> [u32; 2] {
+    [
+        (op as u32) << 25 | (vdst as u32) << 17 | (vsrc1 as u32) << 9 | 0xFA,
+        0xF << 28 | 0xF << 24 | (ctrl as u32 & 0x1FF) << 8 | vsrc0 as u32,
+    ]
+}
+
+#[test]
+fn dpp16_reverse_integer_ops_shuffle_the_second_source() {
+    // Before GFX11 the reverse subtract and shifts take the lane DPP picks
+    // as src1 and their own lane's src0 (LLVM `isSrc1DPPRevOpcode`, Mesa
+    // README-ISA.md). v1 = 0x1000_0001 + lane, v3 = 0x0001_0000 + lane,
+    // quad pairs swapped (0xB1); v_sub_nc_u32 is the control, shuffling src0.
+    let v1 = |lane: u32| 0x1000_0001 + lane;
+    let v3 = |lane: u32| 0x0001_0000 + lane;
+    for (op, name) in [
+        (0x27u8, "v_subrev_nc_u32"),
+        (0x1A, "v_lshlrev_b32"),
+        (0x16, "v_lshrrev_b32"),
+        (0x18, "v_ashrrev_i32"),
+        (0x26, "v_sub_nc_u32"),
+    ] {
+        for read in [0u8, 1, 6, 17, 30, 31] {
+            let mut body = Vec::new();
+            body.push(0x25 << 25 | 1 << 17 | 1 << 9 | 256); // v_add_nc_u32 v1, v0, v1
+            body.push(0x25 << 25 | 3 << 17 | 3 << 9 | 256); // v_add_nc_u32 v3, v0, v3
+            body.extend_from_slice(&vop2_dpp16(op, 2, 1, 3, 0xB1));
+            body.extend_from_slice(&vop3(0x360, 12, vgpr(2), 128 + u16::from(read), 0));
+            body.push(vop1(0x001, 0, sgpr(12)));
+            let shader = build_cs(&body, 32, 0);
+            let (lane, src) = (u32::from(read), u32::from(read) ^ 1);
+            let want = match op {
+                0x27 => v3(src).wrapping_sub(v1(lane)),
+                0x1A => v3(src) << (v1(lane) & 31),
+                0x16 => v3(src) >> (v1(lane) & 31),
+                0x18 => ((v3(src) as i32) >> (v1(lane) & 31)) as u32,
+                _ => v1(src).wrapping_sub(v3(lane)),
+            };
+            let inputs = [[0x1000_0001, 0, 0x0001_0000, 0]];
+            run_cases_on(&shader, &inputs, &[("hardware", false)], |backend, _, _, got| {
+                assert_eq!(got, want, "{backend}: {name}, lane {read}");
+            });
+        }
+    }
+}
+
 #[test]
 fn v_med3_f32_matches_rdna2_with_nan() {
     // v_med3_f32 v0, v1, v2, v3 (VOP3 opcode 0x157)
@@ -822,6 +869,67 @@ fn v_cmp_lg_is_false_for_nan() {
             );
         });
     }
+}
+
+/// `v_div_fixup_f16` as the RDNA2 ISA lists it; `None` for a NaN.
+fn div_fixup_f16_reference(q: u16, den: u16, num: u16) -> Option<u16> {
+    let nan = |x: u16| is_f16_nan(x);
+    let abs = |x: u16| x & 0x7FFF;
+    let sign = (den ^ num) & 0x8000;
+    if nan(num) || nan(den) {
+        return None;
+    }
+    if (abs(den) == 0 && abs(num) == 0) || (abs(den) == 0x7C00 && abs(num) == 0x7C00) {
+        return None;
+    }
+    if abs(den) == 0 || abs(num) == 0x7C00 {
+        return Some(sign | 0x7C00);
+    }
+    if abs(den) == 0x7C00 || abs(num) == 0 {
+        return Some(sign);
+    }
+    if nan(q) {
+        return None;
+    }
+    Some(sign | abs(q))
+}
+
+#[test]
+fn v_div_fixup_f16_follows_the_isa_special_cases() {
+    // v_mov_b32 v0, 0; v_div_fixup_f16 v0, v1, v2, v3 (VOP3 opcode 0x35f):
+    // v1 the quotient, v2 the denominator, v3 the numerator.
+    let mut body = vec![vop1(0x001, 0, 128)];
+    body.extend_from_slice(&vop3(0x35f, 0, vgpr(1), vgpr(2), vgpr(3)));
+    let shader = build_valu_cs(&body);
+    // 0, -0, 1, -1.5, 2^-24, max finite, inf, -inf, NaN, -NaN.
+    let values = [
+        0x0000u16, 0x8000, 0x3C00, 0xBE00, 0x0001, 0x7BFF, 0x7C00, 0xFC00, 0x7E00, 0xFE01,
+    ];
+    let mut cases = Vec::new();
+    for &q in &[0x4248u16, 0xC248, 0x7E00] {
+        for &den in &values {
+            for &num in &values {
+                cases.push([u32::from(q), u32::from(den), u32::from(num), 0]);
+            }
+        }
+    }
+    run_cases(&shader, &cases, |backend, _, inp, got| {
+        let (q, den, num) = (inp[0] as u16, inp[1] as u16, inp[2] as u16);
+        let got_h = got as u16;
+        assert_eq!(got >> 16, 0, "{backend}: the high half changed");
+        match div_fixup_f16_reference(q, den, num) {
+            Some(want) => assert_eq!(
+                got_h, want,
+                "{backend}: v_div_fixup_f16({q:#06x}, {den:#06x}, {num:#06x}) = {got_h:#06x}, \
+                 want {want:#06x}",
+            ),
+            None => assert!(
+                is_f16_nan(got_h),
+                "{backend}: v_div_fixup_f16({q:#06x}, {den:#06x}, {num:#06x}) = {got_h:#06x}, \
+                 want NaN",
+            ),
+        }
+    });
 }
 
 #[test]
@@ -1418,7 +1526,9 @@ fn cvt_16bit_int_from_f16_saturates_and_honors_modifiers() {
     let u16_cases: &[(u16, u16)] = &[
         (0xBC00, 0),      // -1.0 -> 0
         (0xFC00, 0),      // -inf -> 0
-        (0x7E00, 0),      // NaN -> 0
+        (0x7E00, 0),      // +qNaN -> 0
+        (0xFE00, 0),      // -qNaN -> 0
+        (0x7C01, 0),      // +sNaN -> 0
         (0x57BC, 123),    // 123.75 -> 123
         (0x7BFF, 65504),  // 65504.0 (max finite f16) -> 65504
         (0x7C00, 0xFFFF), // +inf -> 65535 (saturated)
@@ -1441,13 +1551,15 @@ fn cvt_16bit_int_from_f16_saturates_and_honors_modifiers() {
     );
 
     let i16_cases: &[(u16, u16)] = &[
-        (0xFC00, 0x8000),       // -inf -> -32768
-        (0xF8E2, 0x8000),       // -40000.0 -> -32768 (saturated, not wrapped)
+        (0xFC00, 0x8000),           // -inf -> -32768
+        (0xF8E2, 0x8000),           // -40000.0 -> -32768 (saturated, not wrapped)
         (0xD7BC, (-123i16) as u16), // -123.75 -> -123
-        (0x7E00, 0),            // NaN -> 0
-        (0x57BC, 123),          // 123.75 -> 123
-        (0x78E2, 0x7FFF),       // +40000.0 -> 32767 (saturated, not wrapped)
-        (0x7C00, 0x7FFF),       // +inf -> 32767
+        (0x7E00, 0),                // +qNaN -> 0
+        (0xFE00, 0),                // -qNaN -> 0
+        (0x7C01, 0),                // +sNaN -> 0
+        (0x57BC, 123),              // 123.75 -> 123
+        (0x78E2, 0x7FFF),           // +40000.0 -> 32767 (saturated, not wrapped)
+        (0x7C00, 0x7FFF),           // +inf -> 32767
     ];
     let i16_in: Vec<[u32; 4]> = i16_cases.iter().map(|&(x, _)| [u32::from(x), 0, 0, 0]).collect();
     run_cases(&cvt_i16, &i16_in, |backend, i, inp, got| {
@@ -2302,4 +2414,78 @@ fn v_rndne_f32_ties_to_even_and_specials() {
     run_cases(&shader_pk, &[[0; 4]], |backend, _, _, got| {
         assert_eq!(got, 2, "{backend}: literal v_cvt_pk_u8_f32(2.5) = {got:#x}, want 2");
     });
+}
+
+/// A select whose mask is a plain SGPR (here a root constant), so the
+/// structure pass does not follow it: this lane takes its own bit of the
+/// number. Inline 0 and -1 masks pick src0 and src1 in every lane.
+#[test]
+fn v_cndmask_on_an_untracked_mask_tests_this_lanes_bit() {
+    // WARP cannot pin a wave size, which the lane-aware programs ask for:
+    // skip when there is no hardware device (a machine without a GPU).
+    if Host::new(false).is_err() {
+        eprintln!("no SM 6.6 hardware device; skipped");
+        return;
+    }
+    // v_cndmask_b32_e64 v0, v1, v2, <mask> (VOP3 0x101); s3 holds the mask.
+    let from_sgpr = build_valu_cs(&vop3(0x101, 0, vgpr(1), vgpr(2), sgpr(3)));
+    let hw = &[("hardware", false)];
+    run_cases_on(
+        &from_sgpr,
+        &[[10, 20, 0, 0], [10, 20, 0, 1], [10, 20, 0, 2], [10, 20, 0, !0]],
+        hw,
+        |label, i, inp, got| {
+            let want = if inp[3] & 1 != 0 { inp[1] } else { inp[0] };
+            assert_eq!(got, want, "{label} case {i}");
+        },
+    );
+    for (mask, pick) in [(128u16, 0usize), (193, 1)] {
+        let k = build_valu_cs(&vop3(0x101, 0, vgpr(1), vgpr(2), mask));
+        run_cases_on(&k, &[[10, 20, 0, 0]], hw, |label, _, inp, got| {
+            assert_eq!(got, inp[pick], "{label} inline {mask}");
+        });
+    }
+}
+
+#[test]
+fn v_log_f16_matches_rdna2_special_values() {
+    let cases = [
+        (0xFC00u16, 0xFE00u16),
+        (0xBC00, 0xFE00),
+        (0x8400, 0xFE00),
+        (0x8001, 0xFE00),
+        (0x8000, 0xFC00),
+        (0x0000, 0xFC00),
+        (0x0001, 0xCE00),
+        (0x3C00, 0x0000),
+        (0x4000, 0x3C00),
+        (0x4400, 0x4000),
+        (0x7C00, 0x7C00),
+    ];
+    let inputs: Vec<_> = cases
+        .iter()
+        .map(|&(input, _)| [u32::from(input), 0, 0, 0xABCD_1234])
+        .collect();
+    let mut failures = Vec::new();
+    for nearest in [false, true] {
+        let was = lower::TEST_F16_NEAREST.replace(Some(nearest));
+        let shader = build_valu_cs(&[
+            0xBFA5_000F,             // s_denorm_mode 15
+            vop1(0x001, 0, vgpr(4)), // v_mov_b32 v0, v4
+            vop1(0x057, 0, vgpr(1)), // v_log_f16 v0, v1
+        ]);
+        lower::TEST_F16_NEAREST.set(was);
+        run_cases(&shader, &inputs, |backend, i, input, got| {
+            let want = 0xABCD_0000 | u32::from(cases[i].1);
+            // The host's conversion toward zero (VICTORY_F16_NEAREST off) may land one
+            // step lower where the host's log is not exact (2^-24 gives -23.99..., 0xcdff).
+            if got != want && (nearest || cases[i].0 != 0x0001 || got != want - 1) {
+                failures.push(format!(
+                    "{backend}, nearest {nearest}: input {:#06x}, got {got:#010x}, want {want:#010x}",
+                    input[0]
+                ));
+            }
+        });
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }

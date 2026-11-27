@@ -19,9 +19,13 @@
 mod ambient;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
+#[cfg(windows)]
+mod compose;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod sidetime;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod faultbook;
 #[cfg(windows)]
@@ -48,7 +52,10 @@ mod port;
 #[cfg(windows)]
 mod port_cbv;
 #[cfg(windows)]
+mod port_journal;
+#[cfg(windows)]
 mod land;
+mod launch;
 pub mod list;
 pub mod object;
 #[cfg(windows)]
@@ -99,7 +106,7 @@ mod watch;
 mod texback;
 
 #[cfg(windows)]
-pub use host::on_failure;
+pub use host::{on_failure, start_host};
 
 /// Whether `switch` is on now, if it is one of those `VICTORY_AB` turns on and
 /// off while the title runs (`ab`).
@@ -113,11 +120,16 @@ pub fn switched(switch: &str) -> Option<bool> {
 pub fn frame_phase() -> u32 {
     copystat::phase()
 }
+
+/// Frames the title has begun (its frame waits that ended), for logs.
+pub fn frames_begun() -> u64 {
+    frame::current()
+}
 #[cfg(windows)]
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_section_gone, title_memory_view};
 #[cfg(windows)]
 pub use watch::{
-    kernel_writing, title_memory_allocated, title_memory_freed, title_memory_reading, title_memory_remapped,
+    kernel_writing, mapping_costs, title_graphics_block, title_memory_allocated, title_memory_freed, title_memory_reading, title_memory_remapped,
     title_memory_remapping, title_memory_splitting, title_memory_unmapping, title_memory_written,
     writing as kernel_will_write,
 };

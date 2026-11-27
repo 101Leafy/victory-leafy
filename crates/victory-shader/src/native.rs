@@ -379,6 +379,18 @@ impl RootType {
             n => RootType::Other(n),
         }
     }
+
+    fn raw(self) -> u32 {
+        match self {
+            RootType::Constants => 0,
+            RootType::Descriptor => 1,
+            RootType::Table => 3,
+            RootType::ImmediateSampler => 4,
+            RootType::ResourceHeap => 5,
+            RootType::SamplerHeap => 6,
+            RootType::Other(n) => n,
+        }
+    }
 }
 
 /// One root parameter (or table range) and the user SGPRs holding it.
@@ -406,6 +418,18 @@ pub enum ResourceType {
     Other(u8),
 }
 
+impl ResourceType {
+    fn raw(self) -> u8 {
+        match self {
+            ResourceType::Srv => 0,
+            ResourceType::Sampler => 1,
+            ResourceType::Cbv => 2,
+            ResourceType::Uav => 3,
+            ResourceType::Other(n) => n,
+        }
+    }
+}
+
 /// A descriptor range the program reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UsedResource {
@@ -426,6 +450,10 @@ pub struct UsedResource {
 pub fn native_programs(part: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
     if part.starts_with(b"FSPX") {
         return Ok(vec![fspx_program(part)?]);
+    }
+    // A loose graphics program ([`loose_graphics`]), unpacked.
+    if part.starts_with(b"FSSM") {
+        return programs(part);
     }
     if part.get(XDAT_OFFSET..XDAT_OFFSET + 4) != Some(b"XDAT") {
         return Ok(Vec::new());
@@ -467,8 +495,9 @@ pub fn native_programs(part: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
 ///         register, u32 view dimension (1 buffer, 4 2D, 0 root view),
 ///         u8 descriptor dwords, u8 user-data dword, u8 root slot, u8 0,
 ///         u32 -1, u32 0
-///   0x42  a view declaration: u32 0, u8 1, u8 class (0 SRV, 1 UAV),
-///         u8 resource kind (DXIL's), u8 0, u32 register
+///   0x42  a view declaration: u32 0, u8 1 (2: picked from a descriptor
+///         heap, [`heap_params`]), u8 class (0 SRV, 1 UAV, 3 sampler
+///         heap), u8 resource kind (DXIL's), u8 0, u32 register
 ///   0x43  the shader hash (16 B); the last record
 /// ```
 pub fn fspx_program(part: &[u8]) -> Result<NativeProgram, ShaderError> {
@@ -501,7 +530,9 @@ pub fn fspx_program(part: &[u8]) -> Result<NativeProgram, ShaderError> {
     let granules = (u32_at(packet, PACKET_RSRC1)? & 0x3F) + 1;
     let vgprs = (granules * if wave64 { 4 } else { 8 }).min(256) as u16;
     let threads = |i: usize| u16_at(packet, PACKET_THREADS + 2 * i).map(u32::from);
-    let (layout, used) = records(meta, FSPX_RECORDS)?;
+    let (mut layout, used) = records(meta, FSPX_RECORDS)?;
+    let users = (u32_at(packet, PACKET_RSRC2)? >> 1 & 0x1F) as u8;
+    heap_params(meta, FSPX_RECORDS, code, users, &mut layout);
     Ok(NativeProgram {
         stage: HwStage::Cs,
         wave64,
@@ -546,6 +577,8 @@ fn records(meta: &[u8], from: usize) -> Result<(Vec<RootParam>, Vec<UsedResource
             slot: e[22],
         };
         let sgprs = match root {
+            // Root constants (graphics stages), their words in user data.
+            RootType::Constants => u.dwords.into(),
             RootType::Table => 1,
             RootType::Descriptor => 2,
             // The code holds its words; no user data.
@@ -567,17 +600,121 @@ fn records(meta: &[u8], from: usize) -> Result<(Vec<RootParam>, Vec<UsedResource
     Ok((layout, used))
 }
 
+/// The descriptor heaps a compute program indexes (SM 6.6's
+/// `ResourceDescriptorHeap` and `SamplerDescriptorHeap`), put ahead of the
+/// root parameters in `layout`. The metadata says a program uses a heap (a
+/// 0x42 record with byte 8 at 2, class 3 for the sampler heap) but not the
+/// user SGPR that holds its address, and the 0x41 records list only the
+/// parameters the program reads, so the position can't be counted from
+/// them: the loose 0x218 programs then failed as "an address with two
+/// computed terms" (the heap address and the index), about 750 of them.
+/// The code tells instead: it makes a 32-bit address of an entry SGPR
+/// (`s_mov_b32 sN, sU` and `s_mov_b32 sN+1, 0`, or the high half cleared
+/// next to it) and loads descriptors from it. In GTA's programs the sampler
+/// heap is always the last user SGPR and the view heap the one below it, or
+/// the last when there is no sampler heap; a view heap the code makes no
+/// address of is left out. A root constant record claims 4 dwords whatever
+/// the program reads, so a heap may sit inside one; being first, the heap
+/// wins that SGPR ([`crate::resource`] takes the first parameter that covers
+/// a register).
+fn heap_params(meta: &[u8], from: usize, code: &[u8], users: u8, layout: &mut Vec<RootParam>) {
+    use crate::gfx10::{Fields, Operand};
+    let (mut views, mut samplers) = (false, false);
+    for e in meta.get(from..).unwrap_or(&[]).as_chunks::<FSPX_RECORD>().0 {
+        match e[0] {
+            0x43 => break,
+            0x42 if e[8] == 2 && e[9] == 3 => samplers = true,
+            0x42 if e[8] == 2 => views = true,
+            _ => {}
+        }
+    }
+    if !(views || samplers) || users == 0 {
+        return;
+    }
+    #[derive(Clone, Copy, PartialEq)]
+    enum Held {
+        Entry(u8),
+        Zero,
+    }
+    // Compute programs: user data dword i is s<i>.
+    let address = |u: u8| {
+        !layout.iter().any(|p| {
+            matches!(p.root, RootType::Table | RootType::Descriptor)
+                && u32::from(u) >= p.user_data.into()
+                && u32::from(u) < u32::from(p.user_data) + p.sgprs
+        })
+    };
+    let mut held = [None; 106];
+    for (r, h) in held.iter_mut().enumerate().take(users.into()) {
+        *h = Some(Held::Entry(r as u8));
+    }
+    // Code that doesn't decode fails later with its own error.
+    let Ok(code) = crate::gfx10::decode(code) else { return };
+    let mut bases = std::collections::BTreeSet::new();
+    for i in code {
+        let f = i.fields(false);
+        if let Fields::Smem { base: Operand::Scalar { code: b, .. }, .. } = f {
+            let at = |r: u8| held.get(usize::from(r)).copied().flatten();
+            if let (Some(Held::Entry(u)), Some(Held::Zero)) = (at(b), at(b + 1))
+                && address(u)
+            {
+                bases.insert(u);
+            }
+        }
+        let copy = match &f {
+            Fields::Sop { dst: Some(Operand::Scalar { code: d, .. }), src, .. } if i.name() == Some("s_mov_b32") => {
+                Some((*d, match src[..] {
+                    [Operand::Scalar { code, .. }] => held.get(usize::from(code)).copied().flatten(),
+                    [Operand::Const(128)] => Some(Held::Zero),
+                    _ => None,
+                }))
+            }
+            _ => None,
+        };
+        for (c, n) in scalar_operands(&f).1 {
+            for r in c..c.saturating_add(n) {
+                if let Some(h) = held.get_mut(usize::from(r)) {
+                    *h = None;
+                }
+            }
+        }
+        if let Some((d, h)) = copy
+            && let Some(slot) = held.get_mut(usize::from(d))
+        {
+            *slot = h;
+        }
+    }
+    let last = users - 1;
+    let mut heaps = Vec::new();
+    if views && let Some(&u) = bases.iter().rev().find(|&&u| !(samplers && u == last)) {
+        heaps.push((RootType::ResourceHeap, u, u8::MAX));
+    }
+    if samplers && address(last) {
+        heaps.push((RootType::SamplerHeap, last, u8::MAX - 1));
+    }
+    layout.splice(
+        0..0,
+        heaps.into_iter().map(|(root, user_data, slot)| RootParam {
+            root,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data,
+            slot,
+        }),
+    );
+}
+
 /// Program metadata handed over on its own, outside a container (device
-/// methods 0x1c8 and 0x218). The records are FSPX kind 7's; the header is
-/// shorter, as observed in one title:
+/// methods 0x1c8 and 0x218). The records are FSPX kind 7's, behind one of
+/// two headers, as observed in one title:
 ///
 /// ```text
-/// version 2  u32 2, u32 size - 0xc, u32 code dwords, u8 0x40, u8 first
-///            user-data dword, u8 count of 0x41 records, u8 0; records
-///            from +0x10 (graphics stages)
-/// version 3  u32 3, u32 size - 0x14, u32 code dwords (0 seen), u32 0,
-///            16 bytes not decoded, u32 x6 not decoded; records from +0x38
-///            (the compute stage)
+/// version 2      u32 2, u32 size - 0xc, u32 code dwords, u8 0x40, u8 first
+///                user-data dword, u8 count of 0x41 records, u8 0; records
+///                from +0x10 (graphics stages)
+/// version 0x403  FSPX kind 7 itself, records from +0x18 (the compute
+///                stage)
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LooseMetadata {
@@ -594,7 +731,7 @@ pub fn loose_metadata(meta: &[u8]) -> Result<LooseMetadata, ShaderError> {
     let version = u32_at(meta, 0)?;
     let (head, from) = match version {
         2 => (0xc, 0x10),
-        3 => (0x14, 0x38),
+        0x403 => (0x14, FSPX_RECORDS),
         _ => return Err(Malformed("unknown loose metadata version")),
     };
     if u32_at(meta, 4)? as usize + head != meta.len() {
@@ -628,19 +765,14 @@ pub fn loose_compute(packet: &[u8], code: &[u8], meta: &[u8]) -> Result<Vec<u8>,
         return Err(Malformed("loose pipeline registers without a thread group"));
     }
     let m = loose_metadata(meta)?;
-    // Code blobs are padded with s_code_end to 0x40 bytes.
-    let dwords = match m.code_dwords {
-        0 => code.len() / 4,
-        n => n as usize,
-    };
-    let code = code.get(..dwords * 4).ok_or(Malformed("loose code shorter than its metadata"))?;
-    let records = &meta[m.records..];
+    let code = loose_code(code, &m)?;
+    // Both headers end in the same word (0x40, user data, record count).
+    let records = &meta[m.records - 4..];
     let mut kind7 = Vec::with_capacity(FSPX_RECORDS + records.len());
     kind7.extend(0x403u32.to_le_bytes());
-    kind7.extend(((FSPX_RECORDS + records.len() - 0x14) as u32).to_le_bytes());
-    kind7.extend((dwords as u32).to_le_bytes());
+    kind7.extend(((FSPX_RECORDS - 4 + records.len() - 0x14) as u32).to_le_bytes());
+    kind7.extend((code.len() as u32 / 4).to_le_bytes());
     kind7.extend([0; 8]);
-    kind7.extend([0x40, 0, 0, 0]);
     kind7.extend(records);
     let parts: [(u32, &[u8]); 3] = [(FSPX_PACKET, packet), (FSPX_CODE, code), (FSPX_METADATA, &kind7)];
     let mut fspx = Vec::new();
@@ -663,6 +795,634 @@ pub fn loose_compute(packet: &[u8], code: &[u8], meta: &[u8]) -> Result<Vec<u8>,
     fspx[12..16].copy_from_slice(&size.to_le_bytes());
     fspx_program(&fspx)?;
     Ok(crate::dxbc::build(&[(crate::FourCC::ACCC, &fspx)]))
+}
+
+/// The code of a loose part up to the size its metadata gives (code blobs
+/// are padded with s_code_end to 0x40 bytes).
+fn loose_code<'a>(code: &'a [u8], m: &LooseMetadata) -> Result<&'a [u8], ShaderError> {
+    let dwords = match m.code_dwords {
+        0 => code.len() / 4,
+        n => n as usize,
+    };
+    code.get(..dwords * 4).ok_or(Malformed("loose code shorter than its metadata"))
+}
+
+/// One element of a loose graphics pipeline's input layout, with
+/// D3D12_INPUT_ELEMENT_DESC's fields (`format` a DXGI format).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InputElement {
+    pub name: String,
+    pub index: u32,
+    pub format: u32,
+    pub slot: u32,
+    pub offset: u32,
+    /// 0 per vertex, 1 per instance.
+    pub class: u32,
+    pub step: u32,
+}
+
+/// The input layout handed to device method 0x1c8, as observed:
+///
+/// ```text
+/// +0x4c u32 element count; elements packed from +0x50: u32 name length
+///       (NUL included), the name, then u32 index, format, slot, offset,
+///       class, step rate
+/// ```
+pub fn loose_input_layout(layout: &[u8]) -> Result<Vec<InputElement>, ShaderError> {
+    let count = u32_at(layout, 0x4c)?;
+    if count > MAX_SEMANTICS {
+        return Err(Malformed("implausible input element count"));
+    }
+    let mut at = 0x50;
+    let mut out = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        let len = u32_at(layout, at)? as usize;
+        let name = layout
+            .get(at + 4..at + 4 + len)
+            .and_then(|n| n.strip_suffix(&[0]))
+            .and_then(|n| std::str::from_utf8(n).ok())
+            .ok_or(Malformed("input element name out of bounds"))?;
+        at += 4 + len;
+        let field = |i: usize| u32_at(layout, at + 4 * i);
+        out.push(InputElement {
+            name: name.to_owned(),
+            index: field(0)?,
+            format: field(1)?,
+            slot: field(2)?,
+            offset: field(3)?,
+            class: field(4)?,
+            step: field(5)?,
+        });
+        at += 24;
+    }
+    if at != layout.len() {
+        return Err(Malformed("loose input layout size disagrees"));
+    }
+    Ok(out)
+}
+
+/// The registers of a loose graphics pipeline that the containers need.
+struct LooseRegs {
+    vs_rsrc1: u32,
+    ps_rsrc1: u32,
+    input_addr: u32,
+    db_shader_control: u32,
+    /// SPI_PS_INPUT_CNTL of each pixel input, in attribute order.
+    cntl: Vec<u32>,
+    /// RSRC1 of a third stage that takes the vertex stage's place (0 when
+    /// there is none).
+    third_rsrc1: u32,
+    /// What looks like CB_TARGET_MASK (word 51): 0 in passes that draw no
+    /// colour, all ones elsewhere.
+    target_mask: u32,
+    /// CB_BLEND0..7_CONTROL (words 52 to 59): blending off is 0x80000000,
+    /// alpha blending 0xe5040504.
+    blend: [u32; 8],
+}
+
+/// The register block of device method 0x1c8 in the layout most calls use:
+/// SPI_SHADER_PGM_RSRC1_VS at word 14, RSRC1_PS at 19, SPI_PS_INPUT_ADDR at
+/// 22, the pixel input count at 23, DB_SHADER_CONTROL at 31, then the
+/// SPI_PS_INPUT_CNTL words from 93, padded to an even count, and two words
+/// more.
+///
+/// Call 15 of the title's pipelines (0x200 bytes) has no vertex stage: its
+/// RSRC1_VS is 0 and 21 words follow the pixel input count, starting with
+/// the third stage's RSRC1 and RSRC2 (words 24 and 25; 128, 128, and 2 at
+/// words 29, 30, and 34 look like a mesh stage's limits and topology). From
+/// there everything sits 21 words on: SPI_PS_INPUT_ADDR at 43, the count at
+/// 44, DB_SHADER_CONTROL at 52, the input words from 114.
+fn loose_regs(regs: &[u8]) -> Result<LooseRegs, ShaderError> {
+    let word = |i: usize| u32_at(regs, 4 * i);
+    let fits = |at: usize| -> Result<Option<usize>, ShaderError> {
+        let n = word(at)? as usize;
+        Ok((n <= MAX_SEMANTICS as usize && regs.len() == 4 * (at + 72 + n.next_multiple_of(2))).then_some(n))
+    };
+    let (n, shift) = match (fits(23)?, regs.len() > 4 * 44) {
+        (Some(n), _) => (n, 0),
+        (None, true) if word(14)? == 0 && let Some(n) = fits(44)? => (n, 21),
+        _ => return Err(Malformed("loose registers of an unknown layout")),
+    };
+    Ok(LooseRegs {
+        vs_rsrc1: word(14)?,
+        ps_rsrc1: word(19)?,
+        input_addr: word(22 + shift)?,
+        db_shader_control: word(31 + shift)?,
+        cntl: (93 + shift..93 + shift + n).map(word).collect::<Result<_, _>>()?,
+        third_rsrc1: if shift == 0 { 0 } else { word(24)? },
+        target_mask: word(51 + shift)?,
+        blend: std::array::from_fn(|i| u32_at(regs, 4 * (52 + shift + i)).unwrap_or(0)),
+    })
+}
+
+/// VGPRs of a wave32 program, from its RSRC1 (granules of 8).
+fn wave32_vgprs(rsrc1: u32) -> u16 {
+    (((rsrc1 & 0x3F) + 1) * 8).min(256) as u16
+}
+
+/// The `exp` targets in `code`.
+fn export_targets(code: &[u8]) -> Result<std::collections::BTreeSet<u8>, ShaderError> {
+    Ok(crate::gfx10::decode(code)?
+        .iter()
+        .filter(|i| matches!(i.encoding, crate::gfx10::Encoding::Exp))
+        .map(|i| (i.words[0] >> 4 & 0x3F) as u8)
+        .collect())
+}
+
+const USAGE_GENERIC: u8 = 6;
+/// The first byte past the slot offsets of an FSSM payload.
+const FSSM_RECORD_AT: usize = 0x68;
+
+fn put32(data: &mut [u8], at: usize, v: u32) {
+    data[at..at + 4].copy_from_slice(&v.to_le_bytes());
+}
+
+/// An FSSM holding one wave32 program, as [`programs`] reads it.
+fn single_fssm(stage: HwStage, code: &[u8], vgprs: u16, m: &LooseMetadata, stage_data: &[u8]) -> Vec<u8> {
+    let mut p = GRAPHICS_SLOT_COUNT.to_le_bytes().to_vec();
+    for (s, at) in SLOTS {
+        p.resize(at, 0);
+        let offset = if s == stage { FSSM_RECORD_AT as u64 } else { ABSENT };
+        p.extend(offset.to_le_bytes());
+    }
+    let record = FSSM_RECORD_AT;
+    let layout_at = record + RECORD_SIZE as usize + stage_data.len();
+    let used_at = layout_at + ENTRY_SIZE as usize * m.layout.len();
+    let code_at = (used_at + ENTRY_SIZE as usize * m.used.len()).next_multiple_of(0x100);
+    p.resize(record + RECORD_SIZE as usize, 0);
+    let r = &mut p[record..];
+    r[0..8].copy_from_slice(&(code_at as u64).to_le_bytes());
+    r[8..16].copy_from_slice(&(code.len() as u64).to_le_bytes());
+    put32(r, RECORD_FLAGS, FLAG_WAVE32);
+    r[RECORD_LAYOUT..RECORD_LAYOUT + 8].copy_from_slice(&(layout_at as u64).to_le_bytes());
+    r[RECORD_USED..RECORD_USED + 8].copy_from_slice(&(used_at as u64).to_le_bytes());
+    put32(r, RECORD_COUNTS, m.layout.len() as u32);
+    put32(r, RECORD_COUNTS + 4, m.used.len() as u32);
+    put32(r, RECORD_REGS, vgprs.into());
+    p.extend(stage_data);
+    for e in &m.layout {
+        for v in [e.root.raw(), e.table_offset_dwords, e.sgprs, e.base_register] {
+            p.extend(v.to_le_bytes());
+        }
+        p.extend([e.user_data, e.slot, 0, 0]);
+    }
+    for e in &m.used {
+        p.extend([e.kind.raw(), e.root.raw() as u8, 0, 0]);
+        for v in [e.table_offset_dwords, e.lower_bound, e.stride] {
+            p.extend(v.to_le_bytes());
+        }
+        p.extend([e.dwords, e.user_data, e.slot, 0]);
+    }
+    p.resize(code_at, 0);
+    p.extend(code);
+    let mut out = b"FSSM".to_vec();
+    out.extend(FSSM_VERSION.to_le_bytes());
+    out.extend((p.len() as u64).to_le_bytes());
+    out.extend(p);
+    out
+}
+
+fn sig_element(name: &str, index: u32, kind: u8, comp: u8, row: u32, cols: u8) -> crate::emit::container::SigElement {
+    crate::emit::container::SigElement {
+        name: name.to_owned(),
+        index,
+        kind,
+        comp,
+        interp: 0,
+        row: Some(row),
+        col: 0,
+        cols,
+        usage: (1 << cols) - 1,
+        half: false,
+    }
+}
+
+/// DXIL component type of a vertex input in DXGI format `format`.
+fn input_comp(format: u32) -> u8 {
+    match format {
+        3 | 7 | 12 | 17 | 25 | 30 | 36 | 42 | 50 | 57 | 62 => 5,
+        4 | 8 | 14 | 18 | 32 | 38 | 43 | 52 | 59 | 64 => 4,
+        _ => 9,
+    }
+}
+
+/// Channel width in bits, channel count, and numeric format of a DXGI
+/// format whose channels are all one width, in register order.
+fn dxgi_channels(format: u32) -> Option<(u32, u32, crate::emit::lower::Numeric)> {
+    use crate::emit::lower::Numeric::*;
+    Some(match format {
+        2 => (32, 4, Float),
+        3 => (32, 4, Uint),
+        4 => (32, 4, Sint),
+        6 => (32, 3, Float),
+        7 => (32, 3, Uint),
+        8 => (32, 3, Sint),
+        10 => (16, 4, Float),
+        11 => (16, 4, Unorm),
+        12 => (16, 4, Uint),
+        13 => (16, 4, Snorm),
+        14 => (16, 4, Sint),
+        16 => (32, 2, Float),
+        17 => (32, 2, Uint),
+        18 => (32, 2, Sint),
+        28 => (8, 4, Unorm),
+        30 => (8, 4, Uint),
+        31 => (8, 4, Snorm),
+        32 => (8, 4, Sint),
+        34 => (16, 2, Float),
+        35 => (16, 2, Unorm),
+        36 => (16, 2, Uint),
+        37 => (16, 2, Snorm),
+        38 => (16, 2, Sint),
+        41 => (32, 1, Float),
+        42 => (32, 1, Uint),
+        43 => (32, 1, Sint),
+        49 => (8, 2, Unorm),
+        50 => (8, 2, Uint),
+        51 => (8, 2, Snorm),
+        52 => (8, 2, Sint),
+        54 => (16, 1, Float),
+        56 => (16, 1, Unorm),
+        57 => (16, 1, Uint),
+        58 => (16, 1, Snorm),
+        59 => (16, 1, Sint),
+        61 => (8, 1, Unorm),
+        62 => (8, 1, Uint),
+        63 => (8, 1, Snorm),
+        64 => (8, 1, Sint),
+        _ => return None,
+    })
+}
+
+/// User data 0-1 of a loose vertex program: the address of its vertex
+/// buffer table, 16-byte buffer descriptors by input slot.
+const VERTEX_TABLE: u8 = 0;
+const S_NOP: u32 = 0xBF80_0000;
+
+fn v_mov(dst: u8, src: u32) -> u32 {
+    0x7E00_0200 | u32::from(dst) << 17 | src
+}
+
+/// Scalar registers an instruction reads and writes, as (first, count).
+fn scalar_operands(f: &crate::gfx10::Fields) -> (Vec<(u8, u8)>, Vec<(u8, u8)>) {
+    use crate::gfx10::{Fields, Operand};
+    let s = |o: &Option<Operand>| match *o {
+        Some(Operand::Scalar { code, dwords }) if code < 106 => Some((code, dwords)),
+        _ => None,
+    };
+    let all = |v: &[Operand]| v.iter().filter_map(|o| s(&Some(*o))).collect::<Vec<_>>();
+    match f {
+        Fields::Sop { dst, src, .. } => (all(src), s(dst).into_iter().collect()),
+        Fields::Smem { data, base, soffset, .. } => (all(&[*base, *soffset]), s(data).into_iter().collect()),
+        Fields::Valu(v) => (all(&v.src), [s(&v.dst), s(&v.carry)].into_iter().flatten().collect()),
+        Fields::Buffer { rsrc, soffset, .. } => (all(&[*rsrc, *soffset]), vec![]),
+        Fields::Image { rsrc, sampler, .. } => {
+            let mut v = vec![*rsrc];
+            v.extend(*sampler);
+            (all(&v), vec![])
+        }
+        Fields::Flat { saddr, .. } => (s(saddr).into_iter().collect(), vec![]),
+        _ => (vec![], vec![]),
+    }
+}
+
+/// Rewrites the vertex fetch of a loose vertex program into reads of the
+/// input VGPRs [`loose_graphics`] declares (element i's channels from
+/// `base + 4i`), so the program reads no vertex buffers.
+///
+/// GTA's programs copy the table address from user data 0-1 (masking its
+/// high half), load buffer descriptors from it with `s_load_dwordx4`, and
+/// fetch each element by vertex index (`idxen`), with raw dword loads or
+/// typed loads at the element's own channel width; the immediate offset is
+/// the byte offset in the vertex. Descriptor loads become `s_nop`, each
+/// fetch `v_mov_b32` from the input VGPRs (typed loads past the format's
+/// channels get 0, 0, 1 as the hardware does). Only the straight-line run
+/// from the entry is lifted; any other use of the table or its descriptors
+/// is refused, as is code there that reads its own address. Programs whose
+/// metadata places a root parameter in user data 0-1 come back as they are.
+fn lift_vertex_fetch(code: &[u8], inputs: &[InputElement], base: u16, m: &LooseMetadata) -> Result<Vec<u8>, ShaderError> {
+    use crate::emit::lower::{Numeric, buffer_format};
+    use crate::gfx10::{Encoding, Fields, Flow, NULL, Operand};
+    let table = VERTEX_TABLE..VERTEX_TABLE + 2;
+    if m.layout.iter().any(|e| {
+        let ud = u32::from(e.user_data);
+        ud < table.end.into() && ud + e.sgprs.max(1) > table.start.into()
+    }) {
+        return Ok(code.to_vec());
+    }
+    let insts = crate::gfx10::decode(code)?;
+    let refuse = |offset, what| ShaderError::Unsupported { offset, what };
+    let mut targets = std::collections::BTreeSet::new();
+    for i in &insts {
+        if let Flow::Jump(t) | Flow::Branch(t) = crate::gfx10::control(i, code.len(), |_| None)? {
+            targets.insert(t);
+        }
+    }
+    // Every edit lies before the first branch and the first branch target,
+    // so no branch offset changes.
+    let straight = insts
+        .iter()
+        .position(|i| targets.contains(&i.offset) || i.name().is_some_and(|n| n.starts_with("s_cbranch_") || matches!(n, "s_branch" | "s_call_b64" | "s_setpc_b64" | "s_swappc_b64")))
+        .unwrap_or(insts.len());
+
+    let mut pairs = std::collections::BTreeSet::from([VERTEX_TABLE]);
+    let mut vsharps = std::collections::BTreeMap::<u8, u32>::new();
+    let mut edits = std::collections::BTreeMap::<usize, Vec<u32>>::new();
+    let overlaps = |r: u8, n: u8, (c, d): (u8, u8)| r < c + d && c < r + n;
+    for (n, i) in insts.iter().enumerate() {
+        let f = i.fields(false);
+        let (reads, writes) = scalar_operands(&f);
+        let name = i.name().unwrap_or("");
+        let lifting = n < straight;
+        match &f {
+            Fields::Sop { dst: Some(Operand::Scalar { code: d, .. }), src, .. }
+                if lifting && name == "s_mov_b64" && matches!(src[..], [Operand::Scalar { code, .. }] if pairs.contains(&code)) =>
+            {
+                pairs.retain(|&p| !overlaps(p, 2, (*d, 2)));
+                vsharps.retain(|&r, _| !overlaps(r, 4, (*d, 2)));
+                pairs.insert(*d);
+                continue;
+            }
+            // Masks the table address to 40 bits or more: still the table.
+            Fields::Sop { dst: Some(Operand::Scalar { code: d, .. }), src, .. }
+                if lifting
+                    && name == "s_bfe_u32"
+                    && pairs.contains(&d.wrapping_sub(1))
+                    && matches!(src[..], [Operand::Scalar { code, .. }, Operand::Literal(l)] if code == *d && l & 0x1F == 0 && l >> 16 & 0x7F >= 8) =>
+            {
+                continue;
+            }
+            Fields::Smem { data: Some(Operand::Scalar { code: d, dwords }), base: Operand::Scalar { code: b, .. }, offset, soffset, .. }
+                if pairs.contains(b) =>
+            {
+                let descriptors = lifting
+                    && name.starts_with("s_load_dwordx")
+                    && dwords % 4 == 0
+                    && *soffset == (Operand::Scalar { code: NULL, dwords: 1 })
+                    && *offset >= 0
+                    && offset % 16 == 0;
+                if !descriptors {
+                    return Err(refuse(i.offset, "a vertex buffer table read the fetch lift does not know"));
+                }
+                pairs.retain(|&p| !overlaps(p, 2, (*d, *dwords)));
+                vsharps.retain(|&r, _| !overlaps(r, 4, (*d, *dwords)));
+                for j in 0..dwords / 4 {
+                    vsharps.insert(d + 4 * j, *offset as u32 / 16 + u32::from(j));
+                }
+                edits.insert(i.offset, vec![S_NOP; i.words.len()]);
+                continue;
+            }
+            Fields::Buffer { data: Some(Operand::Vector { reg, dwords }), rsrc: Operand::Scalar { code: r, .. }, soffset, offset, offen, idxen, format, lds, tfe, .. }
+                if vsharps.contains_key(r) =>
+            {
+                let typed = match (i.encoding, name) {
+                    (Encoding::Mtbuf, n) if n.starts_with("tbuffer_load_format_") && !n.contains("d16") => true,
+                    (Encoding::Mubuf, n) if n.starts_with("buffer_load_format_") && !n.contains("d16") => true,
+                    (Encoding::Mubuf, n) if n.starts_with("buffer_load_dword") => false,
+                    _ => return Err(refuse(i.offset, "a vertex buffer access the fetch lift does not know")),
+                };
+                if !lifting || !idxen || *offen || *lds || *tfe || *soffset != Operand::Const(128) {
+                    return Err(refuse(i.offset, "a vertex fetch the lift does not know"));
+                }
+                let slot = vsharps[r];
+                let at = u32::from(*offset);
+                let found = inputs.iter().enumerate().find_map(|(k, e)| {
+                    let (bits, count, numeric) = dxgi_channels(e.format)?;
+                    (e.slot == slot && (e.offset..e.offset + bits / 8 * count).contains(&at)).then_some((k, e, bits, count, numeric))
+                });
+                let Some((k, e, bits, count, numeric)) = found else {
+                    return Err(refuse(i.offset, "a vertex fetch outside the input layout"));
+                };
+                if e.class != 0 {
+                    return Err(refuse(i.offset, "an instanced loose vertex input"));
+                }
+                // Channels the load reads from memory; past them a typed
+                // load fills in 0, 0, 1.
+                let (width, have, one) = match *format {
+                    Some(fmt) => {
+                        let (widths, n) = buffer_format(fmt).ok_or(refuse(i.offset, "an unknown vertex fetch format"))?;
+                        if widths.iter().any(|&w| w != bits) || n != numeric {
+                            return Err(refuse(i.offset, "a vertex fetch format unlike its element's"));
+                        }
+                        let int = matches!(n, Numeric::Uint | Numeric::Sint);
+                        (bits, widths.len() as u32, if int { 129 } else { 0xF2 })
+                    }
+                    None if typed => (bits, 4, 0xF2),
+                    None if bits == 32 => (32, count, 0),
+                    None => return Err(refuse(i.offset, "a raw vertex fetch of a packed element")),
+                };
+                let comp = (at - e.offset) / (width / 8);
+                if (at - e.offset) % (width / 8) != 0 || (!typed && comp + u32::from(*dwords) > count) || comp + u32::from(*dwords).min(have) > 4 {
+                    return Err(refuse(i.offset, "a vertex fetch across its element"));
+                }
+                let first = u32::from(base) + 4 * k as u32 + comp;
+                let mut words: Vec<u32> = (0..u32::from(*dwords))
+                    .map(|c| {
+                        let src = match c {
+                            c if c < have => 0x100 + first + c,
+                            3 => one,
+                            _ => 0x80,
+                        };
+                        v_mov(reg + c as u8, src)
+                    })
+                    .collect();
+                words.resize(words.len().max(i.words.len()), S_NOP);
+                edits.insert(i.offset, words);
+                continue;
+            }
+            _ => {}
+        }
+        if reads.iter().any(|&o| pairs.iter().any(|&p| overlaps(p, 2, o)) || vsharps.keys().any(|&r| overlaps(r, 4, o))) {
+            return Err(refuse(i.offset, "a vertex buffer descriptor read the fetch lift does not know"));
+        }
+        for &o in &writes {
+            pairs.retain(|&p| !overlaps(p, 2, o));
+            vsharps.retain(|&r, _| !overlaps(r, 4, o));
+        }
+    }
+    if edits.is_empty() {
+        return Ok(code.to_vec());
+    }
+
+    let mut out = Vec::with_capacity(code.len());
+    let mut from = 0;
+    for i in &insts {
+        out.extend(&code[from..i.offset]);
+        let end = i.offset + 4 * i.words.len();
+        match edits.get(&i.offset) {
+            Some(words) => words.iter().for_each(|w| out.extend(w.to_le_bytes())),
+            None => out.extend(&code[i.offset..end]),
+        }
+        from = end;
+    }
+    out.extend(&code[from..]);
+    if out.len() != code.len()
+        && let Some(i) = insts[..straight].iter().find(|i| i.name() == Some("s_getpc_b64"))
+    {
+        return Err(refuse(i.offset, "code that reads its own address, moved by the fetch lift"));
+    }
+    crate::gfx10::decode(&out)?;
+    Ok(out)
+}
+
+/// Fourcc of the part in a [`loose_graphics`] vertex container saying where
+/// the vertex fetch reads: u32 element count, then per element of the input
+/// layout u32 slot, offset, DXGI format, and the VGPR its first channel
+/// arrives in.
+pub const VERTEX_FETCH: crate::FourCC = crate::FourCC(*b"VFCH");
+
+/// Containers made from a loose graphics pipeline ([`loose_graphics`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LooseGraphics {
+    pub vs: Vec<u8>,
+    pub ps: Option<Vec<u8>>,
+    pub inputs: Vec<InputElement>,
+    /// The register block's CB_TARGET_MASK and CB_BLEND0..7_CONTROL, for
+    /// the host's blend state; nothing else in it varies with the
+    /// pipeline's state (depth, rasterizer, and target formats are not
+    /// there).
+    pub target_mask: u32,
+    pub blend: [u32; 8],
+}
+
+/// Containers for a graphics pipeline handed over as loose parts (device
+/// method 0x1c8): the registers ([`loose_regs`]), the input layout
+/// ([`loose_input_layout`]), and each stage's code and metadata
+/// ([`loose_metadata`]), as (code, metadata). Each program goes into an
+/// `ACCC` part as an FSSM of one program, beside signatures made from what
+/// the parts say:
+///
+/// - vertex inputs: one row per layout element, its four channels in VGPRs
+///   past the ones the program uses (the [`VERTEX_FETCH`] part says which),
+///   which the program's own vertex fetch is rewritten to read
+///   ([`lift_vertex_fetch`]);
+/// - vertex outputs: `SV_Position` in row 0, then `TEXCOORD<p>` in row
+///   1 + p for each `exp param<p>` and each parameter the pixel program reads;
+/// - pixel inputs: `SV_Position`, the parameters SPI_PS_INPUT_CNTL names in
+///   the same rows, then `SV_IsFrontFace` when SPI_PS_INPUT_ADDR asks for it;
+/// - pixel outputs: `SV_Target<n>` for each `exp mrt<n>`, 32-bit float.
+///
+/// Both programs run as wave32; no register here says otherwise. Refused
+/// for what that cannot carry: 16-bit or default-value pixel inputs, depth
+/// exports, clip distances, and the third stage of call 15's layout.
+pub fn loose_graphics(
+    regs: &[u8],
+    layout: &[u8],
+    vs: (&[u8], &[u8]),
+    ps: Option<(&[u8], &[u8])>,
+) -> Result<LooseGraphics, ShaderError> {
+    let refuse = |what| ShaderError::Unsupported { offset: 0, what };
+    let regs = loose_regs(regs)?;
+    if regs.third_rsrc1 != 0 {
+        return Err(refuse("a loose pipeline with a third stage in the vertex stage's place"));
+    }
+    let inputs = loose_input_layout(layout)?;
+    let vs_meta = loose_metadata(vs.1)?;
+    let base = wave32_vgprs(regs.vs_rsrc1);
+    let vs_vgprs = base + 4 * inputs.len() as u16;
+    if vs_vgprs > 256 {
+        return Err(refuse("loose vertex inputs past v255"));
+    }
+    let vs_code = &lift_vertex_fetch(loose_code(vs.0, &vs_meta)?, &inputs, base, &vs_meta)?[..];
+    let mut params = std::collections::BTreeSet::new();
+    for t in export_targets(vs_code)? {
+        match t {
+            9 | 12 => {}
+            32..=63 => {
+                params.insert(t - 32);
+            }
+            13..=15 => return Err(refuse("a loose vertex program exporting clip distances")),
+            _ => return Err(refuse("a loose vertex program export")),
+        }
+    }
+    // Each parameter the pixel program reads: its rows and whether flat.
+    let mut flat = std::collections::BTreeMap::new();
+    let mut ps_inputs = Vec::new();
+    if ps.is_some() {
+        for (attr, &c) in regs.cntl.iter().enumerate() {
+            if c & 0x3F >= 0x20 || c >> 19 & 1 != 0 {
+                return Err(refuse("a 16-bit or default-value loose pixel input"));
+            }
+            let p = (c & 0x3F) as u8;
+            params.insert(p);
+            *flat.entry(p).or_insert(false) |= c >> 10 & 1 != 0;
+            ps_inputs.push((p, attr as u8, c >> 10 & 1 != 0));
+        }
+    }
+    if params.last().is_some_and(|&p| p >= 31) {
+        return Err(refuse("a loose varying past row 31"));
+    }
+    let comp = |p: &u8| if flat.get(p) == Some(&true) { 5 } else { 9 };
+
+    let mut data = vec![0; VS_OUTPUT_COUNT + 4];
+    let mut isg1 = Vec::new();
+    let mut fetch = (inputs.len() as u32).to_le_bytes().to_vec();
+    for (i, e) in inputs.iter().enumerate() {
+        let vgpr = base as u8 + 4 * i as u8;
+        data[VS_INPUTS + 5 * i..][..5].copy_from_slice(&[USAGE_GENERIC, i as u8, 0xF, vgpr, 0]);
+        isg1.push(sig_element(&e.name, e.index, 0, input_comp(e.format), i as u32, 4));
+        for v in [e.slot, e.offset, e.format, vgpr.into()] {
+            fetch.extend(v.to_le_bytes());
+        }
+    }
+    put32(&mut data, VS_INPUT_COUNT, inputs.len() as u32);
+    let mut osg1 = vec![sig_element("SV_Position", 0, 3, 9, 0, 4)];
+    for (i, p) in params.iter().enumerate() {
+        data[VS_OUTPUTS + 6 * i..][..6].copy_from_slice(&[USAGE_GENERIC, p + 1, *p, 0, 0, 0]);
+        osg1.push(sig_element("TEXCOORD", (*p).into(), 0, comp(p), u32::from(*p) + 1, 4));
+    }
+    put32(&mut data, VS_OUTPUT_COUNT, params.len() as u32);
+    let fssm = single_fssm(HwStage::Vs, vs_code, vs_vgprs, &vs_meta, &data);
+    programs(&fssm)?;
+    let vs = crate::dxbc::build(&[
+        (crate::FourCC::ACCC, &fssm),
+        (crate::FourCC::ISG1, &crate::emit::container::signature(&isg1, true)),
+        (crate::FourCC::OSG1, &crate::emit::container::signature(&osg1, false)),
+        (VERTEX_FETCH, &fetch),
+    ]);
+
+    let ps = match ps {
+        None => None,
+        Some((code, meta)) => {
+            let meta = loose_metadata(meta)?;
+            let code = loose_code(code, &meta)?;
+            let mut osg1 = Vec::new();
+            for t in export_targets(code)? {
+                match t {
+                    0..=7 => osg1.push(sig_element("SV_Target", t.into(), 16, 9, t.into(), 4)),
+                    9 => {}
+                    8 => return Err(refuse("a loose pixel program exporting depth")),
+                    _ => return Err(refuse("a loose pixel program export")),
+                }
+            }
+            let mut data = vec![0; PS_PATCHES + MRTS * PATCH_BYTES];
+            for (i, &(p, attr, flat)) in ps_inputs.iter().enumerate() {
+                data[PS_INPUTS + 8 * i..][..8].copy_from_slice(&[USAGE_GENERIC, p + 1, 0xF, attr, 0, 0, 0, flat as u8]);
+            }
+            put32(&mut data, PS_INPUT_COUNT, ps_inputs.len() as u32);
+            put32(&mut data, PS_INPUT_ADDR, regs.input_addr);
+            put32(&mut data, PS_DB_SHADER_CONTROL, regs.db_shader_control);
+            for mrt in 0..MRTS {
+                put32(&mut data, PS_PATCHES + mrt * PATCH_BYTES, u32::MAX);
+            }
+            let mut isg1 = vec![sig_element("SV_Position", 0, 3, 9, 0, 4)];
+            for p in flat.keys() {
+                isg1.push(sig_element("TEXCOORD", (*p).into(), 0, comp(p), u32::from(*p) + 1, 4));
+            }
+            if regs.input_addr >> 12 & 1 != 0 {
+                let row = flat.keys().last().map_or(1, |&p| u32::from(p) + 2);
+                isg1.push(sig_element("SV_IsFrontFace", 0, 13, 5, row, 1));
+            }
+            let fssm = single_fssm(HwStage::Ps, code, wave32_vgprs(regs.ps_rsrc1), &meta, &data);
+            programs(&fssm)?;
+            Some(crate::dxbc::build(&[
+                (crate::FourCC::ACCC, &fssm),
+                (crate::FourCC::ISG1, &crate::emit::container::signature(&isg1, true)),
+                (crate::FourCC::OSG1, &crate::emit::container::signature(&osg1, false)),
+            ]))
+        }
+    };
+    Ok(LooseGraphics { vs, ps, inputs, target_mask: regs.target_mask, blend: regs.blend })
 }
 
 fn u16_at(data: &[u8], at: usize) -> Result<u16, ShaderError> {
@@ -1368,11 +2128,12 @@ mod tests {
         r
     }
 
-    /// Version 3 metadata shaped as the title's: an SRV table, a UAV table,
+    /// Compute metadata shaped as the title's: an SRV table, a UAV table,
     /// a declaration, the hash.
-    fn loose_v3() -> Vec<u8> {
-        let mut m = vec![0u8; 0x38];
-        m[0] = 3;
+    fn compute_meta() -> Vec<u8> {
+        let mut m = vec![0u8; FSPX_RECORDS];
+        m[0..4].copy_from_slice(&0x403u32.to_le_bytes());
+        m[0x14..0x18].copy_from_slice(&[0x40, 4, 2, 0]);
         m.extend(record(0x41, 0, 3, 0, 266, 8, 4, 0));
         m.extend(record(0x41, 3, 3, 8, 25, 8, 4, 0));
         m.extend(record(0x42, 0, 0, 0, 266, 0, 0, 0));
@@ -1394,8 +2155,8 @@ mod tests {
 
     #[test]
     fn loose_metadata_reads_both_versions() {
-        let m = loose_metadata(&loose_v3()).unwrap();
-        assert_eq!((m.version, m.code_dwords), (3, 0));
+        let m = loose_metadata(&compute_meta()).unwrap();
+        assert_eq!((m.version, m.code_dwords), (0x403, 0));
         assert_eq!(m.layout.len(), 1);
         assert_eq!(m.used.iter().map(|u| (u.kind, u.lower_bound)).collect::<Vec<_>>(),
             [(ResourceType::Srv, 266), (ResourceType::Uav, 25)]);
@@ -1410,11 +2171,96 @@ mod tests {
         assert!(loose_metadata(&v2).is_err());
     }
 
+    /// A loose compute program of `users` user SGPRs: an SRV table in s4,
+    /// root constants claiming s6-s9, and descriptor heap declarations
+    /// (class 3 the sampler heap).
+    fn heap_program(users: u32, classes: &[u8], code: &[u32]) -> NativeProgram {
+        let mut m = vec![0u8; FSPX_RECORDS];
+        m[0..4].copy_from_slice(&0x403u32.to_le_bytes());
+        m[0x14..0x18].copy_from_slice(&[0x40, 4, 2, 0]);
+        m.extend(record(0x41, 0, 3, 0, 0, 1, 4, 1));
+        m.extend(record(0x41, 2, 0, 0, 500, 4, 6, 2));
+        for &c in classes {
+            m.extend(record(0x42, 0, 0, 2 | u32::from(c) << 8, 0, 0, 0, 0));
+        }
+        m.extend(record(0x43, 0, 0, 0, 0, 0, 0, 0));
+        let size = (m.len() - 0x14) as u32;
+        m[4..8].copy_from_slice(&size.to_le_bytes());
+        let c = loose_compute(&packet([64, 1, 1], users << 1), &words(code), &m).unwrap();
+        let c = crate::Container::parse(&c).unwrap();
+        native_programs(c.part(crate::FourCC::ACCC).unwrap().data).unwrap().remove(0)
+    }
+
+    fn heaps(p: &NativeProgram) -> Vec<(RootType, u8)> {
+        p.layout
+            .iter()
+            .filter(|r| matches!(r.root, RootType::ResourceHeap | RootType::SamplerHeap))
+            .map(|r| (r.root, r.user_data))
+            .collect()
+    }
+
+    /// The view heap in s8, inside the constants' claim: the code clears
+    /// s9 and loads a descriptor at a root constant times 32.
+    #[test]
+    fn a_view_heap_is_found_in_the_code() {
+        let code = [
+            0xBE89_0380, // s_mov_b32 s9, 0
+            0x8F06_8506, // s_lshl_b32 s6, s6, 5
+            0xF408_0304,
+            0x0C00_0000, // s_load_dwordx4 s[12:15], s[8:9], s6
+            0xBF81_0000,
+        ];
+        let p = heap_program(9, &[0], &code);
+        assert_eq!(heaps(&p), [(RootType::ResourceHeap, 8)]);
+        assert_eq!(p.layout[0].root, RootType::ResourceHeap);
+        let ir = crate::ir::build(&p.code, false, 256).unwrap();
+        let lanes = crate::structure::structure(&ir).ok();
+        let r = crate::resource::track(&ir, &p.layout, HwStage::Cs, lanes.as_ref()).unwrap();
+        assert_eq!(r.scalar[0].1.param, 0);
+        // No heap the code makes an address of: none declared.
+        let p = heap_program(9, &[0], &code[1..]);
+        assert!(heaps(&p).is_empty());
+    }
+
+    /// Both heaps: the sampler heap in the last user SGPR, the view heap
+    /// copied to a pair below it.
+    #[test]
+    fn both_heaps_take_the_last_user_sgprs() {
+        let code = [
+            0xBE8C_0308, // s_mov_b32 s12, s8
+            0xBE8D_0380, // s_mov_b32 s13, 0
+            0xF408_0406,
+            0xFA00_0000, // s_load_dwordx4 s[16:19], s[12:13], 0x0
+            0xBF81_0000,
+        ];
+        let p = heap_program(10, &[0, 3], &code);
+        assert_eq!(heaps(&p), [(RootType::ResourceHeap, 8), (RootType::SamplerHeap, 9)]);
+        // The table is no heap, though the code makes the same address of it.
+        let mut table = code;
+        table[0] = 0xBE8C_0304; // s_mov_b32 s12, s4
+        assert_eq!(heaps(&heap_program(10, &[0, 3], &table)), [(RootType::SamplerHeap, 9)]);
+    }
+
+    /// A pixel stage's 4 root constants at b500, user data 9, as in the
+    /// title's 0x1c8 calls.
+    #[test]
+    fn loose_metadata_takes_root_constants() {
+        let mut v2 = vec![2, 0, 0, 0, 0, 0, 0, 0, 0x20, 0, 0, 0, 0x40, 8, 1, 0];
+        v2.extend(record(0x41, 2, 0, 0, 0x1f4, 4, 9, 1));
+        v2.extend(record(0x43, 0, 0, 0, 0, 0, 0, 0));
+        let size = (v2.len() - 0xc) as u32;
+        v2[4..8].copy_from_slice(&size.to_le_bytes());
+        let m = loose_metadata(&v2).unwrap();
+        assert_eq!(m.layout.len(), 1);
+        let p = &m.layout[0];
+        assert_eq!((p.root, p.sgprs, p.base_register, p.user_data), (RootType::Constants, 4, 0x1f4, 9));
+    }
+
     #[test]
     fn loose_compute_parts_make_a_container() {
         let mut code = vec![0u8; 0x40];
         code[0x3c..].copy_from_slice(&0xbf81_0000u32.to_le_bytes());
-        let c = loose_compute(&packet([8, 8, 1], 0x8c), &code, &loose_v3()).unwrap();
+        let c = loose_compute(&packet([8, 8, 1], 0x8c), &code, &compute_meta()).unwrap();
         let c = crate::Container::parse(&c).unwrap();
         let p = native_programs(c.part(crate::FourCC::ACCC).unwrap().data).unwrap().remove(0);
         assert_eq!(p.stage, HwStage::Cs);
@@ -1423,7 +2269,251 @@ mod tests {
         assert_eq!(p.used.len(), 2);
         // The registers as read back after the title reused them: no thread
         // group, no RSRC2.
-        assert!(loose_compute(&packet([0x49ef, 0, 1], 0), &code, &loose_v3()).is_err());
-        assert!(loose_compute(&packet([64, 32, 1], 0x8c), &code, &loose_v3()).is_err());
+        assert!(loose_compute(&packet([0x49ef, 0, 1], 0), &code, &compute_meta()).is_err());
+        assert!(loose_compute(&packet([64, 32, 1], 0x8c), &code, &compute_meta()).is_err());
+    }
+
+    /// The parts of the title's first 0x218 call, the code left out.
+    #[test]
+    fn loose_compute_takes_the_titles_parts() {
+        let packet = [
+            0x00, 0xcf, 0x05, 0x40, 0x02, 0x01, 0x09, 0x6c, 0x00, 0x00, 0x00, 0x00, 0x08, 0x00, 0x08, 0x00,
+            0x01, 0x00, 0x00, 0x00, 0x43, 0x03, 0x2c, 0x40, 0x8a, 0x0b, 0x00, 0x00,
+        ];
+        let meta = [
+            0x03, 0x04, 0x00, 0x00, 0x04, 0x01, 0x00, 0x00, 0x60, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x40, 0x04, 0x04, 0x00, 0x41, 0x00, 0x00, 0x00, 0x01, 0x04, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x0b, 0x00,
+            0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x41, 0x00, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x0a, 0x01, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x08, 0x04, 0x00, 0x00,
+            0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x41, 0x00, 0x00, 0x00, 0x03, 0x03, 0x00, 0x00,
+            0x08, 0x00, 0x00, 0x00, 0x17, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x08, 0x04, 0x00, 0x00,
+            0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x41, 0x00, 0x00, 0x00, 0x02, 0x03, 0x00, 0x00,
+            0x10, 0x00, 0x00, 0x00, 0x1b, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x04, 0x00, 0x00,
+            0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x42, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x01, 0x00, 0x07, 0x00, 0x0a, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x42, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x01, 0x01, 0x07, 0x00, 0x17, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x42, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x01, 0x02, 0x0d, 0x00, 0x1b, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x43, 0x00, 0x00, 0x00, 0xbf, 0xce, 0x41, 0x6a,
+            0xe6, 0x48, 0x53, 0x7f, 0x86, 0x7a, 0xdc, 0x1f, 0x5a, 0xf0, 0xb6, 0xfd, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        let m = loose_metadata(&meta).unwrap();
+        assert_eq!((m.version, m.code_dwords, m.used.len()), (0x403, 0x60, 4));
+        let code = vec![0u8; 0x180];
+        let c = loose_compute(&packet, &code, &meta).unwrap();
+        let c = crate::Container::parse(&c).unwrap();
+        let p = native_programs(c.part(crate::FourCC::ACCC).unwrap().data).unwrap().remove(0);
+        assert_eq!(p.io, StageIo::Cs(ComputeIo { rsrc2: 0xb8a, threads: [8, 8, 1] }));
+        assert_eq!(p.used.len(), 4);
+    }
+
+    /// Version 2 metadata of `dwords` code dwords with these records.
+    fn graphics_meta(dwords: u8, records: &[[u8; 32]]) -> Vec<u8> {
+        let mut m = vec![2, 0, 0, 0, 0, 0, 0, 0, dwords, 0, 0, 0, 0x40, 8, records.len() as u8, 0];
+        for r in records {
+            m.extend(r);
+        }
+        m.extend(record(0x43, 0, 0, 0, 0, 0, 0, 0));
+        let size = (m.len() - 0xc) as u32;
+        m[4..8].copy_from_slice(&size.to_le_bytes());
+        m
+    }
+
+    fn words(w: &[u32]) -> Vec<u8> {
+        w.iter().flat_map(|w| w.to_le_bytes()).collect()
+    }
+
+    /// Registers in the shape of the title's 0x1c8 calls, one pixel input.
+    fn graphics_regs(cntl: u32) -> Vec<u8> {
+        let mut r = vec![0u32; 97];
+        r[14] = 3;
+        r[19] = 1;
+        r[22] = 2;
+        r[23] = 1;
+        r[31] = 0xcc_0000;
+        r[93] = cntl;
+        words(&r)
+    }
+
+    fn graphics_layout() -> Vec<u8> {
+        let mut l = vec![0u8; 0x4c];
+        l.extend(3u32.to_le_bytes());
+        for (name, format, offset) in [("POSITION", 6, 0), ("COLOR", 28, 0xc), ("TEXCOORD", 16, 0x10)] {
+            l.extend((name.len() as u32 + 1).to_le_bytes());
+            l.extend(name.as_bytes());
+            l.push(0);
+            for v in [0, format, 0, offset, 0, 0] {
+                l.extend(u32::to_le_bytes(v));
+            }
+        }
+        l
+    }
+
+    const EXP_POS0: [u32; 2] = [0xf800_08cf, 0x0302_0100];
+    const EXP_PARAM0: [u32; 2] = [0xf800_020f, 0x0706_0504];
+    const EXP_MRT0: [u32; 2] = [0xf800_180f, 0x0302_0100];
+    const EXP_MRTZ: [u32; 2] = [0xf800_188f, 0x0302_0100];
+    const S_ENDPGM: u32 = 0xbf81_0000;
+
+    #[test]
+    fn loose_input_layout_reads_the_elements() {
+        let l = graphics_layout();
+        assert_eq!(l.len(), 188);
+        let e = loose_input_layout(&l).unwrap();
+        assert_eq!(e.iter().map(|e| (e.name.as_str(), e.format, e.offset)).collect::<Vec<_>>(),
+            [("POSITION", 6, 0), ("COLOR", 28, 0xc), ("TEXCOORD", 16, 0x10)]);
+        assert!(loose_input_layout(&l[..187]).is_err());
+    }
+
+    #[test]
+    fn loose_graphics_parts_make_containers() {
+        let vs = words(&[EXP_POS0[0], EXP_POS0[1], EXP_PARAM0[0], EXP_PARAM0[1], S_ENDPGM]);
+        let vs_meta = graphics_meta(5, &[]);
+        let ps = words(&[EXP_MRT0[0], EXP_MRT0[1], S_ENDPGM]);
+        let ps_meta = graphics_meta(3, &[record(0x41, 2, 3, 0, 0x1b, 4, 8, 0)]);
+        let regs = graphics_regs(0);
+        let layout = graphics_layout();
+        let g = loose_graphics(&regs, &layout, (&vs, &vs_meta), Some((&ps, &ps_meta))).unwrap();
+        assert_eq!(g.inputs.len(), 3);
+
+        let c = crate::Container::parse(&g.vs).unwrap();
+        let p = native_programs(c.part(crate::FourCC::ACCC).unwrap().data).unwrap().remove(0);
+        assert_eq!((p.stage, p.wave64, p.vgprs, p.code.as_slice()), (HwStage::Vs, false, 44, vs.as_slice()));
+        let StageIo::Vs { inputs, outputs } = p.io else { panic!() };
+        assert_eq!(inputs.iter().map(|i| (i.row, i.vgpr)).collect::<Vec<_>>(), [(0, 32), (1, 36), (2, 40)]);
+        assert_eq!(outputs.iter().map(|o| (o.row, o.param)).collect::<Vec<_>>(), [(1, 0)]);
+        assert_eq!(u32_at(c.part(crate::FourCC::ISG1).unwrap().data, 0).unwrap(), 3);
+        assert_eq!(u32_at(c.part(crate::FourCC::OSG1).unwrap().data, 0).unwrap(), 2);
+        let fetch = c.part(VERTEX_FETCH).unwrap().data;
+        assert_eq!(fetch.len(), 4 + 3 * 16);
+        assert_eq!(u32_at(fetch, 4 + 16 + 12).unwrap(), 36);
+
+        let c = crate::Container::parse(g.ps.as_ref().unwrap()).unwrap();
+        let p = native_programs(c.part(crate::FourCC::ACCC).unwrap().data).unwrap().remove(0);
+        assert_eq!((p.stage, p.vgprs, p.layout.len(), p.used.len()), (HwStage::Ps, 16, 1, 1));
+        assert_eq!((p.layout[0].root, p.used[0].kind), (RootType::Table, ResourceType::Cbv));
+        let StageIo::Ps { inputs, input_addr, db_shader_control, patches } = p.io else { panic!() };
+        assert_eq!(inputs.iter().map(|i| (i.row, i.attr, i.flat)).collect::<Vec<_>>(), [(1, 0, false)]);
+        assert_eq!((input_addr, db_shader_control, patches.len()), (2, 0xcc_0000, 0));
+        assert_eq!(u32_at(c.part(crate::FourCC::ISG1).unwrap().data, 0).unwrap(), 2);
+        assert_eq!(u32_at(c.part(crate::FourCC::OSG1).unwrap().data, 0).unwrap(), 1);
+    }
+
+    #[test]
+    fn loose_graphics_refuses_what_it_cannot_carry() {
+        let vs = words(&[EXP_POS0[0], EXP_POS0[1], S_ENDPGM]);
+        let vs_meta = graphics_meta(3, &[]);
+        let ps_meta = graphics_meta(3, &[]);
+        let mrt0 = words(&[EXP_MRT0[0], EXP_MRT0[1], S_ENDPGM]);
+        let mrtz = words(&[EXP_MRTZ[0], EXP_MRTZ[1], S_ENDPGM]);
+        let layout = graphics_layout();
+        let regs = graphics_regs(0);
+        assert!(loose_graphics(&regs, &layout, (&vs, &vs_meta), Some((&mrt0, &ps_meta))).is_ok());
+        assert!(loose_graphics(&regs, &layout, (&vs, &vs_meta), Some((&mrtz, &ps_meta))).is_err());
+        let fp16 = graphics_regs(1 << 19);
+        assert!(loose_graphics(&fp16, &layout, (&vs, &vs_meta), Some((&mrt0, &ps_meta))).is_err());
+        let default = graphics_regs(0x20);
+        assert!(loose_graphics(&default, &layout, (&vs, &vs_meta), Some((&mrt0, &ps_meta))).is_err());
+        assert!(loose_graphics(&regs[..regs.len() - 4], &layout, (&vs, &vs_meta), None).is_err());
+    }
+
+    /// Call 15's 0x200 register block, as the title hands it over.
+    fn call15_regs() -> Vec<u8> {
+        let mut r = vec![0u32; 128];
+        r[17] = 0xffff_0000;
+        r[19] = 0x022c_c35f;
+        r[20] = 0x22;
+        r[21] = 0xffff;
+        r[24] = 0x022c_034d;
+        r[25] = 0x0009_0022;
+        r[26] = 0xfffe;
+        r[27] = 0x7f_ffff;
+        r[28] = 0x2004_0080;
+        r[29] = 0x80;
+        r[30] = 0x80;
+        r[34] = 2;
+        r[36] = 1;
+        r[40] = 0x78_8000;
+        r[42] = 0x8004;
+        r[43] = 0x8002;
+        r[44] = 11;
+        r[52] = 0xcc_0010;
+        r[72] = u32::MAX;
+        r[73..81].fill(0xe504_0504);
+        for (i, c) in [1, 2, 3, 4, 5, 6, 7, 0x408, 0x409, 0x40a, 0].into_iter().enumerate() {
+            r[114 + i] = c;
+        }
+        r[125] = 7;
+        r[126] = 0x1000_0700;
+        words(&r)
+    }
+
+    #[test]
+    fn loose_regs_read_the_call15_layout() {
+        let r = loose_regs(&call15_regs()).unwrap();
+        assert_eq!((r.vs_rsrc1, r.ps_rsrc1, r.input_addr, r.db_shader_control, r.third_rsrc1), (0, 0x022c_c35f, 0x8002, 0xcc_0010, 0x022c_034d));
+        assert_eq!(r.cntl, [1, 2, 3, 4, 5, 6, 7, 0x408, 0x409, 0x40a, 0]);
+        assert_eq!((r.target_mask, r.blend), (u32::MAX, [0xe504_0504; 8]));
+        let r = loose_regs(&graphics_regs(0)).unwrap();
+        assert_eq!((r.input_addr, r.cntl.len(), r.third_rsrc1), (2, 1, 0));
+
+        let vs = words(&[EXP_POS0[0], EXP_POS0[1], S_ENDPGM]);
+        let meta = graphics_meta(3, &[]);
+        let ps = words(&[EXP_MRT0[0], EXP_MRT0[1], S_ENDPGM]);
+        assert!(loose_graphics(&call15_regs(), &graphics_layout(), (&vs, &meta), Some((&ps, &meta))).is_err());
+    }
+
+    /// Call 1's vertex program: POSITION by a raw x3 load, COLOR by a typed
+    /// 8_8_8_8 load, both through the table at user data 0-1.
+    fn fetching_vs(position: u32, color: u32) -> Vec<u32> {
+        vec![
+            0xbe88_0400, 0x9389_ff09, 0x0008_0000, 0xf408_0204, 0xfa00_0000, 0x4a00_0002, 0xbf8c_c07f,
+            position, 0x8002_0100, color, 0x8002_0400, 0x7e10_02f2,
+            0xf800_08cf, 0x0803_0201, EXP_PARAM0[0], EXP_PARAM0[1], S_ENDPGM,
+        ]
+    }
+
+    #[test]
+    fn lift_vertex_fetch_reads_the_input_vgprs() {
+        let inputs = loose_input_layout(&graphics_layout()).unwrap();
+        let vs = fetching_vs(0xe03c_2000, 0xe9c3_200c);
+        let meta = loose_metadata(&graphics_meta(vs.len() as u8, &[])).unwrap();
+        let out = lift_vertex_fetch(&words(&vs), &inputs, 32, &meta).unwrap();
+        let mut want = vs[..3].to_vec();
+        want.extend([S_NOP, S_NOP]);
+        want.extend(&vs[5..7]);
+        want.extend((1..4).map(|r| v_mov(r, 0x100 + 31 + u32::from(r))));
+        want.extend((4..8).map(|r| v_mov(r, 0x100 + 32 + u32::from(r))));
+        want.extend(&vs[11..]);
+        assert_eq!(out, words(&want));
+
+        let regs = graphics_regs(0);
+        let layout = graphics_layout();
+        let ps = words(&[EXP_MRT0[0], EXP_MRT0[1], S_ENDPGM]);
+        let ps_meta = graphics_meta(3, &[]);
+        let g = loose_graphics(&regs, &layout, (&words(&vs), &graphics_meta(vs.len() as u8, &[])), Some((&ps, &ps_meta))).unwrap();
+        let c = crate::Container::parse(&g.vs).unwrap();
+        let p = native_programs(c.part(crate::FourCC::ACCC).unwrap().data).unwrap().remove(0);
+        assert_eq!(p.code, words(&want));
+    }
+
+    #[test]
+    fn lift_vertex_fetch_refuses_what_it_cannot_place() {
+        let inputs = loose_input_layout(&graphics_layout()).unwrap();
+        let meta = loose_metadata(&graphics_meta(17, &[])).unwrap();
+        let lift = |position, color| lift_vertex_fetch(&words(&fetching_vs(position, color)), &inputs, 32, &meta);
+        // An 8-bit typed load of the 32-bit POSITION.
+        assert!(lift(0xe03c_2000, 0xe80b_2000).is_err());
+        // A load past the last element.
+        assert!(lift(0xe03c_2040, 0xe9c3_200c).is_err());
+        // An offset load rather than an index load.
+        assert!(lift(0xe03c_1000, 0xe9c3_200c).is_err());
+
+        let rooted = loose_metadata(&graphics_meta(17, &[record(0x41, 2, 3, 0, 0, 2, 0, 0)])).unwrap();
+        let vs = words(&fetching_vs(0xe03c_2000, 0xe9c3_200c));
+        assert_eq!(lift_vertex_fetch(&vs, &inputs, 32, &rooted).unwrap(), vs);
     }
 }

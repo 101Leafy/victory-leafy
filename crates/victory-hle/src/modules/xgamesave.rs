@@ -334,20 +334,39 @@ fn containers(root: &Path) -> Vec<(String, PathBuf)> {
 }
 
 /// Moves a container of the old layout (blob files named by encoded name,
-/// a `.display` file) into a committed version, then removes it.
+/// a `.display` file) into a committed version, then removes it. A blob or
+/// a `.display` that is there but cannot be read (another process holds it)
+/// leaves the old layout as it is, for a later listing to move: committing
+/// without it would lose it once the old folder is removed.
 fn migrate(root: &Path, name: &str, old: &Path) -> Option<PathBuf> {
     let dir = container_dir(root, name);
     let done = current_named(&dir, name).ok()?.is_some(); // a crash after the commit
     if !done {
-        let display = std::fs::read_to_string(old.join(".display")).unwrap_or_default();
-        let mut blobs: Vec<(String, Vec<u8>)> = std::fs::read_dir(old)
-            .ok()?
-            .flatten()
-            .filter_map(|e| {
-                let blob = decode(e.file_name().to_str()?)?;
-                Some((blob, std::fs::read(e.path()).ok()?))
-            })
-            .collect();
+        let kept = |what: &Path, e: std::io::Error| {
+            tracing::warn!(container = name, file = %what.display(), %e, "game save left in the old layout for now");
+        };
+        let display_path = old.join(".display");
+        let display = match std::fs::read_to_string(&display_path) {
+            Ok(display) => display,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => {
+                kept(&display_path, e);
+                return None;
+            }
+        };
+        let mut blobs: Vec<(String, Vec<u8>)> = Vec::new();
+        for e in std::fs::read_dir(old).ok()?.flatten() {
+            let Some(blob) = e.file_name().to_str().and_then(decode) else {
+                continue;
+            };
+            match std::fs::read(e.path()) {
+                Ok(data) => blobs.push((blob, data)),
+                Err(err) => {
+                    kept(&e.path(), err);
+                    return None;
+                }
+            }
+        }
         blobs.sort();
         let sources: Vec<_> = blobs
             .iter()
@@ -396,6 +415,13 @@ fn take<T>(handle: *mut T) {
         // SAFETY: as in `get`; closing ends the handle.
         drop(unsafe { Box::from_raw(handle) });
     }
+}
+/// Nulls a handle the title asked for before anything can fail: the GDK
+/// documents these as null on failure (`_Outptr_result_nullonfailure_`),
+/// and titles close whatever handle they hold, without checking that the
+/// call that should have given it worked.
+fn clear<T>(out: *mut *mut T) {
+    let _ = put(out, std::ptr::null_mut());
 }
 
 impl Provider {
@@ -663,18 +689,27 @@ extern "system" fn initialize_async(
     block: *mut AsyncBlock,
 ) -> HRESULT {
     let saves = runtime::title().saves();
-    let result = if saves.parent().is_none_or(|p| p.as_os_str().is_empty()) {
+    let provider = if saves.parent().is_none_or(|p| p.as_os_str().is_empty()) {
         Err(NO_ACCESS)
     } else {
-        Provider::open(&saves, text(config).as_deref()).map(|p| xasync::bytes(give(p)))
+        Provider::open(&saves, text(config).as_deref()).map(give)
     };
-    xasync::finished_with(block, (&raw const INIT).cast(), result)
+    let hr = xasync::finished_with(block, (&raw const INIT).cast(), provider.map(xasync::bytes));
+    if hr < 0
+        && let Ok(provider) = provider
+    {
+        // Refused before the call existed: the handle was never handed out,
+        // and the call's cleanup frees only the bytes naming it.
+        take(provider);
+    }
+    hr
 }
 extern "system" fn initialize_result(
     _: This,
     block: *mut AsyncBlock,
     out: *mut *mut Provider,
 ) -> HRESULT {
+    clear(out);
     xasync::result(block, (&raw const INIT).cast(), out)
 }
 extern "system" fn close_provider(_: This, provider: *mut Provider) {
@@ -752,6 +787,7 @@ extern "system" fn create_container(
     name: *const c_char,
     out: *mut *mut Container,
 ) -> HRESULT {
+    clear(out);
     let (Some(p), Some(name)) = (get(provider), text(name)) else {
         return E_INVALIDARG;
     };
@@ -876,6 +912,7 @@ extern "system" fn create_update(
     display: *const c_char,
     out: *mut *mut Update,
 ) -> HRESULT {
+    clear(out);
     let Some(c) = get(container) else {
         return E_INVALIDARG;
     };
@@ -1212,6 +1249,46 @@ mod tests {
         assert_eq!((v.dir.file_name(), v.display.as_str()), (Some("v1".as_ref()), "Chapter 1"));
     }
 
+    /// A `.display` or a blob of the old layout that another process holds
+    /// (no sharing) is not moved without: the old layout stays, nothing is
+    /// committed, and the next listing moves it whole, display name included.
+    #[test]
+    fn an_unreadable_old_display_or_blob_leaves_the_old_layout_for_later() {
+        use std::os::windows::fs::OpenOptionsExt;
+        for locked in [".display", "Save%20Game%20Data"] {
+            let saves = tempfile::tempdir().unwrap();
+            let root = saves.path().join(format!("{:016X}", xuser::XUID)).join("scid");
+            let old = root.join("Player");
+            std::fs::create_dir_all(&old).unwrap();
+            std::fs::write(old.join("Save%20Game%20Data"), b"data").unwrap();
+            std::fs::write(old.join("Save%20Game%20Header"), b"header").unwrap();
+            std::fs::write(old.join(".display"), b"Chapter 1").unwrap();
+            let held = std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(0)
+                .open(old.join(locked))
+                .unwrap();
+            let p = Provider::open(saves.path(), Some("scid")).unwrap();
+            assert!(old.exists(), "{locked} held: the old layout is kept");
+            let c = p.container("Player");
+            assert!(current_named(&c.dir, "Player").unwrap().is_none(), "{locked} held: nothing committed");
+            drop(held);
+            let p = Provider::open(saves.path(), Some("scid")).unwrap();
+            assert!(!old.exists(), "{locked} free again: moved over");
+            let c = p.container("Player");
+            assert_eq!(
+                read(&c, None).unwrap(),
+                [
+                    ("Save Game Data".into(), b"data".to_vec()),
+                    ("Save Game Header".into(), b"header".to_vec())
+                ],
+                "{locked}"
+            );
+            let v = current_named(&c.dir, "Player").unwrap().unwrap();
+            assert_eq!(v.display, "Chapter 1", "{locked}");
+        }
+    }
+
     /// An empty configuration id names none. As a folder name it would be
     /// the folder every configuration lives in, whose folders then look
     /// like containers of the old layout and are converted away.
@@ -1235,6 +1312,42 @@ mod tests {
         let other = Provider::open(saves.path(), Some("other")).unwrap();
         assert_eq!(state(&other.root), None);
         assert_eq!(state(&scid.root), kept);
+    }
+
+    #[test]
+    fn a_failed_create_leaves_a_null_handle() {
+        let this: This = &OBJECT;
+        let saves = tempfile::tempdir().unwrap();
+        let provider = give(Provider::open(saves.path(), Some("scid")).unwrap());
+        // What an uninitialized handle variable may hold.
+        fn garbage<T>() -> *mut T {
+            std::ptr::without_provenance_mut(0x1234)
+        }
+
+        let mut container = garbage();
+        let bad = c"bad name".as_ptr();
+        let hr = create_container(this, provider, bad, &mut container);
+        assert_eq!(hr, INVALID_CONTAINER_NAME);
+        assert!(container.is_null());
+
+        let mut update = garbage();
+        let hr = create_update(this, std::ptr::null(), c"x".as_ptr(), &mut update);
+        assert_eq!(hr, E_INVALIDARG);
+        assert!(update.is_null());
+
+        // A provider that could not be opened (its folder could not be made).
+        let mut b = block();
+        xasync::finished_with(&mut b, (&raw const INIT).cast(), Err(NO_ACCESS));
+        let mut opened = garbage();
+        let hr = initialize_result(this, &mut b, &mut opened);
+        assert_eq!(hr, NO_ACCESS);
+        assert!(opened.is_null());
+
+        // So closing what the title holds, as it does, is harmless.
+        close_container(this, container);
+        close_update(this, update);
+        close_provider(this, opened);
+        close_provider(this, provider);
     }
 
     #[test]
