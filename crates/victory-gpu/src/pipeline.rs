@@ -142,6 +142,9 @@ pub(crate) struct Translated {
     pub(crate) stores: bool,
     /// Whether it can store through raw addresses ([`stores_by_address`]).
     pub(crate) stores_by_address: bool,
+    /// Whether it can store anywhere a later command may read, textures
+    /// included ([`writes`]).
+    pub(crate) writes: bool,
     /// Whether it stores through a view it picks from the heap by an index,
     /// once asked (`crate::picked`).
     pub(crate) picks: std::sync::atomic::AtomicU8,
@@ -240,6 +243,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         _ => None,
     });
     let stores_by_address = programs.is_empty() || programs.iter().any(stores_by_address);
+    let writes = stores || programs.iter().any(writes);
     let used = programs
         .into_iter()
         .find(|p| {
@@ -256,6 +260,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         used,
         stores,
         stores_by_address,
+        writes,
         picks: Default::default(),
     })
 }
@@ -404,6 +409,20 @@ fn stores_by_address(program: &victory_shader::NativeProgram) -> bool {
         matches!(i.encoding, Encoding::Flat | Encoding::Global)
             && i.name()
                 .is_none_or(|n| (n.contains("store") || n.contains("atomic")) && !n.contains("scratch"))
+    })
+}
+
+/// Whether a console program can store to a texture (an image store or
+/// atomic), or code that does not decode: with [`stores`], whether a later
+/// command may read what it wrote.
+#[cfg(windows)]
+fn writes(program: &victory_shader::NativeProgram) -> bool {
+    use victory_shader::gfx10::{Encoding, decode};
+    let Ok(code) = decode(&program.code) else {
+        return true;
+    };
+    code.iter().any(|i| {
+        i.encoding == Encoding::Mimg && i.name().is_none_or(|n| n.contains("store") || n.contains("atomic"))
     })
 }
 

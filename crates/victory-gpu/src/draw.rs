@@ -316,6 +316,27 @@ fn batches() -> u8 {
     })
 }
 
+/// Whether a full wait (a title barrier on buffers, a pipeline sync or
+/// barrier group, the wait that opens a batch of clamps) is left out when
+/// nothing that writes was recorded in the list since the last one
+/// (`VICTORY_QUIET_WAITS=1`; off by default).
+///
+/// A frame of gameplay has about 865 barrier groups and 870 clamp passes,
+/// each a wait for every earlier shader write: about 1,850 a frame, where
+/// the card drains its work. The title waits after each of its compute
+/// passes, often two or three times in a row with nothing between, and a
+/// batch opened after a title wait waits again. What writes: dispatches,
+/// draws whose shaders store to buffers or textures, copies, clears and
+/// resolves. Draws that only write render targets and depth are not
+/// waited for by these (their textures move state at use). Our own passes
+/// in the list (the clamps, the ambient light) bring their own waits, and
+/// the clamp budget is changed only by atomics. The first wait in each
+/// host list is always kept.
+fn quiet_waits() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_QUIET_WAITS").is_some_and(|v| v == "1"))
+}
+
 /// The records clamped by the pass opened last ([`batches`]).
 struct Batch {
     table: crate::indirect::batch::Table,
@@ -387,6 +408,9 @@ pub(crate) struct State {
     /// The records clamped in a batch, if later executions may still read
     /// them ([`batches`]).
     batch: Option<Batch>,
+    /// Nothing that writes through shaders, copies or clears was recorded
+    /// in this host list since its last full wait ([`quiet_waits`]).
+    quiet: bool,
     /// The user data bound last, of the last stage that has some (for the
     /// report of a removed device, `crate::host::indirects`).
     #[cfg(feature = "diagnostics")]
@@ -4512,6 +4536,7 @@ impl State {
     /// Shaders that can write buffers were recorded: arguments may be others
     /// from here on.
     fn buffers_written(&mut self) {
+        self.quiet = false;
         match &mut self.batch {
             Some(batch) if batches() == 2 => batch.wrote = true,
             batch => *batch = None,
@@ -4535,10 +4560,35 @@ impl State {
         if p.is_none_or(pipeline_stores) {
             self.batch = None;
         }
+        if p.is_none_or(|p| p.stages.iter().any(|stage| stage.translated().writes)) {
+            self.quiet = false;
+        }
+    }
+
+    /// A copy, clear or resolve was recorded ([`quiet_waits`]).
+    pub(crate) fn wrote(&mut self) {
+        self.quiet = false;
+    }
+
+    /// Whether a full wait recorded now in `list` has anything to wait for,
+    /// or is kept anyway ([`quiet_waits`]).
+    pub(crate) fn wait_needed(&mut self, list: &HostList) -> bool {
+        const QUIET_USE: usize = usize::MAX - 0x79;
+        if list.first_use(QUIET_USE) {
+            self.quiet = false;
+        }
+        let needed = !self.quiet;
+        self.quiet = true;
+        #[cfg(feature = "diagnostics")]
+        if !needed {
+            crate::copystat::add(crate::copystat::C::WaitsQuiet, 1);
+        }
+        needed || !quiet_waits()
     }
 
     /// A buffer was copied to: what was clamped of it ahead is clamped anew.
     pub(crate) fn copied(&mut self) {
+        self.quiet = false;
         self.window = None;
         self.batch = None;
     }
@@ -4577,7 +4627,8 @@ impl State {
             return Some((b.scratch.clone(), at));
         }
         self.batch = None;
-        let (mut table, scratch) = crate::indirect::open_batch(list, (id, &args.buffer), &argument_copies(args))?;
+        let wait = self.wait_needed(list);
+        let (mut table, scratch) = crate::indirect::open_batch(list, (id, &args.buffer), &argument_copies(args), wait)?;
         self.host_pipeline = 0;
         self.host_roots[1] = 0;
         let at = table.place(id, offset, kind)?;
