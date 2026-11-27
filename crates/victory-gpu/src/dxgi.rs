@@ -235,6 +235,14 @@ const _: () = assert!(size_of::<Mode>() == 32);
 /// rendering for the mode it is given, and 4K is what the console reports;
 /// on a 1080p or 1440p screen the host's own size is the cheaper answer, and
 /// the switch is there to try it.
+///
+/// It names a mode; it does not set the size the title renders at, and the
+/// first run outside this project that turned it on said so: an RTX 5070
+/// Laptop with a 2560x1600 panel reported `host=Some((2560, 1600))` here,
+/// went on presenting 3840x2160 into the window fitted to the screen, and
+/// kept the same frame rate (0.9 to 1.5 fps either way). Reading it as a
+/// way to lower the resolution is the mistake to avoid: a title that
+/// ignores the mode it is given renders the same pixels.
 fn display_size() -> (u32, u32) {
     static SIZE: std::sync::OnceLock<(u32, u32)> = std::sync::OnceLock::new();
     *SIZE.get_or_init(|| {
@@ -288,9 +296,11 @@ fn reported(
 }
 
 /// The host display's current mode, in pixels: the primary display, whose
-/// mode a title presented to a window lands on.
+/// mode a title presented to a window lands on. Read by the presentation's
+/// log line as well, so a frame that draws more pixels than the screen has
+/// says so where anyone looking at a slow run will see it.
 #[cfg(windows)]
-fn host_display_size() -> Option<(u32, u32)> {
+pub(crate) fn host_display_size() -> Option<(u32, u32)> {
     use windows_sys::Win32::Graphics::Gdi::{
         DEVMODEW, ENUM_CURRENT_SETTINGS, EnumDisplaySettingsW,
     };
@@ -303,7 +313,7 @@ fn host_display_size() -> Option<(u32, u32)> {
 }
 
 #[cfg(not(windows))]
-fn host_display_size() -> Option<(u32, u32)> {
+pub(crate) fn host_display_size() -> Option<(u32, u32)> {
     None
 }
 

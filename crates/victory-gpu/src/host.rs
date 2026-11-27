@@ -9211,7 +9211,24 @@ impl Host {
                 .cast::<IDXGISwapChain3>()?;
             let copy = self.new_list()?;
             copy.close();
-            tracing::info!(width, height, format = format.0, "presenting to a window");
+            // What the title draws against what the screen shows. A title that
+            // renders 3840x2160 for a 2560x1600 panel pays 2.25 times the
+            // pixels, and 9 times for a 1280x720 one; a run reported as slow
+            // that draws the console's size while the mode it was given was
+            // the screen's own needs this line to say so, since nothing else
+            // in the log compares the two.
+            let screen = crate::dxgi::host_display_size();
+            let drawn_of_the_screen = screen.map(|(w, h)| {
+                (f64::from(width) * f64::from(height)) / (f64::from(w) * f64::from(h))
+            });
+            tracing::info!(
+                width,
+                height,
+                screen = ?screen,
+                drawn_of_the_screen,
+                format = format.0,
+                "presenting to a window"
+            );
             self.log_video_memory("right after the swap chain is made");
             Ok(Presenter {
                 swap_chain,
