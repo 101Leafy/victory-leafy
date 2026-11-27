@@ -496,6 +496,12 @@ pub(crate) struct State {
     /// write the list records, and at more). The copies are held by
     /// `root_srv_slots`, so a key is not another copy's.
     root_tails: std::collections::HashMap<usize, (u64, u64)>,
+    /// Root views the list bound at a 256-aligned address (root SRVs, CBVs
+    /// not copied to scratch): (address, SRV) → list epoch, count of buffer
+    /// changes, GPU address, bytes. The same view again before either
+    /// moves finds the same copy and asks the refresh the list already
+    /// holds, so it is bound without looking (`VICTORY_ROOT_SAME`).
+    root_views: std::collections::HashMap<(u64, u64), (u64, u64, u64, u64), std::hash::BuildHasherDefault<crate::host::AddressHash>>,
     /// Tables another list made this frame that this one uses as they are
     /// ([`SharedTables`]): title heap, first dynamic slot; let go when the
     /// dynamic slots are given back.
@@ -545,6 +551,7 @@ impl State {
         self.root_srv_slots.clear();
         self.root_uav_slots.clear();
         self.root_tails.clear();
+        self.root_views.clear();
         self.tables_gone = true;
     }
 }
@@ -864,6 +871,12 @@ struct Target<D> {
 /// megabyte was never brought up to date - meshes without bodies, exploded
 /// triangles. `VICTORY_ROOT_VIEW_MB` sets a limit again.)
 fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
+    root_view_len(list, address, srv).map(|(gpu, _)| gpu)
+}
+
+/// [`root_view`], with the bytes asked to be brought up to date (none for a
+/// constant buffer copied to scratch).
+fn root_view_len(list: &HostList, address: u64, srv: bool) -> Option<(u64, Option<u64>)> {
     static LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     let limit = *LIMIT.get_or_init(|| {
         std::env::var("VICTORY_ROOT_VIEW_MB")
@@ -880,9 +893,9 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
         shadow.refresh(list, address, len);
         #[cfg(feature = "diagnostics")]
         crate::book::root(gpu, len);
-        return Some(gpu);
+        return Some((gpu, Some(len)));
     }
-    list.fill_scratch(address as *const u8, len)
+    list.fill_scratch(address as *const u8, len).map(|gpu| (gpu, None))
 }
 
 macro_rules! once {
@@ -2103,7 +2116,7 @@ impl State {
                         }
                         continue;
                     }
-                    let gpu = match root_view(list, address, srv) {
+                    let gpu = match self.root_view(list, address, srv) {
                         Some(gpu) if biased => {
                             gpu - u64::from(self.host_word(
                                 compute,
@@ -2391,6 +2404,36 @@ impl State {
             s.refresh(list, address, len);
             self.root_tails.insert(std::sync::Arc::as_ptr(s) as usize, (epoch, address));
         }
+    }
+
+    /// [`root_view`], or what it gave for the same view earlier in the list
+    /// when nothing it looks at has moved since (`root_views`). Draws of a
+    /// world frame bind 2.5 root views each, mostly the ones the draw before
+    /// bound.
+    fn root_view(&mut self, list: &HostList, address: u64, srv: bool) -> Option<u64> {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ON.get_or_init(|| crate::switch::on("VICTORY_ROOT_SAME")) {
+            return root_view(list, address, srv);
+        }
+        let key = (address, u64::from(srv));
+        let at = (list.epoch(), crate::shadow::changes());
+        if let Some(&(epoch, changes, gpu, _len)) = self.root_views.get(&key)
+            && (epoch, changes) == at
+        {
+            #[cfg(feature = "diagnostics")]
+            {
+                crate::copystat::add(crate::copystat::C::RootSameHit, 1);
+                crate::book::root(gpu, _len);
+            }
+            return Some(gpu);
+        }
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::RootSameMiss, 1);
+        let (gpu, len) = root_view_len(list, address, srv)?;
+        if let Some(len) = len {
+            self.root_views.insert(key, (at.0, at.1, gpu, len));
+        }
+        Some(gpu)
     }
 
     /// For a shader that picks buffers from the view heap by an index it

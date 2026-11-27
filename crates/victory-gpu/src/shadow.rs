@@ -5616,6 +5616,11 @@ fn buffers() -> std::sync::RwLockWriteGuard<'static, BTreeMap<(u64, usize), Entr
 /// How often [`BUFFERS`] was taken to be changed.
 static BUFFERS_CHANGED: AtomicU64 = AtomicU64::new(1);
 
+/// [`BUFFERS_CHANGED`]: what [`find`] answers holds while it stays.
+pub(crate) fn changes() -> u64 {
+    BUFFERS_CHANGED.load(Ordering::SeqCst)
+}
+
 /// Answers a thread remembers.
 const FOUND_MOST: usize = 1024;
 

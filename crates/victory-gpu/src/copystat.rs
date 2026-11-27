@@ -404,6 +404,10 @@ pub(crate) enum C {
     /// them (`draw.rs` `refresh_tail`).
     RootTailAsked,
     RootTailCovered,
+    /// Root views bound as the list bound them before, and looked up
+    /// (`draw.rs` `State::root_view`, `VICTORY_ROOT_SAME`).
+    RootSameHit,
+    RootSameMiss,
     /// Settles for tables that came back with too few slots, and the asks
     /// refused without one while the settles are held back after such a
     /// settle (`draw.rs` `dynamic_slots`, `VICTORY_SETTLE_BACKOFF`).
@@ -504,6 +508,7 @@ pub(crate) const NAMES: [&str; 241] = [
     "TexRowsDetiled", "PlacedUavRefused",
     "HeapTexMirrorNs", "HeapTexHostNs", "HeapTexPrintNs",
     "RootTailAsked", "RootTailCovered",
+    "RootSameHit", "RootSameMiss",
     "SettlesBare", "SettlesHeld",
     "TableCacheHit", "TableCacheHitSlots", "TableCacheMiss", "TableCacheStale",
     "TableCacheChanged", "TableCacheRetired", "TableCacheRetiredSlots",
