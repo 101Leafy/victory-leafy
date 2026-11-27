@@ -1336,7 +1336,9 @@ mod tests {
     #[test]
     fn places_written_after_sending_are_learned() {
         // Two pages of memory of our own, page-aligned, as title memory.
-        let memory = vec![0u8; 4 * 4096];
+        // Learned pages are never forgotten and the tests share them: kept
+        // for good, so no other test gets the same place.
+        let memory = vec![0u8; 4 * 4096].leak();
         let page = (memory.as_ptr() as usize).next_multiple_of(4096);
         let (kept, changed) = (page, page + 4096 + 64);
         // What the card read: the bytes as they were, at 0 and 256 of the
@@ -1351,14 +1353,13 @@ mod tests {
         assert!(late::written(changed, changed + 240));
         // The whole page: another constant buffer in it waits too.
         assert!(late::written(page + 4096, page + 4096 + 16));
-        drop(memory);
     }
 
     /// A fill the CPU did into upload memory, whose place the title wrote
     /// again before landing, is learned; one that still matches is not.
     #[test]
     fn fills_done_on_the_cpu_are_learned_too() {
-        let memory = vec![0u8; 4 * 4096];
+        let memory = vec![0u8; 4 * 4096].leak();
         let page = (memory.as_ptr() as usize).next_multiple_of(4096);
         let (kept, changed) = (page + 16, page + 4096 + 0xbd0);
         // The upload memory each was filled into: the bytes as they were.
@@ -1370,7 +1371,7 @@ mod tests {
         late::landed_cpu(&cpu);
         assert!(!late::written(kept, kept + 32));
         assert!(late::written(changed, changed + 0x220));
-        drop((memory, upload));
+        drop(upload);
     }
 
     /// Only what is asked for is taken, all of it, and a step that stands
