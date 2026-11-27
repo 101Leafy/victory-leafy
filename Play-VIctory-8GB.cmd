@@ -34,10 +34,19 @@ rem ---------------------------------------------------------------------------
 set "profile=%~1"
 if not defined profile set "profile=1080p"
 rem
-rem Second argument: `perf` turns the five switches on that no one has seen render
-rem on an 8 GiB card yet (see the block further down). Without it they are 0, so a
-rem run with no second argument draws with the settings the leading continuation
+rem Second argument: `perf` turns three preparing switches on that no one has seen
+rem render on an 8 GiB card yet (see the block further down). Without it they are 0, so
+rem a run with no second argument draws with the settings the leading continuation
 rem ships. A run with no 3D is not a frame rate.
+rem
+rem Two switches and one more are NOT behind `perf` any more, because they were seen
+rem to take the picture away on the 5070 8 GiB card (Logan-Gaillard, 2026-11-27):
+rem   VICTORY_FILL_FORWARD / VICTORY_PLACED_ORDER  blanked a world frame (detail 0.32,
+rem     luminance 20.3 against 91.6 on the reference build)
+rem   VICTORY_TEXTURE_NO_WAIT=1  turns "waiting for room" into "absent", and the runs
+rem     with it lost the environment and its textures (21.0 luminance, 45.5 % of the
+rem     pixels under 16 against 0.3 % on the reference build)
+rem They stay settable by hand, and their blocks below say why they are not defaults.
 set "experiments=0"
 if /i "%~2"=="perf" set "experiments=1"
 
@@ -151,7 +160,8 @@ rem another on the thread that settles (about 630 pieces and 40 MB a frame),
 rem taken instead by eight threads an eighth each.
 if not defined VICTORY_WIDE_MERGE set "VICTORY_WIDE_MERGE=1"
 rem
-rem `perf` only. The parts of one submission go to the queue in one call instead of one
+rem `perf` only (it moves waits, not what is drawn). The parts of one submission go to
+rem the queue in one call instead of one
 rem call a part (VICTORY_JOIN_ONE_CALL, off by default; Skyfrye's
 rem AnyXboxX#337, with barriers standing in for the cuts). A frame that
 rem hands the card 58 pieces, which is what the card-span columns measured on
@@ -172,8 +182,11 @@ rem on the old values, which is what the pair is documented for. Both are off
 rem in the engine and this is the only place they are turned on. If constants
 rem look wrong (camera, lighting, a smeared sky), set BOTH to 0 before
 rem launching and say so: that is a real finding, not a user error.
-if not defined VICTORY_FILL_FORWARD set "VICTORY_FILL_FORWARD=%experiments%"
-if not defined VICTORY_PLACED_ORDER set "VICTORY_PLACED_ORDER=%experiments%"
+rem 0 whatever the tier: this pair was measured blanking a world frame on the 5070
+rem (one capture of run D, detail 0.32 against 2.68). A switch whose failure is
+rem visible is the one allowed to be on, and this is that failure, seen.
+if not defined VICTORY_FILL_FORWARD set "VICTORY_FILL_FORWARD=0"
+if not defined VICTORY_PLACED_ORDER set "VICTORY_PLACED_ORDER=0"
 
 rem Keeping the card's clocks up between submissions, and the submission
 rem stages the continuation keeps on for this profile.
@@ -192,7 +205,11 @@ if not defined VICTORY_CARD_REHASH_RUNS set "VICTORY_CARD_REHASH_RUNS=1"
 if not defined VICTORY_PORT_JOURNAL set "VICTORY_PORT_JOURNAL=1"
 
 rem A texture that is waiting for room is not waited for.
-if not defined VICTORY_TEXTURE_NO_WAIT set "VICTORY_TEXTURE_NO_WAIT=1"
+rem Not a default and not behind `perf`: with it the world's environment and its
+rem textures are absent rather than late (Logan-Gaillard, 2026-11-27: 21.0 luminance
+rem against 91.6, 45.5 % of pixels under 16 against 0.3 %). Set it by hand to see a
+rem run without the waits; do not read a frame time from that picture.
+if not defined VICTORY_TEXTURE_NO_WAIT set "VICTORY_TEXTURE_NO_WAIT=0"
 
 rem A constant, not the frame estimate: walking into a bright doorway raised
 rem the estimate and washed the whole frame out. constant:1.0 is even light.
@@ -214,8 +231,8 @@ if not defined VICTORY_CACHE_DIR set "VICTORY_CACHE_DIR=%LOCALAPPDATA%\VIctory\c
 if not defined VICTORY_LOG if not defined RUST_LOG set "VICTORY_LOG=warn"
 
 echo VIctory: %profile% [VICTORY_OUTPUT=%VICTORY_OUTPUT%] experiments=%experiments% runner=%runner%
-if not "%experiments%"=="1" echo VIctory: the five speculative switches are off (no 3D last time? this is the run that draws). 
-if "%experiments%"=="1" echo VIctory: five switches ON that have never been seen to render on an 8 GiB card: if the picture is wrong, drop "perf".
+if not "%experiments%"=="1" echo VIctory: three speculative switches are off (no 3D last time? this is the run that draws).
+if "%experiments%"=="1" echo VIctory: three switches ON that have never been seen to render on an 8 GiB card: if the picture is wrong, drop "perf".
 if defined VICTORY_FRAMES echo VIctory: frames to %VICTORY_FRAMES%
 "%runner%" run "%VICTORY_GAME_DIR%\game_scarlett_master.exe" --console series-x --execute
 exit /b %errorlevel%

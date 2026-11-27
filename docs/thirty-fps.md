@@ -15,6 +15,76 @@ room to spare. His 378 ms is a world load, where everything is being made for th
 first time. Whether the card is a wall in play on his machine is one of the things
 the test run is for — and it is a question, not a conclusion.
 
+## What the four builds said (Logan-Gaillard, RTX 5070 Laptop 8 GiB, 2026-11-27 13:35)
+
+One dump (`b99f876b74d4a77f…`), same cache, 140 s a run killed by `timeout`, screenshots
+taken from the game window. Four builds:
+
+| | A — reference | B — everything, no switch | C — everything + `1080p` | D — everything + `1080p perf` |
+|---|---|---|---|---|
+| build | `20eb157` + the adapter | `bf0e145`, diag | same | same |
+| outcome | 1,451 frames, no crash | **crash** (`0x80000003`, ~85 frames) | 1,343 frames | 1,316 frames |
+| `frame_us` median | 33.4 ms | — | 33.3 ms | 33.4 ms |
+| `card_idle_us` median | 29.9 ms | — | 32.5 ms | 32.6 ms |
+| `vram_used` peak | 7.95 GB | 1.57 GB at death | **9.48 GB** | 9.25 GB |
+| `vram_shared` peak | 6.82 GB | — | **9.64 GB** | 9.16 GB |
+| budget | 7.47 GB | | 7.47 GB | 7.47 GB |
+| `drawn` median | 10 (p90 22) | — | 10 (p90 22) | 10 (p90 22) |
+| the picture | luminance 91.6, 0.3 % of pixels under 16, detail 2.68 | — | 21.0, **45.5 %** under 16 | one capture at detail **0.32** (a flat field) |
+
+Four things, in the order they change the plan.
+
+**1. A is not the control it looks like, and the comparison is confounded.** A is
+`20eb157`, a `full-build` commit from 2026-11-26 13:50. `full-build` is now `bccee2c`,
+and there are **1,262 commits between them** (`git log --oneline 20eb157..origin/full-build
+| wc -l`). So A against B differs by my pull requests *and* by a day of upstream work.
+The control for "is it mine" is `rebase/logan-adapter` — that is head plus the adapter and
+nothing else, two commits on top of `bccee2c`. Until that build runs on this dump, the
+crash is not attributed to anything, and I should not have let a day-old base be called the
+reference in the first place.
+
+**2. The median frame at 1080p is the title's own clock, not ours.** 33.4 ms with the card
+idle 29.9 of it, in A, C and D alike: all three sit at ~30 Hz with the card nearly idle.
+That revises what I said last cycle and it has to be said plainly: **93 ms of preparing is a
+4K world-load figure, not a 1080p one.** "A frame cannot be shorter than its preparing, so
+the ceiling is 10.8 fps at any size" is wrong as stated — it is a ceiling for *that kind of
+frame*, and at 1080p the reference build already sits at 33 ms in the median. What is still
+true: 1,451 frames in 140 s is 10.4 a second on average against a 33.4 ms median, so the
+average is eaten by a long tail of stalls, which is a different problem from the one the
+plan was aimed at.
+
+**3. `budget_refused` was a bad name and misled the reader it was written for.** It is
+`BUDGET_NOTES[0]`: the **indirect records that ran empty for want of their command list's
+2^27 budget** inside the shaders (`host.rs:8167`, reported by the frame-rate line as
+"indirect records a frame ran empty"). It has nothing to do with card memory, and a run with
+it at 0 says nothing about whether the port refused an upload. The column is `records_refused`
+now, with that in a comment. So "9.6 GB against a 7.47 GB budget with `budget_refused` 0" is
+not a contradiction — it is two unrelated facts, and the memory question is still open.
+
+**4. The new gauges are what closes it without another bisect.** `vram_used` alone cannot
+say whether the 2.2 GB past the budget is ours or the title's and the driver's, and no
+switch of ours can refuse theirs. The CSV now carries `ours_host_textures`,
+`ours_targets_reserve` and `ours_card_room` beside it: the host copies of the title's
+textures, the room kept back for the world's render targets (#26's figure), and the room
+kept for card copies of buffers not made yet.
+
+Two items the same run settles:
+
+- **Step 3 is not payable, and the column says so.** `snapshot_bytes` is **690 MB median**
+  per submission stream (108 of 1,343 frames carry a non-zero sample), 699 MB peak. Two
+  submissions in flight is ~1.4 GB of snapshots on a card already 2.2 GB past its budget.
+  Step 3 is closed here, by measurement, rather than by argument.
+- **The fill-forward pair is off everywhere now.** One capture of run D is a flat field
+  (detail 0.32 against 2.68): `VICTORY_FILL_FORWARD` + `VICTORY_PLACED_ORDER` blanked a world
+  frame. That is the failure mode the pair was allowed to have *because* it would be seen;
+  it was seen, so it is out of the launcher's tiers. Its 13-28 ms (and 40-60 ms in `n19`)
+  were real waits removed, and the picture was the price.
+
+`VICTORY_TEXTURE_NO_WAIT=1` is out of the launcher's default tier for the same kind of
+reason, and it is the likelier cause of the missing environment: it turns "waiting for room"
+into "absent", and the run with it had 45.5 % of its pixels under 16 while the reference had
+0.3 %. The 21.0 luminance is a world with its textures gone, not a world drawn slowly.
+
 ## The arithmetic, before any switch
 
 A frame cannot be shorter than the work of preparing it: the card is handed the
@@ -108,6 +178,12 @@ same idea one level down.
 
 ### 3. Ask for the next submission while this one is sent (the second item)
 
+**Closed by measurement, 2026-11-27.** `snapshot_bytes` — the ranges shaders write, copied
+per submission — is 690 MB median and 699 MB peak on the 8 GiB machine. Two in flight is
+~1.4 GB, on a card already 2.2 GB past its budget with the world's textures missing. The
+step is not payable in memory as the branch stands, and it is no longer in the plan until
+the overrun in §"What the four builds said" has a cause.
+
 Today the preparing thread waits on the submission it just handed over, because
 `self.submitted` is held from preparation to copy-back.
 
@@ -179,7 +255,10 @@ argument is `perf`.** The other four speculative switches the launcher used to s
 two preparing experiments, the one-call submission, and this pair — are off by default
 now, because the last 8 GiB run rendered no 3D with all of them on and **a run with no
 3D is not a frame rate**. `Play-VIctory-8GB.cmd 1080p` draws with what the leading
-continuation ships; `Play-VIctory-8GB.cmd 1080p perf` turns the five on, and the point of
+continuation ships; `Play-VIctory-8GB.cmd 1080p perf` turns on the three that only move
+waits (`REFRESH_FRONT`, `QUIET_WAITS`, `JOIN_ONE_CALL`), while this pair and
+`VICTORY_TEXTURE_NO_WAIT` stay 0 in both tiers: they were measured taking the picture away
+on the 5070 (`docs/thirty-fps.md`, the four builds), and the point of
 the pair is that its failure is visible in the picture rather than silent in a lost write:
 constants that read old values look wrong, and a person watching says so. The rest are not set, and the
 reason is the same for all of them: their failure mode is *a write nobody noticed*, the
