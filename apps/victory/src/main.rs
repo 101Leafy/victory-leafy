@@ -170,6 +170,9 @@ enum Console {
 }
 
 fn main() -> Result<()> {
+    // Before anything else can take the address space it needs.
+    #[cfg(windows)]
+    victory_hle::reserve_upload_space();
     victory_core::logging::init("info");
     #[cfg(windows)]
     agility::load();
