@@ -101,6 +101,7 @@ pub(crate) struct ResourceDesc {
 #[cfg(windows)]
 impl ResourceDesc {
     /// The texture of this one's levels from `base` on.
+    #[allow(clippy::wrong_self_convention)] // it describes a level of this one, not a conversion from a value
     fn from_level(&self, base: u32) -> ResourceDesc {
         let mut d = *self;
         if base > 0 {
@@ -1935,7 +1936,7 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
         // used.
         Some([budget, used, ..]) => {
             used.saturating_sub(free_room()) + crate::shadow::card_room_kept() + targets_room_kept()
-                < budget / 100 * room_percent()
+                < room_line(budget)
         }
         None => filled < WITHOUT_BUDGET,
     }
@@ -2026,6 +2027,8 @@ pub(crate) fn room_lately() -> bool {
 /// textures wait (runs 170-174); the card copies of title buffers from
 /// 1 MiB up take 449 MB more of the card than before (941 against 492),
 /// and 94 gives the textures about that much back.
+///
+/// Unless that switch is set the line is [`line_for`] the budget instead.
 #[cfg(windows)]
 fn room_percent() -> u64 {
     static PERCENT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
@@ -2035,6 +2038,31 @@ fn room_percent() -> u64 {
             .and_then(|v| v.trim().parse::<u64>().ok())
             .map_or(90, |percent| percent.clamp(50, 97))
     })
+}
+
+/// The line [`room`] weighs the card's use against, in bytes of a budget
+/// of `budget`: `VICTORY_TEXTURE_ROOM_PERCENT`'s share of it if set, else
+/// [`line_for`] it.
+#[cfg(windows)]
+pub(crate) fn room_line(budget: u64) -> u64 {
+    static SET: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *SET.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_ROOM_PERCENT").is_some()) {
+        budget / 100 * room_percent()
+    } else {
+        line_for(budget)
+    }
+}
+
+/// The budget less what is left free for the host's own needs that are
+/// made with no room test (render target bursts, buffer copies, upload
+/// buffers): 768 MiB or a twentieth of the budget, whichever is more; never
+/// under 90 % of it. A flat 90 % left 1,060 MB of a 10,600 MB budget unused
+/// while new textures waited (2026-11-26 16:52 run: "no room" at 9,526 to
+/// 9,881 MB weighed against 9,519 to 9,583); this gives about 290 MB of it
+/// to textures there, and keeps 90 % on cards of 7.5 GB or less.
+#[cfg(any(windows, test))]
+fn line_for(budget: u64) -> u64 {
+    budget.saturating_sub((768u64 << 20).max(budget / 20)).max(budget / 100 * 90)
 }
 
 /// For the card accounting line ([`card_accounting`]): the title texture
@@ -2316,7 +2344,7 @@ pub(crate) fn let_go_idle() {
             let used = used.saturating_sub(free_room())
                 + crate::shadow::card_room_kept()
                 + targets_room_kept();
-            crate::host::vram_keep(budget, used)
+            crate::host::vram_keep_below(budget, used, room_line(budget))
         }
         _ => (crate::host::vram_idle_ms(memory), u64::MAX),
     };
@@ -3040,6 +3068,14 @@ pub(crate) fn texture_memory(this: This) -> Option<(*const u8, ResourceDesc)> {
     }
     let r = resource(this);
     (r.desc.dimension != BUFFER).then(|| (r.data().cast_const(), r.desc))
+}
+
+/// Whether resource `this` lies in memory the title mapped itself (made at
+/// an address): the only resource memory that can be unmapped while the
+/// resource lives. A committed resource's memory and a heap's are ours,
+/// allocated and zeroed whole when they were made.
+pub(crate) fn at_title_address(this: This) -> bool {
+    !this.is_null() && matches!(resource(this).backing, Backing::Address(_))
 }
 
 /// A buffer's host memory and size; `None` for textures.
@@ -3959,6 +3995,30 @@ mod tests {
             S_OK
         );
         heap
+    }
+
+    /// Only a resource made at an address the title mapped can lose its
+    /// memory while it lives (`crate::texture::staged` asks only of those).
+    #[test]
+    fn only_resources_at_a_title_address_may_lose_their_memory() {
+        let null = std::ptr::null();
+        let committed = test_buffer(256);
+        assert!(!at_title_address(committed));
+        let heap = heap(KIB_64);
+        let mut placed = null;
+        assert_eq!(create_placed(null, heap, 0, &texture(64, 64, 28, 1), 0, null.cast(), &RESOURCE_IIDS[0], &mut placed), S_OK);
+        assert!(!at_title_address(placed));
+        let title = vec![0u8; KIB_64 as usize];
+        let mut at = null;
+        assert_eq!(
+            create_at_address(null, title.as_ptr() as u64, &texture(64, 64, 28, 1), 0, null.cast(), &RESOURCE_IIDS[0], &mut at),
+            S_OK
+        );
+        assert!(at_title_address(at));
+        assert!(!at_title_address(null));
+        for r in [committed, placed, at, heap] {
+            slot::<Release>(r, 0x10)(r);
+        }
     }
 
     #[test]
@@ -5348,6 +5408,20 @@ float4 lit() : SV_Target { return 1.0; }
         assert_eq!(targets_kept_from_peak(most, 0, 2900 * MIB), most);
         // Nothing made yet: at least 256 MiB.
         assert_eq!(targets_kept_from_peak(most, 0, 0), 256 * MIB);
+    }
+
+    /// The texture queue's line: the budget less 768 MiB or 5 %, never under
+    /// 90 % of it.
+    #[test]
+    fn room_line_follows_the_budget() {
+        const MIB: u64 = 1 << 20;
+        // 10,600 MB: 768 MiB free (92.8 %), not 1,060 MB.
+        assert_eq!(line_for(10_600 * MIB), 9_832 * MIB);
+        // 24 GB: 5 % free.
+        assert_eq!(line_for(24_000 * MIB), 22_800 * MIB);
+        // 6 GB: 90 % (768 MiB would be more than a tenth).
+        assert_eq!(line_for(6_000 * MIB), 6_000 * MIB / 100 * 90);
+        assert_eq!(line_for(0), 0);
     }
 
     /// A placed texture viewed from a later level has a host copy of that

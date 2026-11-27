@@ -447,6 +447,35 @@ pub(crate) struct HostHeap {
     /// other memory there makes stale, and which to look at again when the
     /// runtime maps, unmaps or writes memory ([`remapped`]).
     placed: std::sync::Arc<Mutex<Spans>>,
+    /// The slots that may be in `placed` (a slot noted there is put here
+    /// under its lock, and taken out when it is forgotten there; a slot
+    /// another's view made stale stays, which says only "may"): a write of
+    /// any other view needs nothing of `placed` ([`spans_quick`]).
+    spanned: Slots,
+}
+
+/// Since the last frame line: writes that left `placed` alone
+/// ([`spans_quick`]), writes that took its lock.
+pub(crate) static SPANS_QUICK: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Whether a slot's write of no placed texture view leaves `placed` alone
+/// when the slot is not in it ([`HostHeap::spanned`]; `VICTORY_SPANS_QUICK=1`;
+/// off by default: its lock is taken for every write, as before).
+///
+/// Ported from Belobug/VIctory-Belobug-AMD a284ca7 (on by default there).
+/// Every record the pass over records copied as bytes mirrors went by that
+/// one lock of the heap, from six threads, with the title's own threads and
+/// the texture passes: 4 of the 16 ms a frame the submitting thread waited
+/// for that pass were its threads waiting there (their run city4, timeline
+/// 113). What is done is the same: forgetting a slot that is not there does
+/// nothing.
+fn spans_quick() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_SPANS_QUICK") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SPANS_QUICK").is_some_and(|v| v != "0"))
 }
 
 /// The spans of every view heap made ([`HostHeap::placed`]), for the
@@ -1885,6 +1914,12 @@ pub(crate) fn probe_view_limit() {
 /// table past them is made afresh in these slots like any other.
 pub(crate) const DYNAMIC: u32 = 1 << 18;
 
+/// For the line of `crate::host::wait_for_slots`: the fewest dynamic slots a
+/// view heap had free since the last line (`u32::MAX`: none was asked for),
+/// and how many that heap has in all.
+pub(crate) static DYNAMIC_LOW: [std::sync::atomic::AtomicU32; 2] =
+    [std::sync::atomic::AtomicU32::new(u32::MAX), std::sync::atomic::AtomicU32::new(0)];
+
 /// [`DYNAMIC`] for a heap of `count` title slots whose null slot is `null`
 /// (0: none): up to four times as many where the host heap has the room (a
 /// host that takes more than [`PORTABLE_VIEWS`]; `VICTORY_DYNAMIC_SLOTS`
@@ -2093,6 +2128,7 @@ impl HostHeap {
                 }
                 spans
             },
+            spanned: Slots::new((count + extra) as usize),
         };
         FLIPS.lock().unwrap_or_else(|e| e.into_inner()).insert(h.id, Vec::new());
         // A slot never written is undefined: shaders reading one (a slot
@@ -2203,6 +2239,8 @@ impl HostHeap {
         let enough = self.free.load(std::sync::atomic::Ordering::Relaxed) >= n;
         let found = if enough { self.pool.take(n as usize) } else { None };
         let Some(first) = found else {
+            DYNAMIC_LOW[0].fetch_min(self.free.load(std::sync::atomic::Ordering::Relaxed), std::sync::atomic::Ordering::Relaxed);
+            DYNAMIC_LOW[1].store(self.dynamic, std::sync::atomic::Ordering::Relaxed);
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!(n, "no free dynamic descriptor slots: a table is not made"));
             #[cfg(feature = "diagnostics")]
@@ -2221,10 +2259,10 @@ impl HostHeap {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::DynamicNs, started.elapsed().as_nanos() as u64);
         let free = self.free.fetch_sub(n, std::sync::atomic::Ordering::Relaxed) - n;
+        DYNAMIC_LOW[0].fetch_min(free, std::sync::atomic::Ordering::Relaxed);
+        DYNAMIC_LOW[1].store(self.dynamic, std::sync::atomic::Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
         crate::copystat::most(crate::copystat::C::DynamicHeldMost, u64::from(self.dynamic - free));
-        #[cfg(not(feature = "diagnostics"))]
-        let _ = free;
         Some(self.count + first as u32)
     }
 
@@ -2780,10 +2818,7 @@ impl HostHeap {
             // (As `mirror`.)
             let stale = self.note_buffer(index, Some(&view), true);
             let old = view_at(shown as u32, (shown >> 32) as u32);
-            let kept = old.is_some_and(|old| match kin(&old, &view) {
-                Kin::Same => true,
-                kin => kin.kept(keep_shown()),
-            });
+            let kept = old.is_some_and(|old| kept_meanwhile(&old, &view));
             if shown == 0 || !kept {
                 #[cfg(feature = "diagnostics")]
                 note_before(index, shown, "neutral");
@@ -3296,8 +3331,21 @@ impl HostHeap {
             }
             _ => None,
         };
-        let stale = {
+        // (Under the slot's lock, as every write of it: whether it is in
+        // `spanned` changes only here.)
+        let in_spans = |index: u32| {
+            let bit = 1u64 << (index % 64);
+            self.spanned.0.get(index as usize / 64).is_none_or(|w| w.load(std::sync::atomic::Ordering::Acquire) & bit != 0)
+        };
+        let quick = spans_quick();
+        let stale = if quick && placed_view.is_none() && !in_spans(index) {
+            SPANS_QUICK[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Vec::new()
+        } else {
             use std::sync::atomic::Ordering::Relaxed;
+            if quick {
+                SPANS_QUICK[1].fetch_add(1, Relaxed);
+            }
             let mut placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
             let span = placed_view.and_then(|(resource, start, first, held)| {
                 Some((start, start.saturating_add(placed.bytes(resource)?), first, held))
@@ -3307,6 +3355,7 @@ impl HostHeap {
                     SPANNED[0].fetch_min(start, Relaxed);
                     SPANNED[1].fetch_max(end, Relaxed);
                     placed.rule = stale_rule();
+                    self.spanned.put(index);
                     let stale = placed.note(index, start, end, !seen);
                     placed.shows(index, first, held);
                     // (Under the lock of `placed`: a later write of one of
@@ -3315,6 +3364,7 @@ impl HostHeap {
                 }
                 None => {
                     placed.forget(index);
+                    self.spanned.remove(index);
                     Vec::new()
                 }
             }
@@ -3992,7 +4042,7 @@ impl HostHeap {
                 // ([`keep_shown`]): black, then grey for a frame or two is
                 // what popped.
                 if is_texture_view(&old) {
-                    let kept = kin.kept(keep_shown());
+                    let kept = kept_meanwhile(&old, &view);
                     rewritten(kin, kept);
                     if kept {
                         self.note_keeping(index);
@@ -5406,7 +5456,9 @@ fn kin(old: &View, new: &View) -> Kin {
 /// showing the one it shows until the new one is made and its upload has run
 /// (`VICTORY_KEEP_SHOWN`): 0: never, it reads as zeros, then as the neutral
 /// texture; 1: one of the same kind in another place or size; 2: any of the
-/// same dimension.
+/// same dimension; `checked`: as 1, except that a texture of the same
+/// description placed elsewhere ([`Kin::Moved`]) is kept only when both
+/// memories begin and end with the same 4 KiB.
 fn keep_shown() -> u8 {
     #[cfg(feature = "diagnostics")]
     if let Some(on) = crate::ab::pick("VICTORY_KEEP_SHOWN") {
@@ -5414,6 +5466,69 @@ fn keep_shown() -> u8 {
     }
     static KEEP: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *KEEP.get_or_init(|| std::env::var("VICTORY_KEEP_SHOWN").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(1))
+}
+
+/// `VICTORY_KEEP_SHOWN=checked`: as 1, except that a slot written with a
+/// texture of the same description placed elsewhere ([`Kin::Moved`]) goes on
+/// showing the old one only where both memories begin and end with the same
+/// bytes, i.e. the title moved the texture. Otherwise it shows the neutral
+/// texture until the new one's upload has run.
+///
+/// Why: "the same kind elsewhere" also matches a streamer reusing a slot for
+/// a different texture of the same size and format (e.g. an albedo where a
+/// mask or another character's map was), which renders rainbow-noise texels on
+/// the surface until the upload lands.
+fn keep_checked() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_KEEP_SHOWN").is_ok_and(|v| v.trim() == "checked"))
+}
+
+/// Since the start, under `VICTORY_KEEP_SHOWN=checked`: `[0]` moved slots
+/// whose memories began and ended alike (kept), `[1]` moved slots whose
+/// memories differed or were unreadable (shown neutral).
+static CHECKED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Whether `old` stays in a slot rewritten with `new` until `new`'s upload
+/// runs ([`keep_shown`], [`keep_checked`]).
+fn kept_meanwhile(old: &View, new: &View) -> bool {
+    match kin(old, new) {
+        Kin::Same => true,
+        Kin::Moved if keep_checked() => {
+            let same = moved_whole(old, new);
+            CHECKED[usize::from(!same)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            same
+        }
+        kin => kin.kept(keep_shown()),
+    }
+}
+
+/// Whether the memories of two placed texture views of one description begin
+/// and end with the same bytes (4 KiB each end; title memory read as the
+/// texture pass reads it). False where either cannot be read.
+fn moved_whole(old: &View, new: &View) -> bool {
+    let (View::Placed(false, resource, from), View::Placed(false, _, to)) = (old, new) else {
+        return false;
+    };
+    let at = |d: &[u32]| u64::from(d[10]) | u64::from(d[11]) << 32;
+    let Some(bytes) = crate::resource::placed_bytes(resource) else {
+        return false;
+    };
+    same_ends(at(from), at(to), bytes, |at, out| crate::host::read_into(at as *const u8, out))
+}
+
+/// Whether `[a, a + bytes)` and `[b, b + bytes)` hold the same first and last
+/// 4 KiB (all of them under 8 KiB), read by `read` (false: unreadable).
+fn same_ends(a: u64, b: u64, bytes: u64, read: impl Fn(u64, &mut [u8]) -> bool) -> bool {
+    const END: u64 = 4096;
+    if a == 0 || b == 0 || bytes == 0 {
+        return false;
+    }
+    let ends = if bytes <= 2 * END { vec![(0, bytes)] } else { vec![(0, END), (bytes - END, END)] };
+    let (mut x, mut y) = (vec![0u8; END as usize * 2], vec![0u8; END as usize * 2]);
+    ends.into_iter().all(|(offset, len)| {
+        let len = len as usize;
+        read(a + offset, &mut x[..len]) && read(b + offset, &mut y[..len]) && x[..len] == y[..len]
+    })
 }
 
 /// Slots that showed a texture and were written with a view of another,
@@ -5434,12 +5549,14 @@ fn rewritten(kin: Kin, kept: bool) {
     let n: u64 = REWRITTEN[..4].iter().map(|n| n.load(Relaxed)).sum();
     if n.is_multiple_of(5000) {
         tracing::info!(
-            "slots that showed a texture and were written with another, since the start: {} of the same kind elsewhere, {} of another size, {} others, {} of another dimension; {} of them kept what they showed meanwhile (VICTORY_KEEP_SHOWN)",
+            "slots that showed a texture and were written with another, since the start: {} of the same kind elsewhere, {} of another size, {} others, {} of another dimension; {} of them kept what they showed meanwhile (VICTORY_KEEP_SHOWN); moved ones checked: {} with the same bytes kept, {} with other bytes shown neutral (VICTORY_KEEP_SHOWN=checked)",
             REWRITTEN[0].load(Relaxed),
             REWRITTEN[1].load(Relaxed),
             REWRITTEN[2].load(Relaxed),
             REWRITTEN[3].load(Relaxed),
-            REWRITTEN[4].load(Relaxed)
+            REWRITTEN[4].load(Relaxed),
+            CHECKED[0].load(Relaxed),
+            CHECKED[1].load(Relaxed)
         );
     }
 }
@@ -5531,6 +5648,48 @@ impl Copied<'_> {
         // SAFETY: within the records held; the caller's slots alone.
         let last = unsafe { std::slice::from_raw_parts_mut(self.at.add(at), end - at) };
         changed_records(last, &records[..end - at], self.step, first, out);
+    }
+
+    /// As [`Copied::changes`] for the `count` records of title memory at
+    /// `title` (slot `first` on), 32 bytes each, read where they are, each
+    /// once ([`crate::safecopy::changed`]); `bits` is room. False when a page
+    /// of them could not be read: those before it are done, the others
+    /// stay as last seen.
+    ///
+    /// # Safety
+    /// As [`Copied::changes`]; `title` is title memory (read by a copy that
+    /// fails where a page is not there).
+    pub(crate) unsafe fn changes_in_place(&self, first: u32, title: *const u8, count: usize, bits: &mut Vec<u64>, out: &mut Vec<u32>) -> bool {
+        let at = first as usize * self.step;
+        let count = count.min(self.len.saturating_sub(at) / 32);
+        if self.step != 32 || count == 0 {
+            return true;
+        }
+        bits.clear();
+        bits.resize(count.div_ceil(64), 0);
+        // SAFETY: within the records held; the caller's slots alone.
+        let whole = unsafe { crate::safecopy::changed(title, self.at.add(at), count, bits) };
+        for (n, &word) in bits.iter().enumerate() {
+            let mut word = word;
+            while word != 0 {
+                out.push(first + (n * 64) as u32 + word.trailing_zeros());
+                word &= word - 1;
+            }
+        }
+        whole
+    }
+
+    /// The `count` records last seen from slot `first` on (fewer where the
+    /// heap ends).
+    ///
+    /// # Safety
+    /// As [`Copied::changes`]: no other call beside this one has any of
+    /// these slots.
+    pub(crate) unsafe fn seen(&self, first: u32, count: usize) -> &[u8] {
+        let at = (first as usize * self.step).min(self.len);
+        let len = (count * self.step).min(self.len - at);
+        // SAFETY: within the records held; the caller's slots alone.
+        unsafe { std::slice::from_raw_parts(self.at.add(at), len) }
     }
 }
 
@@ -6821,6 +6980,38 @@ mod tests {
         assert_eq!(slots(u64::MAX), [2]);
     }
 
+    /// A write of no placed texture view forgets the slot in the spans
+    /// whether it goes by their lock or not (`spans_quick`): slots that are
+    /// in them stay marked, also one another's view made stale.
+    #[test]
+    fn writes_of_other_views_leave_the_spans_as_under_their_lock() {
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return; // no host GPU
+        };
+        let marked = |slot: u32| heap.spanned.all(|_| true).contains(&slot);
+        let at = 0x7fed_0000_0000u64;
+        let view = |address: u64, width: u32| {
+            let mut desc = [0u32; 16];
+            (desc[10], desc[11]) = (address as u32, (address >> 32) as u32);
+            View::Placed(false, [3, 0, 0, 0, width, 0, 64, 0x1_0001, 98, 1, 0, 0x105, 0, 0], desc)
+        };
+        assert!(heap.note_buffer(1, Some(&view(at, 64)), false).is_empty());
+        assert!(marked(1) && !marked(2));
+        // Slot 1 made stale by slot 2: out of `by_slot`, still in `first`.
+        assert_eq!(heap.note_buffer(2, Some(&view(at, 128)), false), [(1, 0)]);
+        assert!(marked(1) && marked(2));
+        assert!(heap.placed.lock().unwrap().first.contains_key(&1));
+        // Written with no view: forgotten, under the lock, and unmarked.
+        assert!(heap.note_buffer(1, None, false).is_empty());
+        assert!(!marked(1) && !heap.placed.lock().unwrap().first.contains_key(&1));
+        // A slot never in the spans: nothing there to change.
+        assert!(heap.note_buffer(3, None, false).is_empty());
+        assert!(heap.note_buffer(2, None, false).is_empty());
+        let spans = heap.placed.lock().unwrap();
+        assert!(spans.by_slot.is_empty() && spans.by_start.is_empty() && spans.first.is_empty());
+        assert!(heap.spanned.all(|_| true).is_empty());
+    }
+
     #[test]
     fn a_set_of_slots_holds_what_was_put_in() {
         let set = Slots::new(200);
@@ -7186,4 +7377,43 @@ pub(crate) fn note_listed(recording: u64, words: [u32; 3], listed: Listed) {
 /// for every table).
 pub(crate) fn list_views() -> bool {
     crate::toggled!("VICTORY_LIST_VIEWS")
+}
+
+#[cfg(test)]
+mod keep_checked_tests {
+    /// `VICTORY_KEEP_SHOWN=checked`: a texture of the same description elsewhere stands for the
+    /// new one only where both memories begin and end alike (a move), not where a streamer
+    /// gave the slot another texture of that size and format, nor where a memory is unreadable.
+    #[test]
+    fn a_moved_texture_is_kept_only_with_the_same_ends() {
+        let memory: Vec<u8> = (0..64 * 1024u32).map(|i| (i * 31 + i / 4096) as u8).collect();
+        let mut moved = memory.clone();
+        let mut other = memory.clone();
+        // (The middle of a move may still differ: only the ends are compared.)
+        moved[20_000] ^= 0xff;
+        other[64 * 1024 - 1] ^= 1;
+        let all = [memory.as_slice(), moved.as_slice(), other.as_slice()];
+        let base = |i: usize| (i as u64 + 1) << 32;
+        let read = |at: u64, out: &mut [u8]| {
+            let Some(bytes) = all.get(((at >> 32) as usize).wrapping_sub(1)) else {
+                return false;
+            };
+            let offset = (at & 0xffff_ffff) as usize;
+            match bytes.get(offset..offset + out.len()) {
+                Some(src) => {
+                    out.copy_from_slice(src);
+                    true
+                }
+                None => false,
+            }
+        };
+        let len = memory.len() as u64;
+        assert!(super::same_ends(base(0), base(1), len, read));
+        assert!(!super::same_ends(base(0), base(2), len, read));
+        // Unreadable (no such memory) or no address: not kept.
+        assert!(!super::same_ends(base(0), base(7), len, read));
+        assert!(!super::same_ends(0, base(1), len, read));
+        // Under 8 KiB: compared whole.
+        assert!(super::same_ends(base(0), base(1), 6000, read));
+    }
 }

@@ -7,8 +7,9 @@
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
-use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WAIT_OBJECT_0, WPARAM};
 use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -55,7 +56,7 @@ pub(crate) struct Host {
     /// layer's messages.
     messages: Option<ID3D12InfoQueue>,
     next_rtv: AtomicU32,
-    presenter: Mutex<Option<Presenter>>,
+    presenter: Mutex<Presentation>,
     /// The adapter the device is on, for its memory budget
     /// ([`Host::video_memory`]); `None` if the system does not name it.
     adapter: Option<IDXGIAdapter3>,
@@ -173,20 +174,31 @@ pub(crate) fn total_physical_ram() -> Option<u64> {
 /// (By those times everything idle for 2.5 s went from 75 % of the budget
 /// on: 61,000 of them in the first 300 s of session play-1125-0203, at 78 to
 /// 80 %, of which 13,000 were made and uploaded again.)
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn vram_keep(budget: u64, used: u64) -> (u64, u64) {
+    vram_keep_below(budget, used, budget / 100 * 90)
+}
+
+/// [`vram_keep`] around the texture queue's line `line` (`crate::resource::room_line`)
+/// instead of 90 % of the budget: none go while `used` is 2 % of the budget
+/// under it or more, those idle 5 s go down to 5 % under it while it is
+/// under 5 % over it, those idle 1.5 s above that. (At a line of 90 %: 88,
+/// 85 and 95 %, as [`vram_keep`] was.)
+pub(crate) fn vram_keep_below(budget: u64, used: u64, line: u64) -> (u64, u64) {
     const KEPT_MS: u64 = 600_000;
     const IDLE_MS: u64 = 5_000;
     const SHORT_MS: u64 = 1_500;
     if budget == 0 {
         return (IDLE_MS, u64::MAX);
     }
-    let share = |percent: u64| budget / 100 * percent;
-    if used < share(88) {
+    let step = budget / 100;
+    let aim = line.saturating_sub(5 * step);
+    if used < line.saturating_sub(2 * step) {
         (KEPT_MS, u64::MAX)
-    } else if used < share(95) {
-        (IDLE_MS, used - share(85))
+    } else if used < line + 5 * step {
+        (IDLE_MS, used.saturating_sub(aim))
     } else {
-        (SHORT_MS, used - share(85))
+        (SHORT_MS, used.saturating_sub(aim))
     }
 }
 
@@ -1406,7 +1418,7 @@ fn create() -> windows::core::Result<Host> {
             next_dsv: AtomicU32::new(0),
             messages,
             next_rtv: AtomicU32::new(0),
-            presenter: Mutex::new(None),
+            presenter: Mutex::new(Presentation::default()),
             adapter,
             fallback_view: OnceLock::new(),
             fallback_sampler: OnceLock::new(),
@@ -1636,6 +1648,27 @@ mod tests {
                 assert!(!second.first_builder_memory_use(key));
             }
         }
+    }
+
+    /// A failed call waits a second; a success clears the wait.
+    #[test]
+    fn swap_chain_failures_retry_once_per_second_and_success_clears_the_wait() {
+        use super::{Duration, Instant, SwapChainRetry};
+
+        let start = Instant::now();
+        let mut retry = SwapChainRetry::default();
+        let mut attempts = 0;
+        // Two seconds at 60 Hz, with a failure on every eligible attempt.
+        for frame in 0..120 {
+            retry.attempt(start + Duration::from_millis(frame * 1000 / 60), || {
+                attempts += 1;
+                Err::<(), _>("desktop unavailable")
+            });
+        }
+        assert_eq!(attempts, 2);
+        let recovered = start + Duration::from_secs(2);
+        assert_eq!(retry.attempt(recovered, || Ok::<_, ()>(42)), Some(Ok(42)));
+        assert_eq!(retry.attempt(recovered, || Ok::<_, ()>(43)), Some(Ok(43)));
     }
 
     /// A list of ours is found by its name, with the debug layer's note or not.
@@ -4260,6 +4293,7 @@ struct Flight {
 }
 
 /// One thing in the line of what waits for the card, in order.
+#[allow(clippy::large_enum_variant)] // the line holds one of them at a time, and only for a moment
 enum Late {
     Run(Flight),
     /// A bottom-of-pipe write of the flight before it: address, what, bytes.
@@ -5002,6 +5036,88 @@ pub(crate) fn settle_for_present() {
 pub(crate) fn settle_for_fence() {
     settle_now(WHY_FENCE);
 }
+
+/// Whether a draw that finds no free dynamic descriptor slot first waits for
+/// the next landing without the submission lock (`VICTORY_DYNAMIC_WAIT=1`;
+/// off by default: the settle rules of `draw::dynamic_slots` alone, as
+/// before).
+///
+/// The slots come back flight by flight, when the thread that lands flights
+/// is done with one, and that thread never takes the submission lock. A
+/// settle waits for all of them and keeps the lock meanwhile, so the
+/// submitting thread stands at the lock with submissions ready and the card
+/// runs dry behind it. With this the thread that translates the draw waits
+/// until a landing gave slots back, and takes them; other submissions go on
+/// meanwhile. With nothing in the air and nothing being landed no slot can
+/// come back that way, and the settle rules decide as before.
+fn dynamic_wait() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_DYNAMIC_WAIT").is_some_and(|v| v == "1"))
+}
+
+/// Since the last frame-rate line: asks that found no free dynamic
+/// descriptor slot and waited for landings ([`dynamic_wait`]); the
+/// microseconds they waited; those that had their slots after a landing;
+/// those left to the settle rules all the same.
+static DYNAMIC_WAITS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// `take` found no free dynamic descriptor slots (it gives `None`): with
+/// [`dynamic_wait`] and [`relay`], waits for flights to land, which gives
+/// their lists' slots back, and asks again, without the submission lock and
+/// only until `take` has its slots or nothing is left in the air. `None`
+/// when it is off or nothing came back.
+pub(crate) fn wait_for_slots(mut take: impl FnMut() -> Option<u32>) -> Option<u32> {
+    if !(dynamic_wait() && relay()) {
+        return None;
+    }
+    let began = std::time::Instant::now();
+    DYNAMIC_WAITS[0].fetch_add(1, Ordering::Relaxed);
+    let mut found;
+    {
+        let _waiting = crate::timeline::span("waiting for landings: dynamic descriptor slots");
+        loop {
+            // (Looked at before the asking: what lands after this look is
+            // waited for below.)
+            let nothing = {
+                let line = line();
+                line.line.is_empty() && !line.settling
+            };
+            found = take();
+            if found.is_some() || nothing {
+                break;
+            }
+            // A landing that ended between the asking and here is not
+            // told again: looked at once a millisecond all the same.
+            let line = line();
+            drop(LINE_LANDED.wait_timeout(line, std::time::Duration::from_millis(1)).unwrap_or_else(|e| e.into_inner()));
+        }
+    }
+    DYNAMIC_WAITS[if found.is_some() { 2 } else { 3 }].fetch_add(1, Ordering::Relaxed);
+    DYNAMIC_WAITS[1].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
+    found
+}
+
+/// For the frame-rate line: [`DYNAMIC_WAITS`] per frame, and the fewest
+/// dynamic slots a view heap had free since the last line.
+fn dynamic_wait_line(frames: f64) {
+    let w: Vec<f64> = DYNAMIC_WAITS.iter().map(|w| w.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+    let low = crate::descriptor::host::DYNAMIC_LOW[0].swap(u32::MAX, Ordering::Relaxed);
+    if low == u32::MAX && w[0] <= 0.0 {
+        return;
+    }
+    tracing::info!(
+        "dynamic descriptor slots: the fewest free since the last line {} of {}; per frame {:.2} asks found none and waited \
+         {:.1} ms for landings, {:.2} had their slots after a landing, {:.2} were left to the settle rules \
+         (VICTORY_DYNAMIC_WAIT=1 waits for the next landing without the submission lock: now {})",
+        if low == u32::MAX { 0 } else { low },
+        crate::descriptor::host::DYNAMIC_LOW[1].load(Ordering::Relaxed),
+        w[0],
+        w[1] / 1000.0,
+        w[2],
+        w[3],
+        if dynamic_wait() && relay() { "on" } else { "off" }
+    );
+}
 /// [`settle_now`] when the dynamic descriptor slots ran out: the flights'
 /// lists give theirs back as they land. Counted with the settles for too
 /// much in the air, which it is.
@@ -5023,6 +5139,49 @@ fn land() {
     };
     for (lists, order) in landed {
         crate::list::recycle(lists, &order);
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn host_fence_completion_rejects_removed_device() {
+    assert!(!fence_reached(u64::MAX, 1));
+    assert!(!fence_reached(6, 7));
+    assert!(fence_reached(7, 7));
+    assert!(fence_reached(8, 7));
+}
+
+/// Whether a fence's completed value shows `target` run. `u64::MAX` is not
+/// a value the card reaches: it is what `GetCompletedValue` answers when the
+/// device is gone.
+fn fence_reached(completed: u64, target: u64) -> bool {
+    completed != u64::MAX && completed >= target
+}
+
+/// Waits for `target` on `fence` and reports what went wrong instead of
+/// carrying on: a failed wait used to fall through to the landing step with
+/// nothing run, settling flights off an unsent fence value, and a lost
+/// device (a completed value of `u64::MAX`) made every wait pass at once.
+///
+/// # Safety
+///
+/// `event` is the calling thread's own, never closed while it waits.
+unsafe fn wait_host_fence(fence: &ID3D12Fence, target: u64, event: HANDLE, context: &str) {
+    // SAFETY: the caller's fence and event, alive for the whole wait.
+    if let Err(e) = unsafe { fence.SetEventOnCompletion(target, event) } {
+        fail(format_args!(
+            "{context}: SetEventOnCompletion({target}) failed: {e}"
+        ));
+    }
+    let status = unsafe { WaitForSingleObject(event, INFINITE) };
+    if status != WAIT_OBJECT_0 {
+        fail(format_args!("{context}: fence wait failed: {status:?}"));
+    }
+    let completed = unsafe { fence.GetCompletedValue() };
+    if !fence_reached(completed, target) {
+        fail(format_args!(
+            "{context}: fence {completed} did not reach {target}"
+        ));
     }
 }
 
@@ -5065,14 +5224,10 @@ fn late_helper() {
         };
         // The card first, without the submission lock: the submitting
         // thread prepares and sends meanwhile.
+        #[cfg(feature = "diagnostics")]
+        let _card = crate::timeline::card_wait(Some(target));
         // SAFETY: our fence and event.
-        unsafe {
-            if host.fence.SetEventOnCompletion(target, event).is_ok() {
-                #[cfg(feature = "diagnostics")]
-                let _card = crate::timeline::card_wait(Some(target));
-                WaitForSingleObject(event, INFINITE);
-            }
-        }
+        unsafe { wait_host_fence(&host.fence, target, event, "late helper") };
         {
             let mut submitted = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
             // Something newer went up meanwhile: the card is waited for
@@ -5238,14 +5393,7 @@ fn relay_worker() {
                 #[cfg(feature = "diagnostics")]
                 let _card = crate::timeline::card_wait(Some(target));
                 // SAFETY: the host's fence and this thread's event.
-                let waited = unsafe {
-                    host.fence.SetEventOnCompletion(target, event).map(|()| {
-                        WaitForSingleObject(event, INFINITE);
-                    })
-                };
-                if waited.is_err() {
-                    std::thread::sleep(std::time::Duration::from_millis(1));
-                }
+                unsafe { wait_host_fence(&host.fence, target, event, "relay") };
                 RELAY_STATS[2].fetch_add(waiting.elapsed().as_micros() as u64, Ordering::Relaxed);
             }
         }
@@ -5486,6 +5634,7 @@ fn late_line(frames: f64) {
     }
     card_steps::log(frames);
     fetch_waits::log(frames);
+    dynamic_wait_line(frames);
     crate::port_journal::line(frames);
     crate::port::log(frames);
     crate::port_cbv::log(frames);
@@ -7954,6 +8103,9 @@ impl Host {
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
         let was_working = working(true);
         submitting(1, runs.len());
+        // With [`heap_sync_first`]: the heaps' records begun now, beside the
+        // planning of steps done on the card and the look at flights.
+        let first_heaps = (late && heap_sync_first()).then(crate::descriptor::begin_sync_heaps);
         #[cfg(feature = "diagnostics")]
         let ahead = Split::begin();
         #[cfg(feature = "diagnostics")]
@@ -7990,6 +8142,7 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         ahead.part(12);
         stage.next("submit: waiting for flights it reads from");
+        let mut waited_for_flights = false;
         if !late {
             self.settle(&mut submitted, WHY_SYNC);
         } else if own.is_none()
@@ -8015,10 +8168,25 @@ impl Host {
         // command lists that index those slots are submitted.
         // Renderer port #7 (from renderer patch #4): the round asked for when
         // the title submitted it, if that is known (`crate::port_journal`).
+        // With [`heap_sync_first`] the round begun first is taken, or after a
+        // wait for flights, whose landings wrote title memory, another is
+        // begun, as the first saw them; the first is not waited for.
         let heaps_on = crate::port_journal::on();
-        let heaps_synced = match crate::port_journal::needed() {
-            0 => crate::descriptor::begin_sync_heaps(),
-            mark => crate::descriptor::begin_sync_heaps_after(mark),
+        let heaps_synced = match (first_heaps, waited_for_flights) {
+            (Some(first), false) => {
+                HEAP_SYNC_FIRST[0].fetch_add(1, Ordering::Relaxed);
+                first
+            }
+            (first, _) => {
+                if let Some(first) = first {
+                    HEAP_SYNC_FIRST[1].fetch_add(1, Ordering::Relaxed);
+                    std::mem::forget(first);
+                }
+                match crate::port_journal::needed() {
+                    0 => crate::descriptor::begin_sync_heaps(),
+                    mark => crate::descriptor::begin_sync_heaps_after(mark),
+                }
+            }
         };
         // That list runs first, and is one of the submission's from here on.
         let with: Vec<&HostList>;
@@ -10378,6 +10546,31 @@ static FLUSHES: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::
 #[cfg(feature = "diagnostics")]
 static FRONT: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
+/// Whether a submission sent ahead begins the round of the heaps' records
+/// (`crate::descriptor::begin_sync_heaps`) as soon as it holds the
+/// submission lock, before the steps done on the card are planned and
+/// flights are looked at (`VICTORY_HEAP_SYNC_FIRST=1`; off by default: after
+/// them, as before). With `VICTORY_PORT_JOURNAL=1` it does nothing: the
+/// journal asks for the round at the title's submit, earlier still.
+///
+/// From trustno1-coder's fork: there the submitting thread waited for those
+/// rounds at the end of its preparing, 2.7-5.8 ms a frame, while the
+/// planning ahead of the round's start took 2-4 ms a frame. What changes:
+/// the round reads the heaps' pages earlier, by that planning's time. A
+/// record the title writes for this submission after submitting it (which
+/// the console's card could miss as well) is left to the next round; a
+/// submission that waited for flights to land begins another round after
+/// the wait, as the round begun here saw what they landed.
+fn heap_sync_first() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_HEAP_SYNC_FIRST") && !crate::port_journal::on())
+}
+
+/// Since the last frame line, with [`heap_sync_first`]: submissions whose
+/// round of the heaps' records was begun first, and those that began
+/// another after a wait for flights.
+static HEAP_SYNC_FIRST: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
 /// Counts into [`SPLIT`].
 #[cfg(feature = "diagnostics")]
 struct Split(std::cell::Cell<std::time::Instant>);
@@ -10883,6 +11076,7 @@ enum Touch {
     /// The copy is given to shaders.
     Write(usize),
     /// Title memory is written.
+    #[cfg_attr(not(test), allow(dead_code))] // no step makes it; the tests do
     Title,
     Nothing,
     /// Another part of the submission begins.
@@ -12043,6 +12237,37 @@ fn buffers() -> u32 {
     })
 }
 
+/// The swap chain and whether making or resizing it may be tried now: a
+/// desktop can become presentable again, and DXGI calls during an outage
+/// are throttled to one a second.
+#[derive(Default)]
+struct Presentation {
+    presenter: Option<Presenter>,
+    retry: SwapChainRetry,
+}
+
+#[derive(Default)]
+struct SwapChainRetry {
+    next_attempt: Option<Instant>,
+}
+
+impl SwapChainRetry {
+    /// `Some(result)` when the call may be made now (a failed call waits a
+    /// second before the next), `None` while it may not.
+    fn attempt<T, E>(
+        &mut self,
+        now: Instant,
+        operation: impl FnOnce() -> Result<T, E>,
+    ) -> Option<Result<T, E>> {
+        if self.next_attempt.is_some_and(|next| now < next) {
+            return None;
+        }
+        let result = operation();
+        self.next_attempt = result.is_err().then(|| now + Duration::from_secs(1));
+        Some(result)
+    }
+}
+
 struct Presenter {
     swap_chain: IDXGISwapChain3,
     width: u32,
@@ -12236,6 +12461,13 @@ impl Meter {
         upq::line(frames);
         crate::shadow::exact_line(frames);
         crate::descriptor::sync_line(frames);
+        if heap_sync_first() {
+            let [first, again] = [0, 1].map(|i| HEAP_SYNC_FIRST[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            tracing::info!(
+                "the heaps' records begun as a submission took the lock, per frame (VICTORY_HEAP_SYNC_FIRST=1): {first:.1}, and \
+                 {again:.1} begun again after a wait for flights"
+            );
+        }
         late_line(frames);
         crate::queue::behind_line(frames);
         card_clock_line(frames, ms);
@@ -12261,10 +12493,12 @@ impl Meter {
         split_line(frames);
         {
             let [passes, pieces, compares] = [0, 1, 2].map(|i| CARD_PASSES[i].swap(0, Ordering::Relaxed) as f64 / frames);
-            if passes + compares > 0.0 {
+            let wc_left = crate::shadow::WC_LEFT.swap(0, Ordering::Relaxed) as f64 / 1e6 / frames;
+            if passes + compares + wc_left > 0.0 {
                 tracing::info!(
                     "our passes over copies in the card's memory per frame: {passes:.0} hash passes over {pieces:.0} pieces after \
-                     ranges were sent up (VICTORY_CARD_REHASH_RUNS=1 joins them: now {}), {compares:.0} compare passes",
+                     ranges were sent up (VICTORY_CARD_REHASH_RUNS=1 joins them: now {}), {compares:.0} compare passes; \
+                     {wc_left:.1} MB declared written in write-combined memory left on the card (VICTORY_WC_NO_BACK)",
                     if rehash_runs() { "on" } else { "off" }
                 );
             }
@@ -12287,6 +12521,15 @@ impl Meter {
                      {through:.1} read through the kernel, {left:.1} left for the next refresh (a page was not there), \
                      {filled:.1} first fillings from the pages there (VICTORY_TEXTURE_FILL=0: left empty), {short:.1} of them \
                      with less than was mapped (looked at again)"
+                );
+            }
+            let [read, waited] =
+                [0, 1].map(|i| crate::texture::EXACT_UNLOCKED[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            if read + waited > 0.0 {
+                tracing::info!(
+                    "exact texture refreshes (uploads before a bake) that found title memory being remapped, per frame: \
+                     {read:.1} read whole through the kernel without waiting, {waited:.1} waited (a page was not there) \
+                     (VICTORY_EXACT_NO_WAIT=0: all wait)"
                 );
             }
         }
@@ -12534,12 +12777,13 @@ impl Host {
             format
         };
         let (width, height) = (desc.Width as u32, desc.Height);
-        let mut presenter = self.presenter.lock().unwrap_or_else(|e| e.into_inner());
+        let mut presentation = self.presenter.lock().unwrap_or_else(|e| e.into_inner());
+        let Presentation { presenter, retry } = &mut *presentation;
         if presenter.is_none() {
-            *presenter = match self.presenter(width, height, format) {
+            *presenter = match retry.attempt(Instant::now(), || self.presenter(width, height, format))? {
                 Ok(p) => Some(p),
                 Err(e) => {
-                    tracing::warn!(error = %e, "no swap chain");
+                    tracing::warn!(error = %e, width, height, format = format.0, "no swap chain");
                     return None;
                 }
             };
@@ -12554,7 +12798,7 @@ impl Host {
                 Err(e) => {
                     tracing::warn!(error = %e, "no composer for two planes; the first is shown alone");
                     NO_COMPOSER.store(true, Ordering::Relaxed);
-                    drop(presenter);
+                    drop(presentation);
                     return self.present_planes(texture, state, None, frame);
                 }
             }
@@ -12562,11 +12806,13 @@ impl Host {
         if (p.width, p.height, p.format) != (width, height, format) {
             // Presents sent ahead hold back buffers until they have run.
             settle_now(WHY_SYNC);
-            // SAFETY: no back buffer is held; every submission was waited for.
-            let resized = unsafe {
-                p.swap_chain
-                    .ResizeBuffers(buffers(), width, height, format, DXGI_SWAP_CHAIN_FLAG(0))
-            };
+            let resized = retry.attempt(Instant::now(), || {
+                // SAFETY: no back buffer is held; every submission was waited for.
+                unsafe {
+                    p.swap_chain
+                        .ResizeBuffers(buffers(), width, height, format, DXGI_SWAP_CHAIN_FLAG(0))
+                }
+            })?;
             match resized {
                 Ok(()) => {
                     (p.width, p.height, p.format) = (width, height, format);
@@ -14501,6 +14747,11 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert_eq!((ms, bytes), (5_000, 5 * gib));
         assert_eq!(vram_keep(100 * gib, 120 * gib), (1_500, 35 * gib));
         assert_eq!(vram_keep(0, 7).0, 5_000);
+        // Around a line of 93 % instead: kept under 91 %, down to 88 %.
+        use super::vram_keep_below;
+        assert_eq!(vram_keep_below(100 * gib, 90 * gib, 93 * gib).0, 600_000);
+        assert_eq!(vram_keep_below(100 * gib, 92 * gib, 93 * gib), (5_000, 4 * gib));
+        assert_eq!(vram_keep_below(100 * gib, 99 * gib, 93 * gib), (1_500, 11 * gib));
     }
 
     #[test]

@@ -107,6 +107,10 @@ mod texback;
 
 #[cfg(windows)]
 pub use host::{on_failure, start_host};
+/// Reserves the address space for memory shaders read by address; call it
+/// first thing, before the process's other allocations can fill [4 GiB, 2^37).
+#[cfg(windows)]
+pub use upload::reserve_space as reserve_upload_space;
 
 /// Whether `switch` is on now, if it is one of those `VICTORY_AB` turns on and
 /// off while the title runs (`ab`).
@@ -127,6 +131,8 @@ pub fn frames_begun() -> u64 {
 }
 #[cfg(windows)]
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_section_gone, title_memory_view};
+#[cfg(windows)]
+pub use shadow::title_memory_write_combined;
 #[cfg(windows)]
 pub use watch::{
     kernel_writing, mapping_costs, title_graphics_block, title_memory_allocated, title_memory_freed, title_memory_reading, title_memory_remapped,

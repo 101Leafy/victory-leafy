@@ -884,6 +884,27 @@ fn fill_unlocked() -> bool {
 /// got less than was mapped (their slots are looked at again).
 pub(crate) static UNLOCKED: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
+/// Since the last frame-rate line, exact refreshes (for a bake) that found
+/// the runtime remapping title memory ([`exact_unlocked`]): read whole
+/// through the kernel without waiting, and those that had to wait (a page
+/// was not there).
+pub(crate) static EXACT_UNLOCKED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Whether an exact refresh (the uploads before a bake, `BAKING`) that
+/// finds the runtime remapping title memory first reads the texture whole
+/// through the kernel, and waits for the remapping to end only if a page of
+/// it is not there (`VICTORY_EXACT_NO_WAIT=0`: it always waits, as before).
+/// A read through the kernel that succeeds got every byte as title memory
+/// holds it at that moment, which is what waiting gave; it fails, rather
+/// than reading something else, where a page is away. Waiting made the
+/// texture refreshes of a cutscene second 866 ms a frame, 808 of them
+/// waiting for title memory to hold still (diag run of 2026-11-26 15:58,
+/// with `VICTORY_TEXTURE_NO_WAIT=1`, where only exact refreshes wait).
+fn exact_unlocked() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_EXACT_NO_WAIT").is_none_or(|v| v != "0"))
+}
+
 /// Since the last frame-rate line, of texture refreshes on every thread, in
 /// microseconds: waiting for the texture's own lock (another thread is
 /// refreshing the same texture), asking the write watch and the guards,
@@ -2095,6 +2116,12 @@ impl Staging {
                 return self.refresh_unlocked(last, size);
             };
             mapped
+        } else if exact && exact_unlocked() {
+            match crate::watch::title_memory_reading_now() {
+                Some(mapped) => mapped,
+                None if self.refresh_exact_unlocked(last, size, blind) => return size,
+                None => waited(2, crate::watch::title_memory_reading),
+            }
         } else {
             waited(2, crate::watch::title_memory_reading)
         };
@@ -2207,6 +2234,32 @@ impl Staging {
             last.asked = 0;
             0
         }
+    }
+
+    /// An exact refresh (for a bake) that finds the runtime remapping
+    /// title memory ([`exact_unlocked`]): the texture is read whole through
+    /// the kernel, which needs no lock and fails if a page of it is not
+    /// there; read, it is what title memory holds now, as a read under the
+    /// lock would be. Whether it was read (and detiled if it changed);
+    /// if a page was missing the refresh waits for the lock as before.
+    fn refresh_exact_unlocked(&self, last: &mut Last, size: usize, blind: bool) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        let read = with_read(size, |read| {
+            if !crate::host::read_into(self.memory, read) {
+                return false;
+            }
+            let hash = digest(read);
+            if last.hash == Some(hash) {
+                self.found_unchanged(last);
+            } else {
+                self.found_changed(last, last.hash.is_none(), blind);
+                last.hash = Some(hash);
+                self.detile(read);
+            }
+            true
+        });
+        EXACT_UNLOCKED[usize::from(!read)].fetch_add(1, Relaxed);
+        read
     }
 
     /// The first filling of the staging buffer while the runtime is
@@ -2556,12 +2609,49 @@ pub(crate) fn is_staged(resource: This) -> bool {
 /// The bytes of a title texture's memory, and whether all of it is mapped,
 /// if the texture has been staged for upload.
 /// (Whether it is mapped is asked only if `ask`; else it counts as mapped.)
+/// Only of a texture at an address the title mapped
+/// ([`crate::resource::at_title_address`]): the memory of any other is all
+/// there while it lives. The pass over textures picked by index asked it of
+/// every texture object it took, 20,000-57,000 every 5 seconds, most of them
+/// read through tables (a question per 256 pages: 18-111 us for 1-16 MB,
+/// milliseconds when the pages had left the working set, and each such page
+/// read back into it), for 66 found not all there in a whole run
+/// (coolfox-20261126-223059); the pass's unattributed time went with their
+/// count, 13 us each. Of one at a title address, the runtime's views of
+/// physical pages answer where they cover the memory ([`all_there`]: one
+/// look, under a microsecond), as they do for placed textures
+/// ([`mapped_bytes`]). `VICTORY_STAGED_ASK_ALL=1`: Windows is asked of every
+/// texture, as before.
 pub(crate) fn staged(resource: This, ask: bool) -> Option<(u64, bool)> {
+    static ALL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let s = {
         let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
         map.as_ref()?.get(&(resource as usize))?.clone()
     };
-    Some((s.read as u64, !ask || committed(s.memory, s.read)))
+    let whole = !ask
+        || if *ALL.get_or_init(|| std::env::var_os("VICTORY_STAGED_ASK_ALL").is_some_and(|v| v == "1")) {
+            committed(s.memory, s.read)
+        } else {
+            !crate::resource::at_title_address(resource) || all_there(s.memory, s.read)
+        };
+    Some((s.read as u64, whole))
+}
+
+/// Whether all of `[at, at + len)` is mapped: by the runtime's views of
+/// physical pages where any lies there (as [`mapped_bytes`] asks), else by
+/// asking Windows ([`committed`]).
+fn all_there(at: *const u8, len: usize) -> bool {
+    match by_views().then(|| crate::inplace::shown_bytes(at as usize, len)).flatten() {
+        Some(there) => there >= len as u64,
+        None => committed(at, len),
+    }
+}
+
+/// Whether how much of title memory is mapped is asked of the runtime's
+/// views of physical pages first (`VICTORY_MAPPED_BY_VIEWS=0`: of Windows).
+fn by_views() -> bool {
+    static BY_VIEWS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *BY_VIEWS.get_or_init(|| std::env::var_os("VICTORY_MAPPED_BY_VIEWS").is_none_or(|v| v != "0"))
 }
 
 /// Whether `[at, at + len)` is committed memory (streamed textures may be
@@ -2672,8 +2762,7 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
     // knows which are there: one look, where the host was asked for every
     // 64 KiB of the texture (and once more for each that is not there).
     // `VICTORY_MAPPED_BY_VIEWS=0`: the host is asked, as before.
-    static BY_VIEWS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *BY_VIEWS.get_or_init(|| std::env::var_os("VICTORY_MAPPED_BY_VIEWS").is_none_or(|v| v != "0"))
+    if by_views()
         && let Some(there) = crate::inplace::shown_bytes(start, len)
     {
         return there;
@@ -3068,6 +3157,32 @@ mod remap_tests {
 mod title_memory_tests {
     use super::with_title;
 
+    /// Whether memory is all there is answered by the runtime's views of
+    /// physical pages where they lie, and by Windows where none does.
+    #[test]
+    fn all_there_asks_the_views_where_they_lie() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
+        const BLOCK: usize = 64 << 10;
+        // SAFETY: a reservation of our own, its first two blocks committed.
+        let at = unsafe {
+            let at = VirtualAlloc(std::ptr::null(), 4 * BLOCK, MEM_RESERVE, PAGE_READWRITE);
+            VirtualAlloc(at, 2 * BLOCK, MEM_COMMIT, PAGE_READWRITE);
+            at as usize
+        };
+        let there = |len| super::all_there(at as *const u8, len);
+        assert!(there(2 * BLOCK));
+        assert!(!there(3 * BLOCK));
+        // The runtime's views of the first two blocks answer for them.
+        for block in 0..2 {
+            crate::title_memory_view(at + block * BLOCK, BLOCK, 9, 0);
+        }
+        assert!(there(2 * BLOCK));
+        assert!(!there(3 * BLOCK));
+        crate::inplace::views_gone(at, 4 * BLOCK);
+        // SAFETY: our reservation, released whole.
+        unsafe { VirtualFree(at as *mut _, 0, MEM_RELEASE) };
+    }
+
     /// Title memory whose tail is reserved and not committed reads through
     /// the copy as its bytes and then zeros, without a fault; so does
     /// memory a page of which is taken away between two reads, and the
@@ -3280,7 +3395,7 @@ mod allocation_costs {
                 seen.push(digest(&bytes));
             }
         }
-        let text: Vec<u8> = (0..400u32).map(|i| (i * 37 >> 2) as u8).collect();
+        let text: Vec<u8> = (0..400u32).map(|i| ((i * 37) >> 2) as u8).collect();
         for at in 0..399 {
             let mut bytes = text.clone();
             bytes.swap(at, at + 1);
