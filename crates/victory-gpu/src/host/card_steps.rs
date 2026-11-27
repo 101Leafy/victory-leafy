@@ -103,6 +103,15 @@ fn placed_order() -> bool {
     *ON.get_or_init(|| crate::switch::on("VICTORY_PLACED_ORDER"))
 }
 
+/// Whether a host copy kept in place (title memory as the buffer) holds a
+/// span for GPU-side copies and fills (`VICTORY_CARD_STEPS_IN_PLACE=1`).
+/// Refused, each such step settled its flights first: 7-9 ms a time.
+/// shortcut: the copy reads title memory as it is when the card runs it.
+fn in_place_held() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_CARD_STEPS_IN_PLACE"))
+}
+
 /// Why [`plan`] refuses for [`place`].
 const BEHIND_PLACED: &str = "a copy at its place in a list writes what it reads, or reads or writes what it writes";
 
@@ -404,7 +413,7 @@ fn holder(writers: &[Writer], from: usize, to: usize) -> Result<Arc<Shadow>, &'s
         None => crate::shadow::find(from as u64, (to - from) as u64).ok_or("no host copy of it")?,
     };
     let (start, len) = shadow.span();
-    if shadow.in_place() || (from as u64) < start || to as u64 > start + len {
+    if (shadow.in_place() && !in_place_held()) || (from as u64) < start || to as u64 > start + len {
         return Err("no host copy holds all of it");
     }
     Ok(shadow)
