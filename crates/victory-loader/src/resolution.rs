@@ -37,6 +37,13 @@
 //!   That constant is set to 1.0, so the title renders at the output size
 //!   and nothing is upscaled. `VICTORY_RENDER_SCALE` (pull request #53) is
 //!   still read, and only 1.0 is taken.
+//! - **Interface.** Its layouts name a stretch mode for each panel, looked up
+//!   by name hash in a table at +0x630ff10 (fill 1, uniform 2, uniform to
+//!   fill 3, dynamic 4). Dynamic keeps the 4K pixel size whatever the
+//!   output, so at 720p and under the subtitles and prompts come out three
+//!   or more times too big. With any `VICTORY_OUTPUT` under 3840x2160 the
+//!   dynamic entry reads uniform, which scales the panel with the output
+//!   (`viewbox`); `VICTORY_UI_VIEWBOX=0` leaves the table alone.
 
 use crate::frame_rate::Patched;
 

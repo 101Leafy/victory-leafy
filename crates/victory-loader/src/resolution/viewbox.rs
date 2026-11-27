@@ -1,12 +1,14 @@
-//! Fit dynamic interface viewboxes to 720p using the layout engine's uniform
-//! stretch mode. With the stock mode, subtitle glyphs and controller prompts
-//! keep their 4K pixel size when the output is reduced to 1280×720.
+//! Fit dynamic interface viewboxes to the output using the layout engine's
+//! uniform stretch mode. With the stock mode, subtitle glyphs and controller
+//! prompts keep their 4K pixel size at any smaller output (1280x720 and the
+//! test sizes under it). On whenever a size under 3840x2160 is asked;
+//! `VICTORY_UI_VIEWBOX=0` keeps the stock mode.
 
 use super::Site;
 use std::ffi::OsStr;
 
 pub(super) fn requested(size: (u32, u32), setting: Option<&OsStr>) -> bool {
-    size == (1280, 720) && setting == Some(OsStr::new("1"))
+    size != (3840, 2160) && setting != Some(OsStr::new("0"))
 }
 
 // The layout reader resolves these case-sensitive names through the stretch
@@ -55,7 +57,7 @@ const fn table(dynamic_mode: u8) -> [u8; STRIDE * MODES.len()] {
 
 pub(super) const SITE: Site = Site {
     at: 0x630ff1c,
-    what: "fit UI viewboxes to the 720p output",
+    what: "fit UI viewboxes to the output",
     bytes: &table(DYNAMIC),
 };
 pub(super) const FITTED: [u8; STRIDE * MODES.len()] = table(UNIFORM);
@@ -66,14 +68,13 @@ mod tests {
     use crate::resolution::{Patched, matches};
 
     #[test]
-    fn only_the_explicit_720p_override_selects_this_layout() {
-        let on = Some(OsStr::new("1"));
-        assert!(requested((1280, 720), on));
-        for size in [(1920, 1080), (3840, 2160), (720, 1280)] {
-            assert!(!requested(size, on));
+    fn every_size_under_4k_fits_unless_turned_off() {
+        for size in [(426, 240), (854, 480), (1280, 720), (1920, 1080), (2560, 1440)] {
+            assert!(requested(size, None));
+            assert!(requested(size, Some(OsStr::new("1"))));
+            assert!(!requested(size, Some(OsStr::new("0"))));
         }
-        assert!(!requested((1280, 720), None));
-        assert!(!requested((1280, 720), Some(OsStr::new("0"))));
+        assert!(!requested((3840, 2160), None));
     }
 
     #[test]
