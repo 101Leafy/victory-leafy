@@ -5109,6 +5109,12 @@ mod place;
 #[cfg(feature = "diagnostics")]
 pub(crate) mod pstats;
 mod send;
+
+/// Whether what goes up to copies in the card's memory goes from memory of
+/// its own (`send::own`).
+pub(crate) fn sends_own() -> bool {
+    send::own()
+}
 pub(crate) use send::{goes_as_words, words_under};
 #[cfg(feature = "diagnostics")]
 pub(crate) mod spans;

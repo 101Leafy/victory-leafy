@@ -116,8 +116,12 @@ pub(crate) struct Shadow {
 struct Card {
     /// The CPU's side, in the PC's memory: what `data` maps. Title memory
     /// is copied into it as into any copy, and what changed in it goes to
-    /// the card's side before the next submission.
-    staging: ID3D12Resource,
+    /// the card's side before the next submission. `None` for a window whose
+    /// CPU side is plain memory ([`window_plain`]): `plain` holds it.
+    staging: Option<ID3D12Resource>,
+    /// The plain memory of such a window's CPU side, freed with it.
+    #[allow(dead_code)] // (held for its Drop)
+    plain: Option<Plain>,
     /// The card side's bytes as they were when the submission's shaders
     /// started, in the card's memory too: made when shader writes are
     /// first declared for the copy, and compared with the card's side, on
@@ -705,7 +709,8 @@ fn card_late_windows() {
         let mut shadow = Shadow::new(on_card, old.data, gpu, start, len);
         shadow.window = true;
         shadow.card = Some(Card {
-            staging: old.buffer.clone(),
+            staging: Some(old.buffer.clone()),
+            plain: None,
             before: Mutex::default(),
             dirty: Mutex::default(),
             sent: Mutex::default(),
@@ -3644,7 +3649,7 @@ pub(crate) fn let_go_idle() {
                     && crate::host::references(&s.buffer) == 1
                     // Slots made before a window went to the card late
                     // show its CPU's side ([`card_late_windows`]).
-                    && s.card.as_ref().is_none_or(|c| crate::host::references(&c.staging) == 1)
+                    && s.card.as_ref().and_then(|c| c.staging.as_ref()).is_none_or(|b| crate::host::references(b) == 1)
             })
             .map(|(key, _)| *key)
             .collect();
@@ -5222,8 +5227,9 @@ impl Shadow {
     /// card side's bytes from before if made yet, and their size.
     pub(crate) fn card_sides(&self) -> Option<(&ID3D12Resource, Option<ID3D12Resource>, u64)> {
         let card = self.card.as_ref()?;
+        let staging = card.staging.as_ref()?;
         let before = card.before.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        Some((&card.staging, before, card.size))
+        Some((staging, before, card.size))
     }
 
     /// Shader writes are declared for a copy in the card's memory: makes
@@ -5455,7 +5461,8 @@ impl Shadow {
         let mut shadow = Shadow::new(none(), data, 0, start, len);
         if card {
             shadow.card = Some(Card {
-                staging: none(),
+                staging: Some(none()),
+                plain: None,
                 before: Mutex::default(),
                 dirty: Mutex::default(),
                 sent: Mutex::default(),
@@ -5613,7 +5620,8 @@ mod land_tests {
         unsafe { std::ptr::write_bytes(data, 0, len) };
         let mut shadow = Shadow::new(buffer.clone(), data, 0, title as u64, len as u64);
         shadow.card = Some(Card {
-            staging: buffer,
+            staging: Some(buffer),
+            plain: None,
             before: Mutex::default(),
             dirty: Mutex::default(),
             sent: Mutex::default(),
@@ -6036,7 +6044,8 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                     "a buffer's host copy is in the card's memory"
                 );
                 let card = Card {
-                    staging: buffer,
+                    staging: Some(buffer),
+                    plain: None,
                     before: Mutex::default(),
                     dirty: Mutex::default(),
                     sent: Mutex::default(),
@@ -6264,7 +6273,8 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
     shadow.window = true;
     shadow.changes_only.store(true, Ordering::Relaxed);
     shadow.card = Some(Card {
-        staging,
+        staging: Some(staging),
+        plain: None,
         before: Mutex::default(),
         dirty: Mutex::default(),
         sent: Mutex::default(),
@@ -6482,17 +6492,29 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         let shadow = Arc::new(shadow);
         return finish(shadow);
     }
-    let (buffer, data) = host()?.shared_buffer(len)?;
-    crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
     // With room for windows on the card (`window_card_most`): shaders get a
-    // buffer there, and the one just made is the CPU's side. With
+    // buffer there, and the CPU's side is either a buffer of the PC's memory
+    // shared with the card or, with `window_plain`, plain memory. With
     // `card_late`, later.
     let on_card = if card_late() > 0 && !windows_own() { None } else { window_card_for(len) };
+    let plain = match &on_card {
+        Some(_) if window_plain() => Plain::new(len as usize),
+        _ => None,
+    };
+    let (buffer, data, staging) = match plain.as_ref() {
+        Some(plain) => (on_card.clone()?, plain.0, None),
+        None => {
+            let (buffer, data) = host()?.shared_buffer(len)?;
+            crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
+            (buffer, data, Some(()))
+        }
+    };
     let (buffer, card) = match on_card {
         Some(on_card) => {
             crate::host::name(&on_card, || format!("title memory {start:#x}+{len:#x} on the card"));
             let card = Card {
-                staging: buffer,
+                staging: staging.map(|()| buffer),
+                plain,
                 before: Mutex::default(),
                 dirty: Mutex::default(),
                 sent: Mutex::default(),
@@ -7009,7 +7031,8 @@ mod card_merge_tests {
             side[title_byte] = title[title_byte];
             let mut shadow = Shadow::new(buffer.clone(), side.as_mut_ptr(), 0, title.as_ptr() as u64, LEN as u64);
             shadow.card = Some(Card {
-                staging: staging.clone(),
+                staging: Some(staging.clone()),
+                plain: None,
                 before: Mutex::new(None),
                 dirty: Mutex::default(),
                 sent: Mutex::new(vec![(title_byte, title_byte + 1, 7)]),
@@ -7068,4 +7091,49 @@ pub(crate) fn near(va: u64) -> String {
         ));
     }
     text
+}
+
+/// Whether a window with a side on the card has its CPU side in plain
+/// memory (`VICTORY_WINDOW_PLAIN=1`; off by default). Only while the sends
+/// go from memory of their own (`crate::host::send`, on by default), which
+/// is then the only source the card copies from.
+///
+/// A window's CPU side was a buffer in the PC's memory shared with the card,
+/// as big as the window, though the card reads the card side and the sends
+/// come out of other memory: on a 16 GB PC windows were some 4.7 GB of the
+/// 7.5 GB shared budget in the first mission, where NVIDIA then refused
+/// upload buffers by the thousand and the card hung (runs cf-play2, -4).
+/// Plain memory is the same bytes in RAM that pages like any other, and
+/// does not count against that budget.
+fn window_plain() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("VICTORY_WINDOW_PLAIN").is_some_and(|v| v == "1") && crate::host::sends_own()
+    })
+}
+
+/// Plain committed memory for a window's CPU side, released when dropped.
+struct Plain(*mut u8);
+
+// SAFETY: plain memory, written and read under the copy's own rules as a
+// mapped buffer's would be.
+unsafe impl Send for Plain {}
+unsafe impl Sync for Plain {}
+
+impl Plain {
+    fn new(len: usize) -> Option<Plain> {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+        // SAFETY: a fresh allocation of our own, zeroed by the system.
+        let at = unsafe { VirtualAlloc(std::ptr::null(), len, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) };
+        (!at.is_null()).then_some(Plain(at.cast()))
+    }
+}
+
+impl Drop for Plain {
+    fn drop(&mut self) {
+        use windows_sys::Win32::System::Memory::{MEM_RELEASE, VirtualFree};
+        // SAFETY: our own allocation, which nothing maps any more (the copy
+        // holding it is gone).
+        unsafe { VirtualFree(self.0.cast(), 0, MEM_RELEASE) };
+    }
 }
