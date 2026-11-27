@@ -1055,6 +1055,8 @@ extern "system" fn present(
     if planes > 0 && let Some(plane) = unsafe { plane_parameters.as_ref() } {
         crate::frame::flipped(plane.token);
     }
+    #[cfg(all(windows, feature = "diagnostics"))]
+    planes_seen(frame, planes, plane_parameters);
     if frame.is_power_of_two() {
         let (draws, dispatches) = crate::list::take_counts();
         #[cfg(windows)]
@@ -1171,6 +1173,42 @@ extern "system" fn present(
     #[cfg(all(windows, feature = "diagnostics"))]
     frame_ends();
     S_OK
+}
+
+/// Diagnostics: logs the planes a present passes each time their number
+/// changes (only the first plane's first resource is shown): each
+/// description's 72 bytes (the retail plane: token, count, resources, then
+/// rectangles, color space and options), and the size and format of each
+/// plane's first resource where its count is 1 to 8.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn planes_seen(frame: u64, planes: u32, at: *const Plane) {
+    static LAST: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
+    if LAST.swap(planes, Ordering::Relaxed) == planes || at.is_null() || planes == 0 {
+        return;
+    }
+    let n = planes.min(4) as usize;
+    // SAFETY: the title passes `planes` descriptions of 72 bytes each.
+    let raw = unsafe { std::slice::from_raw_parts(at.cast::<u64>(), n * 9) };
+    let words: Vec<String> = raw.iter().map(|w| format!("{w:x}")).collect();
+    let mut seen = Vec::new();
+    for i in 0..n {
+        let (count, resources) = (raw[i * 9 + 1] as u32, raw[i * 9 + 2] as *const This);
+        if !(1..=8).contains(&count) || resources.is_null() || !resources.is_aligned() {
+            seen.push(format!("plane {i}: not read"));
+            continue;
+        }
+        // SAFETY: the plane lists `count` resources.
+        let first = unsafe { *resources };
+        seen.push(match crate::resource::host_resource(first) {
+            // SAFETY: a live host resource.
+            Some(r) => {
+                let d = unsafe { r.GetDesc() };
+                format!("plane {i}: {count} resources, the first {}x{} format {}", d.Width, d.Height, d.Format.0)
+            }
+            None => format!("plane {i}: {count} resources, the first not on the host"),
+        });
+    }
+    tracing::info!(frame, planes, raw = words.join(" "), seen = seen.join("; "), "the title's present passes another number of planes (only the first plane's first resource is shown)");
 }
 
 /// Diagnostics: the title's present is over.
