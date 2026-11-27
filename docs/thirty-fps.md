@@ -141,14 +141,22 @@ shader writes (14 → 4-7). Narrowing has paid more than any single rewrite here
 
 ### 6. Then the size, and only then
 
-If P is under 33 ms and C is not: **936p** (1664x936, one of the title's own modes) is
-2.25 times fewer pixels than 1080p, so a card at 378 ms on a world load is about 168 ms
-there and one at 12 ms in play is about 5 ms; **720p** is 4 times fewer than 1080p (about
-94 ms from that load figure, which still misses 33 ms); **540p** would be sixteen times
-fewer than 4K, but it is not a mode the title has — and when it was asked for on the 8 GiB
-laptop the title presented **1280x720** instead (Logan-Gaillard, 2026-11-27). So 720p is the
-floor **as measured**, 540p is unproven, and the launcher now says so before the run
-rather than after it: read the `presenting to a window` line before comparing two runs.
+If P is under 33 ms and C is not: the ladder's own arithmetic, in pixels.
+
+| size | MP | fewer pixels than 1080p | card, from 378 ms at 4K | card, from 12 ms in play at 1080p |
+|---|---|---|---|---|
+| 4k (3840x2160) | 8.29 | 4x more | 378 ms | 48 ms |
+| 1080p (1920x1080) | 2.07 | 1 | 94 ms | 12 ms |
+| 936p (1664x936) | 1.56 | **1.33** | 71 ms | 9 ms |
+| 720p (1280x720) | 0.92 | **2.25** | 42 ms | 5 ms |
+| 540p (960x540) | 0.52 | **4** | 24 ms | 3 ms |
+
+So **936p buys a quarter of the frame back, not half**, and 720p — the smallest size the
+title actually presents on the 8 GiB laptop — is still 42 ms from that world load, over 33.
+540p would be the only rung under 33 ms in a load, and it is the one the loader asks for and
+the title clamps: `VICTORY_TEST_LOWRES=1` + `VICTORY_OUTPUT=960x540` presented
+**1280x720** (Logan-Gaillard, 2026-11-27). The launcher now says so before the run rather
+than after it: read the `presenting to a window` line before comparing two runs.
 
 ## The levers already in the tree, and why only one is switched on
 
