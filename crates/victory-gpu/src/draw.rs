@@ -167,6 +167,14 @@ fn bake_exact() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_BAKE_EXACT").is_none_or(|v| v != "0"))
 }
 
+/// Whether a list that set no view heap or no sampler heap gets one of ours
+/// of a single descriptor (`VICTORY_FALLBACK_HEAPS=1`; off, only the title's
+/// heaps are set, as before).
+fn fallback_heaps() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FALLBACK_HEAPS").is_some_and(|v| v == "1"))
+}
+
 /// Whether a texture found changed with nothing to tell of it is looked at
 /// again in the next frame (`VICTORY_RECHECK_SOON=0`: after four, as
 /// before).
@@ -1719,9 +1727,10 @@ impl State {
         }
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them, and needs a view heap and a sampler heap both: one
-        // the title set none of is one of ours of a single descriptor
-        // (codec_d, pareto-residency e05d4633a).
-        if !self.host_heaps_set || self.host_heaps != self.heaps {
+        // the title set none of is one of ours of a single descriptor, with
+        // VICTORY_FALLBACK_HEAPS=1 (codec_d, pareto-residency e05d4633a).
+        let fallback = fallback_heaps();
+        if (fallback && !self.host_heaps_set) || self.host_heaps != self.heaps {
             let mut views = None;
             let mut samplers = None;
             for &h in self.heaps.iter().filter(|&&h| h != 0) {
@@ -1730,12 +1739,14 @@ impl State {
                     *(if heap.samplers() { &mut samplers } else { &mut views }) = Some(host.heap.clone());
                 }
             }
-            let host = crate::host::host();
-            let views = views.or_else(|| host.and_then(|h| h.fallback_view_heap().cloned()));
-            let samplers = samplers.or_else(|| host.and_then(|h| h.fallback_sampler_heap().cloned()));
+            if fallback {
+                let host = crate::host::host();
+                views = views.or_else(|| host.and_then(|h| h.fallback_view_heap().cloned()));
+                samplers = samplers.or_else(|| host.and_then(|h| h.fallback_sampler_heap().cloned()));
+            }
             let heaps: Vec<Option<ID3D12DescriptorHeap>> = [views, samplers].into_iter().filter(Option::is_some).collect();
             heaps.iter().flatten().for_each(|h| list.keep(h));
-            if !heaps.is_empty() {
+            if !heaps.is_empty() || !fallback {
                 // SAFETY: an open list and shader-visible heaps.
                 unsafe { l.SetDescriptorHeaps(&heaps) };
             }
