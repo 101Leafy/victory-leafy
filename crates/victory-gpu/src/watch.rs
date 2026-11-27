@@ -1266,14 +1266,42 @@ pub(crate) fn nothing_new(start: usize, end: usize, base: usize, copied: &[u64],
         crate::faultbook::note(crate::faultbook::What::Known, first, last, 1);
     }
     let j = journal();
-    if !known && !j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
-        return false;
-    }
     let Some(taken) = first.checked_sub(base).and_then(|from| copied.get(from..last - base)) else {
         return false;
     };
+    new_in(&j, known, first, last, taken, ranged)
+}
+
+/// [`nothing_new`] past the bits, `taken` cut to pages `first..last`.
+fn new_in(j: &Journal, known: bool, first: usize, last: usize, taken: &[u64], ranged: u64) -> bool {
+    if !known && !j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
+        return false;
+    }
     (ranged != 0 || taken.iter().all(|&at| at != 0))
         && j.notes.each(first, last, |page, write| write <= taken[page - first].max(ranged))
+}
+
+/// [`nothing_new`] of many ranges, each `(start, end, taken, ranged)` with
+/// `taken` the asking after which each of its pages was taken: the bits of
+/// all of them first, then the journal read once for all.
+pub(crate) fn nothing_new_all(looks: &[(usize, usize, Vec<u64>, u64)]) -> Vec<bool> {
+    let known: Vec<bool> = looks
+        .iter()
+        .map(|&(start, end, ..)| {
+            let known = published(start, end);
+            #[cfg(feature = "diagnostics")]
+            if known {
+                crate::faultbook::note(crate::faultbook::What::Known, start / PAGE, end.div_ceil(PAGE), 1);
+            }
+            known
+        })
+        .collect();
+    let j = journal();
+    looks
+        .iter()
+        .zip(known)
+        .map(|((start, end, taken, ranged), known)| new_in(&j, known, start / PAGE, end.div_ceil(PAGE), taken, *ranged))
+        .collect()
 }
 
 impl Tracked {

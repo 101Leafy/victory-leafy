@@ -2095,6 +2095,49 @@ pub(crate) fn wide_run(jobs: Vec<Box<dyn FnOnce() + Send>>) {
     wide(jobs);
 }
 
+/// Whether a flush's copies are told they hold nothing new all at once, the
+/// write journal read once for all of them ([`nothing_new_all`];
+/// `VICTORY_NEW_BATCH=1`, off by default: each on its own, as many on the
+/// threads as there are). Each copy is in a flush once, so its own locks are
+/// still taken once each.
+///
+/// 10,838 copies in 42 flushes, 9,927 of them with nothing new, three locks
+/// each and a read of the journal (session leafy-0314).
+pub(crate) fn new_batch() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_NEW_BATCH").is_some_and(|v| v == "1"))
+}
+
+/// [`Shadow::nothing_new`] of each `(copy, from, to)`, the journal read once
+/// ([`new_batch`]).
+pub(crate) fn nothing_new_all<'a>(spans: impl Iterator<Item = (&'a Shadow, usize, usize)>) -> Vec<bool> {
+    let mut same = Vec::new();
+    let mut looks = Vec::new();
+    let mut at = Vec::new();
+    for (shadow, from, to) in spans {
+        match shadow.new_look(from, to) {
+            Ok(look) => {
+                at.push(same.len());
+                looks.push(look);
+                same.push(false);
+            }
+            Err(known) => same.push(known),
+        }
+    }
+    for (&i, (new, look)) in at.iter().zip(crate::watch::nothing_new_all(&looks).into_iter().zip(&looks)) {
+        same[i] = new;
+        #[cfg(feature = "diagnostics")]
+        if new {
+            use crate::copystat::{C, add};
+            add(C::Checked, (look.1 - look.0) as u64);
+            add(C::Unchanged, (look.1 - look.0) as u64);
+        }
+        #[cfg(not(feature = "diagnostics"))]
+        let _ = look;
+    }
+    same
+}
+
 /// Calls `work` with every number under `n`, on the kept threads and on
 /// this one, the next number to whichever is free: for thousands of small
 /// pieces of work, where a job each ([`wide`]) is mostly the jobs' queue.
@@ -4587,6 +4630,34 @@ impl Shadow {
             add(C::Unchanged, (to - from) as u64);
         }
         same
+    }
+
+    /// What [`Shadow::nothing_new`] of `[from, to)` reads under this copy's
+    /// locks: the answer, or the range cut to the buffer with its pages'
+    /// notes from `copied` and `ranged`, for [`nothing_new_all`] to answer
+    /// with others'. Notes copied out can only be older than the copy's, so
+    /// the answer can only be `false` more often.
+    fn new_look(&self, from: usize, to: usize) -> Result<(usize, usize, Vec<u64>, u64), bool> {
+        if self.place.is_some() {
+            return Err(true);
+        }
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (from, to) = (from.max(start), to.min(end));
+        if from >= to {
+            return Err(true);
+        }
+        if !matches!(self.watched.load(Ordering::Relaxed), 1 | GUARDED) {
+            return Err(false);
+        }
+        if self.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, e)| a < to && e > from) {
+            return Err(false);
+        }
+        let (first, last, base) = (from / PAGE, to.div_ceil(PAGE), start / PAGE);
+        let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(taken) = first.checked_sub(base).and_then(|at| copied.get(at..last - base)) else {
+            return Err(false);
+        };
+        Ok((from, to, taken.to_vec(), self.ranged(from, to)))
     }
 
     /// The latest asking after which a range that holds `[from, to)` was

@@ -9123,6 +9123,24 @@ fn keep_new(refresh: &mut Refresh) -> bool {
     }
 }
 
+/// [`keep_new`] with the answers for [`ranges`] of `refresh` taken from
+/// `same`, in that order ([`crate::shadow::nothing_new_all`]).
+fn keep_new_by(refresh: &mut Refresh, same: &mut impl Iterator<Item = bool>) -> bool {
+    let main = same.next().unwrap_or(false);
+    let (_, from, to, others) = refresh;
+    others.retain(|_| !same.next().unwrap_or(false));
+    if !main {
+        return true;
+    }
+    match others.pop() {
+        Some((a, e)) => {
+            (*from, *to) = (a, e);
+            true
+        }
+        None => false,
+    }
+}
+
 /// Whether the copies that a submission's shaders write are brought up to
 /// date together, on several threads, ahead of its steps
 /// (`VICTORY_REFRESH_AHEAD=0`: each before the step that gives it to them).
@@ -9501,11 +9519,17 @@ impl Batch {
         // many: then beside the others.
         const FEW: usize = 256;
         let mut spans = spans;
-        let many = spans.len() > FEW;
+        let batch = crate::shadow::new_batch();
+        let many = spans.len() > FEW && !batch;
         if !many {
             #[cfg(feature = "diagnostics")]
             let all = spans.len();
-            spans.retain(|(shadow, from, to)| !shadow.nothing_new(*from, *to - *from));
+            if batch {
+                let mut same = crate::shadow::nothing_new_all(spans.iter().map(|(shadow, from, to)| (&**shadow, *from, *to))).into_iter();
+                spans.retain(|_| !same.next().unwrap_or(false));
+            } else {
+                spans.retain(|(shadow, from, to)| !shadow.nothing_new(*from, *to - *from));
+            }
             #[cfg(feature = "diagnostics")]
             FLUSHES[2].fetch_add((all - spans.len()) as u64, Ordering::Relaxed);
         }
@@ -9659,11 +9683,20 @@ impl Batch {
         // once a frame: on the threads, below.)
         const FEW: usize = 256;
         let light = crate::watch::light();
-        if light && self.refreshes.len() <= FEW {
+        let batch = crate::shadow::new_batch();
+        if light && (self.refreshes.len() <= FEW || batch) {
             let started = std::time::Instant::now();
             #[cfg(feature = "diagnostics")]
             let all = self.refreshes.len();
-            self.refreshes.retain_mut(keep_new);
+            if batch {
+                let mut same = crate::shadow::nothing_new_all(
+                    self.refreshes.iter().flat_map(|r| ranges(r).map(move |(from, to)| (&*r.0, from, to))),
+                )
+                .into_iter();
+                self.refreshes.retain_mut(|r| keep_new_by(r, &mut same));
+            } else {
+                self.refreshes.retain_mut(keep_new);
+            }
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             FLUSHES[2].fetch_add((all - self.refreshes.len()) as u64, Ordering::Relaxed);
@@ -9696,7 +9729,7 @@ impl Batch {
                 crate::shadow::wide_each(refreshes.len(), move |i| {
                     let shadow = &refreshes[i].0;
                     for (from, to) in ranges(&refreshes[i]) {
-                        if refreshes.len() > FEW && shadow.nothing_new(from, to - from) {
+                        if refreshes.len() > FEW && !batch && shadow.nothing_new(from, to - from) {
                             #[cfg(feature = "diagnostics")]
                             FLUSHES[2].fetch_add(1, Ordering::Relaxed);
                             continue;
