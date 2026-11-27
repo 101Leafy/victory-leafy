@@ -1968,6 +1968,8 @@ pub(crate) fn log(frames: f64) {
             .collect();
         tracing::info!("    by size, {} sizes: {}", by_size.len(), text.join(", "));
     }
+    #[cfg(feature = "diagnostics")]
+    crate::host::pstats::report(frames);
     tracing::info!(
         "  waits for every earlier shader write, per frame: {:.0} for the title's barrier groups, {:.0} \
          for its barriers on buffers; {:.0} indirect commands bounded (a dispatch of ours between two \

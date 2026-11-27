@@ -1693,6 +1693,10 @@ pub(crate) struct HostList {
     /// The batched clamps' passes on the card.
     #[cfg(feature = "diagnostics")]
     pub(crate) clamp_stamps: crate::indirect::batch::Stamps,
+    /// With `VICTORY_GPU_STATS`: the card's counts from each note to the
+    /// next.
+    #[cfg(feature = "diagnostics")]
+    pstats: pstats::Stats,
 }
 
 /// A list's prelude: an allocator and a closed list.
@@ -4546,6 +4550,8 @@ mod panel;
 #[cfg(feature = "diagnostics")]
 mod frames;
 mod place;
+#[cfg(feature = "diagnostics")]
+pub(crate) mod pstats;
 mod send;
 pub(crate) use send::{goes_as_words, words_under};
 #[cfg(feature = "diagnostics")]
@@ -5028,6 +5034,8 @@ impl Host {
                 done: Default::default(),
                 #[cfg(feature = "diagnostics")]
                 clamp_stamps: Default::default(),
+                #[cfg(feature = "diagnostics")]
+                pstats: Default::default(),
             })
         }
     }
@@ -7287,6 +7295,8 @@ impl HostList {
         }
         #[cfg(feature = "diagnostics")]
         self.clamp_stamps.resolve(&self.list);
+        #[cfg(feature = "diagnostics")]
+        self.pstats.resolve(&self.list);
         lap.to(6);
         // SAFETY: our list.
         if let Err(e) = unsafe { self.list.Close() } {
@@ -7344,7 +7354,11 @@ impl HostList {
             self.times_taken();
         }
         #[cfg(feature = "diagnostics")]
-        self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        {
+            let mut notes = self.notes.lock().unwrap_or_else(|e| e.into_inner());
+            self.pstats.read(&notes);
+            notes.clear();
+        }
         #[cfg(feature = "diagnostics")]
         self.clamp_stamps.read();
         {
@@ -7794,7 +7808,7 @@ impl HostList {
         // A timing run stamps and keeps the texts without the markers, so
         // the sums by pipeline need no device-removed data.
         let dred = dred_on();
-        if !dred && !timing() && !gpu_times() {
+        if !dred && !timing() && !gpu_times() && !pstats::on() {
             crate::capture::op(std::ptr::from_ref(self) as usize, what);
             return;
         }
@@ -7814,6 +7828,9 @@ impl HostList {
                         self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, at);
                     }
                 }
+            }
+            if pstats::on() {
+                self.pstats.at_note(&self.list, at);
             }
             let what = what();
             crate::capture::op(std::ptr::from_ref(self) as usize, || what.clone());
