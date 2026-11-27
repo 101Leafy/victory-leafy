@@ -304,14 +304,14 @@ fn merge_child(dir: &Path) {
 fn merge_parts(dir: &Path) -> Result<()> {
     let cfg = victory_core::Config::load()?;
     victory_hle::known_pipelines::use_translations(cfg.cache_subdir("shaders")?);
-    let mut parts = Vec::new();
+    let mut found = Vec::new();
     let mut these = std::collections::BTreeSet::new();
     for entry in std::fs::read_dir(parts(dir))?.flatten() {
         let listed = std::fs::read_to_string(entry.path().join(PART_MADE)).unwrap_or_default();
         these.extend(listed.lines().filter_map(|l| l.parse::<usize>().ok()));
-        parts.push(entry.path());
+        found.push(entry.path());
     }
-    known::merge(library_dir(dir), parts);
+    known::merge(library_dir(dir), found);
     let these: Vec<usize> = these.into_iter().collect();
     let mut there = 0;
     known::make(dir, &these, |_, came| there += usize::from(came.is_some_and(|(_, t)| t)));
