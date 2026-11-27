@@ -51,6 +51,7 @@ mod inplace;
 mod port_journal;
 #[cfg(windows)]
 mod land;
+mod launch;
 pub mod list;
 pub mod object;
 pub mod pipeline;
