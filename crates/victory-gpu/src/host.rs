@@ -7437,17 +7437,29 @@ impl HostList {
     pub(crate) fn close(&self) {
         let _closing = crate::timeline::span("closing a host list");
         let mut lap = Lap::begin();
+        // Each step of the close is timed as a command of its own
+        // (`VICTORY_GPU_TIMES`), not summed into "closing list".
+        #[cfg(feature = "diagnostics")]
+        self.note_op(|| "closing: twins to depth".into());
         self.twins_to_depth();
         lap.to(0);
+        #[cfg(feature = "diagnostics")]
+        self.note_op(|| "closing: textures back".into());
         self.textures_back();
         lap.to(1);
+        #[cfg(feature = "diagnostics")]
+        self.note_op(|| "closing: indirect arguments common".into());
         let scratch = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner()).clone();
         if let Some((scratch, _)) = scratch {
             self.indirect_common(&scratch);
         }
         lap.to(2);
+        #[cfg(feature = "diagnostics")]
+        self.note_op(|| "closing: batches common".into());
         self.batches_common();
         lap.to(3);
+        #[cfg(feature = "diagnostics")]
+        self.note_op(|| "closing: card budget out".into());
         self.card_budget_out();
         lap.to(4);
         if coming_at_close() {
