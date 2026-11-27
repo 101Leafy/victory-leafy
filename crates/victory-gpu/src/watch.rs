@@ -1438,6 +1438,71 @@ impl Bits {
     }
 }
 
+/// The 4 KiB parts of guarded blocks a write fault opened ([`part_open`],
+/// [`open_part_loose`]), a bit each, 0 for a block with none; in pieces as
+/// [`Bits`]. The rest of such a block is read-only, and it is not clean.
+/// `WHOLE`: told as written whole at the next asking, whatever parts are
+/// open. Set under the guards' lock, or with none by a fault that holds the
+/// block in [`OPENING`]; taken by who makes the block read-only again.
+struct Parts([std::sync::atomic::AtomicPtr<PartsPiece>; Bits::PIECES]);
+
+/// The parts of the blocks of 4 GiB.
+type PartsPiece = [std::sync::atomic::AtomicU16; Parts::BLOCKS];
+
+impl Parts {
+    const BLOCKS: usize = Bits::WORDS * 64;
+
+    const fn new() -> Parts {
+        Parts([const { std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()) }; Bits::PIECES])
+    }
+
+    fn at(&self, block: usize, make: bool) -> Option<&std::sync::atomic::AtomicU16> {
+        use std::sync::atomic::Ordering::{AcqRel, Acquire};
+        let place = self.0.get(block / Parts::BLOCKS)?;
+        if make && place.load(Acquire).is_null() {
+            // Not on the stack: a fault's thread may have little of it.
+            let layout = std::alloc::Layout::new::<PartsPiece>();
+            // SAFETY: not of size 0; zeros are a piece with no parts open.
+            let piece = unsafe { std::alloc::alloc_zeroed(layout) }.cast::<PartsPiece>();
+            if piece.is_null() {
+                return None;
+            }
+            if place.compare_exchange(std::ptr::null_mut(), piece, AcqRel, Acquire).is_err() {
+                // SAFETY: made just now with this layout, and another
+                // thread's is there.
+                unsafe { std::alloc::dealloc(piece.cast(), layout) };
+            }
+        }
+        // SAFETY: null, or a piece made above, which is never freed.
+        unsafe { place.load(Acquire).as_ref() }.map(|piece| &piece[block % Parts::BLOCKS])
+    }
+
+    fn get(&self, block: usize) -> u16 {
+        self.at(block, false).map_or(0, |open| open.load(std::sync::atomic::Ordering::SeqCst))
+    }
+
+    fn or(&self, block: usize, parts: u16) {
+        if let Some(open) = self.at(block, true) {
+            open.fetch_or(parts, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// What was open, none now.
+    fn take(&self, block: usize) -> u16 {
+        self.at(block, false).map_or(0, |open| open.swap(0, std::sync::atomic::Ordering::SeqCst))
+    }
+
+    /// All parts, if a part is open.
+    fn whole(&self, block: usize) {
+        use std::sync::atomic::Ordering::SeqCst;
+        if let Some(open) = self.at(block, false) {
+            let _ = open.fetch_update(SeqCst, SeqCst, |was| (was != 0).then_some(WHOLE));
+        }
+    }
+}
+
+static PARTED: Parts = Parts::new();
+
 /// The blocks that are read-only by our hand, not written since, and of
 /// which the journal holds every write from before that: for those, what
 /// [`writes`] answers is in the journal, and neither the kernel, nor the
@@ -1582,12 +1647,89 @@ fn loose(g: &mut Guards, block: usize) -> bool {
     if LOOSE.take(block) {
         g.protected.remove(block);
         g.clean.remove(block);
-        g.parted.remove(&block);
+        PARTED.take(block);
         g.opened(block);
         #[cfg(feature = "diagnostics")]
         LOOSE_OPENS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
     true
+}
+
+/// Whether write faults of the descriptor heaps' guarded blocks open their
+/// 4 KiB part with no lock (`VICTORY_LOOSE_PARTS=1`; else they wait for the
+/// guards' lock, as before).
+///
+/// Those were the faults left taking the lock, and the title's threads
+/// waited behind askings for it: 361 waits, 129 ms of all threads a frame
+/// in the intro (2026-11-27).
+fn loose_parts() -> bool {
+    #[cfg(test)]
+    if tests::LOOSE_PARTS_HERE.get() {
+        return true;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LOOSE_PARTS").is_some_and(|v| v == "1"))
+}
+
+/// The blocks a write fault opened a part of with no lock
+/// ([`open_part_loose`]) since an asking last took their bit: not clean,
+/// whatever the guards' notes say.
+static LOOSE_PART: Bits = Bits::new();
+
+/// Diagnostics: write faults that opened a part with no lock, and those that
+/// went on to the lock; since the start.
+#[cfg(feature = "diagnostics")]
+pub(crate) static LOOSE_PARTS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// [`part_open`] with no lock, for a write fault at `at`: whether its part
+/// is open. The block is held in [`OPENING`] meanwhile, and so is it by who
+/// makes it read-only again, so that no part is opened between that one's
+/// look at [`PARTED`] and its `close`.
+fn open_part_loose(at: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE, VirtualProtect};
+    let block = at / BLOCK;
+    let most = part_faults();
+    if !loose_parts() || most == 0 || !FINE.any(block, block + 1) || ALIASED.any(block, block + 1) {
+        return false;
+    }
+    if !OPENING.put(block) {
+        // Another fault's, or an asking closing it.
+        while OPENING.any(block, block + 1) {
+            std::thread::yield_now();
+        }
+        return writable(at);
+    }
+    let part = 1u16 << (at % BLOCK / KERNEL_PAGE);
+    let mut opened = false;
+    let open = PARTED.get(block);
+    if PROTECTED.any(block, block + 1) && (open & part != 0 || open.count_ones() < most) {
+        // The bits before the look at `ALIASED`, as `cover_as` sets that
+        // before its look at them.
+        PARTED.or(block, part);
+        LOOSE_PART.set(block);
+        if !ALIASED.any(block, block + 1) {
+            // Before the part can be written.
+            PUBLISHED.clear(block);
+            let page = at & !(KERNEL_PAGE - 1);
+            let mut old = 0;
+            // SAFETY: a block we made read-only; one kernel page of it.
+            let done = unsafe { VirtualProtect(page as *const _, KERNEL_PAGE, PAGE_READWRITE, &mut old) } != 0;
+            opened = done && matches!(old, PAGE_READONLY | PAGE_READWRITE);
+            if done && !opened {
+                // SAFETY: as above.
+                unsafe { VirtualProtect(page as *const _, KERNEL_PAGE, old, &mut old) };
+            }
+        }
+    }
+    OPENING.clear(block);
+    #[cfg(feature = "diagnostics")]
+    {
+        LOOSE_PARTS[usize::from(!opened)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if opened && open & part == 0 {
+            crate::copystat::add(crate::copystat::C::GuardPartFaults, 1);
+        }
+    }
+    opened
 }
 
 fn put_count(block: usize) -> &'static std::sync::atomic::AtomicU32 {
@@ -1668,7 +1810,11 @@ fn publish(pages: &[usize]) {
             PUBLISHED.set(page);
             // (Put there or opened by a fault since: whoever did clears the
             // bit after this is set, or its own bit is found here.)
-            if BESIDE.any(page, page + 1) || LOOSE.any(page, page + 1) || PENDING.any(page, page + 1) {
+            if BESIDE.any(page, page + 1)
+                || LOOSE.any(page, page + 1)
+                || LOOSE_PART.any(page, page + 1)
+                || PENDING.any(page, page + 1)
+            {
                 PUBLISHED.clear(page);
             }
         }
@@ -2023,11 +2169,6 @@ struct Guards {
     aliased: Blocks,
     /// Blocks opened by a write fault, and when ([`rest`]).
     opened: std::collections::HashMap<usize, std::time::Instant, std::hash::BuildHasherDefault<PageHash>>,
-    /// Guarded blocks with parts opened by write faults ([`part_open`]): the
-    /// parts, a bit each. The rest of such a block is read-only, and it is
-    /// not clean. `WHOLE`: told as written whole at the next asking, whatever
-    /// parts are open.
-    parted: std::collections::HashMap<usize, u16, std::hash::BuildHasherDefault<PageHash>>,
 }
 
 impl Guards {
@@ -2065,7 +2206,6 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     changing: Vec::new(),
     aliased: Blocks::new(),
     opened: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()),
-    parted: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()),
 });
 
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
@@ -2330,7 +2470,12 @@ fn guard_parts(start: usize, end: usize) -> Option<Vec<(usize, u16)>> {
             let these = in_word(word * 64, first, last);
             g.clean.word(word) & these == these
         });
-        if clean && !BESIDE.any(first, last) && !LOOSE.any(first, last) && !PENDING.any(first, last) {
+        if clean
+            && !BESIDE.any(first, last)
+            && !LOOSE.any(first, last)
+            && !LOOSE_PART.any(first, last)
+            && !PENDING.any(first, last)
+        {
             // Nothing written, mapped or new since the range was last taken.
             #[cfg(feature = "diagnostics")]
             tally(3, 1);
@@ -2367,8 +2512,12 @@ fn guard_parts(start: usize, end: usize) -> Option<Vec<(usize, u16)>> {
     // clean.
     let mut written = Vec::new();
     for word in first / 64..last.div_ceil(64) {
-        let known =
-            g.clean.word(word) & !BESIDE.word(word) & !LOOSE.word(word) & !PENDING.word(word) | g.absent.word(word);
+        let known = g.clean.word(word)
+            & !BESIDE.word(word)
+            & !LOOSE.word(word)
+            & !LOOSE_PART.word(word)
+            & !PENDING.word(word)
+            | g.absent.word(word);
         written.extend(BitsOf(!known & in_word(word * 64, first, last)).map(|bit| word * 64 + bit));
     }
     let mut parts = vec![WHOLE; written.len()];
@@ -2393,6 +2542,9 @@ fn guard_parts(start: usize, end: usize) -> Option<Vec<(usize, u16)>> {
         if beside {
             put_count(block).store(0, std::sync::atomic::Ordering::Relaxed);
         }
+        if LOOSE_PART.take(block) {
+            g.clean.remove(block);
+        }
         if loose(&mut g, block) && g.protected.contains(block) {
             // A fault is opening it right now: guarded at the next asking.
             if let Some((from, to)) = run.take() {
@@ -2414,21 +2566,34 @@ fn guard_parts(start: usize, end: usize) -> Option<Vec<(usize, u16)>> {
                 // Another asking's: another view of it is not read-only yet.
                 continue;
             }
-            if let Some(open) = g.parted.remove(&block) {
-                // Read-only again before the caller reads the parts.
-                if !close(block) {
-                    g.parted.insert(block, WHOLE);
-                    continue;
-                }
-                if !beside {
-                    parts[i] = open;
-                }
-                #[cfg(feature = "diagnostics")]
-                if open != WHOLE {
-                    use crate::copystat::{C, add};
-                    add(C::GuardPartBlocks, 1);
-                    add(C::GuardPartParts, u64::from(open.count_ones()));
-                }
+            // No part opened with no lock between the look and the close.
+            let claimed = loose_parts() && FINE.any(block, block + 1);
+            if claimed && !OPENING.put(block) {
+                // A fault is opening a part: told whole, guarded at the next
+                // asking.
+                LOOSE_PART.set(block);
+                continue;
+            }
+            let open = PARTED.take(block);
+            // Read-only again before the caller reads the parts.
+            let closed = open == 0 || close(block);
+            if !closed {
+                PARTED.or(block, WHOLE);
+            }
+            if claimed {
+                OPENING.clear(block);
+            }
+            if !closed {
+                continue;
+            }
+            if open != 0 && !beside {
+                parts[i] = open;
+            }
+            #[cfg(feature = "diagnostics")]
+            if open != 0 && open != WHOLE {
+                use crate::copystat::{C, add};
+                add(C::GuardPartBlocks, 1);
+                add(C::GuardPartParts, u64::from(open.count_ones()));
             }
             if !alias_later() {
                 if cover(&mut g, block, block + 1) {
@@ -2875,6 +3040,7 @@ fn aliases_done(g: &mut Guards, aliases: &Aliases, done: Vec<bool>) {
             && g.protected.contains(block)
             && PROTECTED.any(block, block + 1)
             && !LOOSE.any(block, block + 1)
+            && !LOOSE_PART.any(block, block + 1)
         {
             g.clean.insert(block);
         }
@@ -2925,7 +3091,11 @@ fn cover_as(g: &mut Guards, from: usize, to: usize, mut plan: Option<&mut Aliase
         ALIASES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         g.aliased.insert(block);
         ALIASED.set(block);
-        if loose(g, block) {
+        if loose(g, block)
+            || loose_parts()
+                && FINE.any(block, block + 1)
+                && (LOOSE_PART.any(block, block + 1) || OPENING.any(block, block + 1))
+        {
             // Opened by a fault since it was guarded.
             all = false;
             g.clean.remove(block);
@@ -2978,13 +3148,19 @@ fn protect_alias(g: &mut Guards, block: usize, plan: Option<(&mut Aliases, usize
     }
     if g.protected.contains(block) {
         // With parts open, a write through those would not be seen here.
-        if g.parted.contains_key(&block) {
-            if !close(block) {
-                return false;
-            }
-            g.parted.insert(block, WHOLE);
+        let claimed = loose_parts() && FINE.any(block, block + 1);
+        if claimed && !OPENING.put(block) {
+            // A fault is opening a part.
+            return false;
         }
-        return true;
+        let closed = PARTED.get(block) == 0 || close(block);
+        if closed {
+            PARTED.whole(block);
+        }
+        if claimed {
+            OPENING.clear(block);
+        }
+        return closed;
     }
     if g.left_alone(block) || g.rests(block, rest()) {
         return false;
@@ -3245,9 +3421,7 @@ fn open(g: &mut Guards, start: usize, end: usize) -> usize {
                     // Before the first can be written.
                     g.clean.remove(other);
                     PUBLISHED.clear(other);
-                    if let Some(open) = g.parted.get_mut(&other) {
-                        *open = WHOLE;
-                    }
+                    PARTED.whole(other);
                     continue;
                 }
                 g.aliased.remove(other);
@@ -3275,7 +3449,7 @@ fn unguard(g: &mut Guards, blocks: &[usize]) {
     for &block in blocks {
         g.protected.remove(block);
         g.clean.remove(block);
-        g.parted.remove(&block);
+        PARTED.take(block);
         PUBLISHED.clear(block);
     }
     let mut sorted = blocks.to_vec();
@@ -3375,7 +3549,7 @@ fn part_faults() -> u32 {
 
 /// A write fault at `at`: opens only the 4 KiB part it is in, if the block
 /// is a guarded one of the descriptor heaps ([`FINE`]), and notes the part
-/// ([`Guards::parted`]); [`guard_parts`] tells those parts as written.
+/// ([`PARTED`]); [`guard_parts`] tells those parts as written.
 /// Whether it did, or the part was open already. `false`: open the whole
 /// block. So too for a block with other views (a write through one of those
 /// would not fault at this one's parts), or with [`part_faults`] parts open.
@@ -3392,11 +3566,12 @@ fn part_open(g: &mut Guards, at: usize) -> bool {
         return false;
     }
     let part = 1u16 << (at % BLOCK / KERNEL_PAGE);
-    let open = g.parted.get(&block).copied().unwrap_or(0);
-    if open & part != 0 {
+    let open = PARTED.get(block);
+    // (A part opened with no lock may have been let be read-only again.)
+    if open & part != 0 && !loose_parts() {
         return true;
     }
-    if open.count_ones() >= most {
+    if open & part == 0 && open.count_ones() >= most {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::GuardPartWhole, 1);
         return false;
@@ -3415,7 +3590,7 @@ fn part_open(g: &mut Guards, at: usize) -> bool {
         unsafe { VirtualProtect(page as *const _, KERNEL_PAGE, old, &mut old) };
         return false;
     }
-    g.parted.insert(block, open | part);
+    PARTED.or(block, part);
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::GuardPartFaults, 1);
     true
@@ -3923,7 +4098,7 @@ pub fn title_memory_unmapping(at: usize, len: usize) {
     for block in blocks {
         g.protected.remove(block);
         g.clean.remove(block);
-        g.parted.remove(&block);
+        PARTED.take(block);
         PUBLISHED.clear(block);
         PROTECTED.clear(block);
     }
@@ -4087,6 +4262,9 @@ pub(crate) fn install() {
                     crate::faultbook::note(crate::faultbook::What::Fault, block, 1 << 32, 0);
                     crate::faultbook::note(crate::faultbook::What::Site, r.ExceptionAddress as usize, block, 0);
                 }
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
+            if open_part_loose(at) {
                 return EXCEPTION_CONTINUE_EXECUTION;
             }
             #[cfg(feature = "diagnostics")]
@@ -4306,6 +4484,23 @@ mod tests {
     /// block opens whole.
     #[test]
     fn heap_blocks_open_by_the_part() {
+        heap_parts(false);
+    }
+
+    /// So too with the parts opened with no lock.
+    #[test]
+    fn heap_blocks_open_by_the_part_with_no_lock() {
+        LOOSE_PARTS_HERE.set(true);
+        heap_parts(true);
+        LOOSE_PARTS_HERE.set(false);
+    }
+
+    thread_local! {
+        /// `VICTORY_LOOSE_PARTS=1` for this thread's faults and askings.
+        pub(super) static LOOSE_PARTS_HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    fn heap_parts(loose: bool) {
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, UnmapViewOfFile,
         };
@@ -4331,6 +4526,7 @@ mod tests {
         poke(3);
         assert!(writable(view + 3 * KERNEL_PAGE));
         assert!(!writable(view + 4 * KERNEL_PAGE));
+        assert_eq!(LOOSE_PART.any(block, block + 1), loose);
         poke(3);
         assert_eq!(guard_parts(view, view + 2 * BLOCK), Some(vec![(block, 1 << 3)]));
         assert!(!writable(view + 3 * KERNEL_PAGE));
