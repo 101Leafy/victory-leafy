@@ -11146,15 +11146,16 @@ impl Host {
                 }
                 _ => false,
             };
+            // A texture already in the copy source state takes no barrier
+            // to it and back (the same state on both sides is refused).
+            let moved = state != D3D12_RESOURCE_STATE_COPY_SOURCE;
             if !composed {
-                list.ResourceBarrier(&[
-                    transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE),
-                    transition(
-                        &back,
-                        D3D12_RESOURCE_STATE_PRESENT,
-                        D3D12_RESOURCE_STATE_COPY_DEST,
-                    ),
-                ]);
+                let mut pre = Vec::with_capacity(2);
+                if moved {
+                    pre.push(transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE));
+                }
+                pre.push(transition(&back, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST));
+                list.ResourceBarrier(&pre);
                 list.CopyResource(&back, texture);
             }
             // (A frame put together is read from the back buffer.)
@@ -11187,14 +11188,12 @@ impl Host {
                     D3D12_RESOURCE_STATE_PRESENT,
                 )]);
             } else {
-                list.ResourceBarrier(&[
-                    transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state),
-                    transition(
-                        &back,
-                        D3D12_RESOURCE_STATE_COPY_DEST,
-                        D3D12_RESOURCE_STATE_PRESENT,
-                    ),
-                ]);
+                let mut post = Vec::with_capacity(2);
+                if moved {
+                    post.push(transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state));
+                }
+                post.push(transition(&back, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT));
+                list.ResourceBarrier(&post);
             }
             copy.close();
             let flown = match slot {
