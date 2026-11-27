@@ -442,11 +442,16 @@ pub(crate) enum C {
     CardLateRefused,
     /// Full waits with nothing written since the last one (`crate::draw::State::wait_needed`).
     WaitsQuiet,
+    /// Bytes of partly mapped textures read before their 30 frames were up
+    /// as the guards saw a write, and of those passed over until then
+    /// (`texture::partial_due`).
+    TexPartialWritten,
+    TexPartialSkipped,
 }
 const COUNTERS: usize = 256;
 
 /// The counters' names, in the order of [`C`], for the frame recorder's columns.
-pub(crate) const NAMES: [&str; 234] = [
+pub(crate) const NAMES: [&str; 236] = [
     "Submissions", "Copies", "CopyBytes", "Refreshes", "RefreshBytes", "Skipped", "SkippedBytes", "Runs",
     "RunUs", "Queries", "QueryUs", "MoveUs", "Unmapped", "Watches", "WatchUs", "Checked", "Unchanged",
     "Fallbacks", "GuardFaults", "TexWatched", "TexHashed", "TexChanged", "TexHot", "Frames", "RecordCalls",
@@ -498,6 +503,7 @@ pub(crate) const NAMES: [&str; 234] = [
     "CbvTables", "CbvTablesAligned", "CbvTablesAlignedSlots", "CbvAgainAlignedSlots",
     "CardLateMoved", "CardLateMovedBytes", "CardLateRefused",
     "WaitsQuiet",
+    "TexPartialWritten", "TexPartialSkipped",
 ];
 /// One of some sets of counters, each in lines of the processor's memory of
 /// its own: a set for all threads had them wait for each other's lines at
