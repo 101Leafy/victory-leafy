@@ -657,10 +657,31 @@ fn load(device: &ID3D12Device1, blob: Blob) -> Result<Library, (Blob, String)> {
     }
 }
 
+/// vkd3d-proton refuses a zero-length blob whose pointer is not null; a Rust
+/// empty slice's pointer never is.
+fn null_when_empty(bytes: &[u8]) -> *const std::ffi::c_void {
+    if bytes.is_empty() {
+        return std::ptr::null();
+    }
+    bytes.as_ptr().cast()
+}
+
 /// The host's library made from `bytes` (none: an empty one).
 fn make(device: &ID3D12Device1, bytes: &[u8]) -> windows::core::Result<ID3D12PipelineLibrary1> {
+    let pointer = null_when_empty(bytes);
+    let mut library: Option<ID3D12PipelineLibrary> = None;
     // SAFETY: the bytes outlive the library (kept beside it).
-    unsafe { device.CreatePipelineLibrary::<ID3D12PipelineLibrary>(bytes)?.cast() }
+    unsafe {
+        (Interface::vtable(device).CreatePipelineLibrary)(
+            Interface::as_raw(device),
+            pointer,
+            bytes.len(),
+            &ID3D12PipelineLibrary::IID,
+            (&raw mut library).cast(),
+        )
+        .ok()?;
+    }
+    library.ok_or_else(|| windows::core::Error::from(windows::Win32::Foundation::E_POINTER))?.cast()
 }
 
 /// An empty library.
