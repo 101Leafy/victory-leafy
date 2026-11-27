@@ -1717,4 +1717,81 @@ mod tests {
             }
         }
     }
+
+    /// Detile and tile throughput of mip 0, which holds three quarters of a
+    /// texture's bytes, on the layouts a title's textures and render targets
+    /// use (no game data): `cargo test --release -p victory-formats
+    /// texture_throughput -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "benchmark"]
+    fn texture_throughput() {
+        // Big enough to leave the caches of this machine, which is what a
+        // title's uploads do: 16 MiB of BC7, 8 MiB of BC1, a 32 MiB target.
+        let cases: [(&str, Desc); 3] = [
+            (
+                "BC1 4096^2 mip 0",
+                Desc {
+                    block: 4,
+                    ..desc(4096, 4096, 1, 8, Swizzle::SW_4KB_S)
+                },
+            ),
+            (
+                "BC7 4096^2 mip 0",
+                Desc {
+                    block: 4,
+                    ..desc(4096, 4096, 1, 16, Swizzle::SW_4KB_S)
+                },
+            ),
+            (
+                "RGBA8 3840x2160, 4KB_S",
+                desc(3840, 2160, 1, 4, Swizzle::SW_4KB_S),
+            ),
+        ];
+        for (name, d) in cases {
+            let l = Layout::new(&d).unwrap();
+            let m = l.mips[0];
+            let pitch = m.width as usize * d.element_bytes as usize;
+            let depth_pitch = pitch * m.height as usize;
+            let mut tiled = vec![0u8; l.size as usize];
+            let mut linear = vec![0u8; depth_pitch];
+            let mut plain = vec![0u8; depth_pitch];
+            let bytes = depth_pitch as f64;
+            let runs = 10;
+            // What this machine copies the same bytes at: the floor any
+            // detile is measured against.
+            let started = std::time::Instant::now();
+            for _ in 0..runs {
+                let src = std::hint::black_box(&tiled[..depth_pitch]);
+                plain.copy_from_slice(src);
+            }
+            let copy = elapsed(bytes, runs, started);
+            let started = std::time::Instant::now();
+            for _ in 0..runs {
+                let src = std::hint::black_box(&tiled);
+                l.detile(src, 0, 0, &mut linear, pitch, depth_pitch)
+                    .unwrap();
+            }
+            let detile = elapsed(bytes, runs, started);
+            let started = std::time::Instant::now();
+            for _ in 0..runs {
+                let src = std::hint::black_box(&linear);
+                l.tile(&mut tiled, 0, 0, src, pitch, depth_pitch).unwrap();
+            }
+            let tile = elapsed(bytes, runs, started);
+            println!(
+                "{name}: {} KiB · copy {:.1} MB/s · detile {:.1} ({:.0}% of copy) · tile {:.1} ({:.0}% of copy)",
+                depth_pitch / 1024,
+                copy,
+                detile,
+                100.0 * detile / copy,
+                tile,
+                100.0 * tile / copy
+            );
+        }
+    }
+
+    /// Megabytes a second of `bytes` moved `runs` times since `started`.
+    fn elapsed(bytes: f64, runs: u32, started: std::time::Instant) -> f64 {
+        bytes * f64::from(runs) / started.elapsed().as_secs_f64() / 1e6
+    }
 }
