@@ -5132,7 +5132,7 @@ fn kin(old: &View, new: &View) -> Kin {
 /// texture; 1: one of the same kind in another place or size; 2: any of the
 /// same dimension.
 fn keep_shown() -> u8 {
-    #[cfg(feature = "diagnostics")]
+    #[cfg(any(feature = "diagnostics", feature = "ab"))]
     if let Some(on) = crate::ab::pick("VICTORY_KEEP_SHOWN") {
         return if on { 2 } else { 0 };
     }

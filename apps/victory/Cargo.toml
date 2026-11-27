@@ -33,6 +33,9 @@ diagnostics = [
     "victory-loader/diagnostics",
     "victory-shader/diagnostics",
 ]
+# The A/B switches (`VICTORY_AB`) in a build without the rest of diagnostics:
+# `cargo build --profile ab -p victory --features ab`.
+ab = ["victory-hle/ab"]
 
 [lints]
 workspace = true

@@ -98,13 +98,17 @@ pub(crate) fn presented(change: impl Fn(&str, bool, bool)) {
     let (was, will) = (bits(p.number), bits(number));
     let (mean, median, most) = summary(&mut p.frames);
     let on: Vec<&str> = asked.switches.iter().enumerate().filter(|(n, _)| was >> n & 1 != 0).map(|(_, s)| s.as_str()).collect();
+    // (the present count is kept in diagnostics builds only)
+    #[cfg(feature = "diagnostics")]
+    let next = format!("; the next begins after frame {}", crate::queue::presented());
+    #[cfg(not(feature = "diagnostics"))]
+    let next = "";
     tracing::info!(
-        "A/B phase {} bits {was} on [{}]: {} frames, mean {mean:.1} ms, median {median:.1}, p90 {most:.1}, {:.0} draws a frame; the next begins after frame {}",
+        "A/B phase {} bits {was} on [{}]: {} frames, mean {mean:.1} ms, median {median:.1}, p90 {most:.1}, {:.0} draws a frame{next}",
         p.number,
         on.join(" "),
         p.frames.len(),
         p.draws as f64 / p.frames.len().max(1) as f64,
-        crate::queue::presented()
     );
     for (n, switch) in asked.switches.iter().enumerate() {
         change(switch, was >> n & 1 != 0, will >> n & 1 != 0);

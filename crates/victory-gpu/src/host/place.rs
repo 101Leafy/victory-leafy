@@ -333,7 +333,7 @@ impl HostList {
 /// `VICTORY_PLACED_ORDER=1`, which takes what stands ahead of a copy at its
 /// place.
 pub(super) fn forwarding() -> bool {
-    #[cfg(feature = "diagnostics")]
+    #[cfg(any(feature = "diagnostics", feature = "ab"))]
     if let Some(on) = crate::ab::pick("VICTORY_FILL_FORWARD") {
         return on;
     }
