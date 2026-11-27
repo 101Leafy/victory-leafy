@@ -65,6 +65,13 @@ fn reclaim_on_tick() -> bool {
     *ON.get_or_init(|| std::env::var("VICTORY_POOL_RECLAIM").is_ok_and(|v| v.trim() == "1"))
 }
 
+/// Whether a pool whose block was refused waits 500 ms before asking for
+/// another (`VICTORY_POOL_BACKOFF=1`; off, every miss asks again, as before).
+fn backoff() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_POOL_BACKOFF").map_or(cfg!(test), |v| v.trim() == "1"))
+}
+
 fn spares(memory: Option<[u64; 4]>, keep: bool) -> usize {
     match memory {
         Some([budget, used, ..]) if keep && u128::from(used) * 100 < u128::from(budget) * 85 => SPARE_KEPT,
@@ -310,6 +317,9 @@ impl<B: Clone> Pool<B> {
     }
 
     fn grow(&mut self, now: u64, make: &mut impl FnMut() -> Option<B>) -> Option<B> {
+        if !backoff() {
+            return make();
+        }
         if now < self.retry_growth_at {
             return None;
         }
@@ -357,8 +367,8 @@ impl<B: Clone> Pool<B> {
         }
         // (Without a piece given back too, once there is less room.)
         let most = limit.min(self.most);
-        let previous = std::mem::replace(&mut self.spare, most);
-        if sweep || any || most < previous {
+        if sweep || any || most < self.spare {
+            self.spare = most;
             let mut spare = 0;
             for block in &mut self.blocks {
                 if block.as_ref().is_some_and(|b| b.free.whole(BLOCK)) {
