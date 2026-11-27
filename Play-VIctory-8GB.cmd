@@ -1,31 +1,49 @@
 @echo off
 setlocal EnableExtensions DisableDelayedExpansion
 rem ---------------------------------------------------------------------------
-rem Play-VIctory-8GB.cmd: the settings that fit a card that is short of memory.
+rem Play-VIctory-8GB.cmd [1080p|720p|540p|1440p|4k]: the settings that fit a
+rem card that is short of memory, and a ladder of output sizes to find out
+rem whether a frame is spent on pixels or on preparation.
 rem
-rem Written for the 8 GiB laptop cards (RTX 4060/4070/5070 Laptop, 3060 Ti,
-rem 3070, 5060), where the port runs out of a 7.5 GiB budget, spills into
-rem shared memory, and then pays for it in paging: copy-backs that take a
-rem second and a half for 35 MB, textures re-uploaded thousands of times, and
-rem a frame rate in the single digits. On those cards the card itself measured
-rem under 12 ms of work inside frames of 56 to 119 ms, so what is being paid
-rem for is memory, not shading.
+rem Written for the 8 GiB cards (RTX 4060/4070/5070 Laptop, 3060 Ti, 3070,
+rem 5060), where the port runs out of a 7.5 GiB budget, spills into shared
+rem memory, and then pays for it in paging: copy-backs that take a second and
+rem a half for 35 MB, textures re-uploaded thousands of times, and a frame rate
+rem in the single digits. On those cards the card itself measured under 12 ms
+rem of work inside frames of 56 to 119 ms, so what is being paid for is memory,
+rem not shading.
+rem
+rem THE LADDER IS THE POINT. Run it twice or three times at different sizes and
+rem compare the median frame time:
+rem   4K -> 1080p is 4 times fewer pixels, 1080p -> 540p another 4 times.
+rem If the frame time falls by about those factors, the frame is spent on
+rem pixels and the size is the lever. If it barely moves, the frame is spent on
+rem preparing submissions, and no size will help: the project's own record says
+rem the thread that prepares submissions took 48 ms of a 55 ms frame on an
+rem RX 7900 XTX, and that preparing is the wall. A frame cannot be shorter than
+rem the work of preparing it, so 30 fps needs preparing under 33 ms.
 rem
 rem Every switch below exists in this tree. The profile is the one the leading
 rem continuation (cool_fox) ships for its "pareto-residency" launcher, minus
 rem the two switches this tree does not carry (VICTORY_PORT_GUARD,
-rem VICTORY_LIBRARY_STORE_LATER), plus VICTORY_OUTPUT, which is the largest
+rem VICTORY_LIBRARY_STORE_LATER), plus the output size, which is the largest
 rem single lever here and is off by default. Nothing in the engine changes;
-rem set VICTORY_* yourself to override any line (each is only a default).
-rem
-rem What to expect, measured by others on this project and not by us: 8 GiB
-rem cards report 2 to 3 fps in gameplay with the settings they tried, and the
-rem strongest card in the reports (RTX 5070 Ti 16 GB, 9800X3D) reports 14 to
-rem 25 fps in the prison and indoors. 30 fps is reached in menus, not in
-rem gameplay, by anyone yet. This launcher is aimed at getting an 8 GiB card
-rem from 1-3 fps to the teens by taking it out of shared memory, not at
-rem reaching 30 in the world.
+rem set any VICTORY_* yourself to override a line (each is only a default).
 rem ---------------------------------------------------------------------------
+
+set "profile=%~1"
+if not defined profile set "profile=1080p"
+
+if /i "%profile%"=="540p" set "lowres=1"
+if /i "%profile%"=="540p" set "pixels=960x540"
+if /i "%profile%"=="720p" set "pixels=1280x720"
+if /i "%profile%"=="1080p" set "pixels=1920x1080"
+if /i "%profile%"=="1440p" set "pixels=2560x1440"
+if /i "%profile%"=="4k" set "pixels=3840x2160"
+if not defined pixels (
+  echo Unknown size "%profile%": use 540p, 720p, 1080p, 1440p or 4k. 1>&2
+  exit /b 2
+)
 
 if not defined VICTORY_GAME_DIR (
   echo Set VICTORY_GAME_DIR to the folder containing your title executable. 1>&2
@@ -41,16 +59,26 @@ if not exist "%runner%" (
   exit /b 2
 )
 
-rem The pixel lever, and the only one of its size: at load the title is made to
-rem write 1920x1080 into its own settings instead of the 3840x2160 a Series X
-rem writes, and its screen size, back buffers and render targets are all that
-rem size afterwards. 4 times fewer pixels than 4K, and 1.78 times fewer than
-rem the 2560x1440 the title's own 2/3 upscaler would have rendered. Under 4K
-rem interface panels scale themselves (VICTORY_UI_VIEWBOX, on by default).
-rem The size has to be one of the title's modes: 1280x720, 1664x936,
-rem 1920x1080, 2560x1440, 3840x2160. If your build of the title differs the
-rem patch is left alone and says so, so this line cannot corrupt anything.
-if not defined VICTORY_OUTPUT set "VICTORY_OUTPUT=1920x1080"
+rem The pixel lever: at load the title is made to write this size into its own
+rem settings instead of the 3840x2160 a Series X writes, and its screen size,
+rem back buffers and render targets are all that size afterwards. 1080p is 4
+rem times fewer pixels than 4K (8.29 MP to 2.07 MP) and 1.78 times fewer than
+rem the 2560x1440 the title's own 2/3 upscaler would have rendered; 960x540 is
+rem 16 times fewer than 4K. Under 4K the interface panels scale themselves
+rem (VICTORY_UI_VIEWBOX, on by default).
+rem
+rem 540p is not one of the title's five modes, so it needs VICTORY_TEST_LOWRES,
+rem which is the loader's own escape hatch for sizes below 720p: it writes the
+rem size past the mode list (even dimensions, at least 256x144). Its comment
+rem says "test runs only" because the title has no mode for it; on the sizes
+rem above 720p that caveat does not apply at all.
+rem
+rem Each patch site is byte-compared first and left alone, with a line saying
+rem so, if your build of the title differs: this cannot corrupt a run. If the
+rem size did not take, the log's "presenting to a window" line still reports
+rem 3840x2160 and drawn_of_the_screen stays at 2.025.
+if defined lowres if not defined VICTORY_TEST_LOWRES set "VICTORY_TEST_LOWRES=1"
+if not defined VICTORY_OUTPUT set "VICTORY_OUTPUT=%pixels%"
 
 rem Card memory: mip levels take card memory only for the levels the title
 rem holds, which the continuation measures at up to 3 GiB on this title, and
@@ -62,6 +90,18 @@ rem Never hold a frame waiting for a pipeline that is still being made: a
 rem 500 ms stall measured on exactly this kind of card, over and over while a
 rem scene loads its shaders.
 if not defined VICTORY_PIPELINE_WAIT_MS set "VICTORY_PIPELINE_WAIT_MS=0"
+
+rem Two preparing experiments, off by default in the engine and NOT measured by
+rem anyone on your card. VICTORY_REFRESH_FRONT brings everything a submission
+rem refreshes up to date in one go on several threads ahead of its steps,
+rem instead of 580 copies one after the other on the submitting thread (3.4 to
+rem 6.5 ms measured on one session); VICTORY_QUIET_WAITS leaves out a full wait
+rem when nothing that writes was recorded since the last one. They are here
+rem because preparing is the wall. If you see wrong textures, a black screen or
+rem a device loss, run with VICTORY_REFRESH_FRONT=0 and VICTORY_QUIET_WAITS=0
+rem set in your environment before launching, and say so: that is worth knowing.
+if not defined VICTORY_REFRESH_FRONT set "VICTORY_REFRESH_FRONT=1"
+if not defined VICTORY_QUIET_WAITS set "VICTORY_QUIET_WAITS=1"
 
 rem Keeping the card's clocks up between submissions, and the submission
 rem stages the continuation keeps on for this profile.
@@ -101,5 +141,6 @@ if not defined VICTORY_JOIN_PARTS set "VICTORY_JOIN_PARTS=0"
 if not defined VICTORY_CACHE_DIR set "VICTORY_CACHE_DIR=%LOCALAPPDATA%\VIctory\cache-8gb"
 if not defined VICTORY_LOG if not defined RUST_LOG set "VICTORY_LOG=warn"
 
+echo VIctory: %profile% (VICTORY_OUTPUT=%VICTORY_OUTPUT%)
 "%runner%" run "%VICTORY_GAME_DIR%\game_scarlett_master.exe" --console series-x --execute
 exit /b %errorlevel%
