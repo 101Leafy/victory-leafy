@@ -761,7 +761,9 @@ pub(crate) struct Spans {
     first: std::collections::HashMap<u32, (u32, u64)>,
     /// The bytes a placed texture takes, by resource description: worked
     /// out once for each (a title writes the views of a few thousand
-    /// descriptions, thousands of times a frame).
+    /// descriptions, thousands of times a frame). By description without
+    /// its filler words (`crate::resource::without_filler`), which do not
+    /// change the size.
     sizes: std::collections::HashMap<[u32; 14], Option<u64>>,
 }
 
@@ -795,12 +797,8 @@ impl Spans {
     /// The bytes of title memory a placed texture with the resource
     /// description `desc` takes (`crate::resource::placed_bytes`).
     fn bytes(&mut self, desc: &[u32; 14]) -> Option<u64> {
-        if let Some(&known) = self.sizes.get(desc) {
-            return known;
-        }
-        let bytes = crate::resource::placed_bytes(desc);
-        self.sizes.insert(*desc, bytes);
-        bytes
+        let desc = crate::resource::without_filler(desc);
+        *self.sizes.entry(desc).or_insert_with(|| crate::resource::placed_bytes(&desc))
     }
 
     /// The starts of the spans that overlap `[start, end)`, each taken to
@@ -957,11 +955,12 @@ impl Spans {
 /// [`REMAPPED`] so that what such writes do is counted by itself.
 static PAGE_WRITTEN: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
 
-/// Since the start: such ranges kept for a pass; ranges dropped because no
-/// pass took them; slots of placed textures that held bytes of them when a
-/// pass took them; of those, the slots whose texture had been uploaded
-/// before the write (out of the queue, or in it after an upload): they are
-/// the ones that kept the bytes from before. Then, with
+/// Since the start: such ranges kept for a pass; ranges joined into others
+/// because no pass took them in time ([`record_range`]); slots of placed
+/// textures that held bytes of them when a pass took them; of those, the
+/// slots whose texture had been uploaded before the write (out of the
+/// queue, or in it after an upload): they are the ones that kept the bytes
+/// from before. Then, with
 /// `VICTORY_PAGE_SETTLE` ([`page_settle`]): writes that found their slot
 /// settling already (one upload for them all); slots made due once their
 /// writes settled; settled slots left as they were (waiting for their
@@ -1026,25 +1025,22 @@ pub(crate) fn page_settle() -> u64 {
 /// ranges; locks one mutex and calls nothing.
 pub(crate) fn page_written(at: usize, len: usize) {
     use std::sync::atomic::Ordering::Relaxed;
-    /// Ranges kept until a pass takes them.
-    const MOST: usize = 1 << 15;
+    /// Ranges kept until a pass takes them. (A world's first minutes note
+    /// tens of thousands between two passes: 131,072 were dropped in one run
+    /// at the 32,768 there were.)
+    const MOST: usize = 1 << 18;
     let (start, end) = (at as u64, at.saturating_add(len) as u64);
     if end <= SPANNED[0].load(Relaxed) || start >= SPANNED[1].load(Relaxed) {
         return;
     }
+    #[cfg(feature = "diagnostics")]
+    crate::texture::audit::told(at, len, 2);
     let mut ranges = PAGE_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
     PAGE_WRITES[0].fetch_add(1, Relaxed);
-    if let Some(last) = ranges.last_mut()
-        && last.1 == start
-    {
-        last.1 = end;
-        return;
+    let joined = record_range(&mut ranges, start, end, MOST);
+    if joined > 0 {
+        PAGE_WRITES[1].fetch_add(joined, Relaxed);
     }
-    if ranges.len() >= MOST {
-        PAGE_WRITES[1].fetch_add(ranges.len() as u64, Relaxed);
-        ranges.clear();
-    }
-    ranges.push((start, end));
 }
 
 /// Title memory the runtime mapped, unmapped or is about to write since a
@@ -1061,8 +1057,9 @@ static SPANNED: [std::sync::atomic::AtomicU64; 2] = [
 
 /// Since the start: slots whose view a newer view of other memory there
 /// made stale; ranges of memory noted as mapped, unmapped or written;
-/// ranges dropped because no pass took them; slots made due by such
-/// ranges; and made slots whose memory was found unmapped (made null).
+/// ranges joined into others because no pass took them in time; slots made
+/// due by such ranges; and made slots whose memory was found unmapped
+/// (made null).
 pub(crate) static STALE: [std::sync::atomic::AtomicU64; 5] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 
@@ -1085,31 +1082,61 @@ fn stale_rule() -> Rule {
 /// textures there may have arrived, gone, or changed with no descriptor
 /// written. The range is kept for the next texture pass
 /// ([`HostHeap::texture_slots_remapped`]). Called with the runtime's own
-/// locks held: this locks one mutex of its own and calls nothing.
+/// locks held: this locks one mutex of its own and calls nothing but
+/// [`record_range`].
 pub(crate) fn remapped(at: usize, len: usize) {
     use std::sync::atomic::Ordering::Relaxed;
-    /// Ranges kept until a pass takes them.
-    const MOST: usize = 1 << 15;
+    /// Ranges kept until a pass takes them. (A world's first minutes note
+    /// tens of thousands between two passes: 131,072 were dropped in one run
+    /// at the 32,768 there were.)
+    const MOST: usize = 1 << 18;
     let (start, end) = (at as u64, at.saturating_add(len) as u64);
     if end <= SPANNED[0].load(Relaxed) || start >= SPANNED[1].load(Relaxed) {
         return;
     }
+    #[cfg(feature = "diagnostics")]
+    crate::texture::audit::told(at, len, 1);
     let mut ranges = REMAPPED.lock().unwrap_or_else(|e| e.into_inner());
     STALE[1].fetch_add(1, Relaxed);
-    // Pages are mapped one after the other.
-    if let Some(last) = ranges.last_mut()
-        && last.1 == start
-    {
-        last.1 = end;
-        return;
+    let joined = record_range(&mut ranges, start, end, MOST);
+    if joined > 0 {
+        STALE[2].fetch_add(joined, Relaxed);
     }
-    if ranges.len() >= MOST {
-        // No pass runs (no shader that picks textures by index is bound):
-        // the slots there are looked at when they are due, as before.
-        STALE[2].fetch_add(ranges.len() as u64, Relaxed);
-        ranges.clear();
+}
+
+/// Keeps `[start, end)` among `ranges` for the next pass: one that meets
+/// the last range widens it (pages are mapped one after the other, and the
+/// same ones written over and over). A list that holds `most` is joined
+/// first ([`join`]), and only one still that long becomes the single range
+/// from its lowest start to its highest end: no range is dropped, and the
+/// pass looks at what lies between the ranges, not at all memory. Returns
+/// how many ranges went into others that way (DexNom/VIctory 921d8d3b:
+/// `record_remap`).
+fn record_range(ranges: &mut Vec<(u64, u64)>, start: u64, end: u64, most: usize) -> u64 {
+    if start >= end {
+        return 0;
+    }
+    if let Some(last) = ranges.last_mut()
+        && last.0 <= end
+        && start <= last.1
+    {
+        last.0 = last.0.min(start);
+        last.1 = last.1.max(end);
+        return 0;
+    }
+    let mut joined = 0;
+    if ranges.len() >= most {
+        let before = ranges.len();
+        join(ranges);
+        if ranges.len() >= most {
+            let hull = (ranges[0].0, ranges[ranges.len() - 1].1);
+            ranges.clear();
+            ranges.push(hull);
+        }
+        joined = (before - ranges.len()) as u64;
     }
     ranges.push((start, end));
+    joined
 }
 
 /// Ranges of memory, those that touch made one (DexNom/VIctory 921d8d3b:
@@ -1816,6 +1843,9 @@ fn capped_dynamic_slots(count: u32, null: u32, set: Option<u32>) -> u32 {
 impl Drop for HostHeap {
     fn drop(&mut self) {
         FLIPS.lock().unwrap_or_else(|e| e.into_inner()).remove(&self.id);
+        if !self.sampler {
+            crate::draw::forget_heap_ranges(self.id);
+        }
     }
 }
 
@@ -2096,6 +2126,11 @@ impl HostHeap {
         Some(self.count + first as u32)
     }
 
+    /// Dynamic slots free now, and of how many.
+    pub(crate) fn dynamic_free(&self) -> (u32, u32) {
+        (self.free.load(std::sync::atomic::Ordering::Relaxed), self.dynamic)
+    }
+
     /// The title slots this heap has host slots for; fewer than the title's
     /// when the host caps its size.
     pub(crate) fn count(&self) -> u32 {
@@ -2276,6 +2311,8 @@ impl HostHeap {
     /// `crate::texture` ([`page_settle`], `VICTORY_TABLED_REREAD`).
     /// Counted either way; returns how many slots it made due.
     fn texture_slots_page_written(&self, frame: u64) -> usize {
+        #[cfg(feature = "diagnostics")]
+        crate::texture::audit::check(frame);
         let ranges = std::mem::take(&mut *PAGE_WRITTEN.lock().unwrap_or_else(|e| e.into_inner()));
         // Not in this file's tests: texture.rs's own test settles textures
         // on a made-up clock, which the real one here would run past.
@@ -2489,6 +2526,9 @@ impl HostHeap {
                 remade += 1;
             }
         }
+        if remade > 0 {
+            VIEWS_CHANGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         remade
     }
 
@@ -2547,28 +2587,43 @@ impl HostHeap {
         matches!((view(shown), view(key)), (Some(a), Some(b)) if same_placed_texture(&a, &b))
     }
 
-    /// Slot `index` is made from the record at `handle` (what it is now)
-    /// when `list`, which holds the upload of what that view shows, has run:
-    /// until then it shows what it showed. (Made at once, the frames on the
-    /// card read the new view before its levels were filled.)
-    pub(crate) fn texture_slot_flip(&self, list: &crate::host::HostList, index: u32, handle: u64) {
-        self.flip(list, index, handle, None);
+    /// The view the record at `handle` holds now and its key, read once for
+    /// the texture pass: the upload is made of that view, and the slot is
+    /// made by that key, not by a record the title writes there meanwhile.
+    pub(crate) fn prepare_texture_slot(&self, index: u32, handle: u64) -> Option<(View, u64)> {
+        if index >= self.count || handle == 0 {
+            return None;
+        }
+        let key = record_key(handle);
+        if key == 0 {
+            return None;
+        }
+        Some((view_at(key as u32, (key >> 32) as u32)?, key))
+    }
+
+    /// Slot `index` is made from the record at `handle` (`key`, what it was
+    /// when the upload was recorded) when `list`, which holds the upload of
+    /// what that view shows, has run: until then it shows what it showed.
+    /// (Made at once, the frames on the card read the new view before its
+    /// levels were filled.)
+    pub(crate) fn texture_slot_flip(&self, list: &crate::host::HostList, index: u32, handle: u64, key: u64) {
+        self.flip(list, index, handle, key, None);
     }
 
     /// The same of a slot that shows nothing of the texture the record at
     /// `handle` views, or something else: until then it shows the neutral
     /// texture ([`show_after`]).
-    pub(crate) fn texture_slot_show_after(&self, list: &crate::host::HostList, index: u32, handle: u64) {
-        if self.show_later(index, handle) {
-            self.flip(list, index, handle, Some(crate::frame::current()));
+    pub(crate) fn texture_slot_show_after(&self, list: &crate::host::HostList, index: u32, handle: u64, key: u64) {
+        if self.show_later(index, handle, key) {
+            self.flip(list, index, handle, key, Some(crate::frame::current()));
         }
     }
 
     /// What slot `index` shows until the texture the record at `handle` views
-    /// is shown. False: it shows it, or there is none.
-    fn show_later(&self, index: u32, handle: u64) -> bool {
+    /// (by `key`) is shown. False: it shows it, there is none, or the title
+    /// wrote another record there since.
+    fn show_later(&self, index: u32, handle: u64, key: u64) -> bool {
         use std::sync::atomic::Ordering::Relaxed;
-        let key = record_key(handle);
         let view = view_at(key as u32, (key >> 32) as u32);
         let (true, Some(view)) = (key != 0, view) else {
             return false;
@@ -2578,7 +2633,7 @@ impl HostHeap {
             let Some(shown) = self.made.get(index) else {
                 return false;
             };
-            if shown == key {
+            if shown == key || record_key(handle) != key {
                 return false;
             }
             // (As `mirror`.)
@@ -2611,11 +2666,11 @@ impl HostHeap {
 
     /// [`HostHeap::texture_slot_show_after`] of a texture whose upload `job`
     /// makes: shown when that has run.
-    pub(crate) fn texture_slot_show_ahead(&self, job: &crate::texture::ahead::Job, index: u32, handle: u64) {
-        if !self.show_later(index, handle) {
+    pub(crate) fn texture_slot_show_ahead(&self, job: &crate::texture::ahead::Job, index: u32, handle: u64, key: u64) {
+        if !self.show_later(index, handle, key) {
             return;
         }
-        let (heap, key) = (self.id, record_key(handle));
+        let heap = self.id;
         let late = Some(crate::frame::current());
         job.then(move || {
             queue_flip(heap, Flip { after: 0, index, handle, key, late });
@@ -2629,20 +2684,20 @@ impl HostHeap {
         if show_after()
             && index < self.count
             && !self.texture_slot_made_from(index, handle)
-            && let Some(view) = super::view(handle)
+            && let Some((view, key)) = self.prepare_texture_slot(index, handle)
             && let Some(View::Shader(resource, _)) =
                 placed_texture(&view).map(|placed| placed.view).or(Some(view))
             && crate::resource::buffer_bytes(resource as crate::object::This).is_none()
             && crate::resource::host_resource(resource as crate::object::This).is_some_and(crate::pool::fresh)
             && !crate::texture::ahead::there(resource as crate::object::This)
         {
-            return self.texture_slot_show_after(list, index, handle);
+            return self.texture_slot_show_after(list, index, handle, key);
         }
         self.mirror(index, handle, true);
     }
 
-    fn flip(&self, list: &crate::host::HostList, index: u32, handle: u64, late: Option<u64>) {
-        let (heap, key) = (self.id, record_key(handle));
+    fn flip(&self, list: &crate::host::HostList, index: u32, handle: u64, key: u64, late: Option<u64>) {
+        let heap = self.id;
         list.defer_host(move || {
             let after = crate::host::submissions().0;
             queue_flip(heap, Flip { after, index, handle, key, late });
@@ -3183,6 +3238,40 @@ impl HostHeap {
     /// What slot `index` views.
     fn kept_in(&self, index: u32) -> Option<ID3D12Resource> {
         self.kept.get(index as usize)?.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Whether dynamic slot `index`, made from `view` in an earlier frame,
+    /// still views what [`HostHeap::make_at`] would make it from now: the
+    /// same host copy of a texture, the same shadow of a buffer. Other views
+    /// are taken as they are; a texture view made again with another
+    /// description bumps [`VIEWS_CHANGED`] instead.
+    pub(crate) fn still_views(&self, index: u32, view: &View) -> bool {
+        use windows::core::Interface;
+        let now = match view {
+            View::Shader(resource, _) => match crate::resource::host_copy(*resource as crate::object::This) {
+                Some(copy) => Some(copy.texture.as_raw()),
+                None => buffer_copy(view).map(|(shadow, ..)| shadow.buffer.as_raw()),
+            },
+            View::Unordered(resource, _, _) => {
+                let resource = *resource as crate::object::This;
+                match buffer_copy(view) {
+                    Some((shadow, ..)) => Some(shadow.buffer.as_raw()),
+                    None => crate::resource::twin_resource(resource)
+                        .or_else(|| crate::resource::twin_plane_resource(resource))
+                        .or_else(|| crate::resource::host_resource(resource))
+                        .map(Interface::as_raw),
+                }
+            }
+            View::Placed(..) => match buffer_copy(view) {
+                Some((shadow, ..)) => Some(shadow.buffer.as_raw()),
+                None => return true,
+            },
+            _ => return true,
+        };
+        let Some(slot) = self.kept.get(index as usize) else {
+            return false;
+        };
+        slot.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(Interface::as_raw) == now
     }
 
     /// Makes slot `index` (a dynamic one) a raw buffer view of `len` bytes
@@ -4740,6 +4829,11 @@ pub(crate) static KEPT_YIELDED: std::sync::atomic::AtomicU64 = std::sync::atomic
 /// Slots showing an older texture as of the texture pass's last look.
 pub(crate) static KEEPING_NOW: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Bumped when title texture views are made again with other descriptions
+/// ([`HostHeap::texture_views_remade`]): a table kept from an earlier frame
+/// (`crate::draw`, `VICTORY_TABLE_CACHE`) made before it is made afresh.
+pub(crate) static VIEWS_CHANGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Whether a slot that goes on showing an older texture while the newer one
 /// waits ([`keep_views`], [`keep_shown`]) gives it up when the card has no
 /// room for the newer one (`VICTORY_KEPT_VIEWS_YIELD=1`; off by default: it
@@ -5441,6 +5535,24 @@ mod tests {
         assert_eq!(ranges.len(), 3);
     }
 
+    /// Ranges that meet the last one widen it, and a full list is joined,
+    /// then made one range only if it is still full: what was noted is all
+    /// still looked at by the next pass.
+    #[test]
+    fn noted_ranges_join_and_a_full_list_keeps_them_all() {
+        let mut ranges = Vec::new();
+        for (from, to) in [(40, 50), (30, 40), (35, 40), (10, 20), (45, 60), (60, 61), (1, 1)] {
+            assert_eq!(record_range(&mut ranges, from, to, 3), 0);
+        }
+        join(&mut ranges);
+        assert_eq!(ranges, [(10, 20), (30, 61)]);
+        assert_eq!(record_range(&mut ranges, 90, 99, 2), 1);
+        assert_eq!(ranges, [(10, 61), (90, 99)]);
+        let mut overlapping = vec![(0, 10), (5, 15)];
+        assert_eq!(record_range(&mut overlapping, 20, 30, 2), 1);
+        assert_eq!(overlapping, [(0, 15), (20, 30)]);
+    }
+
     /// Typed buffer views of integer formats are marked in the table of
     /// strides; float, normalized, raw and structured ones are not.
     #[test]
@@ -5514,6 +5626,28 @@ mod tests {
         assert_eq!(constant_bytes(480), 512);
         assert_eq!(constant_bytes(64 << 10), 64 << 10);
         assert_eq!(constant_bytes(u32::MAX), 64 << 10);
+    }
+
+    /// A record the title writes over a slot after the texture pass read it
+    /// is not shown by the upload made of the old one: the slot waits for
+    /// its own.
+    #[test]
+    fn an_upload_cannot_publish_a_replacement_slot_record() {
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return; // no host GPU
+        };
+        let record = |address| {
+            let [index, generation] = crate::descriptor::constant_words(address, 256).unwrap();
+            [VIEW_TAG, index, generation]
+        };
+        let slot = std::cell::Cell::new(record(0x10000));
+        let handle = slot.as_ptr() as u64;
+        let (_, uploaded) = heap.prepare_texture_slot(0, handle).unwrap();
+        slot.set(record(0x20000));
+        assert_ne!(record_key(handle), uploaded);
+        assert!(!heap.show_later(0, handle, uploaded));
+        assert_eq!(heap.prepare_texture_slot(0, handle).map(|(_, key)| key), Some(record_key(handle)));
+        assert!(heap.prepare_texture_slot(4, handle).is_none());
     }
 
     /// With the card full, a slot that goes on showing an older texture while

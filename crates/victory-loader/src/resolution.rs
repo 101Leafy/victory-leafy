@@ -37,27 +37,49 @@
 //!   That constant is set to 1.0, so the title renders at the output size
 //!   and nothing is upscaled. `VICTORY_RENDER_SCALE` (pull request #53) is
 //!   still read, and only 1.0 is taken.
+//! - **Interface.** Its layouts name a stretch mode for each panel, looked up
+//!   by name hash in a table at +0x630ff10 (fill 1, uniform 2, uniform to
+//!   fill 3, dynamic 4). Dynamic keeps the 4K pixel size whatever the
+//!   output, so at 720p and under the subtitles and prompts come out three
+//!   or more times too big. With any `VICTORY_OUTPUT` under 3840x2160 the
+//!   dynamic entry reads uniform, which scales the panel with the output
+//!   (`viewbox`); `VICTORY_UI_VIEWBOX=0` leaves the table alone.
 
 use crate::frame_rate::Patched;
+
+#[cfg(any(windows, test))]
+mod viewbox;
 
 /// Sizes the title has a display mode for (its own list, +0x615c0c0).
 pub const MODES: [(u32, u32); 5] = [(1280, 720), (1664, 936), (1920, 1080), (2560, 1440), (3840, 2160)];
 
-/// `VICTORY_OUTPUT=<w>x<h>`: one of [`MODES`]. `None` if unset or not one
-/// (said why).
+/// `VICTORY_OUTPUT=<w>x<h>`: one of [`MODES`], or with `VICTORY_TEST_LOWRES=1`
+/// a smaller test size (see [`test_size`]). `None` if unset or neither (said
+/// why).
 pub fn asked_output() -> Option<(u32, u32)> {
     let spec = std::env::var("VICTORY_OUTPUT").ok()?;
-    let size = parse_output(&spec);
+    let lowres = std::env::var("VICTORY_TEST_LOWRES").is_ok_and(|v| v == "1");
+    let size = parse_output(&spec).or_else(|| lowres.then(|| parse_size(&spec).filter(|&s| test_size(s))).flatten());
     if size.is_none() {
-        eprintln!("VIctory: VICTORY_OUTPUT={spec}: expected one of the title's modes: 1920x1080, 2560x1440, 1280x720, 1664x936, 3840x2160");
+        eprintln!("VIctory: VICTORY_OUTPUT={spec}: expected one of the title's modes: 1920x1080, 2560x1440, 1280x720, 1664x936, 3840x2160 (smaller test sizes need VICTORY_TEST_LOWRES=1)");
     }
     size
 }
 
 pub fn parse_output(spec: &str) -> Option<(u32, u32)> {
+    parse_size(spec).filter(|s| MODES.contains(s))
+}
+
+fn parse_size(spec: &str) -> Option<(u32, u32)> {
     let (w, h) = spec.trim().split_once(['x', 'X'])?;
-    let size = (w.trim().parse().ok()?, h.trim().parse().ok()?);
-    MODES.contains(&size).then_some(size)
+    Some((w.trim().parse().ok()?, h.trim().parse().ok()?))
+}
+
+/// Test runs only (bug repros, two games at once): under 1280x720, at
+/// least 256x144, both even. The title has no display mode for these, but
+/// the size is written past its mode list (see [`OUTPUT`]).
+pub fn test_size((w, h): (u32, u32)) -> bool {
+    (256..1280).contains(&w) && (144..720).contains(&h) && w % 2 == 0 && h % 2 == 0
 }
 
 /// The title's render scale: the output size, so nothing is upscaled.
@@ -254,6 +276,12 @@ pub unsafe fn apply_asked(base: usize, size: usize) {
     let mut asked: Vec<(&Site, Vec<u8>, String)> = Vec::new();
     if let Some((w, h)) = asked_output() {
         asked.push((&OUTPUT, output_code(w, h), format!("{w}x{h}")));
+        if viewbox::requested((w, h), std::env::var_os("VICTORY_UI_VIEWBOX").as_deref())
+            // SAFETY: the mapped image is live and the output override has not been applied.
+            && unsafe { matches(base, size, &OUTPUT) } == Patched::Done
+        {
+            asked.push((&viewbox::SITE, viewbox::FITTED.to_vec(), format!("{w}x{h}")));
+        }
         asked.push((&POOL_LEFT, vec![0xeb, 0x01], "skipped".into()));
     }
     asked_render_scale();
@@ -283,6 +311,10 @@ mod tests {
         assert_eq!(parse_output(" 2560X1440 "), Some((2560, 1440)));
         assert_eq!(parse_output("1600x900"), None);
         assert_eq!(parse_output("1080p"), None);
+        assert_eq!(parse_output("426x240"), None);
+        assert!(test_size((426, 240)));
+        assert!(!test_size((1280, 720)));
+        assert!(!test_size((425, 240)));
         assert_eq!(parse_render_scale("0.67"), Some(0.67));
         assert_eq!(parse_render_scale("0.5"), Some(0.5));
         assert_eq!(parse_render_scale("1"), Some(1.0));

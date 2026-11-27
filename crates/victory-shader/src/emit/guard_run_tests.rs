@@ -11,7 +11,8 @@ use crate::native::{
     ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
 };
 use crate::ir::Reg;
-use crate::{io, ir, resource, structure};
+use crate::gfx10::{Fields, Operand};
+use crate::{Container, FourCC, io, ir, resource, structure};
 use std::collections::BTreeSet;
 
 const VCC: u16 = 106;
@@ -672,4 +673,397 @@ fn lifted_runs_of_the_slow_shaders_change_no_lane() {
          programs), {compared} lane results compared"
     );
     assert!(shaders > 0, "no shader had runs");
+}
+
+/// What a VALU instruction leaves in its VGPR, for [`f16_rounding_of_the_title_fade`].
+#[derive(Clone, Copy, PartialEq)]
+enum Kind {
+    Half,
+    F32,
+    Other,
+}
+
+fn result_kind(name: &str) -> Kind {
+    if let Some(rest) = name.strip_prefix("v_cvt_") {
+        if rest.starts_with("f16_") || rest.starts_with("pkrtz_f16") {
+            Kind::Half
+        } else if rest.starts_with("f32_") {
+            Kind::F32
+        } else {
+            Kind::Other
+        }
+    } else if name.contains("frexp_exp") {
+        Kind::Other
+    } else if name.ends_with("_f16") {
+        Kind::Half
+    } else if name.ends_with("_f32") {
+        Kind::F32
+    } else {
+        Kind::Other
+    }
+}
+
+/// Whether `i` reads `r` as an f32 (otherwise it gets a pair of halves).
+fn reads_f32(i: &ir::Inst, r: Reg) -> bool {
+    let name = i.name();
+    if let Some(rest) = name.strip_prefix("v_cvt_") {
+        return rest.ends_with("_f32");
+    }
+    if name.starts_with("v_fma_mix") || name.starts_with("v_mad_mix") {
+        let Fields::Valu(v) = &i.fields else {
+            return true;
+        };
+        let at = v.src.iter().position(|o| match (*o, r) {
+            (Operand::Vector { reg, .. }, Reg::V(n)) => reg == n,
+            (Operand::Scalar { code, .. }, Reg::S(c)) => code == c,
+            _ => false,
+        });
+        return at.is_none_or(|k| v.opsel_hi >> k & 1 == 0);
+    }
+    !name.contains("f16") && name.contains("f32")
+}
+
+fn waits(name: &str) -> bool {
+    name.starts_with("s_nop") || name.starts_with("s_waitcnt") || name.starts_with("s_delay_alu")
+}
+
+/// A plain VALU instruction that can be copied out of its program: what
+/// [`super::Lower::runs_alone`] takes, without its waterfall and lane mask checks (no compares
+/// are taken).
+fn liftable(i: &ir::Inst) -> bool {
+    let Fields::Valu(v) = &i.fields else {
+        return false;
+    };
+    let name = i.name();
+    v.dpp.is_none()
+        && !["v_cmp", "v_interp", "v_mbcnt", "v_movrel"].iter().any(|p| name.starts_with(p))
+        && !name.contains("lane")
+        && i.writes.iter().all(|w| matches!(w.0, Reg::V(_)))
+        && !v.src.iter().any(|o| match *o {
+            Operand::Scalar { code, dwords } => code < EXEC + 2 && code + dwords > EXEC,
+            Operand::Const(c) => (251..=254).contains(&c),
+            _ => false,
+        })
+        && touched(std::slice::from_ref(i)).is_some()
+}
+
+/// The longest stretches of [`liftable`] instructions in each block (waits and nops skipped)
+/// that have an f16 result.
+fn windows(p: &ir::Program) -> Vec<Vec<ir::Inst>> {
+    let mut out = Vec::new();
+    for b in &p.blocks {
+        let mut cur: Vec<ir::Inst> = Vec::new();
+        for i in &b.insts {
+            if liftable(i) {
+                cur.push(i.clone());
+            } else if !waits(i.name()) {
+                out.push(std::mem::take(&mut cur));
+            }
+        }
+        out.push(cur);
+    }
+    out.retain(|w| w.iter().any(|i| result_kind(i.name()) == Kind::Half));
+    out
+}
+
+/// A stored VGPR of a lifted window: the window, the register, what wrote it last and the
+/// halves to compare (bit 0 low, bit 1 high).
+struct Output {
+    window: usize,
+    reg: u8,
+    kind: Kind,
+    writer: &'static str,
+    halves: u8,
+}
+
+/// One program of `windows`: every VGPR they read seeded per lane from s0..s3 (see
+/// [`f16_rounding_of_the_title_fade`]), SGPRs fixed in [0.25, 1), all lanes on, and after each
+/// window every VGPR it writes stored, 32 dwords per register.
+fn lift_windows(windows: &[Vec<ir::Inst>]) -> (Vec<u32>, Vec<Output>) {
+    let (mut used_s, mut used_v) = (BTreeSet::new(), BTreeSet::new());
+    for w in windows {
+        let (s, v) = touched(w).unwrap();
+        used_s.extend(s);
+        used_v.extend(v);
+    }
+    used_s.extend(0..6);
+    let quad = (8..=100u8).rev().step_by(4).find(|&q| (q..q + 4).all(|c| !used_s.contains(&c))).unwrap();
+    let c: Vec<u8> = (6..=105u8)
+        .rev()
+        .filter(|c| !used_s.contains(c) && !(quad..quad + 4).contains(c))
+        .take(4)
+        .collect();
+    let l: Vec<u32> = (0..=255u8).rev().filter(|n| !used_v.contains(n)).take(3).map(u32::from).collect();
+    let ([cs, cb, cl, ch], [lane, at, t]) = ([c[0], c[1], c[2], c[3]], [l[0], l[1], l[2]]);
+    let mut w = vec![s_mov_b32(5, 0x80), s_mov_b32(EXEC, 193)];
+    w.extend(s_load(2, quad as u32, 4, 0));
+    w.extend([s_mov_b32(cs, 0), s_mov_b32(cb, 1), s_mov_b32(cl, 2), s_mov_b32(ch, 3)]);
+    w.push(vop1(0x01, lane, v(0))); // v_mov_b32 lane, v0
+    w.push(vop2(0x1A, at, k(2), lane)); // v_lshlrev_b32 at, 2, lane
+    let vt = v(t as u16);
+    let mut outputs = Vec::new();
+    for (j, win) in windows.iter().enumerate() {
+        let (mut f32_reads, mut seen) = (BTreeSet::new(), BTreeSet::new());
+        for i in win {
+            for &(r, _) in &i.reads {
+                if seen.insert(r) && reads_f32(i, r) {
+                    f32_reads.insert(r);
+                }
+            }
+            seen.extend(i.writes.iter().map(|w| w.0));
+        }
+        let (s, regs) = touched(win).unwrap();
+        let ju = j as u32;
+        for c in s {
+            if c == ir::VCC {
+                w.extend([vopc(0xC4, LITERAL, lane), 7 + ju % 19]); // v_cmp_gt_u32 vcc, n, lane
+            } else if c != ir::VCC + 1 {
+                let cu = c as u32;
+                let value = if f32_reads.contains(&Reg::S(c)) {
+                    0x3E80_0000 + ((cu * 0x1_2345 + ju * 0x777) & 0x7F_FFFF)
+                } else {
+                    0x3400_3800 + ((cu * 0x0107_0003 + ju * 0x0011_0005) & 0x03FF_03FF)
+                };
+                w.extend([s_mov_b32(c, LITERAL as u8), value]);
+            }
+        }
+        for r in regs {
+            let ru = r as u32;
+            let jitter = (ru * 5 + ju * 3) % 16 | ((ru * 7 + ju) % 16) << 16;
+            w.extend([
+                vop2(0x0B, t, ch as u16, lane), // v_mul_u32_u24 t, s_step_hi, lane
+                vop2(0x1A, t, k(16), t),
+                vop2(0x0B, ru, cl as u16, lane), // v_mul_u32_u24 r, s_step_lo, lane
+                vop2(0x25, ru, vt, ru),
+                vop2(0x25, ru, cb as u16, ru), // v_add_nc_u32 r, s_base, r
+                vop2(0x25, ru, LITERAL, ru),
+                jitter,
+                // the low half's sign from lane bit 0, the high half's from bit 1
+                vop2(0x1A, t, k(15), lane),
+                vop2(0x1B, t, cs as u16, t),
+                vop2(0x1D, ru, vt, ru),
+                vop2(0x1A, t, k(30), lane),
+                vop2(0x1B, t, cs as u16, t),
+                vop2(0x1D, ru, vt, ru),
+            ]);
+            if f32_reads.contains(&Reg::V(r)) {
+                // the low half as an f32, with mantissa bits below the half's
+                w.push(vop1(0x0B, ru, v(r as u16))); // v_cvt_f32_f16
+                w.extend([vop2(0x0B, t, LITERAL, lane), 0x1F3]);
+                w.push(vop2(0x25, ru, vt, ru));
+                w.extend([vop2(0x25, ru, LITERAL, ru), (ru * 0x2F + ju * 0x65) & 0x1FFF]);
+            }
+        }
+        let mut last: std::collections::BTreeMap<u8, &ir::Inst> = Default::default();
+        for i in win {
+            if !waits(i.name()) {
+                w.extend(&i.machine.words);
+            }
+            for &(r, _) in &i.writes {
+                if let Reg::V(n) = r {
+                    last.insert(n, i);
+                }
+            }
+        }
+        for (&r, i) in &last {
+            // buffer_store_dword r, at offen, then at += 128
+            w.extend([0xE070_1000, 0x80 << 24 | (quad as u32 / 4) << 16 | (r as u32) << 8 | at]);
+            w.extend([vop2(0x25, at, LITERAL, at), 128]);
+            let name = i.name();
+            let Fields::Valu(fv) = &i.fields else {
+                unreachable!()
+            };
+            let halves = if name.starts_with("v_pk_") || name.starts_with("v_cvt_pkrtz") {
+                3
+            } else if name.starts_with("v_fma_mixhi") || name.starts_with("v_mad_mixhi") || fv.opsel & 8 != 0 {
+                2
+            } else {
+                1
+            };
+            outputs.push(Output { window: j, reg: r, kind: result_kind(name), writer: name, halves });
+        }
+    }
+    w.push(S_ENDPGM);
+    (w, outputs)
+}
+
+/// Differences of one output over its lanes in f16 ulps (an f32 difference / 2^13), the
+/// switch off minus on: `sum` by value, `mag` by magnitude (negative is toward zero).
+#[derive(Default)]
+struct Tally {
+    values: u64,
+    differ: u64,
+    nans: u64,
+    max: f64,
+    sum: f64,
+    mag: f64,
+}
+
+impl Tally {
+    fn add(&mut self, d: f64, m: f64) {
+        self.values += 1;
+        self.differ += u64::from(d != 0.0);
+        self.max = self.max.max(d.abs());
+        self.sum += d;
+        self.mag += m;
+    }
+
+    fn merge(&mut self, o: &Tally) {
+        self.values += o.values;
+        self.differ += o.differ;
+        self.nans += o.nans;
+        self.max = self.max.max(o.max);
+        self.sum += o.sum;
+        self.mag += o.mag;
+    }
+
+    fn line(&self) -> String {
+        let n = self.values.max(1) as f64;
+        format!(
+            "values {} differ {} max {:.3} bias {:+.4} mag {:+.4} nan {}",
+            self.values,
+            self.differ,
+            self.max,
+            self.sum / n,
+            self.mag / n,
+            self.nans
+        )
+    }
+}
+
+fn compare(t: &mut Tally, kind: Kind, halves: u8, off: u32, on: u32) {
+    match kind {
+        Kind::Half => {
+            for h in 0..2 {
+                if halves >> h & 1 == 0 {
+                    continue;
+                }
+                let (a, b) = (off >> (16 * h) & 0xFFFF, on >> (16 * h) & 0xFFFF);
+                let nan = |x: u32| x & 0x7C00 == 0x7C00 && x & 0x3FF != 0;
+                if nan(a) || nan(b) {
+                    t.nans += u64::from(nan(a) != nan(b));
+                    continue;
+                }
+                let ord = |x: u32| if x & 0x8000 != 0 { -i64::from(x & 0x7FFF) } else { i64::from(x) };
+                let mag = i64::from(a & 0x7FFF) - i64::from(b & 0x7FFF);
+                t.add((ord(a) - ord(b)) as f64, mag as f64);
+            }
+        }
+        Kind::F32 => {
+            let nan = |x: u32| x & 0x7F80_0000 == 0x7F80_0000 && x & 0x7F_FFFF != 0;
+            if nan(off) || nan(on) {
+                t.nans += u64::from(nan(off) != nan(on));
+                return;
+            }
+            let ord = |x: u32| if x >> 31 != 0 { -i64::from(x & 0x7FFF_FFFF) } else { i64::from(x) };
+            let mag = i64::from(off & 0x7FFF_FFFF) - i64::from(on & 0x7FFF_FFFF);
+            t.add((ord(off) - ord(on)) as f64 / 8192.0, mag as f64 / 8192.0);
+        }
+        Kind::Other => t.add(f64::from(u8::from(off != on)), 0.0),
+    }
+}
+
+/// VICTORY_F16_NEAREST off against on for the pixel shaders in `VICTORY_F16_REPLAY`
+/// (`<hash>.pixel.cdxil` containers from VICTORY_SHADER_SAVE). The stretches of plain VALU
+/// code with an f16 result ([`windows`]) are copied into one compute program per shader and
+/// lowered with the switch off and on. Every VGPR they read gets a pair of halves per lane
+/// (an f32 made from the low one when it is read as an f32) from three ranges: [0, 0.9],
+/// [0.06, 3.7] and [-0.9, 0.9]. Every register they write is compared, and the differences
+/// per output go to `<hash>-f16.txt` in the same folder. Nothing is asserted.
+#[test]
+#[ignore = "needs VICTORY_F16_REPLAY"]
+fn f16_rounding_of_the_title_fade() {
+    let Ok(dir) = std::env::var("VICTORY_F16_REPLAY") else {
+        eprintln!("VICTORY_F16_REPLAY unset; skipped");
+        return;
+    };
+    // s0 sign mask, s1 base pair, s2 low step, s3 high step
+    let cases: [(&str, [u32; 4]); 3] = [
+        ("0..0.9", [0, 0x2000_1C00, 0x0FF, 0x0E3]),
+        ("0.06..3.7", [0, 0x2C00_3000, 0x0A3, 0x0BF]),
+        ("-0.9..0.9", [0x8000_8000, 0x2000_1C00, 0x0FF, 0x0E3]),
+    ];
+    let _one = super::super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let hosts: Vec<(&str, Host)> = [("hardware", false), ("warp", true)]
+        .into_iter()
+        .filter_map(|(label, warp)| match Host::new(warp) {
+            Ok(h) => Some((label, h)),
+            Err(_) => {
+                eprintln!("no SM 6.6 {label} device; skipped");
+                None
+            }
+        })
+        .collect();
+    assert!(!hosts.is_empty(), "no SM 6.6 device");
+    let mut names: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|e| e.ok()?.file_name().into_string().ok())
+        .filter(|n| n.ends_with(".pixel.cdxil"))
+        .collect();
+    names.sort();
+    assert!(!names.is_empty(), "no .pixel.cdxil in {dir}");
+    for file in names {
+        let hash = file.split('.').next().unwrap();
+        let bytes = std::fs::read(format!("{dir}/{file}")).unwrap();
+        let c = Container::parse(&bytes).unwrap();
+        let part = c.part(FourCC::DXIL).or(c.part(FourCC::ACCC)).unwrap();
+        let ps = crate::native_programs(part.data)
+            .unwrap()
+            .into_iter()
+            .find(|p| p.stage == HwStage::Ps)
+            .unwrap();
+        let p = ir::build(&ps.code, ps.wave64, ps.vgprs).unwrap();
+        let wins = windows(&p);
+        let insts: usize = wins.iter().map(Vec::len).sum();
+        let halves = wins.iter().flatten().filter(|i| result_kind(i.name()) == Kind::Half).count();
+        let (code, outputs) = lift_windows(&wins);
+        let native = native(&code, false, 256);
+        let dwords = outputs.len() as u32 * 32;
+        let shaders: Vec<HostShader> = [false, true]
+            .into_iter()
+            .map(|nearest| {
+                super::TEST_F16_NEAREST.set(Some(nearest));
+                let (l, _) = lowered(&native, true, true);
+                super::TEST_F16_NEAREST.set(None);
+                host_shader(l)
+            })
+            .collect();
+        let mut report = format!(
+            "{hash}: wave{} PS, {} windows of {insts} VALU insts, {halves} with an f16 result, {} outputs\n",
+            if ps.wave64 { 64 } else { 32 },
+            wins.len(),
+            outputs.len()
+        );
+        eprint!("{report}");
+        for (label, host) in &hosts {
+            for (case, inputs) in &cases {
+                let off = run(host, &shaders[0], inputs, dwords);
+                let on = run(host, &shaders[1], inputs, dwords);
+                let mut kinds = [("f16", Kind::Half), ("f32", Kind::F32), ("bits", Kind::Other)]
+                    .map(|(name, kind)| (name, kind, Tally::default(), 0));
+                let mut lines = String::new();
+                for (n, o) in outputs.iter().enumerate() {
+                    let mut t = Tally::default();
+                    for i in n * 32..n * 32 + 32 {
+                        compare(&mut t, o.kind, o.halves, off[i], on[i]);
+                    }
+                    let k = kinds.iter_mut().find(|k| k.1 == o.kind).unwrap();
+                    k.2.merge(&t);
+                    k.3 += usize::from(o.kind != Kind::Other && t.max > 1.0);
+                    if t.differ > 0 || t.nans > 0 {
+                        lines += &format!("    w{} v{} {}: {}\n", o.window, o.reg, o.writer, t.line());
+                    }
+                }
+                let mut head = format!("{label} {case}:\n");
+                for (name, _, t, over) in &kinds {
+                    head += &format!("  {name}: {}, outputs above 1 ulp {over}\n", t.line());
+                }
+                eprint!("{head}");
+                report += &head;
+                report += &lines;
+            }
+        }
+        std::fs::write(format!("{dir}/{hash}-f16.txt"), &report).unwrap();
+        eprintln!("{hash}: report in {dir}/{hash}-f16.txt");
+    }
 }
