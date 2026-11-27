@@ -4932,6 +4932,10 @@ impl State {
                                     if host.constant_raw_at(index, &shadow.buffer, shadow.gpu(address), size) {
                                         shadow.refresh(list, address, u64::from(size));
                                         crate::port_cbv::in_copy(size);
+                                        // The refresh is this list's: another
+                                        // list sharing the table would read the
+                                        // copy as it was.
+                                        constants = true;
                                         continue;
                                     }
                                     crate::port_cbv::copied(false);
