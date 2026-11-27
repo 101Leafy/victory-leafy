@@ -1842,9 +1842,6 @@ mod tests {
             trace: Trace {
                 since: Instant::now(),
                 produced: 0,
-                taken: 0,
-                takes: 0,
-                partial_takes: 0,
                 frames: 0,
                 bad_frames: 0,
                 peak: 0,
