@@ -1804,7 +1804,35 @@ pub(crate) fn targets_room_kept() -> u64 {
     });
     // Every host texture's bytes less those of the copies the title fills.
     let targets = HOST_TEXTURES[1].load(Relaxed).saturating_sub(KINDS[1].load(Relaxed));
-    most.saturating_sub(targets)
+    // The most the targets have held this run: what the room is sized by
+    // (`targets_kept_from_peak`), unless the switch above set it flat.
+    static PEAK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let peak = PEAK.fetch_max(targets, Relaxed).max(targets);
+    static FLAT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *FLAT.get_or_init(|| std::env::var_os("VICTORY_CARD_ROOM_FOR_TARGETS_MB").is_some()) {
+        return most.saturating_sub(targets);
+    }
+    targets_kept_from_peak(most, targets, peak)
+}
+
+/// What [`targets_room_kept`] keeps of `most` without the flat switch: half
+/// as much again as the targets have held at their most (`peak`), and at
+/// least 256 MiB, never more than `most`.
+///
+/// The flat 3,072 MB is kept for the targets whatever they hold, and the
+/// runtime's own targets of a 720p world (the SeriesS and SeriesX2
+/// profiles) hold far less: measured on an 8 GB card (RTX 4060 Laptop) the
+/// targets held 390 MB, so 2,675 MB stayed reserved for them for the whole
+/// run, and the texture queue weighed 6,182 MB against a line of 6,181 MB
+/// with the card 41 % used ("no room, new textures wait"): the skin
+/// textures of passers-by were never uploaded (black faces) until the
+/// reserve was cut by hand. Sized by the peak, the same run keeps 195 MB,
+/// and the targets of a 1440p world (peak 2.9 GB) still get what they had.
+#[cfg(any(windows, test))]
+fn targets_kept_from_peak(most: u64, targets: u64, peak: u64) -> u64 {
+    /// Room for targets to grow into while they are still being made.
+    const LEAST: u64 = 256 << 20;
+    peak.saturating_add(peak / 2).max(LEAST).min(most).saturating_sub(targets)
 }
 
 /// [`room`] as it was at most a tenth of a second ago, for a question
@@ -4970,6 +4998,25 @@ float4 lit() : SV_Target { return 1.0; }
         assert_eq!(texture_floor_bytes(Some(12 * GIB)), 2 * GIB);
         assert_eq!(texture_floor_bytes(Some(24 * GIB)), 2 * GIB);
         assert_eq!(texture_floor_bytes(Some(32 * GIB)), 2 * GIB);
+    }
+
+    /// The room kept for render targets follows the most they have held,
+    /// not a flat 3,072 MB.
+    #[test]
+    fn room_for_targets_follows_their_peak() {
+        const MIB: u64 = 1 << 20;
+        let most = 3072 * MIB;
+        // The SeriesS profile on an 8 GB card: the targets stay at 390 MB,
+        // and 195 MB is kept where the flat reserve kept 2,682 MB.
+        assert_eq!(targets_kept_from_peak(most, 390 * MIB, 390 * MIB), 195 * MIB);
+        // A world's first frames: half as much again as their peak so far.
+        assert_eq!(targets_kept_from_peak(most, 650 * MIB, 650 * MIB), 325 * MIB);
+        // 1440p: the peak passes what the switch allows; never more than it.
+        assert_eq!(targets_kept_from_peak(most, 2900 * MIB, 2900 * MIB), 172 * MIB);
+        // A scene's targets given back: the peak still holds what they may want.
+        assert_eq!(targets_kept_from_peak(most, 0, 2900 * MIB), most);
+        // Nothing made yet: at least 256 MiB.
+        assert_eq!(targets_kept_from_peak(most, 0, 0), 256 * MIB);
     }
 
     /// A placed texture viewed from a later level has a host copy of that
