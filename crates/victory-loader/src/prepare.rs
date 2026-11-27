@@ -22,12 +22,20 @@ pub struct PreparedImage {
     pub bytes: Vec<u8>,
     /// BLAKE3 of the original bytes: identifies the exact build.
     pub original_hash: blake3::Hash,
+    /// BLAKE3 of the mod files applied to `bytes`, if any.
+    pub mods: Option<blake3::Hash>,
 }
 
 impl PreparedImage {
-    /// File name for the patched copy, unique per original build.
+    /// File name for the patched copy, unique per original build and set
+    /// of mods. A modded copy never replaces the plain one, which another
+    /// run may have mapped.
     pub fn file_name(&self) -> String {
-        format!("victory-image-{}.dll", &self.original_hash.to_hex()[..16])
+        let build = &self.original_hash.to_hex()[..16];
+        match &self.mods {
+            Some(mods) => format!("victory-image-{build}-{}.dll", &mods.to_hex()[..8]),
+            None => format!("victory-image-{build}.dll"),
+        }
     }
 }
 
@@ -109,6 +117,7 @@ pub fn prepare(original: &[u8]) -> Result<PreparedImage, PrepareError> {
         info,
         bytes,
         original_hash: blake3::hash(original),
+        mods: None,
     })
 }
 
