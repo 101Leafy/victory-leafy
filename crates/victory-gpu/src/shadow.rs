@@ -103,6 +103,10 @@ pub(crate) struct Shadow {
     changes_only: std::sync::atomic::AtomicBool,
     /// A window in card memory the CPU maps ([`window_mapped_for`]).
     mapped: bool,
+    /// A copy by address ([`by_address`]) whose card side lies in the card's
+    /// own memory: its bytes are counted in [`BY_ADDRESS_CARD_BYTES`] until
+    /// it goes.
+    by_address_card: bool,
     /// With `crate::inplace`: not a copy at all. `buffer` is placed in a
     /// heap opened on the title memory itself, so shaders read and write
     /// the title's own bytes and nothing is copied either way. The heap,
@@ -282,6 +286,20 @@ fn card_limits() -> (u64, u64) {
 
 /// Bytes alive of copies' card sides, and of their "before" twins.
 static CARD_BYTES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// Bytes alive of title-memory-by-address (RT BVH) arenas placed in local
+/// VRAM: what [`by_address`] holds against `VICTORY_MEMORY_CARD_MB`, given
+/// back when such a copy goes.
+static BY_ADDRESS_CARD_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Takes `len` bytes of `counter`'s room if they keep it at `most` or under.
+fn take_card_room(counter: &AtomicU64, len: u64, most: u64) -> bool {
+    if counter.fetch_add(len, Ordering::Relaxed) + len <= most {
+        return true;
+    }
+    counter.fetch_sub(len, Ordering::Relaxed);
+    false
+}
 
 /// Whether the texture queue leaves room on the card for the card copies
 /// of title buffers that are not made yet
@@ -3348,6 +3366,9 @@ impl Drop for Shadow {
             WINDOW_MAPPED_BYTES.fetch_sub(self.len, Ordering::Relaxed);
         }
         if let Some(card) = &mut self.card {
+            if self.by_address_card {
+                BY_ADDRESS_CARD_BYTES.fetch_sub(card.size, Ordering::Relaxed);
+            }
             if window {
                 WINDOW_CARD_BYTES.fetch_sub(card.size, Ordering::Relaxed);
             } else {
@@ -4125,6 +4146,7 @@ impl Shadow {
             window: false,
             changes_only: Default::default(),
             mapped: false,
+            by_address_card: false,
             place: None,
         }
     }
@@ -6439,21 +6461,25 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
         return None;
     }
     // At most so much on the card's own memory (4 GiB unless
-    // `VICTORY_MEMORY_CARD_MB` says otherwise), and while it has room; past
-    // that the side shaders see is in the PC's memory.
+    // `VICTORY_MEMORY_CARD_MB` says otherwise) of copies alive, and while it
+    // has room; past that the side shaders see is in the PC's memory.
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    static USED: AtomicU64 = AtomicU64::new(0);
     let most = *MOST.get_or_init(|| {
         let mb = std::env::var("VICTORY_MEMORY_CARD_MB").ok().and_then(|v| v.trim().parse::<u64>().ok());
         mb.unwrap_or(4096) << 20
     });
     let room = host.video_memory().is_none_or(|[budget, used, ..]| used + len < budget / 100 * 97);
     let (staging, data) = host.shared_buffer(len)?;
-    let on_card = if room && USED.fetch_add(len, Ordering::Relaxed) + len <= most {
-        host.uav_buffer(len)
+    let on_card = if room && take_card_room(&BY_ADDRESS_CARD_BYTES, len, most) {
+        let made = host.uav_buffer(len);
+        if made.is_none() {
+            BY_ADDRESS_CARD_BYTES.fetch_sub(len, Ordering::Relaxed);
+        }
+        made
     } else {
         None
     };
+    let by_address_card = on_card.is_some();
     let buffer = match on_card {
         Some(buffer) => buffer,
         None => host.shared_buffer(len)?.0,
@@ -6466,6 +6492,7 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
     let mut shadow = Shadow::new(buffer, data, gpu, start, len);
     shadow.window = true;
+    shadow.by_address_card = by_address_card;
     shadow.changes_only.store(true, Ordering::Relaxed);
     shadow.card = Some(Card {
         staging: Some(staging),
