@@ -207,6 +207,24 @@ pub fn run(
         // SAFETY: the image stays mapped and nothing of it has run yet.
         let done = unsafe { victory_loader::frame_rate::apply_longest_step(image.base(), size, step) };
         println!("simulation: longest step {} s: {done:?}", step.0);
+        if done == victory_loader::frame_rate::Patched::Done
+            && let Some(until) = victory_loader::frame_rate::asked_step_until_ms()
+        {
+            let base = image.base();
+            std::thread::spawn(move || {
+                use victory_loader::frame_rate::{game_ms, restore_longest_step};
+                // SAFETY: the image stays mapped for the life of the process.
+                while unsafe { game_ms(base, size) }.is_some_and(|ms| ms < until) {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                // SAFETY: as above; the load was changed to read step.1.
+                let done = unsafe { restore_longest_step(base, size, step.1) };
+                // SAFETY: as above.
+                let at = unsafe { game_ms(base, size) }.unwrap_or(0);
+                tracing::info!(game_ms = at, ?done, "simulation: longest step back to 1/15 s (VICTORY_LONGEST_STEP_UNTIL)");
+                eprintln!("VIctory: simulation: longest step back to 1/15 s at game {at} ms: {done:?}");
+            });
+        }
     }
     // The output size and render scale (VICTORY_OUTPUT, VICTORY_RENDER_SCALE;
     // each off without it), and the upscaler picker made to return the
