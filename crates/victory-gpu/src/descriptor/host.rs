@@ -4634,7 +4634,7 @@ fn buffer_srv(
                     .CreateShaderResourceView(&shadow.buffer, Some(&desc), twin);
                 shadow.buffer.GetGPUVirtualAddress() + first * 4
             };
-            if by > 0 && by % 4 == 0 && twin_exact(&host.device) {
+            if by > 0 && by % 4 == 0 && count > by / 4 && twin_exact(&host.device) {
                 // The raw twin from the view's own first dword (on 4 bytes, not
                 // 16), not a null view ([`twin_exact`]).
                 TWINS[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -4766,7 +4766,7 @@ fn buffer_uav(
                     .CreateUnorderedAccessView(&shadow.buffer, None::<&ID3D12Resource>, Some(&desc), twin);
                 shadow.buffer.GetGPUVirtualAddress() + first * 4
             };
-            if by > 0 && by % 4 == 0 && twin_exact(&host.device) {
+            if by > 0 && by % 4 == 0 && count > by / 4 && twin_exact(&host.device) {
                 // The raw twin from the view's own first dword (on 4 bytes, not
                 // 16), not a null view ([`twin_exact`]).
                 TWINS[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
