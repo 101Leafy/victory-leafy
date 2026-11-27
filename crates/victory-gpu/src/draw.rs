@@ -843,8 +843,7 @@ fn dynamic_slots(heap: usize, host: &crate::descriptor::host::HostHeap, n: u32) 
         return None;
     }
     let (before, all) = host.dynamic_free();
-    crate::host::settle_for_tables();
-    let found = host.dynamic(n);
+    let found = crate::host::slot_wait::take(|| host.dynamic(n));
     DYNAMIC_SHORT[usize::from(found.is_none())].fetch_add(1, Ordering::Relaxed);
     if most > 0 && mode == 1 {
         let got = (host.dynamic_free().0 + found.map_or(0, |_| n)).saturating_sub(before);
