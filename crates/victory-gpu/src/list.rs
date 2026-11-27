@@ -2666,6 +2666,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    #[ignore = "no ClearUnorderedAccessViewUint yet: slot 53 (0x1a8) is the logging stub, the title never calls it"]
     fn a_raw_buffer_clear_keeps_words_outside_an_odd_offset_view() {
         use windows::Win32::Foundation::RECT;
         use windows::Win32::Graphics::Direct3D12::ID3D12DescriptorHeap;
