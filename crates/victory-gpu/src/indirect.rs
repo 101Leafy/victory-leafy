@@ -617,7 +617,8 @@ fn batch_clamp() -> Option<&'static Clamp> {
 
 /// Opens a batch in `list` ([`batch`]): a pass that clamps the records of
 /// the executions recorded after it, of `source` (a host copy's number and
-/// buffer) and of the `recent` ones after it. The table to add them to,
+/// buffer) and of the `recent` ones after it, after a full wait if `wait`
+/// (`crate::draw::State::wait_needed`). The table to add them to,
 /// and the scratch buffer its places are in. Replaces the list's compute
 /// root signature and pipeline (callers bind theirs after). `None` if the
 /// clamp is not available.
@@ -625,6 +626,7 @@ pub(crate) fn open_batch(
     list: &HostList,
     source: (u64, &ID3D12Resource),
     recent: &[(u64, ID3D12Resource)],
+    wait: bool,
 ) -> Option<(batch::Table, ID3D12Resource)> {
     let c = batch_clamp()?;
     let budget = list.budget()?;
@@ -651,7 +653,7 @@ pub(crate) fn open_batch(
     crate::copystat::add(crate::copystat::C::IndirectBounded, 1);
     #[cfg(feature = "diagnostics")]
     let timed = list.clamp_stamps.before(&list.list);
-    batch::record(c, &list.list, (&dst, before), budget, sources, jobs);
+    batch::record(c, &list.list, (&dst, before), budget, sources, jobs, wait);
     #[cfg(feature = "diagnostics")]
     list.clamp_stamps.after(&list.list, timed);
     // SAFETY: the list's own upload memory of that many bytes, 256-byte
@@ -3105,7 +3107,7 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
                         src_ptr.cast::<u32>().add(w).write_volatile(word);
                     }
                     if batched {
-                        batch::record(&pass, &gpu.list, (&dst, D3D12_RESOURCE_STATE_COMMON), budget_gpu, [src_gpu; 4], table_gpu);
+                        batch::record(&pass, &gpu.list, (&dst, D3D12_RESOURCE_STATE_COMMON), budget_gpu, [src_gpu; 4], table_gpu, true);
                         assert_eq!(batch::Table::new(table_ptr, 0, [1, 0, 0, 0]).place(1, 0, 2), Some(0));
                     } else {
                         let to = (&dst, D3D12_RESOURCE_STATE_COMMON);
@@ -3215,7 +3217,7 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
                 // SAFETY: mapped buffers; nothing runs.
                 unsafe { std::ptr::write_bytes(budget_ptr, 0, 256) };
                 if batched {
-                    batch::record(&pass, &warp.list, (&dst, D3D12_RESOURCE_STATE_COMMON), budget_gpu, [src_gpu, other_gpu, src_gpu, src_gpu], table_gpu);
+                    batch::record(&pass, &warp.list, (&dst, D3D12_RESOURCE_STATE_COMMON), budget_gpu, [src_gpu, other_gpu, src_gpu, src_gpu], table_gpu, true);
                     // SAFETY: the mapped table; the list has not run.
                     let mut table = unsafe { batch::Table::new(table_ptr, 0, [1, 2, 0, 0]) };
                     assert_eq!(table.place(1 + i as u64 % 2, offset, *kind), Some(0));
@@ -3263,7 +3265,7 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
             let (back, back_ptr, _) = warp.shared_buffer(1024);
             let (_table, table_ptr, table_gpu) = warp.shared_buffer(batch::TABLE);
             let dst = warp.default_uav(64 << 10);
-            batch::record(&pass, &warp.list, (&dst, D3D12_RESOURCE_STATE_COMMON), budget_gpu, [src_gpu; 4], table_gpu);
+            batch::record(&pass, &warp.list, (&dst, D3D12_RESOURCE_STATE_COMMON), budget_gpu, [src_gpu; 4], table_gpu, true);
             // SAFETY: mapped buffers, which the list has not read yet.
             let mut table = unsafe {
                 std::ptr::write_bytes(budget_ptr, 0, 256);
@@ -3339,7 +3341,7 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
             // More batches than one scratch buffer holds.
             for k in 0..12u32 {
                 let (mut table, scratch) =
-                    open_batch(&list, (1, &sources[0]), &[(1, sources[0].clone()), (2, sources[1].clone())]).unwrap();
+                    open_batch(&list, (1, &sources[0]), &[(1, sources[0].clone()), (2, sources[1].clone())], true).unwrap();
                 // SAFETY: an open list; the worker's root signature and
                 // pipeline; buffers the test holds until the list has run.
                 unsafe {
@@ -3396,7 +3398,7 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
                         assert!(record_clamp_as(&gpu.clamp, &gpu.list, (&dst, state), budget_gpu, (&src, u64::from(i % 2048) * 32), None, (2, 12, 1), false));
                     } else if i % run == 0 {
                         let k = u64::from(i / run) * batch::TABLE;
-                        batch::record(&pass, &gpu.list, (&dst, state), budget_gpu, [src_gpu; 4], tables_gpu + k);
+                        batch::record(&pass, &gpu.list, (&dst, state), budget_gpu, [src_gpu; 4], tables_gpu + k, true);
                         // SAFETY: the mapped table; the list has not run.
                         table = unsafe { batch::Table::new(tables_ptr.add(k as usize), 0, [1, 0, 0, 0]) };
                     }

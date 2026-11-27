@@ -505,10 +505,70 @@ pub(crate) fn queued() -> u64 {
 /// For the frame-rate line.
 #[cfg(windows)]
 pub(crate) fn behind_line(frames: f64) {
+    census_line(frames);
     if behind::on() {
         crate::list::thin::line(frames);
         behind::line(frames);
     }
+}
+
+/// Whether each queue's submissions are counted for the frame-rate line
+/// (`VICTORY_QUEUE_CENSUS=1`): how much of its work the title gives its
+/// compute and copy queues, which all run on our one direct queue.
+fn census() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_QUEUE_CENSUS").is_some_and(|v| v == "1"))
+}
+
+/// The queues the title submitted to, in the order it first did: address,
+/// kind, then submissions and lists since the last line.
+/// shortcut: a queue let go of keeps its row, and one made later at the
+/// same address is counted in it.
+#[cfg(windows)]
+static CENSUS: Mutex<Vec<(usize, u32, u64, u64)>> = Mutex::new(Vec::new());
+
+#[cfg(windows)]
+fn count_submission(this: This, lists: u32) {
+    let mut rows = lock(&CENSUS);
+    let at = this as usize;
+    match rows.iter_mut().find(|r| r.0 == at) {
+        Some(row) => {
+            row.2 += 1;
+            row.3 += u64::from(lists);
+        }
+        None => rows.push((at, queue(this).kind, 1, u64::from(lists))),
+    }
+}
+
+fn kind_name(kind: u32) -> String {
+    match kind {
+        0 => "direct".into(),
+        2 => "compute".into(),
+        3 => "copy".into(),
+        k => format!("kind {k}"),
+    }
+}
+
+#[cfg(windows)]
+fn census_line(frames: f64) {
+    if !census() {
+        return;
+    }
+    let mut rows = lock(&CENSUS);
+    let each: Vec<String> = rows
+        .iter_mut()
+        .enumerate()
+        .map(|(i, r)| {
+            let (submissions, lists) = (std::mem::take(&mut r.2), std::mem::take(&mut r.3));
+            format!(
+                "{} {i} {:.1} submissions {:.1} lists",
+                kind_name(r.1),
+                submissions as f64 / frames,
+                lists as f64 / frames
+            )
+        })
+        .collect();
+    tracing::info!("the title's queues per frame (VICTORY_QUEUE_CENSUS=1): {}", each.join(", "));
 }
 
 /// Whether a queue may pass `wait`: memory holds the value, or, with
@@ -572,7 +632,11 @@ pub(crate) extern "system" fn create_x(
     let Some(&x) = (unsafe { desc.as_ref() }) else {
         return E_INVALIDARG;
     };
-    tracing::debug!(desc = ?x, "console command queue");
+    if census() {
+        tracing::info!(kind = %kind_name(x.kind), engine_or_pipe = x.engine_or_pipe, queue = x.queue, flags = x.flags, "the title makes a queue (all run on our one direct queue)");
+    } else {
+        tracing::debug!(desc = ?x, "console command queue");
+    }
     let desc = QueueDesc {
         kind: x.kind,
         priority: 0,
@@ -618,6 +682,10 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
         return;
     }
     let _called = crate::timeline::span("the title's ExecuteCommandLists");
+    #[cfg(windows)]
+    if census() && !this.is_null() {
+        count_submission(this, count);
+    }
     #[cfg(all(windows, feature = "diagnostics"))]
     crate::timeline::title_thread();
     #[cfg(windows)]
@@ -987,6 +1055,13 @@ extern "system" fn present(
         release_held(forces());
     }
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
+    // The title's frame this flips, for its statistics.
+    // SAFETY: the title passes `planes` plane descriptions.
+    if planes > 0 && let Some(plane) = unsafe { plane_parameters.as_ref() } {
+        crate::frame::flipped(plane.token);
+    }
+    #[cfg(all(windows, feature = "diagnostics"))]
+    planes_seen(frame, planes, plane_parameters);
     if frame.is_power_of_two() {
         let (draws, dispatches) = crate::list::take_counts();
         #[cfg(windows)]
@@ -1105,6 +1180,42 @@ extern "system" fn present(
     S_OK
 }
 
+/// Diagnostics: logs the planes a present passes each time their number
+/// changes (only the first plane's first resource is shown): each
+/// description's 72 bytes (the retail plane: token, count, resources, then
+/// rectangles, color space and options), and the size and format of each
+/// plane's first resource where its count is 1 to 8.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn planes_seen(frame: u64, planes: u32, at: *const Plane) {
+    static LAST: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
+    if LAST.swap(planes, Ordering::Relaxed) == planes || at.is_null() || planes == 0 {
+        return;
+    }
+    let n = planes.min(4) as usize;
+    // SAFETY: the title passes `planes` descriptions of 72 bytes each.
+    let raw = unsafe { std::slice::from_raw_parts(at.cast::<u64>(), n * 9) };
+    let words: Vec<String> = raw.iter().map(|w| format!("{w:x}")).collect();
+    let mut seen = Vec::new();
+    for i in 0..n {
+        let (count, resources) = (raw[i * 9 + 1] as u32, raw[i * 9 + 2] as *const This);
+        if !(1..=8).contains(&count) || resources.is_null() || !resources.is_aligned() {
+            seen.push(format!("plane {i}: not read"));
+            continue;
+        }
+        // SAFETY: the plane lists `count` resources.
+        let first = unsafe { *resources };
+        seen.push(match crate::resource::host_resource(first) {
+            // SAFETY: a live host resource.
+            Some(r) => {
+                let d = unsafe { r.GetDesc() };
+                format!("plane {i}: {count} resources, the first {}x{} format {}", d.Width, d.Height, d.Format.0)
+            }
+            None => format!("plane {i}: {count} resources, the first not on the host"),
+        });
+    }
+    tracing::info!(frame, planes, raw = words.join(" "), seen = seen.join("; "), "the title's present passes another number of planes (only the first plane's first resource is shown)");
+}
+
 /// Diagnostics: the title's present is over.
 #[cfg(all(windows, feature = "diagnostics"))]
 fn frame_ends() {
@@ -1220,6 +1331,8 @@ extern "system" fn copy_page_mappings(
         return E_INVALIDARG;
     }
     let _called = crate::timeline::span("the title's CopyPageMappings");
+    let started = std::time::Instant::now();
+    let mut bytes = 0;
     let batches = (count > 0).then(|| {
         // SAFETY: the title passes `count` batches.
         unsafe { std::slice::from_raw_parts(batches, count as usize) }
@@ -1245,6 +1358,9 @@ extern "system" fn copy_page_mappings(
             let len = u64::from(r.count) * PAGE;
             let inside = |pages: u32| r.start.checked_add(pages).is_some_and(|e| e <= pool_pages);
             let source = pool + u64::from(r.start) * PAGE;
+            if r.kind != 3 {
+                bytes += len;
+            }
             ok &= match r.kind {
                 0 if inside(r.count) => map(at, source, len),
                 1 if inside(1) => (0..u64::from(r.count)).all(|k| map(at + k * PAGE, source, PAGE)),
@@ -1258,6 +1374,8 @@ extern "system" fn copy_page_mappings(
     if let Some(many) = many {
         ok &= many(&gathered);
     }
+    #[cfg(windows)]
+    crate::watch::mapping_cost("copy", started.elapsed().as_nanos() as u64, bytes);
     if !ok {
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| tracing::warn!(pool = format_args!("{pool:#x}"), "a page mapping failed"));

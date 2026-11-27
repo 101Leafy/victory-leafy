@@ -202,6 +202,8 @@ impl Composer {
 
 /// Select a legal float-sampled view of a display plane, preserving a typed
 /// resource's format. Typeless resources use the corresponding display type.
+/// sRGB planes are read as plain UNORM: the bytes go to the screen as they
+/// are, as a one-plane present's copy does, not decoded to linear first.
 pub(crate) fn view(d: &D3D12_RESOURCE_DESC) -> Option<DXGI_FORMAT> {
     if d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D
         || d.DepthOrArraySize != 1
@@ -213,9 +215,9 @@ pub(crate) fn view(d: &D3D12_RESOURCE_DESC) -> Option<DXGI_FORMAT> {
     match d.Format.0 {
         9 => Some(DXGI_FORMAT_R16G16B16A16_FLOAT),
         23 => Some(DXGI_FORMAT_R10G10B10A2_UNORM),
-        27 => Some(DXGI_FORMAT_R8G8B8A8_UNORM),
-        90 => Some(DXGI_FORMAT_B8G8R8A8_UNORM),
-        10 | 11 | 13 | 24 | 26 | 28 | 29 | 31 | 67 | 87 | 91 => Some(d.Format),
+        27 | 29 => Some(DXGI_FORMAT_R8G8B8A8_UNORM),
+        90 | 91 => Some(DXGI_FORMAT_B8G8R8A8_UNORM),
+        10 | 11 | 13 | 24 | 26 | 28 | 31 | 67 | 87 => Some(d.Format),
         _ => None,
     }
 }

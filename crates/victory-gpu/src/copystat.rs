@@ -404,11 +404,62 @@ pub(crate) enum C {
     /// them (`draw.rs` `refresh_tail`).
     RootTailAsked,
     RootTailCovered,
+    /// Settles for tables that came back with too few slots, and the asks
+    /// refused without one while the settles are held back after such a
+    /// settle (`draw.rs` `dynamic_slots`, `VICTORY_SETTLE_BACKOFF`).
+    SettlesBare,
+    SettlesHeld,
+    /// Tables kept from an earlier frame (`draw.rs` `SharedTables`,
+    /// `VICTORY_TABLE_CACHE`): found and used as they are, asked for and not
+    /// kept, found but made afresh as another host heap asked or texture
+    /// views were made again, or as a view's host copy or shadow changed,
+    /// and runs given back unused or for room.
+    TableCacheHit,
+    TableCacheHitSlots,
+    TableCacheMiss,
+    TableCacheStale,
+    TableCacheChanged,
+    TableCacheRetired,
+    TableCacheRetiredSlots,
+    /// Constant views of tables made afresh, and of them those whose address
+    /// is a multiple of 256 (a host constant view could read the title's
+    /// memory in place), with their bytes; tables holding constant views,
+    /// those whose constant views all are, and their slots; slots of tables
+    /// asked again this frame whose constant views all are.
+    CbvViews,
+    CbvAligned,
+    CbvBytes,
+    CbvAlignedBytes,
+    CbvTables,
+    CbvTablesAligned,
+    CbvTablesAlignedSlots,
+    CbvAgainAlignedSlots,
+    /// Windows given their side on the card late (`shadow.rs`
+    /// `card_late_windows`, `VICTORY_CARD_WINDOWS_LATE`), and their bytes;
+    /// and the times one due found no room.
+    CardLateMoved,
+    CardLateMovedBytes,
+    CardLateRefused,
+    /// Full waits with nothing written since the last one (`crate::draw::State::wait_needed`).
+    WaitsQuiet,
+    /// Bytes of partly mapped textures read before their 30 frames were up
+    /// as the guards saw a write, and of those passed over until then
+    /// (`texture::partial_due`).
+    TexPartialWritten,
+    TexPartialSkipped,
+    /// Bytes of the texture uploads recorded; uploads recorded only because
+    /// the texture was hot and their bytes; and of those the ones whose
+    /// refresh detiled nothing new, which copied what the host texture held.
+    TexUploadBytes,
+    TexForced,
+    TexForcedBytes,
+    TexForcedSame,
+    TexForcedSameBytes,
 }
 const COUNTERS: usize = 256;
 
 /// The counters' names, in the order of [`C`], for the frame recorder's columns.
-pub(crate) const NAMES: [&str; 213] = [
+pub(crate) const NAMES: [&str; 241] = [
     "Submissions", "Copies", "CopyBytes", "Refreshes", "RefreshBytes", "Skipped", "SkippedBytes", "Runs",
     "RunUs", "Queries", "QueryUs", "MoveUs", "Unmapped", "Watches", "WatchUs", "Checked", "Unchanged",
     "Fallbacks", "GuardFaults", "TexWatched", "TexHashed", "TexChanged", "TexHot", "Frames", "RecordCalls",
@@ -453,6 +504,15 @@ pub(crate) const NAMES: [&str; 213] = [
     "TexRowsDetiled", "PlacedUavRefused",
     "HeapTexMirrorNs", "HeapTexHostNs", "HeapTexPrintNs",
     "RootTailAsked", "RootTailCovered",
+    "SettlesBare", "SettlesHeld",
+    "TableCacheHit", "TableCacheHitSlots", "TableCacheMiss", "TableCacheStale",
+    "TableCacheChanged", "TableCacheRetired", "TableCacheRetiredSlots",
+    "CbvViews", "CbvAligned", "CbvBytes", "CbvAlignedBytes",
+    "CbvTables", "CbvTablesAligned", "CbvTablesAlignedSlots", "CbvAgainAlignedSlots",
+    "CardLateMoved", "CardLateMovedBytes", "CardLateRefused",
+    "WaitsQuiet",
+    "TexPartialWritten", "TexPartialSkipped",
+    "TexUploadBytes", "TexForced", "TexForcedBytes", "TexForcedSame", "TexForcedSameBytes",
 ];
 /// One of some sets of counters, each in lines of the processor's memory of
 /// its own: a set for all threads had them wait for each other's lines at
@@ -831,7 +891,7 @@ mod command_tests {
     #[test]
     fn every_counter_is_named() {
         use super::{C, COUNTERS, NAMES};
-        assert_eq!(C::RootTailCovered as usize + 1, NAMES.len());
+        assert_eq!(C::TexForcedSameBytes as usize + 1, NAMES.len());
         assert_eq!(NAMES[C::Frames as usize], "Frames");
         assert!(NAMES.len() <= COUNTERS);
     }
@@ -1250,6 +1310,20 @@ fn log_memory() {
             mb(sides[7]),
             sides[8],
             mb(sides[9])
+        );
+        let w = crate::shadow::windows_by_use();
+        tracing::info!(
+            "windows outside buffers by use (idle: no draw for 10 s, no list or slot): on the card {} in use {:.0} MB, {} idle {:.0} MB; in the PC's memory {} in use {:.0} MB, {} idle {:.0} MB; turned away from the card since the start {} {:.0} MB (VICTORY_CARD_WINDOWS_IDLE_MS lets idle ones on the card go sooner)",
+            w[0],
+            mb(w[1]),
+            w[2],
+            mb(w[3]),
+            w[4],
+            mb(w[5]),
+            w[6],
+            mb(w[7]),
+            w[8],
+            mb(w[9])
         );
     }
     tracing::info!(
@@ -1780,6 +1854,19 @@ pub(crate) fn log(frames: f64) {
         c[C::HostListNs as usize] / 1e6,
         c[C::PartsTogether as usize],
     );
+    tracing::info!(
+        "texture uploads per frame: {:.0} recorded {:.1} MB; {:.0} of them only because the texture \
+         was hot {:.1} MB, {:.0} of those {:.1} MB after a refresh that found nothing new; partly \
+         mapped textures {:.1} MB read early as written, {:.1} MB passed over",
+        c[C::TexUploads as usize],
+        mb(c[C::TexUploadBytes as usize]),
+        c[C::TexForced as usize],
+        mb(c[C::TexForcedBytes as usize]),
+        c[C::TexForcedSame as usize],
+        mb(c[C::TexForcedSameBytes as usize]),
+        mb(c[C::TexPartialWritten as usize]),
+        mb(c[C::TexPartialSkipped as usize]),
+    );
     // What is copied whole, largest first: memory nobody tells us about.
     let whole = WHOLE.lock().unwrap_or_else(|e| e.into_inner()).take();
     let mut whole: Vec<_> = whole.into_iter().flatten().collect();
@@ -1881,13 +1968,16 @@ pub(crate) fn log(frames: f64) {
             .collect();
         tracing::info!("    by size, {} sizes: {}", by_size.len(), text.join(", "));
     }
+    #[cfg(feature = "diagnostics")]
+    crate::host::pstats::report(frames);
     tracing::info!(
         "  waits for every earlier shader write, per frame: {:.0} for the title's barrier groups, {:.0} \
          for its barriers on buffers; {:.0} indirect commands bounded (a dispatch of ours between two \
-         such waits each); barrier experiment {}",
+         such waits each); {:.0} of all these after nothing that writes; barrier experiment {}",
         c[C::WaitsForGroups as usize],
         c[C::WaitsForBuffers as usize],
         c[C::IndirectBounded as usize],
+        c[C::WaitsQuiet as usize],
         barrier_test()
     );
     barrier_next();
