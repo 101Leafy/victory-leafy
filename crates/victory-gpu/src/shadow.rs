@@ -79,6 +79,9 @@ pub(crate) struct Shadow {
     /// outside buffers nothing asked for in a while, and nothing holds, is
     /// let go ([`let_go_idle`]).
     used: AtomicU64,
+    /// Of a window, the frames after the one it was made in that asked for
+    /// it ([`card_late`]).
+    frames: std::sync::atomic::AtomicU32,
     /// The lowest and highest title address asked for in the copy (a
     /// window is 4 MiB whatever was asked: measured for the memory line).
     asked: [AtomicU64; 2],
@@ -611,6 +614,126 @@ fn window_room_for(size: u64) -> Option<ID3D12Resource> {
         WINDOW_CARD_BYTES.fetch_sub(size, Ordering::Relaxed);
     }
     buffer
+}
+
+/// Windows get their side in the card's own memory ([`window_room_for`])
+/// only once asked for in this many frames after the one they were made in,
+/// those asked for in the most frames first (`VICTORY_CARD_WINDOWS_LATE`;
+/// "1" is 2 frames, another number that many; unset or 0, when made, as
+/// before). Made with the window, the room went to whichever came first:
+/// 7.5 GB of windows in wbar-a2 against 3 GB of room in dh-cw3, many of
+/// them read in one frame only.
+fn card_late() -> u32 {
+    static FRAMES: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *FRAMES.get_or_init(|| {
+        match std::env::var("VICTORY_CARD_WINDOWS_LATE").ok().and_then(|v| v.trim().parse::<u32>().ok()) {
+            Some(1) => 2,
+            Some(frames) => frames,
+            None => 0,
+        }
+    })
+}
+
+/// Most windows [`card_late_windows`] moves at one submission: each is a
+/// buffer made on the card, and its window copied again and sent up whole.
+const LATE_AT_ONCE: usize = 8;
+
+/// Gives the windows due ([`card_late`]) their side on the card. The window
+/// becomes a new copy whose CPU's side is the old copy's buffer, with the
+/// same bytes: slots made earlier still show that buffer, and as the new
+/// copy is brought up to date there they read what they read before, over
+/// the bus. Slots made after, root views and the copy's own refreshes take
+/// the new copy and its card side.
+///
+/// Only windows that only the table holds (no list, no pass), that were
+/// asked for in the last frame, that shaders never wrote, and with no side
+/// of their own. The buffers are made with no lock held; a window handed
+/// out in the meantime stays as it is. Called by [`let_go_idle`].
+fn card_late_windows() {
+    let late = card_late();
+    if late == 0 || !cards() || WINDOW_CARD_BYTES.load(Ordering::Relaxed) >= window_card_most() {
+        return;
+    }
+    let frame = crate::host::moment() >> 32;
+    let mut due: Vec<((u64, u64), Arc<Shadow>)> = {
+        let map = LOOSE.read().unwrap_or_else(|e| e.into_inner());
+        map.iter()
+            .filter(|(_, s)| {
+                s.window
+                    && s.card.is_none()
+                    && s.place.is_none()
+                    && !s.mapped
+                    && !s.written.load(Ordering::Relaxed)
+                    && s.frames.load(Ordering::Relaxed) >= late
+                    && frame.saturating_sub(s.used.load(Ordering::Relaxed) >> 32) <= 1
+                    && Arc::strong_count(s) == 1
+            })
+            .map(|(key, s)| (*key, s.clone()))
+            .collect()
+    };
+    if due.is_empty() {
+        return;
+    }
+    due.sort_unstable_by_key(|(_, s)| std::cmp::Reverse(s.frames.load(Ordering::Relaxed)));
+    due.truncate(LATE_AT_ONCE);
+    let mut made = Vec::new();
+    for (key, old) in due {
+        let Some(on_card) = window_room_for(old.len) else {
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::CardLateRefused, 1);
+            break;
+        };
+        let (start, len) = (old.start, old.len);
+        crate::host::name(&on_card, || format!("title memory {start:#x}+{len:#x} on the card"));
+        // SAFETY: a live buffer.
+        let gpu = unsafe { on_card.GetGPUVirtualAddress() };
+        let mut shadow = Shadow::new(on_card, old.data, gpu, start, len);
+        shadow.window = true;
+        shadow.card = Some(Card {
+            staging: old.buffer.clone(),
+            before: Mutex::default(),
+            dirty: Mutex::default(),
+            sent: Mutex::default(),
+            touched: Default::default(),
+            me: Default::default(),
+            changed_at: Default::default(),
+            size: len,
+        });
+        for (to, from) in [
+            (&shadow.used, &old.used),
+            (&shadow.asked[0], &old.asked[0]),
+            (&shadow.asked[1], &old.asked[1]),
+            (&shadow.unsized_asks, &old.unsized_asks),
+        ] {
+            to.store(from.load(Ordering::Relaxed), Ordering::Relaxed);
+        }
+        shadow.frames.store(old.frames.load(Ordering::Relaxed), Ordering::Relaxed);
+        made.push((key, old, Arc::new(shadow)));
+    }
+    let mut moved = Vec::new();
+    let mut unused = Vec::new();
+    {
+        let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
+        for (key, old, shadow) in made {
+            // Ours and the table's: nothing took it since.
+            if map.get(&key).is_some_and(|s| Arc::ptr_eq(s, &old)) && Arc::strong_count(&old) == 2 {
+                note_carded(&shadow);
+                map.insert(key, shadow);
+                moved.push(old);
+            } else {
+                unused.push(shadow);
+            }
+        }
+    }
+    drop(unused);
+    for old in moved {
+        #[cfg(feature = "diagnostics")]
+        {
+            crate::copystat::add(crate::copystat::C::CardLateMoved, 1);
+            crate::copystat::add(crate::copystat::C::CardLateMovedBytes, old.len);
+        }
+        crate::host::retire(old);
+    }
 }
 
 /// What went up, by send: its number, and the offsets, in order and joined
@@ -3150,11 +3273,15 @@ pub(crate) fn let_go_idle() {
                 Arc::strong_count(s) == 1
                     && crate::host::long_ago(s.used.load(Ordering::Relaxed), idle_ms, IDLE_FRAMES)
                     && crate::host::references(&s.buffer) == 1
+                    // Slots made before a window went to the card late
+                    // show its CPU's side ([`card_late_windows`]).
+                    && s.card.as_ref().is_none_or(|c| crate::host::references(&c.staging) == 1)
             })
             .map(|(key, _)| *key)
             .collect();
         idle.into_iter().filter_map(|key| map.remove(&key)).collect()
     };
+    card_late_windows();
     if !gone.is_empty() {
         let (went, bytes) = (gone.len(), gone.iter().map(|s| s.len).sum::<u64>());
         crate::host::trail(|| {
@@ -3440,6 +3567,7 @@ impl Shadow {
             merging: RwLock::default(),
             kept: Mutex::default(),
             used: AtomicU64::new(crate::host::moment()),
+            frames: Default::default(),
             asked: [AtomicU64::new(u64::MAX), AtomicU64::new(0)],
             unsized_asks: AtomicU64::new(0),
             written: Default::default(),
@@ -5780,8 +5908,12 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     let note = |shadow: &Shadow| {
         // (Read first: the lines are shared by all recording threads.)
         let now = crate::host::moment();
-        if shadow.used.load(Ordering::Relaxed) != now {
+        let was = shadow.used.load(Ordering::Relaxed);
+        if was != now {
             shadow.used.store(now, Ordering::Relaxed);
+            if was >> 32 != now >> 32 {
+                shadow.frames.fetch_add(1, Ordering::Relaxed);
+            }
         }
         if shadow.asked[0].load(Ordering::Relaxed) > address {
             shadow.asked[0].fetch_min(address, Ordering::Relaxed);
@@ -5851,8 +5983,10 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     let (buffer, data) = host()?.shared_buffer(len)?;
     crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
     // With room for windows on the card (`window_card_most`): shaders get a
-    // buffer there, and the one just made is the CPU's side.
-    let (buffer, card) = match window_card_for(len) {
+    // buffer there, and the one just made is the CPU's side. With
+    // `card_late`, later.
+    let on_card = if card_late() > 0 && !windows_own() { None } else { window_card_for(len) };
+    let (buffer, card) = match on_card {
         Some(on_card) => {
             crate::host::name(&on_card, || format!("title memory {start:#x}+{len:#x} on the card"));
             let card = Card {
