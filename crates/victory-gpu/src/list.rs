@@ -245,6 +245,26 @@ fn pools() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_LIST_POOL").is_none_or(|v| v != "0"))
 }
 
+/// Whether a submitted list is left without a host list until the title
+/// resets it (`VICTORY_LIST_LAZY=1`; off: it gets a new one, closed, at
+/// once, as before). Every title list held one at all times, recording or
+/// not: wbar-b2 at the boat had 2,052 host lists alive for 2,871 made, each
+/// with two command allocators that keep their largest recording over a
+/// reset, and private bytes grew 6,690 MB while they were made. Left
+/// without one, the lists the title keeps and does not reset for a while
+/// hold nothing, and the pool ([`IDLE_MOST`]) caps the rest.
+#[cfg(windows)]
+fn lazy() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_LIST_LAZY").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!("submitted lists keep no host list until their reset (VICTORY_LIST_LAZY)");
+        }
+        on
+    })
+}
+
 /// A host list open for recording: one that has run, as a title's list is
 /// after its reset, or a new one.
 #[cfg(windows)]
@@ -419,16 +439,21 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
             }
             continue;
         }
-        let Some(fresh) = fresh_list() else {
-            continue;
+        let spare = if lazy() {
+            None
+        } else {
+            let Some(fresh) = fresh_list() else {
+                continue;
+            };
+            // A new host list is open; the title's next call on its list is a
+            // reset, which wants it closed.
+            fresh.close();
+            Some(fresh)
         };
-        // A new host list is open; the title's next call on its list is a
-        // reset, which wants it closed.
-        fresh.close();
         // SAFETY: one of our lists, closed and submitted: nothing records
         // into it until the title resets it.
         let list = unsafe { &mut *this.cast_mut().cast::<List>() };
-        let Some(host) = list.host.replace(fresh) else {
+        let Some(host) = std::mem::replace(&mut list.host, spare) else {
             continue;
         };
         let earlier = std::mem::take(&mut list.earlier);
@@ -491,17 +516,22 @@ pub(crate) fn detach(lists: &[This]) -> (Vec<Detached>, Vec<usize>) {
             order.push(i);
             continue;
         }
-        let Some(fresh) = fresh_list() else {
-            continue;
+        let spare = if lazy() {
+            None
+        } else {
+            let Some(fresh) = fresh_list() else {
+                continue;
+            };
+            // A new host list is open; the title's next call on its list is a
+            // reset, which wants it closed.
+            fresh.close();
+            Some(fresh)
         };
-        // A new host list is open; the title's next call on its list is a
-        // reset, which wants it closed.
-        fresh.close();
         let list = this.cast_mut().cast::<List>();
         // SAFETY: one of our lists, closed and submitted: nothing records
         // into it until the title resets it.
         let (host, uploads, state) = unsafe {
-            let Some(host) = (*list).host.replace(fresh) else {
+            let Some(host) = std::mem::replace(&mut (*list).host, spare) else {
                 continue;
             };
             let uploads =
@@ -703,6 +733,14 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
         list.earlier.clear();
         list.gate.clear();
         list.open_queries.clear();
+        // Left without a host list at its submission (`lazy`): it takes one
+        // now, closed, as a submission would have left it.
+        if list.host.is_none()
+            && let Some(fresh) = fresh_list()
+        {
+            fresh.close();
+            list.host = Some(fresh);
+        }
     }
     #[cfg(windows)]
     with_state(this, |host, state| {
