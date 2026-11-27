@@ -2136,7 +2136,7 @@ fn a_select_on_a_mask_held_as_a_number_keeps_the_consoles_lanes() {
 }
 
 fn fp32_reduce(op: u32, identity: u32) -> Vec<u32> {
-    let mut words = super::super::wave::WAVE_OR_V7_TO_S7.to_vec();
+    let mut words = super::wave::WAVE_OR_V7_TO_S7.to_vec();
     if identity != 0 {
         words[2] = (words[2] & !0x1ff) | LIT;
         words.insert(3, identity);
