@@ -87,6 +87,10 @@ $settings = @{
     VICTORY_LEAVE_OUT = '02384a60fda6f2d0,731a39171b568298'
     # Pipelines the title makes are written down, so `victory warm` can make them ahead
     VICTORY_PIPELINE_BOOK = '1'
+    # Pipelines the library cannot hold are made again every start: 12 makers at normal priority and no slow limit
+    # finish them before the world (38-46 s, not 170 s). Intro cutscene 18.5 -> 26-27 FPS, no half-second stalls.
+    # The wait stays at 500 ms: at 50 ms a pass a face needs is dropped.
+    VICTORY_PIPELINE_LOWEST = '0'; VICTORY_PIPELINE_WORKERS = '12'; VICTORY_PIPELINE_SLOW = '0'
 }
 if (-not $SeriesS) {
     if ($Res -eq '1440') { $settings.VICTORY_NATIVE_1440P = '1' }
