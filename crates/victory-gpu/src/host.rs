@@ -4486,6 +4486,51 @@ pub(crate) fn will_meet(list: &HostList, wait: &crate::list::ValueWait) -> bool 
     matches!(last, Some((at, crate::queue::Written::Value(v), n)) if *at == address && *n >= bytes && wait.holds_for(*v))
 }
 
+/// Whether a submission sent ahead is cut before its first list that waits
+/// for flights, and the lists in front of it go to the card at once
+/// (`VICTORY_SEND_FREE_FIRST=1`; off by default).
+///
+/// The card stood 37 ms a frame with nothing of ours queued while the
+/// submitting thread worked, in Leafy's play run of 2026-11-27 (game
+/// 90-180 s, 222 ms frames): a submission that reads what the flights write
+/// waits for them to land, the card runs dry, and its lists are prepared
+/// after that with the card standing. Its first lists may read nothing the
+/// flights write: those now run behind the flights while the thread waits
+/// and prepares the rest.
+fn send_free_first() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_SEND_FREE_FIRST"))
+}
+
+/// Since the last frame-rate line ([`send_free_first`]): submissions cut,
+/// the lists sent in front, and all the lists of those submissions.
+static FREE_FIRST: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// With [`send_free_first`]: before which of `runs` the submission is cut,
+/// the first that flights in the air stop, if lists come before it that
+/// they stop in no way (taken together, as a submission of their own).
+fn free_cut(runs: &[&HostList]) -> Option<usize> {
+    if !send_free_first() || runs.len() < 2 {
+        return None;
+    }
+    let (written, copies) = {
+        let line = line();
+        if line.written.is_empty() {
+            return None;
+        }
+        (line.written.clone(), card_steps::copies(&line))
+    };
+    let cut = (0..runs.len()).find(|&n| blocked_by(&written, &runs[n..=n], false).is_some())?;
+    let ahead = &runs[..cut];
+    if cut == 0 || blocked_by(&written, ahead, false).is_some() || card_steps::copied_read(&copies, ahead) {
+        return None;
+    }
+    FREE_FIRST[0].fetch_add(1, Ordering::Relaxed);
+    FREE_FIRST[1].fetch_add(cut as u64, Ordering::Relaxed);
+    FREE_FIRST[2].fetch_add(runs.len() as u64, Ordering::Relaxed);
+    Some(cut)
+}
+
 /// Lists and the order they run in.
 type Run<T> = (Vec<T>, Vec<usize>);
 
@@ -5001,6 +5046,15 @@ fn late_line(frames: f64) {
         s[13],
         s[14],
     );
+    if send_free_first() {
+        let f: Vec<f64> = FREE_FIRST.iter().map(|f| f.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+        tracing::info!(
+            "submissions cut in front of their first list that waits for flights, per frame (VICTORY_SEND_FREE_FIRST=1): {:.1},              {:.1} lists sent in front of {:.1}",
+            f[0],
+            f[1],
+            f[2]
+        );
+    }
     {
         let w: Vec<f64> = LATE_WAITED.iter().map(|w| w.swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames).collect();
         tracing::info!(
@@ -7153,7 +7207,7 @@ impl Host {
         }
         if let Some(cut) = {
             let runs: Vec<&HostList> = order.iter().map(|&i| lists[i].host()).collect();
-            card_steps::cut_for(&runs)
+            card_steps::cut_for(&runs).or_else(|| free_cut(&runs))
         } {
             match split(lists, order, cut) {
                 Ok([(lists, order), (more, behind)]) => {
