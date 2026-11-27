@@ -846,7 +846,7 @@ fn emit_forms(
         let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1") || WIDE_HERE.get();
         if !splits.is_empty() && (!halves || wide_on) {
             let why = std::env::var_os("VICTORY_WAVE_WHY").is_some();
-            match widen(c, native, p, &splits, why) {
+            match widen(c, native, p, &splits, why, false) {
                 Ok((shader, wave)) if !(halves && wave == Some(64)) => {
                     if why {
                         eprintln!("SCALAR-SPLITS {} branches taken wave-wide", splits.len());
