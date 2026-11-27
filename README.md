@@ -217,6 +217,11 @@ described in a comment where it is read.
 
 On top of what the forks above bring:
 
+- **Renderer port 5** (`VICTORY_PORT_CBV=1`, off by default): translated shaders
+  read constant buffers as raw bytes, so a table's constant buffer in title
+  memory in place is a raw view of the title's bytes rather than a copy made at
+  every submission (~23,000 a frame and ~9 MB of the city); the shader cache
+  keys on the switch (from Belobug's renderer ports, 3920dc2).
 - **NVIDIA**: the wave64 pull requests merged together, and float colour exports
   held to what the console's colour block allows, with a NaN written as 0
   (`VICTORY_COLOR_FINITE`).
