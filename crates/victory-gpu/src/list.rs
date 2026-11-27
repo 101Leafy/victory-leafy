@@ -206,6 +206,12 @@ impl Detached {
     pub(crate) fn host(&self) -> &crate::host::HostList {
         &self.host
     }
+
+    /// Gives the list's scratch chunks to the next lists once its submission has landed
+    /// ([`crate::host::HostList::release_scratch`]).
+    pub(crate) fn release_scratch(&self) {
+        self.host.release_scratch();
+    }
 }
 
 /// A host list that has run and waits to be used again, and the bytes of
