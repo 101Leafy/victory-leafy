@@ -4076,8 +4076,9 @@ const WHY_FENCE: usize = 10;
 /// microseconds settles waited for the card; value waits met by a flight's
 /// bottom-of-pipe write; fence signals set behind flights.
 /// Then: the settles for title memory read, by what read it (a buffer
-/// copy, a fill of upload memory, a texture).
-static LATE_STATS: [std::sync::atomic::AtomicU64; 18] = [const { std::sync::atomic::AtomicU64::new(0) }; 18];
+/// copy, a fill of upload memory, a texture). Then: joined submissions
+/// cut before a part that waits for flights ([`cut_waiting`]).
+static LATE_STATS: [std::sync::atomic::AtomicU64; 19] = [const { std::sync::atomic::AtomicU64::new(0) }; 19];
 
 /// Since the last frame-rate line: the microseconds settles waited for the
 /// card, by why they settled (the `WHY_` places).
@@ -4455,6 +4456,55 @@ fn joins_asked() -> (usize, usize) {
         return (if on { 8 } else { 1 }, lists);
     }
     (parts, lists)
+}
+
+/// With flights in the air: before which part of joined submissions
+/// ([`joins`]) they are cut, so that the parts ahead of the first one that
+/// waits for flights go to the card without waiting
+/// (`VICTORY_CUT_WAITING=1`; off by default).
+///
+/// The parts are joined while they wait in the line, without looking at
+/// the flights, and are prepared as one: a part that reads what a flight
+/// writes held back those in front of it too. Leafy's run past the intro
+/// (leafy-0314) waited three times a frame for fills of the title's ring
+/// of constants, 113 to 222 ms, and the card stood 30 to 68 ms a frame
+/// behind the thread that lands and prepares, with nothing of ours queued.
+/// Cut, the parts in front run on the card while the rest waits.
+///
+/// Only for the relay's exact wait ([`relay_exact`]), which waits for the
+/// flights that write what is read and not for the parts just sent; a
+/// settle for everything would wait for those as well.
+fn cut_waiting(runs: &[&HostList], parts: &[usize]) -> Option<usize> {
+    if parts.is_empty() || !cut_waiting_on() || !relay_exact() {
+        return None;
+    }
+    let (written, copies) = {
+        let line = line();
+        if line.written.is_empty() {
+            return None;
+        }
+        (line.written.clone(), card_steps::copies(&line))
+    };
+    let why = |runs: &[&HostList]| blocked_by(&written, runs, false).or_else(|| card_steps::copied_read(&copies, runs).then_some(WHY_READ));
+    let mut cut = 0;
+    for &end in parts.iter().chain(std::iter::once(&runs.len())) {
+        match why(&runs[cut..end]) {
+            None => cut = end,
+            Some(WHY_READ) => break,
+            Some(_) => return None,
+        }
+    }
+    // (Copies at their place are looked at across parts.)
+    if cut == 0 || cut == runs.len() || why(&runs[..cut]).is_some() {
+        return None;
+    }
+    LATE_STATS[18].fetch_add(1, Ordering::Relaxed);
+    Some(cut)
+}
+
+fn cut_waiting_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_CUT_WAITING"))
 }
 
 /// Whether the part `next` can be prepared together with `ahead`, which goes
@@ -5067,6 +5117,9 @@ fn late_line(frames: f64) {
             f[1],
             f[2]
         );
+    }
+    if cut_waiting_on() {
+        tracing::info!("joined submissions cut before a part that waits for flights, per frame (VICTORY_CUT_WAITING=1): {:.1}", s[18]);
     }
     {
         let w: Vec<f64> = LATE_WAITED.iter().map(|w| w.swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames).collect();
@@ -7223,7 +7276,7 @@ impl Host {
         }
         if let Some(cut) = {
             let runs: Vec<&HostList> = order.iter().map(|&i| lists[i].host()).collect();
-            card_steps::cut_for(&runs).or_else(|| free_cut(&runs))
+            card_steps::cut_for(&runs).or_else(|| free_cut(&runs)).or_else(|| cut_waiting(&runs, parts))
         } {
             match split(lists, order, cut) {
                 Ok([(lists, order), (more, behind)]) => {
