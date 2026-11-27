@@ -141,10 +141,14 @@ shader writes (14 → 4-7). Narrowing has paid more than any single rewrite here
 
 ### 6. Then the size, and only then
 
-If P is under 33 ms and C is not: 540p is four times fewer pixels than 1080p and
-sixteen times fewer than 4K, so a card at 378 ms on a world load is about 24 ms there,
-and one at 12 ms in play is about 1 ms. 720p (42 ms from Logan's load figure) is the
-in-between that would still miss 33 ms — worth knowing before promising it.
+If P is under 33 ms and C is not: **936p** (1664x936, one of the title's own modes) is
+2.25 times fewer pixels than 1080p, so a card at 378 ms on a world load is about 168 ms
+there and one at 12 ms in play is about 5 ms; **720p** is 4 times fewer than 1080p (about
+94 ms from that load figure, which still misses 33 ms); **540p** would be sixteen times
+fewer than 4K, but it is not a mode the title has — and when it was asked for on the 8 GiB
+laptop the title presented **1280x720** instead (Logan-Gaillard, 2026-11-27). So 720p is the
+floor **as measured**, 540p is unproven, and the launcher now says so before the run
+rather than after it: read the `presenting to a window` line before comparing two runs.
 
 ## What would make me say thirty is out of reach
 
