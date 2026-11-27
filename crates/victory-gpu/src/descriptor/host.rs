@@ -957,11 +957,12 @@ impl Spans {
 /// [`REMAPPED`] so that what such writes do is counted by itself.
 static PAGE_WRITTEN: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
 
-/// Since the start: such ranges kept for a pass; ranges dropped because no
-/// pass took them; slots of placed textures that held bytes of them when a
-/// pass took them; of those, the slots whose texture had been uploaded
-/// before the write (out of the queue, or in it after an upload): they are
-/// the ones that kept the bytes from before. Then, with
+/// Since the start: such ranges kept for a pass; ranges joined into others
+/// because no pass took them in time ([`record_range`]); slots of placed
+/// textures that held bytes of them when a pass took them; of those, the
+/// slots whose texture had been uploaded before the write (out of the
+/// queue, or in it after an upload): they are the ones that kept the bytes
+/// from before. Then, with
 /// `VICTORY_PAGE_SETTLE` ([`page_settle`]): writes that found their slot
 /// settling already (one upload for them all); slots made due once their
 /// writes settled; settled slots left as they were (waiting for their
@@ -1026,25 +1027,20 @@ pub(crate) fn page_settle() -> u64 {
 /// ranges; locks one mutex and calls nothing.
 pub(crate) fn page_written(at: usize, len: usize) {
     use std::sync::atomic::Ordering::Relaxed;
-    /// Ranges kept until a pass takes them.
-    const MOST: usize = 1 << 15;
+    /// Ranges kept until a pass takes them. (A world's first minutes note
+    /// tens of thousands between two passes: 131,072 were dropped in one run
+    /// at the 32,768 there were.)
+    const MOST: usize = 1 << 18;
     let (start, end) = (at as u64, at.saturating_add(len) as u64);
     if end <= SPANNED[0].load(Relaxed) || start >= SPANNED[1].load(Relaxed) {
         return;
     }
     let mut ranges = PAGE_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
     PAGE_WRITES[0].fetch_add(1, Relaxed);
-    if let Some(last) = ranges.last_mut()
-        && last.1 == start
-    {
-        last.1 = end;
-        return;
+    let joined = record_range(&mut ranges, start, end, MOST);
+    if joined > 0 {
+        PAGE_WRITES[1].fetch_add(joined, Relaxed);
     }
-    if ranges.len() >= MOST {
-        PAGE_WRITES[1].fetch_add(ranges.len() as u64, Relaxed);
-        ranges.clear();
-    }
-    ranges.push((start, end));
 }
 
 /// Title memory the runtime mapped, unmapped or is about to write since a
@@ -1061,8 +1057,9 @@ static SPANNED: [std::sync::atomic::AtomicU64; 2] = [
 
 /// Since the start: slots whose view a newer view of other memory there
 /// made stale; ranges of memory noted as mapped, unmapped or written;
-/// ranges dropped because no pass took them; slots made due by such
-/// ranges; and made slots whose memory was found unmapped (made null).
+/// ranges joined into others because no pass took them in time; slots made
+/// due by such ranges; and made slots whose memory was found unmapped
+/// (made null).
 pub(crate) static STALE: [std::sync::atomic::AtomicU64; 5] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 
@@ -1085,31 +1082,59 @@ fn stale_rule() -> Rule {
 /// textures there may have arrived, gone, or changed with no descriptor
 /// written. The range is kept for the next texture pass
 /// ([`HostHeap::texture_slots_remapped`]). Called with the runtime's own
-/// locks held: this locks one mutex of its own and calls nothing.
+/// locks held: this locks one mutex of its own and calls nothing but
+/// [`record_range`].
 pub(crate) fn remapped(at: usize, len: usize) {
     use std::sync::atomic::Ordering::Relaxed;
-    /// Ranges kept until a pass takes them.
-    const MOST: usize = 1 << 15;
+    /// Ranges kept until a pass takes them. (A world's first minutes note
+    /// tens of thousands between two passes: 131,072 were dropped in one run
+    /// at the 32,768 there were.)
+    const MOST: usize = 1 << 18;
     let (start, end) = (at as u64, at.saturating_add(len) as u64);
     if end <= SPANNED[0].load(Relaxed) || start >= SPANNED[1].load(Relaxed) {
         return;
     }
     let mut ranges = REMAPPED.lock().unwrap_or_else(|e| e.into_inner());
     STALE[1].fetch_add(1, Relaxed);
-    // Pages are mapped one after the other.
-    if let Some(last) = ranges.last_mut()
-        && last.1 == start
-    {
-        last.1 = end;
-        return;
+    let joined = record_range(&mut ranges, start, end, MOST);
+    if joined > 0 {
+        STALE[2].fetch_add(joined, Relaxed);
     }
-    if ranges.len() >= MOST {
-        // No pass runs (no shader that picks textures by index is bound):
-        // the slots there are looked at when they are due, as before.
-        STALE[2].fetch_add(ranges.len() as u64, Relaxed);
-        ranges.clear();
+}
+
+/// Keeps `[start, end)` among `ranges` for the next pass: one that meets
+/// the last range widens it (pages are mapped one after the other, and the
+/// same ones written over and over). A list that holds `most` is joined
+/// first ([`join`]), and only one still that long becomes the single range
+/// from its lowest start to its highest end: no range is dropped, and the
+/// pass looks at what lies between the ranges, not at all memory. Returns
+/// how many ranges went into others that way (DexNom/VIctory 921d8d3b:
+/// `record_remap`).
+fn record_range(ranges: &mut Vec<(u64, u64)>, start: u64, end: u64, most: usize) -> u64 {
+    if start >= end {
+        return 0;
+    }
+    if let Some(last) = ranges.last_mut()
+        && last.0 <= end
+        && start <= last.1
+    {
+        last.0 = last.0.min(start);
+        last.1 = last.1.max(end);
+        return 0;
+    }
+    let mut joined = 0;
+    if ranges.len() >= most {
+        let before = ranges.len();
+        join(ranges);
+        if ranges.len() >= most {
+            let hull = (ranges[0].0, ranges[ranges.len() - 1].1);
+            ranges.clear();
+            ranges.push(hull);
+        }
+        joined = (before - ranges.len()) as u64;
     }
     ranges.push((start, end));
+    joined
 }
 
 /// Ranges of memory, those that touch made one (DexNom/VIctory 921d8d3b:
@@ -5453,6 +5478,24 @@ mod tests {
         assert_eq!(ranges, [(1, 1), (10, 20), (30, 61)]);
         join(&mut ranges);
         assert_eq!(ranges.len(), 3);
+    }
+
+    /// Ranges that meet the last one widen it, and a full list is joined,
+    /// then made one range only if it is still full: what was noted is all
+    /// still looked at by the next pass.
+    #[test]
+    fn noted_ranges_join_and_a_full_list_keeps_them_all() {
+        let mut ranges = Vec::new();
+        for (from, to) in [(40, 50), (30, 40), (35, 40), (10, 20), (45, 60), (60, 61), (1, 1)] {
+            assert_eq!(record_range(&mut ranges, from, to, 3), 0);
+        }
+        join(&mut ranges);
+        assert_eq!(ranges, [(10, 20), (30, 61)]);
+        assert_eq!(record_range(&mut ranges, 90, 99, 2), 1);
+        assert_eq!(ranges, [(10, 61), (90, 99)]);
+        let mut overlapping = vec![(0, 10), (5, 15)];
+        assert_eq!(record_range(&mut overlapping, 20, 30, 2), 1);
+        assert_eq!(overlapping, [(0, 15), (20, 30)]);
     }
 
     /// Typed buffer views of integer formats are marked in the table of
