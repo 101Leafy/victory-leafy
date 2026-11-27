@@ -1,7 +1,7 @@
 @echo off
 setlocal EnableExtensions DisableDelayedExpansion
 rem ---------------------------------------------------------------------------
-rem Play-VIctory-8GB.cmd [4k|1440p|1080p|936p|720p|540p]: the settings that fit a
+rem Play-VIctory-8GB.cmd [4k|1440p|1080p|936p|720p|540p] [perf]: the settings that fit a
 rem card that is short of memory, and a ladder of output sizes to find out
 rem whether a frame is spent on pixels or on preparation.
 rem
@@ -33,6 +33,13 @@ rem ---------------------------------------------------------------------------
 
 set "profile=%~1"
 if not defined profile set "profile=1080p"
+rem
+rem Second argument: `perf` turns the five switches on that no one has seen render
+rem on an 8 GiB card yet (see the block further down). Without it they are 0, so a
+rem run with no second argument draws with the settings the leading continuation
+rem ships. A run with no 3D is not a frame rate.
+set "experiments=0"
+if /i "%~2"=="perf" set "experiments=1"
 
 if /i "%profile%"=="540p" set "lowres=1"
 if /i "%profile%"=="540p" set "pixels=960x540"
@@ -118,6 +125,10 @@ rem its draws were gone. A frame that is fast because it was not drawn is not
 rem a frame to measure. Set it yourself if you want the stall gone, and look at
 rem the picture before you look at the clock.
 
+rem Two preparing experiments, off in the engine, NOT measured by anyone on your
+rem card, and off here too unless the second argument is `perf`: a run that does not
+rem draw measures nothing, and these are the ones that can take the picture away.
+rem
 rem Two preparing experiments, off by default in the engine and NOT measured by
 rem anyone on your card. Note what the engine already does for itself: on a
 rem machine with 4 or more logical CPUs it spreads a flush's copies, the fills
@@ -131,8 +142,8 @@ rem when nothing that writes was recorded since the last one. They are here
 rem because preparing is the wall. If you see wrong textures, a black screen or
 rem a device loss, run with VICTORY_REFRESH_FRONT=0 and VICTORY_QUIET_WAITS=0
 rem set in your environment before launching, and say so: that is worth knowing.
-if not defined VICTORY_REFRESH_FRONT set "VICTORY_REFRESH_FRONT=1"
-if not defined VICTORY_QUIET_WAITS set "VICTORY_QUIET_WAITS=1"
+if not defined VICTORY_REFRESH_FRONT set "VICTORY_REFRESH_FRONT=%experiments%"
+if not defined VICTORY_QUIET_WAITS set "VICTORY_QUIET_WAITS=%experiments%"
 rem
 rem VICTORY_WIDE_MERGE is the one spreading switch the engine leaves off by
 rem default: what shaders wrote, fetched and then merged one piece after
@@ -140,12 +151,15 @@ rem another on the thread that settles (about 630 pieces and 40 MB a frame),
 rem taken instead by eight threads an eighth each.
 if not defined VICTORY_WIDE_MERGE set "VICTORY_WIDE_MERGE=1"
 rem
-rem The parts of one submission go to the queue in one call instead of one
+rem `perf` only. The parts of one submission go to the queue in one call instead of one
 rem call a part (VICTORY_JOIN_ONE_CALL, off by default; Skyfrye's
 rem AnyXboxX#337, with barriers standing in for the cuts). A frame that
 rem hands the card 58 pieces, which is what the card-span columns measured on
 rem an 8 GiB laptop, is 58 ExecuteCommandLists calls to pay for.
-if not defined VICTORY_JOIN_ONE_CALL set "VICTORY_JOIN_ONE_CALL=1"
+if not defined VICTORY_JOIN_ONE_CALL set "VICTORY_JOIN_ONE_CALL=%experiments%"
+rem
+rem `perf` only, for the same reason: the pair touches constants, which is the kind of
+rem thing that blanks a frame when it is wrong.
 rem
 rem The pair that costs the least for what it gives: a copy at its place in a
 rem list writes a few hundred bytes into the title's constants ring, and a
@@ -158,8 +172,8 @@ rem on the old values, which is what the pair is documented for. Both are off
 rem in the engine and this is the only place they are turned on. If constants
 rem look wrong (camera, lighting, a smeared sky), set BOTH to 0 before
 rem launching and say so: that is a real finding, not a user error.
-if not defined VICTORY_FILL_FORWARD set "VICTORY_FILL_FORWARD=1"
-if not defined VICTORY_PLACED_ORDER set "VICTORY_PLACED_ORDER=1"
+if not defined VICTORY_FILL_FORWARD set "VICTORY_FILL_FORWARD=%experiments%"
+if not defined VICTORY_PLACED_ORDER set "VICTORY_PLACED_ORDER=%experiments%"
 
 rem Keeping the card's clocks up between submissions, and the submission
 rem stages the continuation keeps on for this profile.
@@ -199,7 +213,9 @@ if not defined VICTORY_JOIN_PARTS set "VICTORY_JOIN_PARTS=0"
 if not defined VICTORY_CACHE_DIR set "VICTORY_CACHE_DIR=%LOCALAPPDATA%\VIctory\cache-8gb"
 if not defined VICTORY_LOG if not defined RUST_LOG set "VICTORY_LOG=warn"
 
-echo VIctory: %profile% [VICTORY_OUTPUT=%VICTORY_OUTPUT%] runner=%runner%
+echo VIctory: %profile% [VICTORY_OUTPUT=%VICTORY_OUTPUT%] experiments=%experiments% runner=%runner%
+if not "%experiments%"=="1" echo VIctory: the five speculative switches are off (no 3D last time? this is the run that draws). 
+if "%experiments%"=="1" echo VIctory: five switches ON that have never been seen to render on an 8 GiB card: if the picture is wrong, drop "perf".
 if defined VICTORY_FRAMES echo VIctory: frames to %VICTORY_FRAMES%
 "%runner%" run "%VICTORY_GAME_DIR%\game_scarlett_master.exe" --console series-x --execute
 exit /b %errorlevel%

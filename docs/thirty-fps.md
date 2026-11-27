@@ -166,9 +166,14 @@ comments measured.
 | `VICTORY_HOST_QUERIES=1` | occlusion queries kept on the host heap | culls draws; its own comment says "until a run shows that measured occlusion culls nothing our dropped draws should have drawn" | 0 |
 | `VICTORY_PORT_CONSTANTS=1` | renderer port #1: the title's memory used in place | the largest change of the set, unmeasured on this card | 0 |
 
-**The first row is now set in `Play-VIctory-8GB.cmd`**, because it is the only one whose
-failure mode is visible in the picture rather than silent in a lost write: constants that
-read old values look wrong, and a person watching says so. The rest are not set, and the
+**The first row is the only one `Play-VIctory-8GB.cmd` sets, and only when the second
+argument is `perf`.** The other four speculative switches the launcher used to set — the
+two preparing experiments, the one-call submission, and this pair — are off by default
+now, because the last 8 GiB run rendered no 3D with all of them on and **a run with no
+3D is not a frame rate**. `Play-VIctory-8GB.cmd 1080p` draws with what the leading
+continuation ships; `Play-VIctory-8GB.cmd 1080p perf` turns the five on, and the point of
+the pair is that its failure is visible in the picture rather than silent in a lost write:
+constants that read old values look wrong, and a person watching says so. The rest are not set, and the
 reason is the same for all of them: their failure mode is *a write nobody noticed*, the
 class this repository's own findings record as **six in two hundred runs**. A default is
 not the place for a defect that needs two hundred runs to appear.
