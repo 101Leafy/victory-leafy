@@ -962,6 +962,11 @@ impl Written {
             } else {
                 at.cast::<u64>().write_unaligned(value);
             }
+            // The title may wait on the address.
+            #[cfg(windows)]
+            if crate::fence::block() {
+                windows_sys::Win32::System::Threading::WakeByAddressAll(at.cast());
+            }
         }
         crate::watch::told(&[(at as usize, bytes)]);
     }
