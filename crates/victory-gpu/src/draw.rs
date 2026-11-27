@@ -6459,6 +6459,18 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
                 SHADER_RESOURCE
             };
             crate::list::ensure_state(list, *resource as This, state);
+            // `VICTORY_DUMP_READS=1`: textures shaders read are dumped with the targets too
+            // (a pass's input written in an earlier frame, which no pass of the frame writes).
+            #[cfg(feature = "diagnostics")]
+            {
+                static READS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                // Only textures the card writes (targets, depth, unordered access), not materials.
+                if *READS.get_or_init(|| crate::switch::on("VICTORY_DUMP_READS"))
+                    && crate::resource::host_copy(*resource as This).is_some_and(|t| t.flags() & 0x7 != 0)
+                {
+                    crate::capture::note_target(*resource as This);
+                }
+            }
             #[cfg(feature = "diagnostics")]
             if tracing::enabled!(tracing::Level::DEBUG)
                 && let Some(t) = crate::resource::host_resource(*resource as This)
