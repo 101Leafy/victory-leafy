@@ -4570,6 +4570,20 @@ impl State {
                             cbv[2] += u64::from(size);
                             cbv[3] += aligned * u64::from(size);
                         }
+                        // Renderer port 5: title memory in place is the
+                        // card's to read where it is; nothing is copied.
+                        if crate::port_cbv::in_place_on() {
+                            match crate::shadow::find(address, u64::from(size)).filter(|s| s.in_place()) {
+                                Some(shadow) => {
+                                    if host.constant_raw_at(index, &shadow.buffer, shadow.gpu(address), size) {
+                                        crate::port_cbv::in_place(size);
+                                        continue;
+                                    }
+                                    crate::port_cbv::copied(false);
+                                }
+                                None => crate::port_cbv::copied(true),
+                            }
+                        }
                         if let Some((buffer, gpu)) = list.place_constant(address as usize, size as usize) {
                             host.constant_at(index, &buffer, gpu, size);
                             continue;
