@@ -131,6 +131,21 @@ extern "system" fn completed_called(this: This) -> u64 {
     crate::timeline::polled(this as usize, value);
     value
 }
+/// What a run that exercises the null-event path looks like, since a
+/// tester asked and a silent log cannot say it:
+///
+/// - the call arrives from a title thread that means to wait in place, so a
+///   run that reaches it spends visible time inside `SetEventOnCompletion`
+///   rather than in `GetCompletedValue` polls;
+/// - in a `--features diagnostics` build every call is named as it happens
+///   (`an event asked for`, with the value), null event or not, so the answer
+///   is a `grep` on the log rather than a guess;
+/// - the null-event branch then says so once per process ("a fence is waited
+///   for through a null event"), which is the line that separates a run that
+///   cannot exercise it from one that is not fixed;
+/// - a wait that does not get its value warns with `value`: "blocking fence
+///   wait timed out" under `VICTORY_FENCE_BLOCK=1` (see [`block`]), "not
+///   implemented" without it.
 extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c_void) -> HRESULT {
     let fence = fence(this);
     let mut waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
@@ -143,6 +158,18 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
     #[cfg(all(windows, feature = "diagnostics"))]
     crate::timeline::told("an event asked for", this as usize, value);
     if event.is_null() {
+        // Does the title ever wait through a null event at all? Said once per
+        // process, because the answer is what tells a run that exercises this
+        // path from one that cannot: a test that reports "no regression" and a
+        // run where the wait happens fifty times look the same in a log that
+        // never mentions it.
+        static NULL_WAITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        if NULL_WAITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
+            tracing::info!(
+                value,
+                "a fence is waited for through a null event: the title's thread blocks until the value is reached"
+            );
+        }
         // With submissions sent to the card and not waited for
         // (`crate::host::late`) the signal may be behind them: they are
         // settled, which sets it.
