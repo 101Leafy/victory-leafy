@@ -531,9 +531,10 @@ pub(crate) fn lock_waits(frames: f64) -> String {
     let h: [u64; 8] = std::array::from_fn(|i| HOLDS[i].swap(0, std::sync::atomic::Ordering::Relaxed));
     let per = |v: u64| v as f64 / frames;
     let each = |v: u64| if h[0] > 0 { v as f64 / h[0] as f64 } else { 0.0 };
+    let w: [u64; 3] = std::array::from_fn(|i| REFRESH_HOLDS[i].swap(0, std::sync::atomic::Ordering::Relaxed));
     let (long_ns, long_first, long_last) = std::mem::take(&mut *LONGEST.lock().unwrap_or_else(|e| e.into_inner()));
     format!(
-        "ranges held {}, journal read {}, journal noted in {}, guards {};          whole submissions waiting {:.1} for {:.2} ms (longest {:.2} ms), {:.1} ranges held as each began, {:.1} taken while each waited;          held longest: whole {:.2} ms, a range {:.2} ms ({} KiB at {:#x}); ranges held 10 ms or more {:.1}, all held {:.2} ms (VICTORY_ASK_ALL_FIRST={})",
+        "ranges held {}, journal read {}, journal noted in {}, guards {};          whole submissions waiting {:.1} for {:.2} ms (longest {:.2} ms), {:.1} ranges held as each began, {:.1} taken while each waited;          held longest: whole {:.2} ms, a range {:.2} ms ({} KiB at {:#x}); ranges held 10 ms or more {:.1}, all held {:.2} ms (VICTORY_ASK_ALL_FIRST={});          refreshes held {:.1} ranges, {:.1} of them sent to the guards, held there {:.2} ms",
         of(0),
         of(1),
         of(2),
@@ -550,6 +551,9 @@ pub(crate) fn lock_waits(frames: f64) -> String {
         per(h[6]),
         h[7] as f64 / 1e6 / frames,
         u8::from(all_first()),
+        per(w[0]),
+        per(w[1]),
+        w[2] as f64 / 1e6 / frames,
     )
 }
 
@@ -563,6 +567,11 @@ pub(crate) fn lock_waits(frames: f64) -> String {
 static HOLDS: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];
 #[cfg(feature = "diagnostics")]
 static LONGEST: Mutex<(u64, usize, usize)> = Mutex::new((0, 0, 0));
+/// Ranges [`writes`] held, those of them it sent to the guards (the kernel
+/// refused them, or `VICTORY_ASK_SPANS` left them unasked), and nanoseconds
+/// at the guards with the range held.
+#[cfg(feature = "diagnostics")]
+static REFRESH_HOLDS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 /// Ranges held so far, for "taken while each waited".
 #[cfg(feature = "diagnostics")]
 static TAKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1449,6 +1458,8 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     if let Some(known) = ahead(&journal()) {
         return Some(known);
     }
+    #[cfg(feature = "diagnostics")]
+    REFRESH_HOLDS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut guards_asked = false;
     let mut loosely = false;
     // (View memory read-only by our hand: the kernel would refuse.)
@@ -1470,6 +1481,8 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
                 use crate::copystat::{C, add};
                 let us = guarding.elapsed().as_micros() as u64;
                 add(C::GuardUs, us);
+                REFRESH_HOLDS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                REFRESH_HOLDS[2].fetch_add(guarding.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
                 if written.is_some() {
                     add(C::Watches, 1);
                     add(C::WatchUs, us);
