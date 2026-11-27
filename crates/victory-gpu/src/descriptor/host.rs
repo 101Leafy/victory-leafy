@@ -604,6 +604,7 @@ fn neutral() -> Option<&'static ID3D12Resource> {
                 list.CopyTextureRegion(&to, 0, 0, 0, &source, None);
                 list.Close().ok()?;
                 let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
+                crate::host::before_send(&queue);
                 queue.ExecuteCommandLists(&[Some(windows::core::Interface::cast(&list).ok()?)]);
                 queue.Signal(&fence, 1).ok()?;
                 // (Without an event: this waits.)
@@ -3694,6 +3695,9 @@ impl HostHeap {
     }
 
     fn cpu(&self, index: u32) -> D3D12_CPU_DESCRIPTOR_HANDLE {
+        // Lists already sent read the slot as it is: new memory a view
+        // could show is waited for first (`VICTORY_RESIDENT_LATER`).
+        crate::host::settle();
         D3D12_CPU_DESCRIPTOR_HANDLE {
             ptr: self.cpu + index as usize * self.step as usize,
         }

@@ -271,6 +271,7 @@ impl Worker {
                 job.record(&self.list);
             }
             self.list.Close()?;
+            crate::host::before_send(&self.queue);
             self.queue.ExecuteCommandLists(&[Some(self.list.cast()?)]);
             self.queue.Signal(&self.fence, value)?;
             // (Without an event: this waits.)

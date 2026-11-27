@@ -1537,7 +1537,7 @@ pub(crate) static LOOSE_OPENS: [std::sync::atomic::AtomicU64; 3] = [const { std:
 /// other view and no parts: whether it is open. The notes have it guarded
 /// and clean until a holder of the lock finds its [`LOOSE`] bit.
 fn open_loose(block: usize) -> bool {
-    use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE, VirtualProtect};
+    use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE};
     if !loose_faults() || FINE.any(block, block + 1) || ALIASED.any(block, block + 1) {
         return false;
     }
@@ -1558,12 +1558,12 @@ fn open_loose(block: usize) -> bool {
             PUBLISHED.clear(block);
             let mut old = 0;
             // SAFETY: a block we made read-only.
-            let done = unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) } != 0;
+            let done = unsafe { protect_as(6, (block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) } != 0;
             opened = done && old == PAGE_READONLY;
             if done && !matches!(old, PAGE_READONLY | PAGE_READWRITE) {
                 // Not what we left there: as it was.
                 // SAFETY: as above.
-                unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, old, &mut old) };
+                unsafe { protect_as(8, (block * BLOCK) as *const _, BLOCK, old, &mut old) };
             }
         }
         if opened {
@@ -1852,6 +1852,50 @@ fn tally(what: usize, n: u64) {
 #[cfg(feature = "diagnostics")]
 pub(crate) fn asks() -> [u64; 13] {
     std::array::from_fn(|i| ASKS[i].swap(0, std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Since the last frame line: changes of the protection of title memory by
+/// who made them, each calls, 64 KiB blocks, nanoseconds, and calls of
+/// 100 us or more. Under the guards' lock: 0 other views of a page made
+/// read-only as a copy takes it, 3 blocks with parts open made read-only
+/// again, 4 runs and 5 single blocks given write access back, 7 a 4 KiB part
+/// opened for a fault. With the lock let go: 1 the runs an asking makes
+/// read-only (and their blocks one by one when a run fails), 2 other views
+/// made read-only after the asking (`VICTORY_ALIAS_LATER`), 6 blocks a write
+/// fault opens with no lock. 8 put back as they were (not ours to guard).
+#[cfg(feature = "diagnostics")]
+static PROTECTS: [[std::sync::atomic::AtomicU64; 4]; 9] =
+    [const { [const { std::sync::atomic::AtomicU64::new(0) }; 4] }; 9];
+
+/// `VirtualProtect`, counted in `who`'s row of [`PROTECTS`].
+///
+/// # Safety
+///
+/// As `VirtualProtect`.
+unsafe fn protect_as(who: usize, at: *const std::ffi::c_void, len: usize, new: u32, old: *mut u32) -> i32 {
+    #[cfg(feature = "diagnostics")]
+    let started = std::time::Instant::now();
+    // SAFETY: the caller's.
+    let done = unsafe { windows_sys::Win32::System::Memory::VirtualProtect(at, len, new, old) };
+    #[cfg(feature = "diagnostics")]
+    {
+        use std::sync::atomic::Ordering::Relaxed;
+        let ns = started.elapsed().as_nanos() as u64;
+        let row = &PROTECTS[who];
+        row[0].fetch_add(1, Relaxed);
+        row[1].fetch_add(len.div_ceil(BLOCK) as u64, Relaxed);
+        row[2].fetch_add(ns, Relaxed);
+        row[3].fetch_add(u64::from(ns >= 100_000), Relaxed);
+    }
+    #[cfg(not(feature = "diagnostics"))]
+    let _ = who;
+    done
+}
+
+/// [`PROTECTS`], taken.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn protects() -> [[u64; 4]; 9] {
+    std::array::from_fn(|i| std::array::from_fn(|j| PROTECTS[i][j].swap(0, std::sync::atomic::Ordering::Relaxed)))
 }
 
 /// The guards' lock, the wait for it counted.
@@ -2484,7 +2528,7 @@ fn guard_parts(start: usize, end: usize) -> Option<Vec<(usize, u16)>> {
         let fared: Vec<Fared> = later
             .iter()
             .map(|&(from, to)| {
-                if all_views(from, to) && read_only(from, to) {
+                if all_views(from, to) && read_only(from, to, 1) {
                     Fared::Whole
                 } else if fallback_later() {
                     Fared::Blocks(read_only_blocks(from, to))
@@ -2499,7 +2543,7 @@ fn guard_parts(start: usize, end: usize) -> Option<Vec<(usize, u16)>> {
         }
         if !aliases.blocks.is_empty() {
             drop(g);
-            let done: Vec<bool> = aliases.blocks.iter().map(|&block| read_only(block, block + 1)).collect();
+            let done: Vec<bool> = aliases.blocks.iter().map(|&block| read_only(block, block + 1, 2)).collect();
             aliases_done(&mut guards_timed(), &aliases, done);
         }
     }
@@ -3078,9 +3122,9 @@ fn read_only_blocks(from: usize, to: usize) -> Vec<Took> {
         let whole = whole.min(to);
         let until = whole.max(block + 1);
         match what {
-            There::View if read_only(block, until) => took.extend((block..until).map(|_| Took::ReadOnly)),
+            There::View if read_only(block, until, 1) => took.extend((block..until).map(|_| Took::ReadOnly)),
             There::View => took.extend(
-                (block..until).map(|block| if read_only(block, block + 1) { Took::ReadOnly } else { Took::Not }),
+                (block..until).map(|block| if read_only(block, block + 1, 1) { Took::ReadOnly } else { Took::Not }),
             ),
             There::Hole => {
                 took.extend((block..whole).map(|block| Took::Absent { held: known_holes() && placeholder(block) }));
@@ -3340,7 +3384,7 @@ fn cover_as(g: &mut Guards, from: usize, to: usize, mut plan: Option<&mut Aliase
 /// and [`PENDING`] now, the block whose page it is a view of relies on it,
 /// and it counts as read-only.
 fn protect_alias(g: &mut Guards, block: usize, plan: Option<(&mut Aliases, usize)>) -> bool {
-    use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE, VirtualProtect};
+    use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE};
     g.aliased.insert(block);
     ALIASED.set(block);
     if alias_later() && PENDING.any(block, block + 1) {
@@ -3386,7 +3430,7 @@ fn protect_alias(g: &mut Guards, block: usize, plan: Option<(&mut Aliases, usize
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
     // SAFETY: title view memory; only its protection changes.
-    let done = unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READONLY, &mut old) } != 0;
+    let done = unsafe { protect_as(0, (block * BLOCK) as *const _, BLOCK, PAGE_READONLY, &mut old) } != 0;
     #[cfg(feature = "diagnostics")]
     {
         tally(5, 1);
@@ -3401,22 +3445,24 @@ fn protect_alias(g: &mut Guards, block: usize, plan: Option<(&mut Aliases, usize
     if done {
         // Not for us to guard: as it was.
         // SAFETY: as above.
-        unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, old, &mut old) };
+        unsafe { protect_as(8, (block * BLOCK) as *const _, BLOCK, old, &mut old) };
     }
     PROTECTED.clear(block);
     false
 }
 
 /// Makes blocks `[from, to)` read-only in one call: whether it was done.
-/// Memory that was neither read-write nor read-only stays as it was.
-fn read_only(from: usize, to: usize) -> bool {
-    use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE, VirtualProtect};
+/// Memory that was neither read-write nor read-only stays as it was. `who`
+/// is a row of [`PROTECTS`].
+fn read_only(from: usize, to: usize, who: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE};
     let mut old = 0;
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
     // SAFETY: title view memory; only its protection changes.
     let mut done = unsafe {
-        VirtualProtect(
+        protect_as(
+            who,
             (from * BLOCK) as *const _,
             (to - from) * BLOCK,
             PAGE_READONLY,
@@ -3427,7 +3473,7 @@ fn read_only(from: usize, to: usize) -> bool {
         // What is there is not for us to guard (code, or memory the
         // title protects itself): as it was.
         // SAFETY: as above.
-        unsafe { VirtualProtect((from * BLOCK) as *const _, (to - from) * BLOCK, old, &mut old) };
+        unsafe { protect_as(8, (from * BLOCK) as *const _, (to - from) * BLOCK, old, &mut old) };
         done = false;
     }
     #[cfg(feature = "diagnostics")]
@@ -3691,7 +3737,7 @@ thread_local! {
 /// make that writable: those are left to [`open_block`].
 fn open_run(first: usize, last: usize) -> bool {
     use windows_sys::Win32::System::Memory::{
-        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_READONLY, PAGE_READWRITE, VirtualProtect, VirtualQuery,
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_READONLY, PAGE_READWRITE, VirtualQuery,
     };
     // SAFETY: plain data filled in by the query.
     let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
@@ -3707,7 +3753,7 @@ fn open_run(first: usize, last: usize) -> bool {
     let mut old = 0;
     // SAFETY: blocks we made read-only, all of one region.
     let done =
-        unsafe { VirtualProtect((first * BLOCK) as *const _, (last - first) * BLOCK, PAGE_READWRITE, &mut old) } != 0;
+        unsafe { protect_as(4, (first * BLOCK) as *const _, (last - first) * BLOCK, PAGE_READWRITE, &mut old) } != 0;
     #[cfg(test)]
     TEST_OPEN_CALLS.with(|c| c.set(c.get() + 1));
     #[cfg(feature = "diagnostics")]
@@ -3720,16 +3766,16 @@ fn open_run(first: usize, last: usize) -> bool {
 
 /// Gives write access back to guarded block `block`.
 fn open_block(block: usize) {
-    use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE, VirtualProtect};
+    use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE};
     let mut old = 0;
     // SAFETY: a block we made read-only.
     unsafe {
-        if VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) != 0
+        if protect_as(5, (block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) != 0
             && !matches!(old, PAGE_READONLY | PAGE_READWRITE)
         {
             // Not what we left there: the address is other memory's
             // (code's, say), which keeps its protection.
-            VirtualProtect((block * BLOCK) as *const _, BLOCK, old, &mut old);
+            protect_as(8, (block * BLOCK) as *const _, BLOCK, old, &mut old);
         }
     }
     #[cfg(test)]
@@ -3761,7 +3807,7 @@ fn part_faults() -> u32 {
 /// block. So too for a block with other views (a write through one of those
 /// would not fault at this one's parts), or with [`part_faults`] parts open.
 fn part_open(g: &mut Guards, at: usize) -> bool {
-    use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE, VirtualProtect};
+    use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE};
     let block = at / BLOCK;
     let most = part_faults();
     if most == 0 || !FINE.any(block, block + 1) || !g.protected.contains(block) {
@@ -3788,12 +3834,12 @@ fn part_open(g: &mut Guards, at: usize) -> bool {
     let page = at & !(KERNEL_PAGE - 1);
     let mut old = 0;
     // SAFETY: a block we made read-only; one kernel page of it.
-    if unsafe { VirtualProtect(page as *const _, KERNEL_PAGE, PAGE_READWRITE, &mut old) } == 0 {
+    if unsafe { protect_as(7, page as *const _, KERNEL_PAGE, PAGE_READWRITE, &mut old) } == 0 {
         return false;
     }
     if !matches!(old, PAGE_READONLY | PAGE_READWRITE) {
         // SAFETY: as above.
-        unsafe { VirtualProtect(page as *const _, KERNEL_PAGE, old, &mut old) };
+        unsafe { protect_as(8, page as *const _, KERNEL_PAGE, old, &mut old) };
         return false;
     }
     g.parted.insert(block, open | part);
@@ -3805,12 +3851,12 @@ fn part_open(g: &mut Guards, at: usize) -> bool {
 /// Makes all of a guarded `block` read-only again, the parts [`part_open`]
 /// opened too.
 fn close(block: usize) -> bool {
-    use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
+    use windows_sys::Win32::System::Memory::PAGE_READONLY;
     let mut old = 0;
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
     // SAFETY: title view memory; only its protection changes.
-    let done = unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READONLY, &mut old) } != 0;
+    let done = unsafe { protect_as(3, (block * BLOCK) as *const _, BLOCK, PAGE_READONLY, &mut old) } != 0;
     #[cfg(feature = "diagnostics")]
     {
         tally(5, 1);
@@ -5684,7 +5730,7 @@ mod tests {
         assert!(writable(at), "not read-only yet");
         assert!(written_since_taken(at, BLOCK));
         open(&mut guards(), at, at + 1);
-        assert!(read_only(block, block + 1));
+        assert!(read_only(block, block + 1, 1));
         protected_later(&mut guards(), block, block + 1, true);
         assert!(writable(at), "opened in between");
         assert!(!PENDING.any(block, block + 1));
@@ -5718,7 +5764,7 @@ mod tests {
         pend(&mut guards(), block, block + 1, &mut later);
         open(&mut guards(), at, at + 1);
         assert!(!PROTECTED.any(block, block + 1));
-        assert!(read_only(block, block + 1));
+        assert!(read_only(block, block + 1, 1));
         let (sent, came) = std::sync::mpsc::channel();
         let writer = std::thread::spawn(move || {
             // SAFETY: inside the view; the handler waits for it to open.
@@ -5738,7 +5784,7 @@ mod tests {
         open(&mut guards(), at, at + 1);
         assert_eq!(guard(at, at + BLOCK), Some(vec![block]));
         assert!(writable(at), "not guarded again while the first run has it");
-        assert!(read_only(block, block + 1));
+        assert!(read_only(block, block + 1, 1));
         protected_later(&mut guards(), block, block + 1, true);
         assert!(writable(at));
         title_memory_unmapping(at, BLOCK);

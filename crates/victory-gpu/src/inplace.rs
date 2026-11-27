@@ -661,6 +661,7 @@ impl Rig {
             self.list.Reset(&self.allocator, None)?;
             record(&self.list);
             self.list.Close()?;
+            crate::host::before_send(&self.queue);
             self.queue.ExecuteCommandLists(&[Some(self.list.cast()?)]);
             self.done += 1;
             self.queue.Signal(&self.fence, self.done)?;

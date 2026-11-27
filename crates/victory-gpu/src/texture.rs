@@ -1516,7 +1516,7 @@ fn shared_zeros(host: &crate::host::Host, size: u64) -> Option<ID3D12Resource> {
                 None,
                 &mut buffer,
             )
-            .and_then(|()| crate::host::resident(&host.device, buffer.as_ref().ok_or_else(windows::core::Error::empty)?))
+            .and_then(|()| crate::host::resident_soon(&host.device, buffer.as_ref().ok_or_else(windows::core::Error::empty)?, false))
     };
     let buffer = match made {
         Ok(()) => buffer?,

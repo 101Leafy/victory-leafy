@@ -345,6 +345,138 @@ pub(crate) fn resident(device: &ID3D12Device, object: &impl Interface) -> window
     made
 }
 
+/// Whether new memory is only asked to be made resident where it is made
+/// (`VICTORY_RESIDENT_LATER=1`; off by default), with
+/// `EnqueueMakeResident`: the system pages it in while we go on and signals
+/// a fence of ours. What could name it waits then: a slot of our descriptor
+/// heap before it is written ([`settle`]: on the CPU, then [`mapped`] once for
+/// all asked so far, since lists already sent read the heap as it is), and a
+/// queue before lists are sent to it ([`before_send`]: on the card). Memory the
+/// CPU maps where it is made is still waited for there. An intro frame of
+/// Leafy's play run waited 20 times, 16.5 ms in all, plus 4.5 ms in
+/// [`mapped`].
+fn resident_later() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RESIDENT_LATER").is_some_and(|v| v == "1"))
+}
+
+/// The fence [`resident_soon`] asks with, and the device that asks.
+static LATER: OnceLock<Option<(ID3D12Device3, ID3D12Fence)>> = OnceLock::new();
+/// The last value asked for, and the last one [`settle`] waited for.
+static ASKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static SETTLED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Asked, microseconds asking, settles that waited, microseconds of them
+/// (with [`mapped`]), the longest, queue waits.
+static LATER_STATS: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
+
+/// New memory (made with [`not_resident`]) is resident when this returns,
+/// and mapped too with `map`; with [`resident_later`], asked to be.
+pub(crate) fn resident_soon(device: &ID3D12Device, object: &impl Interface, map: bool) -> windows::core::Result<()> {
+    if !wait_resident() {
+        return Ok(());
+    }
+    if resident_later()
+        && let Some((asker, fence)) = LATER
+            .get_or_init(|| {
+                // SAFETY: plain creation.
+                let made = device.cast::<ID3D12Device3>().and_then(|d| Ok((d, unsafe { device.CreateFence(0, D3D12_FENCE_FLAG_NONE)? })));
+                made.inspect_err(|e| tracing::warn!(error = %e, "no EnqueueMakeResident: new memory is waited for where it is made")).ok()
+            })
+            .as_ref()
+    {
+        static ASKING: Mutex<()> = Mutex::new(());
+        let started = std::time::Instant::now();
+        let object: ID3D12Pageable = object.cast()?;
+        let _one = ASKING.lock().unwrap_or_else(|e| e.into_inner());
+        let value = ASKED.load(Ordering::Relaxed) + 1;
+        // SAFETY: a live heap or resource of the device's, our fence.
+        unsafe { asker.EnqueueMakeResident(D3D12_RESIDENCY_FLAG_NONE, &[Some(object)], fence, value)? };
+        ASKED.store(value, Ordering::Release);
+        LATER_STATS[0].fetch_add(1, Ordering::Relaxed);
+        LATER_STATS[1].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        return Ok(());
+    }
+    resident(device, object)?;
+    if map { mapped(device) } else { Ok(()) }
+}
+
+/// What [`resident_soon`] asked for is resident and mapped when this
+/// returns. Called before a slot of our descriptor heap is written.
+pub(crate) fn settle() {
+    let asked = ASKED.load(Ordering::Acquire);
+    if asked != SETTLED.load(Ordering::Acquire) {
+        wait_asked(asked);
+    }
+}
+
+#[cold]
+fn wait_asked(asked: u64) {
+    // (The event's handle as a number: a handle is not Send.)
+    static WAITING: Mutex<Option<usize>> = Mutex::new(None);
+    let Some(Some((asker, fence))) = LATER.get() else { return };
+    let started = std::time::Instant::now();
+    let mut event = WAITING.lock().unwrap_or_else(|e| e.into_inner());
+    if SETTLED.load(Ordering::Acquire) >= asked {
+        return;
+    }
+    // SAFETY: our fence, an event only this lock's holder waits on.
+    unsafe {
+        if fence.GetCompletedValue() < asked {
+            if event.is_none() {
+                *event = CreateEventW(None, false, false, None).ok().map(|e| e.0 as usize);
+            }
+            match event.map(|e| HANDLE(e as *mut _)) {
+                Some(e) if fence.SetEventOnCompletion(asked, e).is_ok() => {
+                    WaitForSingleObject(e, INFINITE);
+                }
+                _ => {
+                    while fence.GetCompletedValue() < asked {
+                        std::thread::yield_now();
+                    }
+                }
+            }
+        }
+    }
+    if let Ok(device) = asker.cast::<ID3D12Device>()
+        && let Err(e) = mapped(&device)
+    {
+        tracing::warn!(error = %e, "new memory not waited for until it is mapped");
+    }
+    SETTLED.fetch_max(asked, Ordering::Release);
+    let us = started.elapsed().as_micros() as u64;
+    let n = LATER_STATS[2].fetch_add(1, Ordering::Relaxed) + 1;
+    LATER_STATS[3].fetch_add(us, Ordering::Relaxed);
+    LATER_STATS[4].fetch_max(us, Ordering::Relaxed);
+    if n == 1 || n.is_multiple_of(200) {
+        let ms = |i: usize| LATER_STATS[i].load(Ordering::Relaxed) as f64 / 1000.0;
+        tracing::info!(
+            "new memory asked to be resident where it is made (VICTORY_RESIDENT_LATER=1), since the start: {} times, {:.1} ms asking; waited for before a descriptor slot {n} times, {:.1} ms with the mapping, the longest {:.1} ms; queues waited on the card {} times",
+            LATER_STATS[0].load(Ordering::Relaxed),
+            ms(1),
+            ms(3),
+            ms(4),
+            LATER_STATS[5].load(Ordering::Relaxed)
+        );
+    }
+}
+
+/// Lists sent to `queue` after this wait on the card for what
+/// [`resident_soon`] asked for.
+pub(crate) fn before_send(queue: &ID3D12CommandQueue) {
+    let asked = ASKED.load(Ordering::Acquire);
+    if asked == 0 {
+        return;
+    }
+    let Some(Some((_, fence))) = LATER.get() else { return };
+    // SAFETY: our fence and a live queue.
+    unsafe {
+        if fence.GetCompletedValue() < asked {
+            let _ = queue.Wait(fence, asked);
+            LATER_STATS[5].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
 /// Whether memory of the card that shaders use every frame is made with the
 /// highest residency priority (`VICTORY_RESIDENCY_HIGH=1`; off by default):
 /// card buffers (card sides of title buffers and windows, hash buffers) and
@@ -2072,6 +2204,7 @@ fn record_plane_pass(
             let gpu = D3D12_GPU_DESCRIPTOR_HANDLE {
                 ptr: pass.gpu + u64::from(slot * pass.step),
             };
+            settle();
             // SAFETY: an open list; a slot of our heap; live resources and
             // objects (the pass's own live as long as the process).
             unsafe {
@@ -5333,6 +5466,7 @@ impl Host {
                     #[cfg(feature = "diagnostics")]
                     crate::sidetime::end(list, side);
                     list.Close()?;
+                    before_send(&self.queue);
                     self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
                     Ok(())
                 })()
@@ -5719,6 +5853,7 @@ impl Host {
                 let lists = [Some(list.cast::<ID3D12CommandList>()?)];
                 let _fetching = crate::timeline::span("landing: fetching pieces");
                 if let Some(queue) = &copy_queue {
+                    before_send(queue);
                     queue.ExecuteCommandLists(&lists);
                     queue.Signal(&fence, sent)?;
                     meanwhile();
@@ -5731,6 +5866,7 @@ impl Host {
                 // In the order of the queue: the sends of title bytes so
                 // far are ahead of this fetch, every later one behind it.
                 let order = QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner());
+                before_send(&self.queue);
                 self.queue.ExecuteCommandLists(&lists);
                 let after = *order;
                 drop(order);
@@ -6036,6 +6172,7 @@ impl Host {
                     #[cfg(feature = "diagnostics")]
                     crate::sidetime::end(list, side);
                     list.Close()?;
+                    before_send(&self.queue);
                     self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
                     self.card_sent();
                     *submitted += 1;
@@ -6758,6 +6895,7 @@ impl Host {
             let signalled = unsafe {
                 let mut from = 0;
                 for to in cuts.into_iter().chain([lists.len()]) {
+                    before_send(&self.queue);
                     self.queue.ExecuteCommandLists(&lists[from..to]);
                     from = to;
                 }
@@ -6819,6 +6957,7 @@ impl Host {
             let timed = crate::overlay::time_lists(&self.device, &self.queue, group);
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
+                before_send(&self.queue);
                 self.queue
                     .ExecuteCommandLists(timed.as_deref().unwrap_or(group));
                 self.card_sent();
@@ -8786,6 +8925,25 @@ fn split_line(frames: f64) {
         s[1] / 1048576.0,
         s[2] / 1048576.0,
         s[3],
+    );
+    let p = crate::watch::protects();
+    let row = |i: usize| {
+        let r = p[i];
+        format!("{:.1} calls, {:.1} blocks, {:.2} ms, {:.2} slow", r[0] as f64 / frames, r[1] as f64 / frames, r[2] as f64 / 1e6 / frames, r[3] as f64 / frames)
+    };
+    tracing::info!(
+        "title memory protections changed per frame, by who: under the guards' lock, other views as a copy takes the page {}, \
+         parted blocks closed {}, runs opened {}, blocks opened {}, parts opened for faults {}; with the lock let go, runs an \
+         asking guards {}, other views after the asking {}, blocks faults open with no lock {}; put back as they were {}",
+        row(0),
+        row(3),
+        row(4),
+        row(5),
+        row(7),
+        row(1),
+        row(2),
+        row(6),
+        row(8),
     );
     tracing::info!(
         "the pass over the heap's views per frame: {:.1} ms looking at slots, {:.1} their copies' spans and refreshes, {:.1} textures; the \
@@ -11147,7 +11305,7 @@ impl Host {
         if let Some(b) = &buffer {
             crate::book::made(b, || "an unordered access buffer".into());
         }
-        let made = made.and_then(|()| buffer.as_ref().map_or(Ok(()), |b| resident(&self.device, b))).and_then(|()| mapped(&self.device));
+        let made = made.and_then(|()| buffer.as_ref().map_or_else(|| mapped(&self.device), |b| resident_soon(&self.device, b, true)));
         if made.is_ok()
             && let Some(b) = &buffer
         {

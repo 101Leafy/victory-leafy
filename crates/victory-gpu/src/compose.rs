@@ -169,6 +169,7 @@ impl Composer {
                         },
                     },
                 };
+                crate::host::settle();
                 host.device
                     .CreateShaderResourceView(Some(plane.0), Some(&desc), at);
             }
