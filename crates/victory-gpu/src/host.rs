@@ -1686,6 +1686,10 @@ pub(crate) struct HostList {
     /// and at the end, and where they are read back.
     #[cfg(feature = "diagnostics")]
     stamps: OnceLock<Option<(ID3D12QueryHeap, ID3D12Resource)>>,
+    /// With `VICTORY_GPU_TIMES`: whether the last noted command has its
+    /// stamp for when it was done ([`HostList::noted_done`]).
+    #[cfg(feature = "diagnostics")]
+    done: std::sync::atomic::AtomicBool,
     /// The batched clamps' passes on the card.
     #[cfg(feature = "diagnostics")]
     pub(crate) clamp_stamps: crate::indirect::batch::Stamps,
@@ -1750,6 +1754,17 @@ fn lazy_prelude() -> bool {
 /// Timestamps per list (diagnostics); commands past them are not timed.
 #[cfg(feature = "diagnostics")]
 const STAMPS: u32 = 4096;
+
+/// With `VICTORY_GPU_TIMES` a list's stamps are halves: the first for when
+/// each command starts, the second for when it is done.
+#[cfg(feature = "diagnostics")]
+const HALF: u32 = STAMPS / 2;
+
+/// The commands a list times.
+#[cfg(feature = "diagnostics")]
+fn timed() -> u32 {
+    if gpu_times() && !timing() { HALF - 1 } else { STAMPS - 1 }
+}
 
 /// A marker's text and the host range its command reads (diagnostics).
 #[cfg(feature = "diagnostics")]
@@ -5010,6 +5025,8 @@ impl Host {
                 #[cfg(feature = "diagnostics")]
                 stamps: OnceLock::new(),
                 #[cfg(feature = "diagnostics")]
+                done: Default::default(),
+                #[cfg(feature = "diagnostics")]
                 clamp_stamps: Default::default(),
             })
         }
@@ -7191,19 +7208,20 @@ impl HostList {
     #[cfg(feature = "diagnostics")]
     fn times_taken(&self) {
         let notes = self.notes.lock().unwrap_or_else(|e| e.into_inner());
-        let count = notes.len().min(STAMPS as usize - 1);
+        let count = notes.len().min(HALF as usize - 1);
         let (Some((_, back)), Some(host), 1..) = (self.stamps(), host(), count) else {
             return;
         };
+        let half = HALF as usize;
         let mut data = std::ptr::null_mut();
-        let range = D3D12_RANGE { Begin: 0, End: (count + 1) * 8 };
+        let range = D3D12_RANGE { Begin: 0, End: (half + count) * 8 };
         // SAFETY: a read-back buffer the finished list resolved into; the
         // card writes it again only after the next close.
         let stamps: Vec<u64> = unsafe {
             if back.Map(0, Some(&range), Some(&mut data)).is_err() {
                 return;
             }
-            let mapped = std::slice::from_raw_parts_mut(data.cast::<u64>(), count + 1);
+            let mapped = std::slice::from_raw_parts_mut(data.cast::<u64>(), half + count);
             let stamps = mapped.to_vec();
             (mapped[0], mapped[count]) = (0, 0);
             back.Unmap(0, Some(&range));
@@ -7214,9 +7232,19 @@ impl HostList {
         }
         // SAFETY: a plain query.
         let frequency = unsafe { host.queue.GetTimestampFrequency() }.unwrap_or(1).max(1);
+        let ms = |ticks: u64| ticks as f64 * 1e3 / frequency as f64;
+        // What runs between a command's end and the next one's start (the
+        // next one's barriers, clamp and copies) is summed as "before" it.
         for (i, (op, _)) in notes.iter().take(count).enumerate() {
-            let ticks = stamps[i + 1].saturating_sub(stamps[i]);
-            crate::copystat::command_took(op, ticks as f64 * 1e3 / frequency as f64);
+            let done = stamps[half + i];
+            crate::copystat::command_took(op, ms(done.saturating_sub(stamps[i])));
+            let between = stamps[i + 1].saturating_sub(done);
+            if between > 0 {
+                match notes.get(i + 1).filter(|_| i + 1 < count) {
+                    Some((next, _)) => crate::copystat::command_took(&format!("before {next}"), ms(between)),
+                    None => crate::copystat::command_took("closing list", ms(between)),
+                }
+            }
         }
     }
 
@@ -7242,11 +7270,19 @@ impl HostList {
         lap.to(5);
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
-            let count = (self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32).min(STAMPS - 1);
+            let noted = self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32;
+            let count = noted.min(timed());
+            let halves = gpu_times() && !timing() && count > 0;
             // SAFETY: an open list, our heap and read-back buffer.
             unsafe {
+                if halves && noted == count && !self.done.swap(true, Ordering::Relaxed) {
+                    self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, HALF + count - 1);
+                }
                 self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, count);
                 self.list.ResolveQueryData(heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, count + 1, back, 0);
+                if halves {
+                    self.list.ResolveQueryData(heap, D3D12_QUERY_TYPE_TIMESTAMP, HALF, count, back, u64::from(HALF) * 8);
+                }
             }
         }
         #[cfg(feature = "diagnostics")]
@@ -7728,6 +7764,24 @@ impl HostList {
         self.note(what, None);
     }
 
+    /// The command noted last was just recorded (`VICTORY_GPU_TIMES`): its
+    /// time on the card ends here, and what is recorded before the next
+    /// note counts as that one's setup.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn noted_done(&self) {
+        if !gpu_times() || timing() {
+            return;
+        }
+        let at = self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32;
+        if let Some((heap, _)) = self.stamps()
+            && (1..=timed()).contains(&at)
+            && !self.done.swap(true, Ordering::Relaxed)
+        {
+            // SAFETY: an open list and our query heap.
+            unsafe { self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, HALF + at - 1) };
+        }
+    }
+
     /// As [`HostList::note_op`], for a copy that reads the host GPU range
     /// `(address, bytes)`: the report places the faulting address in it.
     #[cfg(feature = "diagnostics")]
@@ -7747,9 +7801,19 @@ impl HostList {
         {
             let started = std::time::Instant::now();
             let at = self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32;
-            if let Some((heap, _)) = self.stamps() && at < STAMPS - 1 {
+            if let Some((heap, _)) = self.stamps() {
+                let most = timed();
+                // The last command's end, if it has none of its own.
+                let done = self.done.swap(false, Ordering::Relaxed);
                 // SAFETY: an open list and our query heap.
-                unsafe { self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, at) };
+                unsafe {
+                    if gpu_times() && !timing() && (1..=most).contains(&at) && !done {
+                        self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, HALF + at - 1);
+                    }
+                    if at < most {
+                        self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, at);
+                    }
+                }
             }
             let what = what();
             crate::capture::op(std::ptr::from_ref(self) as usize, || what.clone());
