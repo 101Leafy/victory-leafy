@@ -2052,6 +2052,10 @@ impl Guards {
         }
         put_count(block).store(0, std::sync::atomic::Ordering::Relaxed);
         self.opened.insert(block, std::time::Instant::now());
+        #[cfg(feature = "diagnostics")]
+        if guard_frames::on() {
+            guard_frames::opened(block);
+        }
     }
 }
 
@@ -2550,6 +2554,139 @@ fn taken(from: usize, to: usize) {
     crate::faultbook::note(crate::faultbook::What::Taken, from, to, 0);
     let again = (from..to).filter(|&block| crate::copystat::again(4, (block, 0, 0))).count();
     crate::copystat::add(crate::copystat::C::GuardAgain, again as u64);
+    if guard_frames::on() {
+        guard_frames::guarded(from, to);
+    }
+}
+
+/// `VICTORY_GUARD_FRAMES=1`, for the log: whether the blocks made read-only
+/// are the same frame after frame, and how many guard faults land on those.
+/// In Leafy's run (leafy-0314) 400 blocks a frame were made read-only, with
+/// 282 guard faults and 264 waits for the guards' lock (91 ms) over all
+/// threads. A block guarded and written every frame costs a fault and two
+/// protection changes each time for nothing.
+#[cfg(feature = "diagnostics")]
+pub(crate) mod guard_frames {
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    use std::sync::{Mutex, OnceLock};
+
+    /// Frames running from which a block counts as guarded every frame.
+    const RUNNING: u32 = 8;
+
+    pub(crate) fn on() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("VICTORY_GUARD_FRAMES").is_some_and(|v| v == "1"))
+    }
+
+    /// Per block: the last frame it was made read-only, the frames running
+    /// it was, and the guard faults on it in that run.
+    type Seen = HashMap<usize, (u64, u32, u32), std::hash::BuildHasherDefault<super::PageHash>>;
+    static SEEN: Mutex<Option<Seen>> = Mutex::new(None);
+
+    /// Blocks made read-only; of them, made read-only the frame before too;
+    /// [`RUNNING`] frames running or more; guard faults; of them, on blocks
+    /// made read-only the frame before or this one; on blocks [`RUNNING`]
+    /// frames running.
+    static COUNTS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+
+    pub(super) fn guarded(from: usize, to: usize) {
+        let frame = crate::frame::current();
+        let (mut before, mut running) = (0, 0);
+        {
+            let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+            let seen = seen.get_or_insert_with(Default::default);
+            if seen.len() >= 1 << 20 {
+                seen.retain(|_, &mut (at, _, _)| at + 2 >= frame);
+            }
+            for block in from..to {
+                let e = seen.entry(block).or_insert((0, 0, 0));
+                if e.0 == frame && e.1 > 0 {
+                    continue;
+                }
+                if e.1 > 0 && e.0 + 1 == frame {
+                    e.1 += 1;
+                    before += 1;
+                } else {
+                    *e = (0, 1, 0);
+                }
+                e.0 = frame;
+                if e.1 >= RUNNING {
+                    running += 1;
+                }
+            }
+        }
+        COUNTS[0].fetch_add((to - from) as u64, Relaxed);
+        COUNTS[1].fetch_add(before, Relaxed);
+        COUNTS[2].fetch_add(running, Relaxed);
+    }
+
+    /// A guard fault on `block`.
+    pub(super) fn opened(block: usize) {
+        let frame = crate::frame::current();
+        COUNTS[3].fetch_add(1, Relaxed);
+        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(e) = seen.as_mut().and_then(|seen| seen.get_mut(&block)) else {
+            return;
+        };
+        if e.0 + 1 >= frame {
+            COUNTS[4].fetch_add(1, Relaxed);
+            e.2 += 1;
+            if e.1 >= RUNNING {
+                COUNTS[5].fetch_add(1, Relaxed);
+            }
+        }
+    }
+
+    /// The counts per frame, and the longest runs of neighbouring blocks
+    /// made read-only every frame: start, length, frames running (the least
+    /// of the run), guard faults per frame in it.
+    pub(crate) fn line(frames: f64) -> String {
+        let c = [0, 1, 2, 3, 4, 5].map(|i| COUNTS[i].swap(0, Relaxed) as f64 / frames);
+        let frame = crate::frame::current();
+        let mut blocks: Vec<(usize, u32, u32)> = {
+            let seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+            seen.iter()
+                .flatten()
+                .filter(|(_, &(at, run, _))| at + 1 >= frame && run >= RUNNING)
+                .map(|(&block, &(_, run, faults))| (block, run, faults))
+                .collect()
+        };
+        blocks.sort_unstable();
+        let mut runs: Vec<(usize, usize, u32, f64)> = Vec::new();
+        for (block, run, faults) in blocks {
+            match runs.last_mut() {
+                Some(r) if r.0 + r.1 == block => {
+                    r.1 += 1;
+                    r.2 = r.2.min(run);
+                    r.3 += f64::from(faults) / f64::from(run);
+                }
+                _ => runs.push((block, 1, run, f64::from(faults) / f64::from(run))),
+            }
+        }
+        let every: usize = runs.iter().map(|r| r.1).sum();
+        runs.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+        let top: Vec<String> = runs
+            .iter()
+            .take(8)
+            .map(|&(block, n, run, faults)| {
+                format!("{:#x}+{:#x} ({run}+ frames, {faults:.1} faults a frame)", block * super::BLOCK, n * super::BLOCK)
+            })
+            .collect();
+        format!(
+            "{:.0} blocks made read-only, {:.0} of them the frame before too, {:.0} {RUNNING}+ frames running; \
+             {:.0} guard faults, {:.0} on blocks made read-only that frame or the one before, {:.0} on blocks {RUNNING}+ frames running; \
+             {every} blocks made read-only every frame now, in {} runs, the longest: {}",
+            c[0],
+            c[1],
+            c[2],
+            c[3],
+            c[4],
+            c[5],
+            runs.len(),
+            top.join(", ")
+        )
+    }
 }
 
 /// Blocks [`guard_parts`] has noted guarded and clean but not made

@@ -4526,6 +4526,7 @@ fn late_line(frames: f64) {
         );
     }
     card_steps::log(frames);
+    fetch_waits::log(frames);
     crate::port_journal::line(frames);
     crate::picked::log(frames);
     #[cfg(feature = "diagnostics")]
@@ -4544,6 +4545,7 @@ fn late_line(frames: f64) {
 pub(crate) mod aside;
 pub(crate) mod awake;
 mod card_steps;
+mod fetch_waits;
 pub(crate) mod indirects;
 #[cfg(feature = "diagnostics")]
 pub(crate) mod panel;
@@ -5748,6 +5750,11 @@ impl Host {
         };
         let us = waiting.elapsed().as_micros() as u64;
         RELAY_STATS[3].fetch_add(us, Ordering::Relaxed);
+        if fetch_waits::on() {
+            let who = if copy_queue.is_some() { fetch_waits::RELAY_COPY } else { fetch_waits::RELAY_MAIN };
+            let fetched = check.as_ref().map_or(&pieces, |c| &c.copies);
+            fetch_waits::fetched(who, fetched.iter().map(|(shadow, lo, hi, _)| (shadow.span().0 as usize, *lo, *hi)), us, 0);
+        }
         {
             use crate::shadow::CARD_STATS;
             CARD_STATS[3].fetch_add(pieces.len() as u64, Ordering::Relaxed);
@@ -6012,6 +6019,8 @@ impl Host {
                 fail(format_args!("no memory to fetch what shaders wrote to the card's memory ({total} bytes)"));
             };
             let waiting = std::time::Instant::now();
+            // SAFETY: our fence.
+            let ahead = fetch_waits::on().then(|| submitted.saturating_sub(unsafe { self.fence.GetCompletedValue() }));
             let (allocator, list) = &work.fetch;
             // SAFETY: the list's last run was waited for; live buffers; the
             // fence and event are ours, under the submission lock.
@@ -6048,6 +6057,14 @@ impl Host {
                 CARD_STATS[4].fetch_add(total, Ordering::Relaxed);
                 CARD_STATS[5].fetch_add(1, Ordering::Relaxed);
                 CARD_STATS[6].fetch_add(waiting.elapsed().as_micros() as u64, Ordering::Relaxed);
+            }
+            if let Some(ahead) = ahead {
+                fetch_waits::fetched(
+                    fetch_waits::SUBMITTING,
+                    pieces.iter().map(|&(i, lo, hi, _)| (plan.ranges[i].shadow.span().0 as usize, lo, hi)),
+                    waiting.elapsed().as_micros() as u64,
+                    ahead,
+                );
             }
             if wide_merge() && pieces.len() >= 8 {
                 // The pieces are apart from one another (each its own bytes
