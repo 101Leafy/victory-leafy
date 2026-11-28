@@ -5019,12 +5019,11 @@ impl State {
                             host.constant_at(index, &buffer, gpu, size);
                             continue;
                         }
-                        let Some((buffer, gpu, to)) = list.scratch_held(u64::from(size)) else {
+                        let slot = (std::ptr::from_ref(heap) as usize, index);
+                        let Some((buffer, gpu)) = list.constants_held(address as *const u8, u64::from(size), slot) else {
                             host.make_null(index);
                             continue;
                         };
-                        let slot = (std::ptr::from_ref(heap) as usize, index);
-                        list.defer_constants(to, address as *const u8, size as usize, slot);
                         host.constant_at(index, &buffer, gpu, size);
                         constants = true;
                     }
