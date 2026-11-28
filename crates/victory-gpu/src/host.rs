@@ -4092,7 +4092,7 @@ struct Deferred {
     /// fills behind them ([`HostList::place_constants`]).
     placed: Vec<(usize, usize)>,
     /// Scratch memory of constant views since the list last wrote title
-    /// memory, with `VICTORY_CBV_ONCE=1` (source, bytes): the buffer, its
+    /// memory, unless `VICTORY_CBV_ONCE=0` (source, bytes): the buffer, its
     /// GPU address, the CPU address of its fill, and whether more than one
     /// slot shows it ([`HostList::constants_held`]).
     constants: std::collections::HashMap<(usize, usize), (ID3D12Resource, u64, usize, bool), std::hash::BuildHasherDefault<AddressHash>>,
@@ -6223,10 +6223,9 @@ fn declare_once() -> bool {
 }
 
 /// Whether constant views of the same bytes share a copy
-/// ([`HostList::constants_held`], `VICTORY_CBV_ONCE=1`).
+/// ([`HostList::constants_held`]; `VICTORY_CBV_ONCE=0`: each its own).
 fn cbv_once() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| crate::switch::on("VICTORY_CBV_ONCE"))
+    crate::toggled!("VICTORY_CBV_ONCE")
 }
 
 /// The ranges the shaders of `runs` may write, per host copy, as declared.
@@ -10466,7 +10465,7 @@ impl HostList {
     /// Scratch memory that holds the `len` bytes of title memory at `src` as
     /// of the list's submission, for the constant view in `slot` (a title
     /// heap's address, and the slot): the buffer and the GPU address.
-    /// `VICTORY_CBV_ONCE=1`: the constant views of the same bytes share one
+    /// Unless `VICTORY_CBV_ONCE=0`, the constant views of the same bytes share one
     /// copy until the list next writes title memory. In play-g scene A lists
     /// made 4,057 constant views a frame, 2,637 of the 3,050 tables made
     /// afresh held one, and every view had a copy of its own. A shared copy
