@@ -22,10 +22,13 @@ $settings = @{
     VICTORY_SHOW_AFTER = '1'; VICTORY_AMBIENT = '0.8'; VICTORY_D3D12_DRED = 'light'; VICTORY_SKIP_PIPELINES = 'none'
     VICTORY_OUTPUT = '1280x720'; VICTORY_DISPLAY_MODE = '1280x720'; VICTORY_RT_RESOLVE = '0'
 }
+# What victory.toml [settings] (the F1 menu's saves) may change; the switches and -More win over it.
+$defaults = @($settings.Keys)
 if ($Safe) {
     $settings.VICTORY_UNDER_WIDE = '0'; $settings.VICTORY_LAND_ECHO = '0'; $settings.VICTORY_CARD_WINDOWS_MB = '0'
 } else {
     $settings.VICTORY_THIN = '1'; $settings.VICTORY_JOIN_PARTS = '8'; $settings.VICTORY_UPLOAD_AHEAD = '1'
+    $defaults += 'VICTORY_THIN', 'VICTORY_JOIN_PARTS', 'VICTORY_UPLOAD_AHEAD'
 }
 if ($RayTracing) { $settings.VICTORY_BVH_BUILDER = '1' }
 if ($Borderless) { $settings.VICTORY_BORDERLESS = '1' }
@@ -38,6 +41,7 @@ if (-not (Test-Path $Exe)) { Write-Host "No $Exe."; exit 1 }
 $paths = 'VICTORY_HOME', 'VICTORY_ADAPTER', 'VICTORY_LOG', 'VICTORY_CONFIG', 'VICTORY_GAME_DIR', 'VICTORY_CACHE_DIR', 'VICTORY_DATA_DIR'
 Get-ChildItem Env:VICTORY_* | Where-Object { $_.Name -notin $paths } | ForEach-Object { Remove-Item "Env:$($_.Name)" }
 foreach ($k in $settings.Keys) { Set-Item "Env:$k" $settings[$k] }
+$env:VICTORY_SCRIPT_DEFAULTS = ($defaults | Where-Object { -not $More.ContainsKey($_) }) -join ','
 $Exe = (Resolve-Path $Exe).Path
 Push-Location (Join-Path $PSScriptRoot '..')   # victory.toml is looked for here
 try { & $victory run $Exe --console series-s --execute } finally { Pop-Location }

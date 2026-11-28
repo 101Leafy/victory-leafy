@@ -87,6 +87,10 @@ pub fn run(
     if execute {
         check_cpu_features()?;
     }
+    // The F1 menu's saved settings are variables like the launchers' and
+    // must be in place before anything below reads one.
+    let cfg = victory_core::Config::load()?;
+    cfg.apply_settings();
     // A title that relaunched itself: the old process must be gone first.
     victory_hle::modules::lifecycle::wait_for_previous();
     if execute {
@@ -96,7 +100,6 @@ pub fn run(
         victory_hle::modules::d3d12x::start_host();
         keep_ram();
     }
-    let cfg = victory_core::Config::load()?;
     victory_hle::modules::controls::configure(cfg.controls.as_ref())
         .map_err(anyhow::Error::msg)?;
     let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;

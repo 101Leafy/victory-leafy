@@ -3,6 +3,10 @@
 //! Resolution order for each value: environment variable, then the config
 //! file (`VICTORY_CONFIG`, else `./victory.toml`), then the default.
 //! See `victory.example.toml` at the repository root.
+//!
+//! `[settings]` holds the F1 menu's saved choices: `name = value` stands for
+//! `VICTORY_<NAME>`. A variable already set wins over it, except one a
+//! launcher only set as its default (named in `VICTORY_SCRIPT_DEFAULTS`).
 
 use std::path::{Path, PathBuf};
 
@@ -26,6 +30,8 @@ pub struct Config {
     pub source: Option<PathBuf>,
     /// `[controls]`: keyboard and mouse bindings, read by `victory-hle`.
     pub controls: Option<toml::Table>,
+    /// `[settings]`: `VICTORY_*` variables, see [`Config::apply_settings`].
+    pub settings: Option<toml::Table>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -34,6 +40,7 @@ struct FileConfig {
     #[serde(default)]
     paths: FilePaths,
     controls: Option<toml::Table>,
+    settings: Option<toml::Table>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -75,6 +82,7 @@ impl Config {
         };
         let mut cfg = Self::resolve(parsed.paths, source, |k| std::env::var_os(k))?;
         cfg.controls = parsed.controls;
+        cfg.settings = parsed.settings;
         Ok(cfg)
     }
 
@@ -111,7 +119,26 @@ impl Config {
             test_titles,
             source,
             controls: None,
+            settings: None,
         })
+    }
+
+    /// Sets the `[settings]` variables, said on standard output. Call it
+    /// before the title starts and before anything reads them.
+    pub fn apply_settings(&self) {
+        let Some(table) = &self.settings else { return };
+        let defaults = std::env::var("VICTORY_SCRIPT_DEFAULTS").unwrap_or_default();
+        for (var, value) in settings_env(table, |k| std::env::var_os(k).is_some(), &defaults) {
+            // SAFETY: the title has not started, and the host reads these
+            // through std::env, which holds its own lock.
+            unsafe {
+                match &value {
+                    Some(v) => std::env::set_var(&var, v),
+                    None => std::env::remove_var(&var),
+                }
+            }
+            println!("Settings: {var}={} (victory.toml [settings])", value.as_deref().unwrap_or(""));
+        }
     }
 
     /// The game directory, or a helpful error if it is not configured.
@@ -139,6 +166,40 @@ fn explicit_config_path(env: impl Fn(&str) -> Option<std::ffi::OsString>) -> Opt
     env("VICTORY_CONFIG")
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
+}
+
+/// Path variables belong to `[paths]`, never `[settings]`.
+const NOT_SETTINGS: [&str; 5] = ["CONFIG", "GAME_DIR", "CACHE_DIR", "DATA_DIR", "TEST_TITLES"];
+
+/// What `[settings]` changes: each variable and its value, `None` (an empty
+/// string) to unset it. `set` says if a variable is already set; `defaults`
+/// lists the ones a launcher set only as defaults (`,` or `;` between).
+fn settings_env(table: &toml::Table, set: impl Fn(&str) -> bool, defaults: &str) -> Vec<(String, Option<String>)> {
+    let is_default = |var: &str| defaults.split([',', ';']).any(|d| d.trim() == var);
+    let mut out = Vec::new();
+    for (key, value) in table {
+        let name = key.to_ascii_uppercase();
+        if NOT_SETTINGS.contains(&name.as_str()) || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+            println!("Settings: [settings] {key} left out (not a setting)");
+            continue;
+        }
+        let value = match value {
+            toml::Value::String(s) => s.clone(),
+            toml::Value::Integer(i) => i.to_string(),
+            toml::Value::Float(f) => f.to_string(),
+            toml::Value::Boolean(b) => if *b { "1" } else { "0" }.to_string(),
+            _ => {
+                println!("Settings: [settings] {key} left out (not a string, number or true/false)");
+                continue;
+            }
+        };
+        let var = format!("VICTORY_{name}");
+        if set(&var) && !is_default(&var) {
+            continue;
+        }
+        out.push((var, (!value.is_empty()).then_some(value)));
+    }
+    out
 }
 
 fn subdir(root: &Path, sub: &str) -> Result<PathBuf> {
@@ -226,6 +287,31 @@ mod tests {
         let text = include_str!("../../../victory.example.toml");
         let parsed: FileConfig = toml::from_str(text).unwrap();
         assert!(parsed.paths.game_dir.is_some());
+    }
+
+    #[test]
+    fn settings_lose_to_the_environment_but_not_to_launcher_defaults() {
+        let table: toml::Table = toml::from_str(
+            "relay = 2
+ambient = 0.8
+fps_line = true
+title_fps = \"\"
+game_dir = 'x'
+card_steps = 3",
+        )
+        .unwrap();
+        let set = |k: &str| k == "VICTORY_RELAY" || k == "VICTORY_CARD_STEPS";
+        let out = settings_env(&table, set, "VICTORY_AMBIENT, VICTORY_CARD_STEPS");
+        let got: Vec<_> = out.iter().map(|(k, v)| (k.as_str(), v.as_deref())).collect();
+        assert_eq!(
+            got,
+            [
+                ("VICTORY_AMBIENT", Some("0.8")),
+                ("VICTORY_CARD_STEPS", Some("3")),
+                ("VICTORY_FPS_LINE", Some("1")),
+                ("VICTORY_TITLE_FPS", None),
+            ]
+        );
     }
 
     #[test]

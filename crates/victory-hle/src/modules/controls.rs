@@ -542,7 +542,7 @@ impl Look {
             .map_or(FIRST_TAKE_US, |last| now.saturating_sub(last).min(MAX_TAKE_US));
         self.last_take = Some(now);
         let dt = span as f64 / 1e6;
-        let full = FULL_RATE / f64::from(s.sensitivity);
+        let full = FULL_RATE / f64::from(s.sensitivity * victory_gpu::kbm_mouse_sens());
         let mut ux = self.pending.0 / dt / full;
         let mut uy = -self.pending.1 * f64::from(s.y_scale) / dt / full;
         let mut m = ux.hypot(uy);
