@@ -136,6 +136,15 @@ fn on_card() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_SEND_BAR").is_some_and(|v| v == "1"))
 }
 
+/// Whether submission send buffers use CPU write-back (`L0`) memory instead of
+/// write-combined upload memory (`VICTORY_SEND_WB=1`; off by default). Large
+/// send buffers (16–64 MiB) can evict hotter CPU working sets from L3 when
+/// write-back cached, so write-combined upload memory remains the default.
+fn writeback() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SEND_WB").is_some_and(|v| v == "1"))
+}
+
 fn memory(host: &Host, size: u64) -> Option<Memory> {
     {
         let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
@@ -150,6 +159,7 @@ fn memory(host: &Host, size: u64) -> Option<Memory> {
     let mapped = if on_card() { host.mapped_card_buffer(size, false) } else { None };
     let (buffer, data) = match mapped {
         Some(made) => made,
+        None if writeback() => host.writeback_upload_buffer(size).or_else(|| host.upload_buffer(size))?,
         None => host.upload_buffer(size)?,
     };
     name(&buffer, || "bytes a submission sends up".into());
