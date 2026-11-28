@@ -2,7 +2,8 @@ use super::{
     A, B, DOWN, LEFT, LEFT_SHOULDER, LEFT_STICK, MENU, PadState, RIGHT, RIGHT_SHOULDER,
     RIGHT_STICK, UP, VIEW, X, Y,
 };
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::Ordering::Relaxed;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use windows_sys::Win32::{
     Foundation::{HWND, POINT, RECT},
@@ -108,23 +109,37 @@ fn parse(file: &str) -> Result<Bindings, String> {
     Ok(b)
 }
 
-fn config() -> Option<&'static Bindings> {
-    static CONFIG: OnceLock<Option<Bindings>> = OnceLock::new();
-    CONFIG
-        .get_or_init(|| {
-            let file = std::env::var_os("VICTORY_MNK_BINDINGS")?;
-            match std::fs::read_to_string(file)
-                .map_err(|e| e.to_string())
-                .and_then(|s| parse(&s))
-            {
-                Ok(b) => Some(b),
-                Err(e) => {
-                    eprintln!("Mouse and keyboard disabled: {e}");
-                    None
-                }
+fn load() -> Option<Bindings> {
+    let file = std::env::var_os("VICTORY_MNK_BINDINGS")?;
+    match std::fs::read_to_string(file)
+        .map_err(|e| e.to_string())
+        .and_then(|s| parse(&s))
+    {
+        Ok(b) => Some(b),
+        Err(e) => {
+            eprintln!("Mouse and keyboard disabled: {e}");
+            None
+        }
+    }
+}
+
+/// The bindings, read again each time F1's KEY BINDINGS wrote the file
+/// (`victory_gpu::MNK_BINDINGS_CHANGED`); a file that no longer reads keeps the last ones.
+fn config() -> Option<Arc<Bindings>> {
+    static CONFIG: Mutex<(u32, Option<Option<Arc<Bindings>>>)> = Mutex::new((0, None));
+    let changed = victory_gpu::MNK_BINDINGS_CHANGED.load(Relaxed);
+    let mut c = CONFIG.lock().unwrap_or_else(|e| e.into_inner());
+    match &c.1 {
+        None => *c = (changed, Some(load().map(Arc::new))),
+        Some(Some(_)) if c.0 != changed => {
+            c.0 = changed;
+            if let Some(b) = load() {
+                c.1 = Some(Some(Arc::new(b)));
             }
-        })
-        .as_ref()
+        }
+        _ => {}
+    }
+    c.1.clone().flatten()
 }
 
 pub(crate) fn enabled() -> bool {
@@ -208,6 +223,11 @@ impl Mouse {
 pub(super) fn sample() -> Option<PadState> {
     let b = config()?;
     let mut m = mouse();
+    // F1 open: the mouse is left free and no key reaches the game.
+    if victory_gpu::SETTINGS_MENU_OPEN.load(Relaxed) {
+        *m = Mouse::default();
+        return Some(PadState::default());
+    }
     let hwnd = unsafe { wm::GetForegroundWindow() };
     let mut pid = 0;
     unsafe { wm::GetWindowThreadProcessId(hwnd, &mut pid) };
