@@ -261,6 +261,16 @@ fn wait_resident() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_WAIT_RESIDENT").is_none_or(|v| v != "0"))
 }
 
+/// Whether plain buffers are waited for as well ([`wait_resident`]).
+/// `VICTORY_WAIT_RESIDENT=textures` waits for texture blocks and textures
+/// only: the device losses above lay in texture blocks, and the waits for
+/// buffers are most of them (an RTX 4090 run: 59,000 waits, 18.1 s, the
+/// longest 1.2 s; on an RTX 3080, 212,000 waits, 60.8 s, Belobug issue #346).
+fn wait_resident_buffers() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WAIT_RESIDENT").is_none_or(|v| v != "0" && v != "textures"))
+}
+
 /// The flag memory is made with that [`resident`] waits for.
 pub(crate) fn not_resident() -> D3D12_HEAP_FLAGS {
     if wait_resident() { D3D12_HEAP_FLAG_CREATE_NOT_RESIDENT } else { D3D12_HEAP_FLAG_NONE }
@@ -288,6 +298,20 @@ pub(crate) fn fresh(level: u8) -> D3D12_HEAP_FLAGS {
     } else {
         not_resident()
     }
+}
+
+/// [`not_resident`], [`resident`] and [`mapped`] for a plain buffer
+/// ([`wait_resident_buffers`]).
+fn buffer_not_resident() -> D3D12_HEAP_FLAGS {
+    if wait_resident_buffers() { not_resident() } else { D3D12_HEAP_FLAG_NONE }
+}
+
+fn buffer_resident(device: &ID3D12Device, object: &impl Interface) -> windows::core::Result<()> {
+    if wait_resident_buffers() { resident(device, object) } else { Ok(()) }
+}
+
+fn buffer_mapped(device: &ID3D12Device) -> windows::core::Result<()> {
+    if wait_resident_buffers() { mapped(device) } else { Ok(()) }
 }
 
 /// A queue of its own that new memory is waited for with ([`mapped`]).
@@ -1117,9 +1141,36 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
 static HOST: OnceLock<Option<Host>> = OnceLock::new();
 
 /// The host GPU if it is made already.
-#[cfg(feature = "diagnostics")]
 pub(crate) fn made_host() -> Option<&'static Host> {
     HOST.get()?.as_ref()
+}
+
+/// Capture the budgets at the failing reset; an earlier periodic sample may
+/// describe a different frame. The original error survives unavailable counters.
+fn reset_error(part: &str, error: &windows::core::Error) -> String {
+    use std::fmt::Write;
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+
+    let mut text = format!("a host command {part} did not reset ({error})");
+    if error.code() == windows::Win32::Foundation::E_OUTOFMEMORY {
+        // SAFETY: plain data the call fills in.
+        let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+        m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+        // SAFETY: a sized structure.
+        if unsafe { GlobalMemoryStatusEx(&mut m) } != 0 {
+            let _ = write!(
+                text, "; available RAM {} MiB, available commit {} MiB",
+                m.ullAvailPhys >> 20, m.ullAvailPageFile >> 20
+            );
+        }
+        if let Some([local, shared]) = made_host().and_then(Host::video_memory_groups) {
+            let _ = write!(
+                text, "; DXGI usage/budget: local {}/{} MiB, non-local {}/{} MiB",
+                local[1] >> 20, local[0] >> 20, shared[1] >> 20, shared[0] >> 20
+            );
+        }
+    }
+    text
 }
 
 /// The host GPU, created on first use; `None` without one (a run then
@@ -2019,6 +2070,33 @@ mod tests {
         list.close();
         host.execute(&[&list]);
         list.reset();
+    }
+
+    #[test]
+    fn reset_error_preserves_the_operation_and_hresult() {
+        use windows::Win32::Foundation::{E_INVALIDARG, E_OUTOFMEMORY};
+        use windows::core::Error;
+        let oom = reset_error("allocator", &Error::from_hresult(E_OUTOFMEMORY));
+        assert!(oom.starts_with("a host command allocator did not reset"));
+        assert!(oom.contains("0x8007000E"));
+        let invalid = Error::from_hresult(E_INVALIDARG);
+        assert_eq!(reset_error("list", &invalid), format!("a host command list did not reset ({invalid})"));
+    }
+
+    #[test]
+    #[ignore = "requires a D3D12 adapter with DXGI memory budgets"]
+    fn reset_error_reports_live_memory_budgets() {
+        let device = host().expect("D3D12 adapter");
+        // SAFETY: the adapter belongs to the live device.
+        let desc = unsafe { device.adapter.as_ref().expect("DXGI adapter").GetDesc1() }.unwrap();
+        let n = desc.Description.iter().position(|&c| c == 0).unwrap_or(desc.Description.len());
+        eprintln!("D3D12 adapter: {}", String::from_utf16_lossy(&desc.Description[..n]));
+        let error = windows::core::Error::from_hresult(windows::Win32::Foundation::E_OUTOFMEMORY);
+        let report = reset_error("list", &error);
+        eprintln!("{report}");
+        for field in ["available RAM ", "available commit ", "DXGI usage/budget: local ", "non-local "] {
+            assert!(report.contains(field), "{report}");
+        }
     }
 
     #[test]
@@ -3011,11 +3089,7 @@ static SPARE: Mutex<Spare<Chunk>> = Mutex::new(Spare::new());
 fn take_chunk(host: &Host, size: u64) -> Option<(Chunk, u64)> {
     if scratch_pool() {
         let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
-        let kept = spare.take(size).map(|c| (c, size)).or_else(|| {
-            let any = size == SCRATCH_FIRST && scratch_any_size();
-            any.then(|| spare.take(SCRATCH_CHUNK).map(|c| (c, SCRATCH_CHUNK))).flatten()
-        });
-        if let Some((chunk, size)) = kept {
+        if let Some((chunk, size)) = take_kept(&mut spare, size, scratch_any_size()) {
             ALIVE[3].fetch_sub(1, Ordering::Relaxed);
             ALIVE[4].fetch_sub(size, Ordering::Relaxed);
             ALIVE[5].fetch_add(1, Ordering::Relaxed);
@@ -3052,6 +3126,16 @@ fn spare_most() -> u64 {
     *MOST.get_or_init(|| {
         let mb = std::env::var("VICTORY_SCRATCH_SPARE_MB").ok();
         mb.and_then(|v| v.trim().parse::<u64>().ok()).map_or(SPARE_MOST, |mb| mb << 20)
+    })
+}
+
+/// A kept chunk for a list that asks for `size` bytes, and its size: one of
+/// that size, else, for a small first chunk with `any`, a kept 4 MiB one.
+fn take_kept<T>(spare: &mut Spare<T>, size: u64, any: bool) -> Option<(T, u64)> {
+    spare.take(size).map(|c| (c, size)).or_else(|| {
+        (any && size == SCRATCH_FIRST)
+            .then(|| spare.take(SCRATCH_CHUNK).map(|c| (c, SCRATCH_CHUNK)))
+            .flatten()
     })
 }
 
@@ -9563,13 +9647,12 @@ impl HostList {
             FRESH_OPEN[1].fetch_add(1, Ordering::Relaxed);
         } else {
             // SAFETY: the list is not executing.
-            let reset = unsafe {
-                self.allocator
-                    .Reset()
-                    .and_then(|()| self.list.Reset(&self.allocator, None))
-            };
-            if let Err(e) = reset {
-                fail(format_args!("a host command list did not reset ({e})"));
+            if let Err(e) = unsafe { self.allocator.Reset() } {
+                fail(format_args!("{}", reset_error("allocator", &e)));
+            }
+            // SAFETY: the list is not executing and its allocator is ready.
+            if let Err(e) = unsafe { self.list.Reset(&self.allocator, None) } {
+                fail(format_args!("{}", reset_error("list", &e)));
             }
         }
         #[cfg(feature = "diagnostics")]
@@ -9875,6 +9958,24 @@ impl HostList {
             u.behind[0] = Some(true);
             self.changed_something();
         }
+    }
+
+    /// For tests: whether the list's read-back wants a *fresh* target for
+    /// `resource` — one whose ticket has not gone stale. A stale target is
+    /// one the title's memory reuse invalidated, which the list must
+    /// re-register on the next write of `resource`.
+    #[cfg(test)]
+    pub(crate) fn back_wanted_fresh(&self, resource: crate::object::This) -> bool {
+        self.deferred()
+            .back_wanted
+            .iter()
+            .any(|t| t.owner() == resource as usize && t.fresh())
+    }
+
+    /// For tests: how many texture read-backs the list recorded at its close.
+    #[cfg(test)]
+    pub(crate) fn texture_back_count(&self) -> usize {
+        self.deferred().texture_backs.len()
     }
 
     /// At submission: the list that moves each texture this list uses from
@@ -12681,7 +12782,7 @@ impl Host {
             self.device
                 .CreateCommittedResource(
                     &heap,
-                    not_resident(),
+                    buffer_not_resident(),
                     &desc,
                     D3D12_RESOURCE_STATE_GENERIC_READ,
                     None,
@@ -12689,7 +12790,7 @@ impl Host {
                 )
                 .and_then(|()| {
                     let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
-                    resident(&self.device, b)?;
+                    buffer_resident(&self.device, b)?;
                     b.Map(0, None, Some(&mut data))
                 })
         };
@@ -13896,7 +13997,7 @@ impl Host {
             self.device
                 .CreateCommittedResource(
                     &heap,
-                    not_resident(),
+                    buffer_not_resident(),
                     &desc,
                     D3D12_RESOURCE_STATE_COMMON,
                     None,
@@ -13904,8 +14005,8 @@ impl Host {
                 )
                 .and_then(|()| {
                     let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
-                    resident(&self.device, b)?;
-                    mapped(&self.device)?;
+                    buffer_resident(&self.device, b)?;
+                    buffer_mapped(&self.device)?;
                     b.Map(0, None, Some(&mut data))
                 })
         };
@@ -13985,7 +14086,7 @@ impl Host {
             self.device
                 .CreateCommittedResource(
                     &heap,
-                    not_resident(),
+                    buffer_not_resident(),
                     &desc,
                     D3D12_RESOURCE_STATE_COMMON,
                     None,
@@ -13993,9 +14094,9 @@ impl Host {
                 )
                 .and_then(|()| {
                     let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
-                    resident(&self.device, b)?;
+                    buffer_resident(&self.device, b)?;
                     hot(&self.device, b);
-                    mapped(&self.device)?;
+                    buffer_mapped(&self.device)?;
                     b.Map(0, None, Some(&mut data))
                 })
         };
@@ -14036,7 +14137,7 @@ impl Host {
         let made = unsafe {
             self.device.CreateCommittedResource(
                 &heap,
-                not_resident(),
+                buffer_not_resident(),
                 &desc,
                 D3D12_RESOURCE_STATE_COMMON,
                 None,
@@ -14047,7 +14148,7 @@ impl Host {
         if let Some(b) = &buffer {
             crate::book::made(b, || "an unordered access buffer".into());
         }
-        let made = made.and_then(|()| buffer.as_ref().map_or_else(|| mapped(&self.device), |b| resident_soon(&self.device, b, true)));
+        let made = made.and_then(|()| buffer.as_ref().map_or_else(|| buffer_mapped(&self.device), |b| if wait_resident_buffers() { resident_soon(&self.device, b, true) } else { Ok(()) }));
         if made.is_ok()
             && let Some(b) = &buffer
         {
@@ -14462,6 +14563,26 @@ mod spare {
         assert_eq!(spare.take(1), Some(2));
         assert_eq!(spare.bytes, 0);
         assert!(spare.kept.is_empty());
+    }
+
+    /// A list's small first chunk takes a kept 4 MiB one when none of its own
+    /// size is kept (`VICTORY_SCRATCH_ANY_SIZE`), and says so by its size; a
+    /// kept small one comes first, and other sizes take only their own.
+    #[test]
+    fn a_small_first_chunk_takes_a_kept_4_mib_one() {
+        use super::{SCRATCH_CHUNK, SCRATCH_FIRST, take_kept};
+        let mut spare: Spare<u32> = Spare::new();
+        assert_eq!(spare.give(1, SCRATCH_CHUNK, u64::MAX), None);
+        assert_eq!(take_kept(&mut spare, SCRATCH_FIRST, false), None, "switched off: its own size only");
+        assert_eq!(take_kept(&mut spare, 8 << 20, true), None, "only the small first chunk");
+        assert_eq!(take_kept(&mut spare, SCRATCH_FIRST, true), Some((1, SCRATCH_CHUNK)));
+        assert_eq!(spare.bytes, 0);
+        // A kept small one is taken before a 4 MiB one.
+        assert_eq!(spare.give(2, SCRATCH_CHUNK, u64::MAX), None);
+        assert_eq!(spare.give(3, SCRATCH_FIRST, u64::MAX), None);
+        assert_eq!(take_kept(&mut spare, SCRATCH_FIRST, true), Some((3, SCRATCH_FIRST)));
+        assert_eq!(take_kept(&mut spare, SCRATCH_CHUNK, true), Some((2, SCRATCH_CHUNK)));
+        assert_eq!(take_kept(&mut spare, SCRATCH_FIRST, true), None);
     }
 }
 
