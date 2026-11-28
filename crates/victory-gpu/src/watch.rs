@@ -4487,6 +4487,13 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
                 // (A block that only begins as a hole is left for the next
                 // asking, as before.)
                 for block in block..whole {
+                    // A view in the runtime's books alone is a placeholder
+                    // to the host, a hole by what Windows says: guarded in
+                    // the books ([`protect_views`]), not noted absent.
+                    if soft_block(block) {
+                        protect_views(g, block, block + 1);
+                        continue;
+                    }
                     g.absent.insert(block);
                     if known_holes() && placeholder(block) {
                         g.held.insert(block);
