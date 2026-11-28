@@ -496,8 +496,31 @@ unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
     if FATAL.contains(&unsafe { (*(*info).ExceptionRecord).ExceptionCode }) {
         // SAFETY: as above.
         unsafe { report("first-chance exception", info, false) };
+        // SAFETY: as above.
+        if unsafe { writes_zero(&*(*info).ExceptionRecord) } && stacks_at_kill() {
+            crate::stacks::dump_stacks();
+        }
     }
     EXCEPTION_CONTINUE_SEARCH
+}
+
+/// A write to address 0: how the title kills itself on purpose. Its GPU
+/// watchdog (thread at image+0x2215a60, b99f876b74d4a77f) writes there 30 s
+/// after the frame loop stops (bp9 r45, bp3, big-play-1).
+fn writes_zero(record: &windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_RECORD) -> bool {
+    record.ExceptionCode == EXCEPTION_ACCESS_VIOLATION
+        && record.NumberParameters >= 2
+        && record.ExceptionInformation[0] == 1
+        && record.ExceptionInformation[1] == 0
+}
+
+/// `VICTORY_STACKS_AT_KILL=1`: on the first such write, every other
+/// thread's stack, to name what the frame loop was stuck in.
+fn stacks_at_kill() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    *ON.get_or_init(|| std::env::var_os("VICTORY_STACKS_AT_KILL").is_some_and(|v| v == "1"))
+        && !DONE.swap(true, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// For an unhandled-exception filter: reports the exception that is about
