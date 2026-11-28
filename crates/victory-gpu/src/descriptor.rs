@@ -1571,15 +1571,18 @@ static WAITING: std::sync::Mutex<std::collections::BTreeMap<usize, Vec<u64>>> =
 /// Textures given their host copy since [`make_waiting`] last ran.
 #[cfg(windows)]
 static MADE_LATE: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+/// Lock-free mirror of `!MADE_LATE.is_empty()` so [`make_waiting`] skips
+/// locking on submissions with no newly-made textures.
+#[cfg(windows)]
+static HAS_MADE_LATE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Title texture `resource` was given its host copy (called under that
 /// texture's own lock: nothing else is locked here).
 #[cfg(windows)]
 pub(crate) fn texture_made(resource: usize) {
-    MADE_LATE
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .push(resource);
+    let mut made = MADE_LATE.lock().unwrap_or_else(|e| e.into_inner());
+    made.push(resource);
+    HAS_MADE_LATE.store(true, std::sync::atomic::Ordering::Release);
 }
 
 /// The slot at `handle` was written with a view of texture `resource`,
@@ -1627,7 +1630,14 @@ fn wait_for(resource: usize, handle: u64) {
 /// the thread that submits: a slot is read when a list runs.
 #[cfg(windows)]
 pub(crate) fn make_waiting() {
-    let made = std::mem::take(&mut *MADE_LATE.lock().unwrap_or_else(|e| e.into_inner()));
+    if !HAS_MADE_LATE.load(std::sync::atomic::Ordering::Acquire) {
+        return;
+    }
+    let made = {
+        let mut guard = MADE_LATE.lock().unwrap_or_else(|e| e.into_inner());
+        HAS_MADE_LATE.store(false, std::sync::atomic::Ordering::Release);
+        std::mem::take(&mut *guard)
+    };
     for resource in made {
         let handles = WAITING
             .lock()

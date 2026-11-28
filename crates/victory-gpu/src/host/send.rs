@@ -109,6 +109,7 @@ fn pass(host: &Host) -> Option<&'static Pass> {
 pub(super) struct Memory {
     buffer: ID3D12Resource,
     data: usize,
+    gpu: u64,
     size: u64,
 }
 
@@ -135,6 +136,15 @@ fn on_card() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_SEND_BAR").is_some_and(|v| v == "1"))
 }
 
+/// Whether submission send buffers use CPU write-back (`L0`) memory instead of
+/// write-combined upload memory (`VICTORY_SEND_WB=1`; off by default). Large
+/// send buffers (16–64 MiB) can evict hotter CPU working sets from L3 when
+/// write-back cached, so write-combined upload memory remains the default.
+fn writeback() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SEND_WB").is_some_and(|v| v == "1"))
+}
+
 fn memory(host: &Host, size: u64) -> Option<Memory> {
     {
         let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
@@ -149,12 +159,16 @@ fn memory(host: &Host, size: u64) -> Option<Memory> {
     let mapped = if on_card() { host.mapped_card_buffer(size, false) } else { None };
     let (buffer, data) = match mapped {
         Some(made) => made,
+        None if writeback() => host.writeback_upload_buffer(size).or_else(|| host.upload_buffer(size))?,
         None => host.upload_buffer(size)?,
     };
     name(&buffer, || "bytes a submission sends up".into());
+    // SAFETY: a live upload/card buffer.
+    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
     Some(Memory {
         buffer,
         data: data as usize,
+        gpu,
         size,
     })
 }
@@ -190,6 +204,50 @@ pub(super) struct Own {
 /// Runs whose pairs are one piece of work.
 const RUNS_AT_A_TIME: usize = 4096;
 
+/// Target byte size per parallel copy task into upload memory.
+const COPY_TASK_BYTES: usize = 128 << 10;
+/// Minimum total long-run copy bytes to parallelize when there is no scatter work.
+const PARALLEL_COPY_MIN_BYTES: u64 = 256 << 10;
+
+/// Slices large copy runs into [`COPY_TASK_BYTES`] pieces and packs smaller runs
+/// into contiguous task ranges `(piece_start, piece_end)` of ~[`COPY_TASK_BYTES`]
+/// so parallel workers fill upload memory concurrently without fine-grained
+/// claiming overhead.
+fn pack_copy_tasks(moves: &[(usize, usize, usize)]) -> (Vec<(usize, usize, usize)>, Vec<(usize, usize)>) {
+    let mut pieces = Vec::with_capacity(moves.len());
+    let mut tasks = Vec::new();
+    let mut task_start = 0usize;
+    let mut task_bytes = 0usize;
+    for &(mut from, mut to, mut len) in moves {
+        while len > COPY_TASK_BYTES {
+            if task_bytes > 0 {
+                tasks.push((task_start, pieces.len()));
+                task_start = pieces.len();
+                task_bytes = 0;
+            }
+            pieces.push((from, to, COPY_TASK_BYTES));
+            tasks.push((task_start, pieces.len()));
+            task_start = pieces.len();
+            from += COPY_TASK_BYTES;
+            to += COPY_TASK_BYTES;
+            len -= COPY_TASK_BYTES;
+        }
+        if len > 0 {
+            if task_bytes > 0 && task_bytes + len > COPY_TASK_BYTES {
+                tasks.push((task_start, pieces.len()));
+                task_start = pieces.len();
+                task_bytes = 0;
+            }
+            pieces.push((from, to, len));
+            task_bytes += len;
+        }
+    }
+    if task_start < pieces.len() {
+        tasks.push((task_start, pieces.len()));
+    }
+    (pieces, tasks)
+}
+
 /// Takes what `dirty` sends up out of the CPU sides.
 pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, usize)>)]) -> Option<Own> {
     let began = std::time::Instant::now();
@@ -199,13 +257,17 @@ pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, us
     let short = |&(a, b): &(usize, usize)| short(a, b - a);
     let mut at = 0u64;
     let mut copies = Vec::with_capacity(dirty.len());
+    let mut total_run_bytes = 0u64;
+    let mut total_pair_words = 0u64;
     for (_, ranges) in dirty {
         let mut runs = Vec::new();
         for &(a, b) in ranges.iter().filter(|r| !short(r)) {
             runs.push((a, at, b - a));
+            total_run_bytes += (b - a) as u64;
             at += ((b - a) as u64).next_multiple_of(16);
         }
         let words: usize = ranges.iter().filter(|r| short(r)).map(|r| (r.1 - r.0) / 4).sum();
+        total_pair_words += words as u64;
         copies.push(Copy { runs, pairs: (at, words as u32) });
         at += (words as u64 * 8).next_multiple_of(16);
     }
@@ -228,7 +290,7 @@ pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, us
             }
         }
     }
-    let one = |i: usize| {
+    let run_scatter = |i: usize| {
         let (from, ranges, to) = work[i];
         let mut to = to as *mut [u32; 2];
         for &(a, b) in ranges.iter().filter(|r| short(r)) {
@@ -245,11 +307,44 @@ pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, us
             }
         }
     };
-    crate::land::each_under(work.len(), &one);
-    STATS[0].fetch_add(moves.iter().map(|m| m.2 as u64).sum(), Ordering::Relaxed);
+    let parallelize_copies = !moves.is_empty() && (!work.is_empty() || total_run_bytes >= PARALLEL_COPY_MIN_BYTES);
+    if parallelize_copies {
+        let (copy_pieces, copy_tasks) = pack_copy_tasks(&moves);
+        let n_scatter = work.len();
+        let total_tasks = n_scatter + copy_tasks.len();
+        let one = |i: usize| {
+            if i < n_scatter {
+                run_scatter(i);
+            } else {
+                let (lo, hi) = copy_tasks[i - n_scatter];
+                for &(from, to, len) in &copy_pieces[lo..hi] {
+                    // SAFETY: disjoint non-overlapping destination slices in
+                    // `memory.data` and read-only CPU-side source mappings.
+                    unsafe { std::ptr::copy_nonoverlapping(from as *const u8, to as *mut u8, len) };
+                }
+            }
+        };
+        if total_tasks > 1 {
+            crate::land::each_under(total_tasks, &one);
+        } else if total_tasks == 1 {
+            one(0);
+        }
+    } else {
+        if !work.is_empty() {
+            if work.len() > 1 {
+                crate::land::each_under(work.len(), &run_scatter);
+            } else {
+                run_scatter(0);
+            }
+        }
+        for &(from, to, len) in &moves {
+            // SAFETY: inside the CPU-side mapping and `memory.data`.
+            unsafe { std::ptr::copy_nonoverlapping(from as *const u8, to as *mut u8, len) };
+        }
+    }
+    STATS[0].fetch_add(total_run_bytes, Ordering::Relaxed);
     STATS[1].fetch_add(moves.len() as u64, Ordering::Relaxed);
-    STATS[2].fetch_add(copies.iter().map(|c| u64::from(c.pairs.1)).sum(), Ordering::Relaxed);
-    crate::shadow::copy_all(moves);
+    STATS[2].fetch_add(total_pair_words, Ordering::Relaxed);
     STATS[3].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
     Some(Own { memory, copies, used: at })
 }
@@ -291,7 +386,7 @@ impl Own {
                 }
                 state = Some(write);
             }
-            let hashed = shadow.card_sides().is_some_and(|(_, before, _)| before.is_some());
+            let hashed = shadow.card_has_before();
             if let Some(was) = state
                 && hashed
                 && (!copy.runs.is_empty() || copy.pairs.1 > 0)
@@ -311,7 +406,7 @@ impl Own {
                 list.SetPipelineState(&pass.pso);
                 list.SetComputeRootShaderResourceView(1, source.GetGPUVirtualAddress());
                 for ((shadow, _), copy) in dirty.iter().zip(&self.copies).filter(|(_, c)| c.pairs.1 > 0) {
-                    list.SetComputeRootUnorderedAccessView(2, shadow.buffer.GetGPUVirtualAddress());
+                    list.SetComputeRootUnorderedAccessView(2, shadow.buffer_gpu());
                     const MOST: u32 = 64 * D3D12_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION;
                     let (at, words) = copy.pairs;
                     let mut done = 0;
@@ -333,5 +428,40 @@ impl Own {
     /// The memory, to be kept until the submission has run.
     pub(super) fn memory(self) -> Memory {
         self.memory
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{COPY_TASK_BYTES, pack_copy_tasks};
+
+    #[test]
+    fn pack_copy_tasks_splits_large_and_groups_small() {
+        let moves = vec![
+            (0x1000, 0x2000, 4096),
+            (0x3000, 0x4000, 8192),
+            (0x10_0000, 0x20_0000, COPY_TASK_BYTES * 2 + 5000),
+            (0x90_0000, 0xa0_0000, 1024),
+        ];
+        let (pieces, tasks) = pack_copy_tasks(&moves);
+        assert!(tasks.len() >= 3);
+        let mut covered = 0usize;
+        let mut reconstructed = Vec::new();
+        for &(lo, hi) in &tasks {
+            assert!(lo < hi);
+            assert_eq!(lo, covered);
+            covered = hi;
+            for &p in &pieces[lo..hi] {
+                reconstructed.push(p);
+            }
+        }
+        assert_eq!(covered, pieces.len());
+        let expected_bytes: usize = moves.iter().map(|m| m.2).sum();
+        let actual_bytes: usize = reconstructed.iter().map(|m| m.2).sum();
+        assert_eq!(actual_bytes, expected_bytes);
+        // Verify contiguous reconstruction of the large split move
+        assert_eq!(reconstructed[2], (0x10_0000, 0x20_0000, COPY_TASK_BYTES));
+        assert_eq!(reconstructed[3], (0x10_0000 + COPY_TASK_BYTES, 0x20_0000 + COPY_TASK_BYTES, COPY_TASK_BYTES));
+        assert_eq!(reconstructed[4], (0x10_0000 + COPY_TASK_BYTES * 2, 0x20_0000 + COPY_TASK_BYTES * 2, 5000));
     }
 }

@@ -1356,6 +1356,9 @@ pub(crate) struct HostList {
     /// What the list does with depth textures that have a colour twin, by
     /// twin ([`TwinUse`]).
     twins: Mutex<std::collections::HashMap<usize, TwinUse>>,
+    /// Set once `deferred.prelude_uploads` is non-empty so `prelude_uploads`
+    /// skips locking `deferred` on lists with none.
+    has_prelude_uploads: std::sync::atomic::AtomicBool,
     /// The list that runs those transitions just before this one: taken
     /// from [`PRELUDES`] when a submission of the list first needs one, given
     /// back when the list is reset (every submission of it has run).
@@ -2254,10 +2257,11 @@ impl Drop for Counted {
 }
 
 /// A chunk of upload memory for lists' scratch data: the buffer, its
-/// mapping.
+/// mapping, and its cached GPU virtual address.
 struct Chunk {
     buffer: ID3D12Resource,
     data: usize,
+    gpu: u64,
 }
 
 // SAFETY: a D3D12 resource (free-threaded) and its persistent mapping,
@@ -2361,6 +2365,17 @@ impl<T> Spare<T> {
 /// Scratch chunks no list holds.
 static SPARE: Mutex<Spare<Chunk>> = Mutex::new(Spare::new());
 
+/// Whether [`HostList`] scratch chunks use CPU write-back (`L0`) memory
+/// instead of write-combined upload memory (on by default;
+/// `VICTORY_SCRATCH_WB=0`: write-combined upload heap, as before).
+/// Scratch chunks hold a small hot working set (~4–12 MiB of constant buffers,
+/// draw arguments and uniforms) that fits in L3/3D V-Cache, cutting batch fill
+/// and command translation latency while staying coherent for GPU reads.
+fn scratch_wb() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SCRATCH_WB").is_none_or(|v| v != "0"))
+}
+
 /// A scratch chunk of `size` bytes: one kept ([`SPARE`]) or a new one.
 fn take_chunk(host: &Host, size: u64) -> Option<Chunk> {
     if scratch_pool()
@@ -2371,13 +2386,20 @@ fn take_chunk(host: &Host, size: u64) -> Option<Chunk> {
         ALIVE[5].fetch_add(1, Ordering::Relaxed);
         return Some(chunk);
     }
-    let (buffer, data) = host.upload_buffer(size)?;
+    let (buffer, data) = if scratch_wb() {
+        host.writeback_upload_buffer(size).or_else(|| host.upload_buffer(size))?
+    } else {
+        host.upload_buffer(size)?
+    };
     name(&buffer, || "list scratch".into());
+    // SAFETY: a live buffer.
+    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
     ALIVE[1].fetch_add(1, Ordering::Relaxed);
     ALIVE[2].fetch_add(size, Ordering::Relaxed);
     Some(Chunk {
         buffer,
         data: data as usize,
+        gpu,
     })
 }
 
@@ -4814,6 +4836,7 @@ impl Host {
                 scratch: Mutex::default(),
                 states: Mutex::default(),
                 twins: Mutex::default(),
+                has_prelude_uploads: std::sync::atomic::AtomicBool::new(false),
                 prelude,
                 pipelines,
                 #[cfg(feature = "diagnostics")]
@@ -5088,7 +5111,7 @@ impl Host {
                     list.SetPipelineState(&work.pso);
                     list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
                     for (shadow, ranges) in &dirty {
-                        let (Some((_, Some(before), _)), size) = (shadow.card_sides(), shadow.card_hash_size()) else {
+                        let (Some(before_gpu), size) = (shadow.card_before_gpu(), shadow.card_hash_size()) else {
                             continue;
                         };
                         // No twin (it cost the card the copy's size again,
@@ -5097,8 +5120,8 @@ impl Host {
                         // hashed again, all of them the first time; the
                         // compare after the lists hashes the declared
                         // pieces and flags those whose hash is another.
-                        list.SetComputeRootShaderResourceView(1, shadow.buffer.GetGPUVirtualAddress());
-                        list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
+                        list.SetComputeRootShaderResourceView(1, shadow.buffer_gpu());
+                        list.SetComputeRootUnorderedAccessView(2, before_gpu);
                         let joins = rehash_runs() || own.is_some();
                         let runs: Vec<crate::shadow::CardSpan> = if whole.iter().any(|s| Arc::ptr_eq(s, shadow)) {
                             vec![shadow.card_run(0, usize::MAX)]
@@ -5156,7 +5179,7 @@ impl Host {
                     _ => spans.push((from, to)),
                 }
             }
-            let twin = shadow.card_sides().is_some_and(|(_, before, _)| before.is_some());
+            let twin = shadow.card_has_before();
             for (from, to) in spans {
                 let Some(span) = shadow.card_span(from, to) else {
                     continue;
@@ -5176,7 +5199,7 @@ impl Host {
             }
         }
         for (shadow, from, len) in looked {
-            let twin = shadow.card_sides().is_some_and(|(_, before, _)| before.is_some());
+            let twin = shadow.card_has_before();
             if let Some(span) = shadow.card_span(*from, from + len)
                 && twin
                 && u64::from(at + span.pieces) * 4 <= work.differs.2
@@ -5218,12 +5241,17 @@ impl Host {
                     list.SetComputeRootSignature(&work.root);
                     list.SetPipelineState(&work.pso);
                     list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
+                    let mut last_bound = (0u64, 0u64);
                     for r in plan.ranges.iter().filter(|r| r.compared) {
-                        let (Some((_, Some(before), _)), size) = (r.shadow.card_sides(), r.shadow.card_hash_size()) else {
+                        let (Some(before_gpu), size) = (r.shadow.card_before_gpu(), r.shadow.card_hash_size()) else {
                             continue;
                         };
-                        list.SetComputeRootShaderResourceView(1, r.shadow.buffer.GetGPUVirtualAddress());
-                        list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
+                        let buf_gpu = r.shadow.buffer_gpu();
+                        if last_bound != (buf_gpu, before_gpu) {
+                            list.SetComputeRootShaderResourceView(1, buf_gpu);
+                            list.SetComputeRootUnorderedAccessView(2, before_gpu);
+                            last_bound = (buf_gpu, before_gpu);
+                        }
                         // (What is only looked at keeps its hashes: what
                         // changed there is the next declared range's to land.)
                         card_pass(list, &r.span, size as u32, r.at, if flown && !r.picked { 2 } else { 1 });
@@ -7214,6 +7242,7 @@ impl HostList {
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.has_prelude_uploads.store(false, Ordering::Relaxed);
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.indirects.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -7621,10 +7650,13 @@ impl HostList {
         const COPY_SOURCE: u32 = 0x800;
         let host_state = |state: u32| D3D12_RESOURCE_STATES(state as i32);
         let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
+        let twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
+        if twins.is_empty() && uploads.is_empty() && states.is_empty() {
+            return None;
+        }
         // The copies (depth texture, twin, whether into the twin); the
         // sides are then as this list leaves them.
         let mut syncs = Vec::new();
-        let twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
         for u in twins.values() {
             let real = u.twin.behind.load(Ordering::Relaxed);
             let mut behind = [real & 1 != 0, real & 2 != 0];
@@ -7705,7 +7737,7 @@ impl HostList {
         }
         barriers.extend(states.iter().filter_map(|(key, (first, last, copy))| {
             let real = copy.state.swap(*last, Ordering::Relaxed);
-            let real = copying.get(key).copied().unwrap_or(real);
+            let real = if copying.is_empty() { real } else { copying.get(key).copied().unwrap_or(real) };
             (real != *first)
                 .then(|| transition(&copy.texture, host_state(real), host_state(*first)))
         }));
@@ -8008,31 +8040,42 @@ impl HostList {
     /// `len` bytes of upload memory (256-byte aligned) until the list is
     /// reset: the host GPU address and the CPU pointer.
     pub(crate) fn scratch(&self, len: u64) -> Option<(u64, *mut u8)> {
-        let (buffer, at, data) = self.scratch_at(len)?;
-        // SAFETY: a live buffer.
-        Some((unsafe { buffer.GetGPUVirtualAddress() } + at, data))
+        let (_, gpu, _, data) = self.scratch_alloc(len, false)?;
+        Some((gpu, data))
     }
 
     /// [`HostList::scratch`] and the buffer it lies in, for a descriptor
     /// slot to hold: the slot outlives the list's use of it.
     pub(crate) fn scratch_held(&self, len: u64) -> Option<(ID3D12Resource, u64, *mut u8)> {
-        let (buffer, at, data) = self.scratch_at(len)?;
-        // SAFETY: a live buffer.
-        let gpu = unsafe { buffer.GetGPUVirtualAddress() } + at;
-        Some((buffer, gpu, data))
+        let (buffer, gpu, _, data) = self.scratch_alloc(len, true)?;
+        Some((buffer?, gpu, data))
     }
 
     /// [`HostList::scratch`]: the buffer, the offset in it and the CPU
     /// pointer.
     fn scratch_at(&self, len: u64) -> Option<(ID3D12Resource, u64, *mut u8)> {
+        let (buffer, _, at, data) = self.scratch_alloc(len, true)?;
+        Some((buffer?, at, data))
+    }
+
+    /// [`HostList::scratch`]: optional cloned buffer (only when `need_buffer`),
+    /// GPU virtual address, byte offset in the buffer, and CPU pointer.
+    fn scratch_alloc(&self, len: u64, need_buffer: bool) -> Option<(Option<ID3D12Resource>, u64, u64, *mut u8)> {
         let host = host()?;
         let mut s = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
         let len = len.max(1).next_multiple_of(256);
         if len > SCRATCH_CHUNK {
-            let (buffer, data) = host.upload_buffer(len)?;
+            let (buffer, data) = if scratch_wb() {
+                host.writeback_upload_buffer(len).or_else(|| host.upload_buffer(len))?
+            } else {
+                host.upload_buffer(len)?
+            };
             name(&buffer, || format!("list scratch {len:#x}"));
-            self.deferred().hold_upload(buffer.clone(), len);
-            return Some((buffer, 0, data));
+            // SAFETY: a live buffer.
+            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+            let out_buf = need_buffer.then(|| buffer.clone());
+            self.deferred().hold_upload(buffer, len);
+            return Some((out_buf, gpu, 0, data));
         }
         // The chunk in use while `len` fits in what is left of it, else the
         // next one (a list's first chunk may be a small one).
@@ -8049,10 +8092,13 @@ impl HostList {
             s.chunks.push((chunk, size));
             s.used = 0;
         }
-        let (data, buffer) = (s.chunks[s.current].0.data, s.chunks[s.current].0.buffer.clone());
+        let chunk = &s.chunks[s.current].0;
         let at = s.used;
+        let gpu = chunk.gpu + at;
+        let ptr = (chunk.data + at as usize) as *mut u8;
+        let out_buf = need_buffer.then(|| chunk.buffer.clone());
         s.used += len;
-        Some((buffer, at, (data + at as usize) as *mut u8))
+        Some((out_buf, gpu, at, ptr))
     }
 
     /// The bytes of scratch chunks the list holds now (after a reset:
@@ -8368,6 +8414,7 @@ impl HostList {
     /// prelude records if the check finds it due
     /// (`crate::texture::prelude_uploads`; [`HostList::prelude_uploads`]).
     pub(crate) fn defer_prelude_upload(&self, upload: crate::texture::PreludeUpload) {
+        self.has_prelude_uploads.store(true, Ordering::Relaxed);
         let mut deferred = self.deferred();
         deferred.copies.push(Step::Texture(upload.staging()));
         deferred.prelude_uploads.push(upload);
@@ -8379,6 +8426,9 @@ impl HostList {
     /// submission's steps left pending). Ported from
     /// Belobug/VIctory-Belobug-AMD 5d6bd84.
     fn prelude_uploads(&self, batch: &mut Batch) -> Vec<(crate::texture::PreludeUpload, bool)> {
+        if !self.has_prelude_uploads.load(Ordering::Relaxed) {
+            return Vec::new();
+        }
         let waiting = self.deferred().prelude_uploads.clone();
         if waiting.is_empty() {
             return Vec::new();
@@ -9936,6 +9986,67 @@ impl Host {
             Err(e) => {
                 crate::residency::allocation_error(&e);
                 tracing::warn!(error = %e, size, "no upload buffer");
+                None
+            }
+        }
+    }
+
+    /// CPU-cached (`WRITE_BACK`, `L0`) read-only GPU buffer in `COMMON` state
+    /// (implicitly promotable to `COPY_SOURCE` / `SRV` / `CBV` and decaying
+    /// back to `COMMON` after each submission). Lets CPU upload fills hit L3
+    /// cache instead of bypassing it through write-combined `UPLOAD` memory.
+    pub(crate) fn writeback_upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        MADE[0].fetch_add(1, Ordering::Relaxed);
+        MADE[1].fetch_add(size, Ordering::Relaxed);
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_CUSTOM,
+            CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
+            MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: size.max(1),
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let mut buffer: Option<ID3D12Resource> = None;
+        let mut data = std::ptr::null_mut();
+        // SAFETY: plain creation and mapping of a CPU write-back L0 buffer.
+        let made = unsafe {
+            self.device
+                .CreateCommittedResource(
+                    &heap,
+                    not_resident(),
+                    &desc,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    None,
+                    &mut buffer,
+                )
+                .and_then(|()| {
+                    let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
+                    resident(&self.device, b)?;
+                    b.Map(0, None, Some(&mut data))
+                })
+        };
+        #[cfg(feature = "diagnostics")]
+        if made.is_ok()
+            && let Some(b) = &buffer
+        {
+            crate::book::made(b, || "a write-back upload buffer".into());
+        }
+        match made {
+            Ok(()) => Some((buffer?, data.cast())),
+            Err(e) => {
+                crate::residency::allocation_error(&e);
+                tracing::warn!(error = %e, size, "no write-back upload buffer");
                 None
             }
         }
