@@ -147,7 +147,7 @@ fn texture(desc: &ResourceDesc) -> Option<Texture> {
         l if l & !0xff == SWIZZLED => Swizzle(l & 0xff),
         _ => return None,
     };
-    let texture = Texture::new(&TextureDesc {
+    let mut texture = Texture::new(&TextureDesc {
         dimension,
         width: u32::try_from(desc.width).ok()?,
         height: desc.height,
@@ -158,6 +158,11 @@ fn texture(desc: &ResourceDesc) -> Option<Texture> {
         swizzle,
     })
     .ok()?;
+    // Offsets are from the texture's start, which the title places on a
+    // block boundary.
+    for plane in &mut texture.planes {
+        plane.layout.configure_xor(crate::console::current().pipes());
+    }
     // The layout struct has room for 15 mips.
     (texture.planes[0].layout.mips.len() <= MIPS).then_some(texture)
 }
