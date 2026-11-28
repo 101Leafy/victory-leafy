@@ -158,6 +158,16 @@ const POPS_PACKER: u16 = 25;
 /// The operand `src_pops_exiting_wave_id`.
 const POPS_EXITING: u8 = 239;
 
+/// Whether pixel float colour outputs are held to the console's HDR range
+/// `[-65024, 65024]` (`VICTORY_HDR_CLAMP=0`: off). From aki-gta6/aki-runtime
+/// 01f6f31 via ProjectLeonida/mandy 1411b6c.
+fn hdr_clamp() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HDR_CLAMP").is_none_or(|v| v != "0"))
+}
+
+const HDR_MAX: f32 = 65024.0;
+
 /// The instructions inside a pixel program's ordered section
 /// (primitive-ordered pixel shading, which the console compiler makes of
 /// rasterizer ordered views): from the write of `POPS_PACKER`, along every
@@ -4599,6 +4609,22 @@ impl<'a> Lower<'a> {
         let is0 = self.s.m.cmp(c, pred::EQ, w, zero);
         let keep = self.s.m.bin(c, Bin::Or, full, is0);
         self.s.m.select(c, keep, r, t)
+    }
+
+    /// Holds a pixel float colour output to `[-65024, 65024]` (`VICTORY_HDR_CLAMP`).
+    /// Prevents >65504 values from becoming `+Inf` in 16-bit float host targets
+    /// (which the title's tonemap turns into black blobs/glitter).
+    fn clamp_hdr(&mut self, f: V) -> V {
+        if !hdr_clamp() {
+            return f;
+        }
+        let c = self.cur;
+        let min = self.s.m.f32((-HDR_MAX).to_bits());
+        let max = self.s.m.f32(HDR_MAX.to_bits());
+        let lo = self.binary(35, f, min); // FMax
+        let hi = self.binary(36, lo, max); // FMin
+        let nan = self.is_nan_f32(f);
+        self.s.m.select(c, nan, max, hi)
     }
 
     /// Whether an f32 value is NaN, tested in integer arithmetic so host
@@ -13886,12 +13912,14 @@ impl<'a> Lower<'a> {
                     .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[x]);
                 x = self.as_int(f);
             }
+            let is_ps = !mesh && matches!(self.x.native.stage, HwStage::Ps);
             let el = &mut elements(self, primitive)[id];
             el.usage |= 1 << col;
+            let colour = is_ps && el.kind == 16;
             let (suffix, x) = match el.comp {
                 9 if half.is_some() => {
                     let f = self.as_float(x);
-                    (".f32", if colour { self.scrub_nan(f) } else { f })
+                    (".f32", if colour { { let f = self.scrub_nan(f); self.clamp_hdr(f) } } else { f })
                 }
                 9 => {
                     let f = match self.floats.get(&value) {
@@ -13901,7 +13929,7 @@ impl<'a> Lower<'a> {
                     // `VICTORY_NAN_SCRUB=1`: a colour a pixel shader writes is
                     // 0 where it is NaN, so one bad value does not spread
                     // through the title's blur and temporal passes.
-                    let f = if colour { self.scrub_nan(f) } else { f };
+                    let f = if colour { let f = self.scrub_nan(f); self.clamp_hdr(f) } else { f };
                     (".f32", f)
                 }
                 _ => (".i32", x),
