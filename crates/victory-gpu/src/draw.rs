@@ -7267,7 +7267,7 @@ void lighting_consume(uint3 id : SV_DispatchThreadID) {
         };
         let (table, scratch) = crate::indirect::open_batch(&list, (1, &src), &[], true).unwrap();
         let mut state = State::default();
-        state.batch = Some(Batch { table, scratch: scratch.clone(), wrote: false });
+        state.batch = Some(Batch { table, scratch: scratch.clone(), wrote: false, anywhere: false });
         state.window = Some(Window {
             copy: 1,
             kind: 2,
@@ -7554,7 +7554,7 @@ void lighting_consume(uint3 id : SV_DispatchThreadID) {
                 state.host_pipeline = 0;
                 state.host_roots[1] = 0;
                 let at = table.place(1, offset, 2).unwrap();
-                state.batch = Some(Batch { table, scratch: scratch.clone(), wrote: false });
+                state.batch = Some(Batch { table, scratch: scratch.clone(), wrote: false, anywhere: false });
                 (scratch, at)
             };
 
