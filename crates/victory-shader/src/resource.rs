@@ -1087,8 +1087,8 @@ impl<'a> Tracer<'a> {
             return self.carried(self.vorigin(lane), high);
         }
         if let Some((_, [a, b])) = self.sop2(v, &["s_addc_u32"]) {
-            return a == Term::Const(0) && self.carried(b, high)
-                || b == Term::Const(0) && self.carried(a, high);
+            return (a == Term::Const(0) || self.sign_high(a)) && self.carried(b, high)
+                || (b == Term::Const(0) || self.sign_high(b)) && self.carried(a, high);
         }
         let Some(inst) = self.def(v) else {
             return false;
@@ -1110,7 +1110,8 @@ impl<'a> Tracer<'a> {
     }
 
     /// `t` is the high dword of a signed 32-bit index made 64-bit: its sign
-    /// (`v_ashrrev_i32` by 31), or that pair shifted left by a constant. The
+    /// (`v_ashrrev_i32` or `s_ashr_i32` by 31), or that pair shifted left by
+    /// a constant. The
     /// address is then the base plus a signed offset below 2 GB, which the
     /// low half's offset modulo 2^32 gives (a table in the code read at
     /// base + (sext(i) << 2); refused, every draw of its pixel shader was
@@ -1120,6 +1121,24 @@ impl<'a> Tracer<'a> {
         let Some(inst) = self.def(v) else {
             return false;
         };
+        if let Fields::Sop { src, .. } = &inst.fields {
+            let operand = |k: usize| src.get(k).and_then(|o| self.term(inst, o));
+            return match inst.name() {
+                "s_ashr_i32" => inst.writes.first().is_some_and(|w| w.1 == v) && operand(1) == Some(Term::Const(31)),
+                "s_lshl_b64" => {
+                    let Some(&Operand::Scalar { code, .. }) = src.first() else {
+                        return false;
+                    };
+                    let word = |k| inst.read(Reg::S(code + k)).map(|x| self.origin(x));
+                    inst.writes.get(1).is_some_and(|w| w.1 == v)
+                        && matches!(operand(1), Some(Term::Const(n)) if n < 32)
+                        && matches!((word(0), word(1)), (Some(lo), Some(Term::Value(hi)))
+                            if self.sop2(hi, &["s_ashr_i32"]).is_some_and(|(_, [x, _])| x == lo)
+                                && self.sign_high(Term::Value(hi)))
+                }
+                _ => false,
+            };
+        }
         let Fields::Valu(f) = &inst.fields else {
             return false;
         };
@@ -4662,6 +4681,50 @@ pub(crate) mod tests {
             run(false).unwrap_err(),
             ShaderError::Unsupported {
                 offset: 0x34,
+                what: "an address with an untracked high half"
+            }
+        );
+    }
+
+    /// The same in SGPRs: base + (sext(s24) << 2) added with `s_addc_u32`
+    /// (pixel 98bd9f9ae5f9c7e3 at 0xcc). With the sign of another register
+    /// the high half is refused.
+    #[test]
+    fn a_code_table_index_made_64_bit_in_sgprs_carries_its_sign() {
+        let run = |sign_of_low: bool| {
+            let code: Vec<u8> = [
+                0xBE98_0306, // 0x00: s_mov_b32 s24, s6
+                if sign_of_low {
+                    0x9119_9F18 // s_ashr_i32 s25, s24, 31
+                } else {
+                    0x9119_9F07 // s_ashr_i32 s25, s7, 31
+                },
+                0x8F84_8218, // s_lshl_b64 s[4:5], s[24:25], 2
+                0xBE96_1F00, // 0x0c: s_getpc_b64 s[22:23]
+                0x8016_FF16,
+                0x0000_0338, // s_add_u32 s22, s22, 0x338
+                0x8217_8017, // s_addc_u32 s23, s23, 0
+                0x8008_1604, // s_add_u32 s8, s4, s22
+                0x8209_1705, // s_addc_u32 s9, s5, s23
+                0xF400_0204,
+                0xFA00_0000, // 0x24: s_load_dword s8, s[8:9], null
+                S_ENDPGM,
+            ]
+            .iter()
+            .flat_map(|w: &u32| w.to_le_bytes())
+            .collect();
+            let p = crate::ir::build(&code, true, 256).unwrap();
+            track(&p, &[], HwStage::Ps, lanes(&p).as_ref())
+        };
+        let r = run(true).unwrap();
+        assert_eq!(r.scalar.len(), 1);
+        let a = r.scalar[0].1;
+        assert_eq!((a.param, a.offset), (CODE, 0x10 + 0x338));
+        assert!(a.dynamic.is_some());
+        assert_eq!(
+            run(false).unwrap_err(),
+            ShaderError::Unsupported {
+                offset: 0x24,
                 what: "an address with an untracked high half"
             }
         );
