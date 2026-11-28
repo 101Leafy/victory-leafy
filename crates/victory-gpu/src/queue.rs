@@ -1203,12 +1203,13 @@ const PAGE: u64 = 64 << 10;
 /// was low). If the device is lost at the world's entry, this switch is the
 /// first thing to turn on.
 ///
-/// Not the same step as there: that fork, after the line, also lands the
-/// flights in the air whose shaders may write the pages before it maps them
-/// (`crate::host::land_before_remap`, Steenax6/VIctory-NVID 20315a5), and
-/// every count above was taken with that. This tree has no such landing, so
-/// what the line sends here may land after the remap; what the switch does
-/// here is not measured.
+/// That fork, after the line, also lands the flights in the air whose
+/// shaders may write the pages before it maps them, and every count above
+/// was taken with that. Here too ([`crate::host::land_before_remap`], from
+/// Steenax6/VIctory-NVID 20315a5), with or without this switch, unless
+/// `VICTORY_LAND_BEFORE_REMAP=0`: so what the line sends here lands before
+/// the remap if its shaders may write the pages. Neither is run in the game
+/// here; what the switch does here is not measured.
 #[cfg(windows)]
 fn remap_sync() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -1219,9 +1220,14 @@ fn remap_sync() -> bool {
 /// pages of a pool (memory the title mapped physical pages into) at the
 /// batches' addresses. The title streams textures into pool pages
 /// and maps them into its tiled heap this way (title+0xf2c470, ranges of
-/// one constant page or of unmapped pages). Done at once: every earlier
-/// submission has run, but for those that stand in the queues' line
-/// ([`remap_sync`] runs them first).
+/// one constant page or of unmapped pages). Done at once, once the flights
+/// sent ahead whose shaders may write the pages have landed
+/// ([`crate::host::land_before_remap`]): every earlier submission has run,
+/// but for those that stand in the queues' line ([`remap_sync`] runs them
+/// first).
+/// shortcut: a submission a queue still holds behind a wait that is not
+/// met runs after the remap, where the console runs it before when it was
+/// sent first (fxceless/victory-fork #1131).
 extern "system" fn copy_page_mappings(
     _: This,
     count: u32,
@@ -1246,6 +1252,19 @@ extern "system" fn copy_page_mappings(
         // SAFETY: the title passes `count` batches.
         unsafe { std::slice::from_raw_parts(batches, count as usize) }
     });
+    // And what that work's shaders write must land in the pages mapped
+    // now, not in those mapped next (flights sent ahead land after their
+    // submission returned). No lock of ours is held here.
+    #[cfg(windows)]
+    for b in batches.into_iter().flatten() {
+        if b.ranges.is_null() {
+            continue;
+        }
+        // SAFETY: each batch holds `count` ranges.
+        let ranges = unsafe { std::slice::from_raw_parts(b.ranges, b.count as usize) };
+        let len: u64 = ranges.iter().map(|r| u64::from(r.count) * PAGE).sum();
+        crate::host::land_before_remap(b.destination, len);
+    }
     let mut ok = true;
     let many = crate::resource::many_page_mapper();
     let mut gathered: Vec<(u64, u64, u64)> = Vec::new();
