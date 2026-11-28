@@ -163,9 +163,25 @@ fn memory(host: &Host, size: u64) -> Option<Memory> {
             return Some(spare.swap_remove(i));
         }
     }
+    #[cfg(test)]
+    if std::env::var_os("COPY_PROBE_REFUSE_FRESH_UPLOAD").is_some() {
+        eprintln!("synthetic fresh snapshot allocation refusal: {size} bytes");
+        return None;
+    }
     // By doubles, so that the next of about this size finds it: what
     // submissions send differs from frame to frame.
     let size = size.max(8 << 20).next_power_of_two();
+    memory_new(host, size)
+}
+
+/// A one-off upload when the spare pool and the pooled fresh path cannot
+/// supply memory: still private to the submission, so later prepares cannot
+/// change what this one's GPU copies read (unlike the CPU staging side).
+fn memory_unpooled(host: &Host, size: u64) -> Option<Memory> {
+    memory_new(host, size.max(256).next_multiple_of(256))
+}
+
+fn memory_new(host: &Host, size: u64) -> Option<Memory> {
     let mapped = if on_card() { host.mapped_card_buffer(size, false) } else { None };
     let (buffer, data) = match mapped {
         Some(made) => made,
@@ -238,6 +254,7 @@ fn plan_copy<'a>(
     ranges: &'a [(usize, usize)],
     at: &mut u64,
     work: &mut Vec<PairWork<'a>>,
+    pairs: bool,
 ) -> Copy {
     let mut runs = Vec::new();
     let mut words = 0usize;
@@ -246,7 +263,7 @@ fn plan_copy<'a>(
         let before = words;
         for &(a, b) in chunk {
             let len = b - a;
-            if short(a, len) {
+            if pairs && short(a, len) {
                 words += len / 4;
             } else {
                 runs.push((a, *at, len));
@@ -267,20 +284,34 @@ fn plan_copy<'a>(
 
 /// Takes what `dirty` sends up out of the CPU sides.
 pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, usize)>)]) -> Option<Own> {
+    take_inner(host, dirty, true)
+}
+
+/// Like [`take`], but every run is a buffer copy (no compute scatter): for
+/// one-sided L0 mappings that are not unordered-access destinations.
+pub(super) fn take_copies(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, usize)>)]) -> Option<Own> {
+    take_inner(host, dirty, false)
+}
+
+fn take_inner(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, usize)>)], pairs: bool) -> Option<Own> {
     let began = std::time::Instant::now();
-    pass(host)?;
+    if pairs {
+        pass(host)?;
+    }
     // Runs of whole words of the copy: only those are pairs. (A byte beside
     // them in a word may be the card's.)
     let mut at = 0u64;
     let mut copies = Vec::with_capacity(dirty.len());
     let mut work = Vec::new();
     for (shadow, ranges) in dirty {
-        copies.push(plan_copy(shadow.card_data() as usize, ranges, &mut at, &mut work));
+        copies.push(plan_copy(shadow.card_data() as usize, ranges, &mut at, &mut work, pairs));
     }
     if at == 0 {
         return None;
     }
-    let memory = memory(host, at)?;
+    // Prefer the spare pool; if that and the pooled fresh path fail, a
+    // one-off upload still keeps this submission's bytes private.
+    let memory = memory(host, at).or_else(|| memory_unpooled(host, at))?;
     let mut moves: Vec<(usize, usize, usize)> = Vec::new();
     for ((shadow, _), copy) in dirty.iter().zip(&copies) {
         let from = shadow.card_data() as usize;
@@ -289,7 +320,7 @@ pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, us
     let one = |i: usize| {
         let (from, ranges, to) = work[i];
         let mut to = (memory.data + to as usize) as *mut [u32; 2];
-        for &(a, b) in ranges.iter().filter(|&&(a, b)| short(a, b - a)) {
+        for &(a, b) in ranges.iter().filter(|&&(a, b)| pairs && short(a, b - a)) {
             for offset in (a..b).step_by(4) {
                 // SAFETY: inside the copy's mapping (its CPU side, which
                 // the thread that asked, and waits, alone writes in these
@@ -469,7 +500,7 @@ mod tests {
         let (mut old_work, mut new_work) = (Vec::new(), Vec::new());
         for (i, ranges) in cases.into_iter().enumerate() {
             let old = reference(i, ranges, &mut old_at, &mut old_work);
-            let new = plan_copy(i, ranges, &mut new_at, &mut new_work);
+            let new = plan_copy(i, ranges, &mut new_at, &mut new_work, true);
             assert_eq!(new.runs, old.runs);
             assert_eq!(new.pairs, old.pairs);
             assert_eq!(new_at, old_at);
