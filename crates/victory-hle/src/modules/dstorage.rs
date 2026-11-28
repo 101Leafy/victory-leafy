@@ -964,6 +964,7 @@ mod stuck {
                         let age = match first {
                             Command::Read(read) => ms(read.note.enqueued),
                             Command::Status(status) => stream_log::now().saturating_sub(status.enqueued),
+                            Command::Signal(signal) => stream_log::now().saturating_sub(signal.enqueued),
                         };
                         let statuses = lane.unsubmitted.iter().filter(|c| matches!(c, Command::Status(_))).count();
                         name((id, 0, Stage::Unsubmitted), age, &|age| {
@@ -977,7 +978,7 @@ mod stuck {
                             )
                         });
                     }
-                    if let Some(&(seq, Read { request, note })) = lane.reads.front() {
+                    if let Some(&(seq, Read { request, note, .. })) = lane.reads.front() {
                         name((id, seq, Stage::Unstarted), ms(note.submitted), &|age| {
                             tracing::warn!(
                                 queue = id,
@@ -995,14 +996,18 @@ mod stuck {
                             )
                         });
                     }
-                    if let Some(&(seq, ref status)) = lane.statuses.front() {
+                    if let Some(&(seq, ref notice)) = lane.statuses.front() {
+                        let (enqueued, index) = match notice {
+                            Notice::Status(status) => (status.enqueued, Some(status.index)),
+                            Notice::Signal(signal) => (signal.enqueued, None),
+                        };
                         let before = lane.reads.front().map(|r| r.0).into_iter().chain(lane.running.first().copied()).min();
-                        name((id, seq, Stage::Unwritten), stream_log::now().saturating_sub(status.enqueued), &|age| {
+                        name((id, seq, Stage::Unwritten), stream_log::now().saturating_sub(enqueued), &|age| {
                             tracing::warn!(
                                 queue = id,
                                 seq,
                                 ms = age,
-                                index = status.index,
+                                index = ?index,
                                 held_by = before,
                                 unstarted = lane.reads.len(),
                                 running = lane.running.len(),
@@ -1928,6 +1933,8 @@ enum Notice {
 struct Signal {
     fence: usize,
     value: u64,
+    /// For the log.
+    enqueued: u64,
 }
 
 impl Drop for Signal {
@@ -2173,7 +2180,7 @@ extern "system" fn enqueue_signal(this: QueueRef, fence: *mut c_void, value: u64
     }
     let fence = fence as usize;
     com::<extern "system" fn(usize) -> u32>(fence, 0x08)(fence);
-    queue(this, Command::Signal(Signal { fence, value }));
+    queue(this, Command::Signal(Signal { fence, value, enqueued: stream_log::now() }));
 }
 
 /// `GetErrorEvent`: an event set when a request of the queue fails, made on
@@ -3326,6 +3333,7 @@ mod tests {
             refused: 0,
             bcpack: Default::default(),
             since: None,
+            running_since: HashMap::new(),
         }
     }
 
