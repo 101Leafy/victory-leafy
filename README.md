@@ -278,6 +278,7 @@ Known issues:
 
 - The first run builds every shader and stutters for a while.
 - On that first run the first open world scene can stay black. From the second run on (2026-11-28) both opening scenes come up lit.
+- From 2026-11-28 `play.ps1` sets `VICTORY_RT_RESOLVE=0`: with the title's ray tracing off, the 1,000 or so ray-tracing resolve programs are not made. Then both opening scenes come up lit on the first run too (2 runs of 2, from an empty cache). `-RayTracing` keeps them.
 - Cutscene faces don't animate yet: heads and bodies move, mouths and brows stay still. It is being fixed.
 
 ## Where it stood on 2026-11-26
