@@ -61,6 +61,7 @@ macro_rules! asked_for {
         }
     }};
 }
+pub(crate) use asked_for;
 
 fn copies_on() -> bool {
     #[cfg(test)]

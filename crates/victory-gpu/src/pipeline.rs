@@ -489,6 +489,14 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
     make::ready(&p.host)
 }
 
+/// Whether one of the containers of the title pipeline `this` is one `f`
+/// picks (false for none bound). Known at the call, before any host
+/// pipeline is made.
+#[cfg(windows)]
+pub(crate) fn shaders_any(this: This, f: impl Fn(&Shader) -> bool) -> bool {
+    !this.is_null() && pipeline(this).shaders.iter().any(|s| f(s))
+}
+
 /// At a draw, before [`host_pipeline`]: a pipeline made from loose parts
 /// picks its host pipeline for the targets bound (`State::set_targets`'s
 /// handles). Nothing for other pipelines.
