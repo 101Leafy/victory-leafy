@@ -251,6 +251,18 @@ fn kind(index: usize) -> u32 {
     }
 }
 
+/// Whether `id` is one of our devices' (`APP_LOCAL_DEVICE_ID`), for
+/// `XUserFindForDevice`.
+pub(crate) fn is_device_id(id: &[u8; 32]) -> bool {
+    (0..DEVICES).any(|i| Device::new(i).info.id == *id)
+}
+
+/// A device id of ours, for other modules' tests.
+#[cfg(test)]
+pub(crate) fn a_device_id() -> [u8; 32] {
+    Device::new(0).info.id
+}
+
 impl Device {
     fn new(index: usize) -> Device {
         let mut id = [0; 32];
@@ -399,6 +411,11 @@ struct State {
     /// The title sees one pad ([`one_pad`]): every host pad merged into the
     /// stand-in pad.
     one_pad: bool,
+    /// Host pads that have shown input. Some wireless receivers answer for a
+    /// pad that is switched off with a success and an all-zero state: that is
+    /// not a device the title can use, and counting it as one would take the
+    /// keyboard's stand-in pad away.
+    shown_input: [bool; PADS],
 }
 
 pub struct Hub {
@@ -459,6 +476,7 @@ impl Hub {
                 host_pads: [None; PADS],
                 keys: Vec::new(),
                 one_pad,
+                shown_input: [false; PADS],
             }),
             returned: Condvar::new(),
         }));
@@ -572,6 +590,28 @@ impl State {
                 .chain(mouse_buttons.iter().copied())
                 .collect();
             c.feed(&held, counts);
+        }
+        // Counted over the pads actually shown: an all-zero pad is no
+        // device, and must not keep the keyboard's stand-in pad away.
+        let mut pads = pads;
+        if !self.one_pad {
+            for (slot, pad) in pads.iter_mut().enumerate() {
+                // A pad that has never shown input is not a device: it neither
+                // takes the keyboard's stand-in pad away nor shows up as a
+                // connected device the title could wait on.
+                *pad = match *pad {
+                    Some(p) => {
+                        if p != PadState::default() {
+                            self.shown_input[slot] = true;
+                        }
+                        self.shown_input[slot].then_some(p)
+                    }
+                    None => {
+                        self.shown_input[slot] = false;
+                        None
+                    }
+                };
+            }
         }
         self.host_pads = pads;
         self.keys.clone_from(&keys);
@@ -933,8 +973,11 @@ fn token(out: *mut u64) -> HRESULT {
     S_OK
 }
 
-// shortcut: reading callbacks never run; the title registers none
-// (it polls).
+/// Reading callbacks are not implemented here, and the title polls instead of
+/// registering one. The platform refuses the registration too (measured on
+/// the host's GameInput.dll: E_NOTIMPL with the token cleared), so a title
+/// that checks the HRESULT falls back to polling instead of waiting for
+/// callbacks this runtime would never call.
 extern "system" fn register_reading(
     _: This,
     _device: *const c_void,
@@ -944,8 +987,11 @@ extern "system" fn register_reading(
     _callback: *const c_void,
     out: *mut u64,
 ) -> HRESULT {
-    tracing::warn!("input reading callbacks are never called");
-    token(out)
+    if !out.is_null() {
+        // SAFETY: checked non-null.
+        unsafe { out.write(0) };
+    }
+    E_NOTIMPL
 }
 
 /// Device callbacks run on our poll thread when a device comes or goes.
@@ -1002,8 +1048,24 @@ extern "system" fn register_device(
     hub.deliver(found);
     S_OK
 }
-/// Guide button and keyboard layout callbacks: neither ever changes here.
-extern "system" fn register_other(
+/// The system button callback (guide, share and the like): a registration and
+/// its token; no callback ever runs. Its button filter comes between the
+/// device and the context (six arguments), so it cannot share the
+/// keyboard-layout handler below.
+extern "system" fn register_button(
+    _: This,
+    _device: *const c_void,
+    _button: u32,
+    _context: *mut c_void,
+    _callback: *const c_void,
+    out: *mut u64,
+) -> HRESULT {
+    token(out)
+}
+
+/// Keyboard layout callbacks: a registration and its token; the layout never
+/// changes here.
+extern "system" fn register_layout(
     _: This,
     _device: *const c_void,
     _context: *mut c_void,
@@ -1102,8 +1164,8 @@ static INPUT: Table<22> = Table([
     temporal_reading as *const (),    // 0x38
     register_reading as *const (),    // 0x40
     register_device as *const (),     // 0x48
-    register_other as *const (),      // 0x50 guide button
-    register_other as *const (),      // 0x58 keyboard layout
+    register_button as *const (),     // 0x50 guide button
+    register_layout as *const (),     // 0x58 keyboard layout
     stop_callback as *const (),       // 0x60
     unregister_callback as *const (), // 0x68
     create_dispatcher as *const (),   // 0x70
@@ -2153,6 +2215,47 @@ mod tests {
         release(rest);
     }
 
+    /// A pad a receiver answers for while it is switched off comes back as a
+    /// success and an all-zero state. It is not a device the title can use:
+    /// counting it as one takes the keyboard's stand-in pad away, and the
+    /// title then waits for input from a pad nobody can press.
+    #[test]
+    fn an_all_zero_pad_is_not_a_device_the_title_can_use() {
+        let (hub, host) = fake();
+        let log = Log::default();
+        register(hub, GAMEPAD_KIND, 2, &log);
+        assert_eq!(*log.lock().unwrap(), [(FALLBACK, STATUS_CONNECTED, 0)]);
+
+        // The receiver answers, the pad is off: still only the stand-in.
+        host.lock().unwrap().pads[0] = Some(PadState::default());
+        hub.poll();
+        assert_eq!(*log.lock().unwrap(), [(FALLBACK, STATUS_CONNECTED, 0)]);
+
+        // Its first input makes it a device.
+        host.lock().unwrap().pads[0] = Some(PadState {
+            buttons: A,
+            ..Default::default()
+        });
+        hub.poll();
+        assert_eq!(
+            log.lock().unwrap()[1..],
+            [(0, STATUS_CONNECTED, 0), (FALLBACK, 0, STATUS_CONNECTED)]
+        );
+
+        // At rest it stays connected: it has shown it is there.
+        host.lock().unwrap().pads[0] = Some(PadState::default());
+        hub.poll();
+        assert_eq!(log.lock().unwrap().len(), 3);
+
+        // The receiver stops answering: it goes, the stand-in returns.
+        host.lock().unwrap().pads[0] = None;
+        hub.poll();
+        assert_eq!(
+            log.lock().unwrap()[3..],
+            [(0, 0, STATUS_CONNECTED), (FALLBACK, STATUS_CONNECTED, 0)]
+        );
+    }
+
     #[test]
     fn keys_feed_the_keyboard_and_the_stand_in_pad() {
         let (hub, host) = fake();
@@ -2187,6 +2290,39 @@ mod tests {
         release(r);
         // A keyboard reading is no gamepad reading.
         assert_eq!(current(hub, GAMEPAD_KIND, KEYBOARD), Err(READING_NOT_FOUND));
+    }
+
+    /// The platform refuses a reading-callback registration (measured on the
+    /// host's GameInput.dll: E_NOTIMPL, the token cleared), so a title that
+    /// checks the HRESULT falls back to polling instead of waiting for
+    /// callbacks this runtime never calls.
+    #[test]
+    fn a_reading_callback_registration_is_refused_like_the_platform_does() {
+        let (hub, _host) = fake();
+        type Register = extern "system" fn(
+            This,
+            *const c_void,
+            u32,
+            f32,
+            *mut c_void,
+            *const c_void,
+            *mut u64,
+        ) -> HRESULT;
+        let register = slot::<Register, _>(&hub.object, 0x40);
+        let mut token = 0xdead_beef_u64;
+        assert_eq!(
+            register(
+                &hub.object,
+                std::ptr::null(),
+                0,
+                0.0,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                &mut token
+            ),
+            E_NOTIMPL
+        );
+        assert_eq!(token, 0, "the token is cleared");
     }
 
     #[test]
@@ -2393,7 +2529,12 @@ mod tests {
             register(&hub.object, std::ptr::null(), GAMEPAD_KIND, 1, 0, context, Some(slow), &mut token),
             S_OK
         );
-        host.lock().unwrap().pads[1] = Some(PadState::default());
+        // A pad with input is a device: the registration's callback runs
+        // when it connects.
+        host.lock().unwrap().pads[1] = Some(PadState {
+            buttons: A,
+            ..Default::default()
+        });
         let poller = std::thread::spawn(|| hub.poll());
         while !INSIDE.load(Ordering::SeqCst) {
             std::thread::sleep(Duration::from_millis(1));
@@ -2437,5 +2578,39 @@ mod tests {
         rumble(&hub.devices[FALLBACK], &[1.0; 4]);
         rumble(device, std::ptr::null());
         assert_eq!(host.lock().unwrap().rumble, [(2, 32767, 65535), (2, 0, 0)]);
+    }
+
+    /// RegisterSystemButtonCallback (slot 0x50) takes six arguments: the button
+    /// filter comes before the context and the callback. It used to share the
+    /// five-argument keyboard-layout handler, so its fifth argument (the
+    /// title's callback) was taken for the token out: the token was written
+    /// over the title's callback instead of into the title's token.
+    #[test]
+    fn a_system_button_registration_writes_its_token_and_not_the_callback() {
+        let (hub, _host) = fake();
+        type Register = extern "system" fn(
+            This,
+            *const Device,
+            u32,
+            *mut c_void,
+            *const c_void,
+            *mut u64,
+        ) -> HRESULT;
+        let register = slot::<Register, _>(&hub.object, 0x50);
+        // What a title's callback code would be: writable, so the old
+        // handler's stray write is observable here instead of fatal.
+        let callback = [0xa5u8; 8];
+        let mut token = 0;
+        let hr = register(
+            &hub.object,
+            std::ptr::null(),
+            1,
+            std::ptr::null_mut(),
+            callback.as_ptr().cast(),
+            &mut token,
+        );
+        assert_eq!(hr, S_OK);
+        assert_ne!(token, 0, "the token out is written");
+        assert_eq!(callback, [0xa5u8; 8], "the callback is not written over");
     }
 }

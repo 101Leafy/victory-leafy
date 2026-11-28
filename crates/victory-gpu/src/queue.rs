@@ -468,6 +468,15 @@ pub(crate) fn release_held(all: bool) {
     }
 }
 
+/// What a present does with what queues still hold ([`forces`]), for a
+/// thread of the title's that blocks on a fence and so cannot present.
+#[cfg(windows)]
+pub(crate) fn release_forced() {
+    if !behind::on() {
+        release_held(forces());
+    }
+}
+
 /// Before a submission of ours that is waited for, or a wait for flights by
 /// a thread of the title's: what the title gave its queues before goes to the
 /// card first ([`behind`]).
@@ -482,6 +491,15 @@ pub(crate) fn before_sync() {
 #[cfg(windows)]
 pub(crate) fn line_on() -> bool {
     behind::on()
+}
+
+/// A thread of the title's waits for `fence` to reach `value`: what holds
+/// its signal back in the line may have to go ([`behind`]).
+#[cfg(windows)]
+pub(crate) fn title_waits(fence: This, value: u64) {
+    if behind::on() {
+        behind::urge(fence, value);
+    }
 }
 
 /// Lists in the line may have been translated ([`crate::list::thin`]).
@@ -969,6 +987,8 @@ impl Written {
             }
         }
         crate::watch::told(&[(at as usize, bytes)]);
+        // A fence's value: the events waiting for it are set.
+        crate::fence::written(at as usize, bytes);
     }
 }
 
@@ -1062,6 +1082,8 @@ extern "system" fn present(
     }
     #[cfg(all(windows, feature = "diagnostics"))]
     planes_seen(frame, planes, plane_parameters);
+    #[cfg(all(windows, feature = "diagnostics"))]
+    crate::capture::poll_request(frame);
     if frame.is_power_of_two() {
         let (draws, dispatches) = crate::list::take_counts();
         #[cfg(windows)]

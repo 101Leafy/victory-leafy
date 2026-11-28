@@ -61,6 +61,19 @@ mod n {
 
 static COUNTS: [AtomicU64; n::COUNT] = [const { AtomicU64::new(0) }; n::COUNT];
 
+/// The same since the start, by MiB of title memory: pages made no-access,
+/// landed in again untouched, first touched by other code (read, written),
+/// first touched by ours. Ranges whose pages are only ever landed in again
+/// are the ones a landing could leave on the card. Locked after `KEPT`.
+static REGIONS: Mutex<BTreeMap<usize, [u64; 5]>> = Mutex::new(BTreeMap::new());
+
+const REGION: usize = 1 << 20;
+
+fn region(page: usize, which: usize, by: u64) {
+    let mut r = REGIONS.lock().unwrap_or_else(|e| e.into_inner());
+    r.entry(page * PAGE / REGION).or_default()[which] += by;
+}
+
 fn count(which: usize, by: u64) {
     COUNTS[which].fetch_add(by, Ordering::Relaxed);
 }
@@ -126,6 +139,7 @@ pub(super) fn watch(put: &[(usize, usize)]) {
         if old != PAGE_NOACCESS && unsafe { VirtualProtect((first * PAGE) as *const _, n * PAGE, PAGE_NOACCESS, &mut was) } != 0 {
             for page in first..first + n {
                 kept.insert(page, (old, frame));
+                region(page, 0, 1);
             }
             count(n::WATCHED, n as u64);
         }
@@ -140,7 +154,12 @@ pub(super) fn again(at: usize, len: usize) {
     let pages: Vec<(usize, u32)> = kept.range(at / PAGE..(at + len).div_ceil(PAGE)).map(|(&p, &(old, _))| (p, old)).collect();
     for (page, old) in pages {
         kept.remove(&page);
-        count(if open(page, old) { n::AGAIN } else { n::LOST }, 1);
+        if open(page, old) {
+            count(n::AGAIN, 1);
+            region(page, 1, 1);
+        } else {
+            count(n::LOST, 1);
+        }
     }
 }
 
@@ -210,6 +229,7 @@ unsafe extern "system" fn on_fault(info: *mut EXCEPTION_POINTERS) -> i32 {
         1,
     );
     count(n::FRAMES, crate::frame::current().saturating_sub(frame));
+    region(at / PAGE, if by_us { 4 } else if write { 3 } else { 2 }, 1);
     EXCEPTION_CONTINUE_EXECUTION
 }
 
@@ -235,6 +255,39 @@ pub(super) fn log(frames: f64) {
         f(n::LOST),
         kept().len(),
         if touched == 0 { 0.0 } else { c[n::FRAMES] as f64 / touched as f64 },
+    );
+    let r: Vec<(usize, [u64; 5])> = REGIONS.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|(&k, &v)| (k, v)).collect();
+    // Runs of MiB next to each other with no touch by other code count as one.
+    let mut never: Vec<(usize, usize, u64, u64)> = Vec::new();
+    for &(k, v) in &r {
+        if v[2] + v[3] != 0 || v[1] == 0 {
+            continue;
+        }
+        match never.last_mut() {
+            Some(last) if last.1 == k => {
+                last.1 = k + 1;
+                last.2 += v[0];
+                last.3 += v[1];
+            }
+            _ => never.push((k, k + 1, v[0], v[1])),
+        }
+    }
+    let all: u64 = r.iter().map(|(_, v)| v[0]).sum();
+    let left: u64 = never.iter().map(|n| n.2).sum();
+    never.sort_by_key(|n| std::cmp::Reverse(n.2));
+    let list: Vec<String> =
+        never.iter().take(16).map(|n| format!("{:#x}+{:#x} {}/{}", n.0 * REGION, (n.1 - n.0) * REGION, n.3, n.2)).collect();
+    let mut read: Vec<&(usize, [u64; 5])> = r.iter().filter(|(_, v)| v[2] + v[3] != 0).collect();
+    read.sort_by_key(|(_, v)| std::cmp::Reverse(v[0]));
+    let read: Vec<String> =
+        read.iter().take(8).map(|(k, v)| format!("{:#x} {} read {} written {} again {}", k * REGION, v[0], v[2], v[3], v[1])).collect();
+    tracing::info!(
+        "landed MiB never touched by other code since the start (VICTORY_LAND_READS=1): {} of {} pages watched ({:.0}%),          biggest (range, landed in again untouched/watched): {}; most watched of the touched: {}",
+        left,
+        all,
+        if all == 0 { 0.0 } else { left as f64 * 100.0 / all as f64 },
+        list.join(", "),
+        read.join(", "),
     );
 }
 

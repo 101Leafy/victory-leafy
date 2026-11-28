@@ -139,6 +139,19 @@ impl Target {
     /// re-registered so the read-back tracks the memory the texture is in
     /// now, not where it was when it was last written.
     pub(crate) fn fresh(&self) -> bool { self.ticket.valid.load(Ordering::Acquire) }
+
+    pub(crate) fn can_land(&self) -> bool {
+        if self.layout.addressable() {
+            return true;
+        }
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| tracing::warn!(
+            swizzle = self.layout.desc.swizzle.0,
+            samples = self.layout.desc.samples,
+            "texture readback skipped: tiling this console layout is unsupported"
+        ));
+        false
+    }
 }
 
 /// The readback resources and the allocation the pixels belong to.

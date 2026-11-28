@@ -133,7 +133,7 @@ use crate::{ShaderError, io, ir, resource, structure};
 pub use bitcode::census;
 pub use link::{link_mesh, mesh_fits};
 pub use sampler::StaticSampler;
-pub use lower::{host_settings, set_host_max_wave, set_host_rdna};
+pub use lower::{host_settings, set_host_max_wave, set_host_rdna, with_program};
 pub use rect::rect_list_gs;
 pub use shader::{
     mesh_payload_bytes,
@@ -159,7 +159,7 @@ pub use shader::{
 /// The first run after a source change without a raise translates its first
 /// 64 cached shaders again and compares the entries byte for byte; if one
 /// differs, that build keys on the whole source instead, as before.
-pub const VERSION: u32 = 37;
+pub const VERSION: u32 = 38;
 
 static HELPER_LANE_WAVES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 

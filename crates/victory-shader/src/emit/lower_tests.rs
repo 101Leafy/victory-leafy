@@ -1,4 +1,4 @@
-use super::{Lowered, Numeric, Parts, buffer_format, half_shift, lower};
+use super::{Lowered, Numeric, Parts, buffer_format, half_shift, lds_bounds_exempt, lower, with_program};
 use crate::native::{
     ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
 };
@@ -877,4 +877,13 @@ fn small_floats_widen_as_halves() {
     assert!(f10(0x3FF).is_nan());
     // A 16-bit float is a half already, sign included.
     assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
+}
+
+#[test]
+fn face_programs_skip_the_lds_bounds() {
+    // (VICTORY_LDS_BOUNDS_EXEMPT unset: the face programs.)
+    assert!(with_program("38a65783327c30b6", lds_bounds_exempt));
+    assert!(with_program("e4a7e088c7780ce8", lds_bounds_exempt));
+    assert!(!with_program("0123456789abcdef", lds_bounds_exempt));
+    assert!(!lds_bounds_exempt(), "no program outside a translation");
 }
