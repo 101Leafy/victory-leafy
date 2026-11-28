@@ -140,12 +140,15 @@ const KEPT: &[&str] = &[
 const FG_TYPES: [&str; 3] = ["auto", "dlss", "fsr"];
 
 const RESOLUTIONS: [&str; 3] = ["1440", "1080to1440", "4k"];
-const DLSS_MODES: [&str; 5] = ["off", "dlaa", "quality", "balanced", "performance"];
+const DLSS_MODES: [&str; 6] = ["off", "dlaa", "quality", "balanced", "performance", "ultraperformance"];
 /// The Series S scene heights the F1 menu offers and the DLSS mode of each: the picture
 /// is 1920x1080, the scene that mode's share of it (720: the game's own size, and what
 /// it stays at without DLSS: the title's own FidelityFX path from 540 stopped it at the
 /// start, 0xc0000094, a division by zero in the title, 2026-11-28).
-const S_SIZES: [(&str, &str); 4] = [("1080", "dlaa"), ("720", "quality"), ("626", "balanced"), ("540", "performance")];
+/// 360 (ultra performance) is also the one size DLSS takes where a driver-side DLSS override
+/// at ultra performance answers 640x360 for every mode (an RTX 3060, 2026-11-28).
+const S_SIZES: [(&str, &str); 5] =
+    [("1080", "dlaa"), ("720", "quality"), ("626", "balanced"), ("540", "performance"), ("360", "ultraperformance")];
 
 #[derive(clap::Args, Clone, Debug)]
 pub(crate) struct Play {
@@ -1136,6 +1139,12 @@ mod tests {
         assert_eq!(get(&s, "VICTORY_DLSS_MODE").as_deref(), Some("performance"));
         assert_eq!(get(&s, "VICTORY_MENU_DLSS").as_deref(), Some("performance"));
         assert_eq!(get(&s, "VICTORY_FSR_PATH"), None);
+        // 360 with DLSS: ultra performance
+        let (s, _) = settings(&options(), &s_menu("VICTORY_MENU_DLSS=quality
+VICTORY_MENU_S_RES=360
+"), Some(Path::new("x")));
+        assert_eq!(get(&s, "VICTORY_DLSS_MODE").as_deref(), Some("ultraperformance"));
+        assert_eq!(get(&s, "VICTORY_MENU_S_RES").as_deref(), Some("360"));
         // DLAA is 1080
         let (s, _) = settings(&options(), &s_menu("VICTORY_MENU_DLSS=dlaa\r\n"), Some(Path::new("x")));
         assert_eq!((get(&s, "VICTORY_DLSS_MODE").as_deref(), get(&s, "VICTORY_MENU_S_RES").as_deref()), (Some("dlaa"), Some("1080")));

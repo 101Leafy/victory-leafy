@@ -1383,8 +1383,24 @@ fn record(list: *mut c_void, textures: &Textures, camera: &plan::Camera, pre_exp
     };
     let sizes: Vec<(u32, Option<[u32; 2]>)> = plan::MODES.iter().map(|&m| (m, optimal(&mut calls, m))).collect();
     let optimal_of_mode = |m: u32| sizes.iter().find(|s| s.0 == m).and_then(|s| s.1);
-    let mode = plan::pick_mode(camera.render, output, optimal_of_mode)
-        .ok_or_else(|| format!("no DLSS mode takes a {:?} render for a {output:?} output", camera.render))?;
+    let Some(mode) = plan::pick_mode(camera.render, output, optimal_of_mode) else {
+        // Said once, with what would work: the line below repeats every frame and names
+        // neither the cause nor the way out.
+        if let Some(fixed) = plan::one_size_for_all(&sizes) {
+            let hint = Mode::of_size(fixed, output).map_or_else(String::new, |m| {
+                let series_s = if m == Mode::UltraPerformance && output == [1920, 1080] { ", on Series S the F1 menu's SERIES S PICTURE 640X360" } else { "" };
+                format!(", or render the scene at that size: VICTORY_DLSS_MODE={}{series_s}", m.name())
+            });
+            once!(
+                warn,
+                "DLSS answers {fixed:?} for every mode (optimal, smallest and largest), so the {:?} scene fits none and nothing is upscaled: \
+                 the picture stays black or still. A driver-side DLSS override does this (NVIDIA App, DLSS Override - Super Resolution): \
+                 turn it off for this program{hint}",
+                camera.render
+            );
+        }
+        return Err(format!("no DLSS mode takes a {:?} render for a {output:?} output", camera.render));
+    };
     let mut options = abi::DlssOptions::new(mode, output, plan.asked.preset);
     options.pre_exposure = if pre_exposure > 0.0 { pre_exposure } else { 1.0 };
     options.color_buffers_hdr = abi::boolean(camera.flags & plan::FFX_HIGH_DYNAMIC_RANGE != 0);
