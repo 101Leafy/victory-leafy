@@ -964,12 +964,18 @@ fn compute_first() -> bool {
 }
 
 /// For [`compute_first`]: the quickest asked-for compute pipeline while
-/// compute has places, else the first one the slow list does not name.
-fn compute_ahead(list: &mut VecDeque<Arc<Pending>>, compute_free: bool) -> Option<Arc<Pending>> {
+/// compute has places, else, in one place past them, the one asked for last
+/// that the slow list does not name. A cold run has no slow list, and taking
+/// the oldest went to the 15-30 s CS_RaytracingResolve variants asked for
+/// first (run 139: about 120 of them ahead of CS_DepthCopy).
+fn compute_ahead(list: &mut VecDeque<Arc<Pending>>, compute_free: bool, one_past: bool) -> Option<Arc<Pending>> {
     if compute_free {
         return quickest(list);
     }
-    let at = list.iter().position(|p| !super::library::slow(&p.key))?;
+    if !one_past {
+        return None;
+    }
+    let at = list.iter().rposition(|p| !super::library::slow(&p.key))?;
     list.remove(at)
 }
 
@@ -1117,7 +1123,7 @@ impl Queue {
         let mut from = TAKEN_SCREEN;
         if p.is_none() && !screens_only {
             if compute_first() {
-                p = compute_ahead(&mut self.requested_compute, compute_free);
+                p = compute_ahead(&mut self.requested_compute, compute_free, self.compute_now <= self.compute_cap);
             }
             if p.is_none() {
                 p = newest(&mut self.requested);
