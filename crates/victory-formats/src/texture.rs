@@ -382,7 +382,7 @@ impl Layout {
         let bpe = u64::from(d.element_bytes);
         let align = 256 / d.element_bytes;
         let three_d = d.dimension == Dimension::Tex3d;
-        let mut mips = vec![];
+        let mut mips = Vec::with_capacity(d.mips as usize);
         let mut offset = 0;
         for i in (0..d.mips).rev() {
             let h = padded_dim(d.height, i, d.block);
@@ -491,7 +491,7 @@ impl Layout {
                 fixed[0] /= b[0] / BLOCK_256_2D[2][0];
                 fixed[1] /= b[1] / BLOCK_256_2D[2][1];
             }
-            let mut sizes = vec![];
+            let mut sizes = [0u64; MAX_MIPS as usize];
             for i in 0..d.mips {
                 let (w, h) = padded(i);
                 if w <= fixed[0] && h <= fixed[1] && d.mips - i <= max_in_tail {
@@ -504,7 +504,7 @@ impl Layout {
                 let depth = mip_depth(i).next_multiple_of(block[2]);
                 let one = u64::from(pitch) * u64::from(rows) * bpe;
                 slice_size += one;
-                sizes.push(one * u64::from(block[2]));
+                sizes[i as usize] = one * u64::from(block[2]);
                 mips.push(Mip {
                     width: width(i),
                     height: height(i),
@@ -1175,6 +1175,57 @@ mod tests {
             samples: 1,
             swizzle,
         }
+    }
+
+    #[test]
+    fn linear_mips_keep_smallest_first_offsets() {
+        let l = Layout::new(&desc(257, 3, 5, 4, Swizzle::LINEAR)).unwrap();
+        let footprints: Vec<_> = l.mips.iter().map(|m| (m.pitch, m.rows, m.offset)).collect();
+        assert_eq!(
+            footprints,
+            [
+                (320, 3, 2560),
+                (192, 2, 1024),
+                (128, 1, 512),
+                (64, 1, 256),
+                (64, 1, 0)
+            ]
+        );
+        assert_eq!((l.first_tail_mip, l.size, l.alignment), (5, 6400, 256));
+    }
+
+    #[test]
+    fn tiled_standard_mips_fill_the_validated_limit() {
+        // Microtiles have no mip tail, so all sixteen scratch slots are used.
+        let d = desc(MAX_EXTENT, 1, MAX_MIPS, 4, Swizzle::SW_256B_S);
+        let l = Layout::new(&d).unwrap();
+        let offsets: Vec<_> = l.mips.iter().map(|m| m.offset).collect();
+        assert_eq!(
+            offsets,
+            [
+                525_056, 262_912, 131_840, 66_304, 33_536, 17_152, 8_960, 4_864, 2_816, 1_792,
+                1_280, 1_024, 768, 512, 256, 0,
+            ]
+        );
+        assert_eq!(
+            (l.first_tail_mip, l.size, l.alignment),
+            (MAX_MIPS, 1_049_344, 256)
+        );
+        for mips in [0, MAX_MIPS + 1] {
+            assert_eq!(Layout::new(&Desc { mips, ..d }), Err(Error::Invalid));
+        }
+    }
+
+    #[test]
+    fn tiled_tail_only_mips_keep_their_offsets() {
+        let l = Layout::new(&desc(4, 4, 2, 4, Swizzle::SW_64KB_S)).unwrap();
+        let offsets: Vec<_> = l
+            .mips
+            .iter()
+            .map(|m| (m.offset, m.tail.unwrap().offset))
+            .collect();
+        assert_eq!(offsets, [(0, 32768), (0, 16384)]);
+        assert_eq!((l.first_tail_mip, l.size, l.alignment), (0, 65536, 65536));
     }
 
     const RGBA8_TEXTURE: TextureDesc = TextureDesc {
