@@ -1202,6 +1202,13 @@ const PAGE: u64 = 64 << 10;
 /// `show_new_later`), 16 entries without it lost none (no proof: the rate
 /// was low). If the device is lost at the world's entry, this switch is the
 /// first thing to turn on.
+///
+/// Not the same step as there: that fork, after the line, also lands the
+/// flights in the air whose shaders may write the pages before it maps them
+/// (`crate::host::land_before_remap`, Steenax6/VIctory-NVID 20315a5), and
+/// every count above was taken with that. This tree has no such landing, so
+/// what the line sends here may land after the remap; what the switch does
+/// here is not measured.
 #[cfg(windows)]
 fn remap_sync() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
