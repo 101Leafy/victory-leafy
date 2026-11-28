@@ -253,21 +253,50 @@ impl<W: Work> Lane<W> {
         }
     }
 
-    /// Waits until at most `most` presents are in the line.
-    pub(super) fn wait_presents(&self, most: usize) {
-        let mut state = self.lock();
-        while state.presents > most {
-            state = self.moved.wait(state).unwrap_or_else(|e| e.into_inner());
-        }
+    /// Waits until at most `most` presents are in the line, or for `bound`
+    /// with nothing taken from the line: whether it got there.
+    pub(super) fn wait_presents(&self, most: usize, bound: Option<Duration>) -> bool {
+        self.wait_while(bound, |state| state.presents > most)
     }
 
     /// Waits until at most `most` submissions are in the line, or what is
-    /// left of it stands at something.
-    pub(super) fn wait_runs(&self, most: usize) {
+    /// left of it stands at something, or for `bound` with nothing taken:
+    /// whether it got there.
+    pub(super) fn wait_runs(&self, most: usize, bound: Option<Duration>) -> bool {
+        self.wait_while(bound, |state| state.runs > most && state.served < state.asked)
+    }
+
+    /// Presents and submissions in the line or being done.
+    pub(super) fn held(&self) -> (usize, usize) {
+        let state = self.lock();
+        (state.presents, state.runs)
+    }
+
+    fn wait_while(&self, bound: Option<Duration>, waits: impl Fn(&State<W>) -> bool) -> bool {
         let mut state = self.lock();
-        while state.runs > most && state.served < state.asked {
-            state = self.moved.wait(state).unwrap_or_else(|e| e.into_inner());
+        let Some(bound) = bound else {
+            while waits(&state) {
+                state = self.moved.wait(state).unwrap_or_else(|e| e.into_inner());
+            }
+            return true;
+        };
+        let taken = |state: &State<W>| state.next - state.items.len() as u64;
+        let mut seen = taken(&state);
+        let mut since = Instant::now();
+        while waits(&state) {
+            let left = bound.saturating_sub(since.elapsed());
+            if left.is_zero() {
+                return false;
+            }
+            state = self.moved.wait_timeout(state, left).unwrap_or_else(|e| e.into_inner()).0;
+            // Anything taken from the line restarts the clock: only a line
+            // that stands still is given up on.
+            if taken(&state) != seen {
+                seen = taken(&state);
+                since = Instant::now();
+            }
         }
+        true
     }
 
     /// Looks at the line for as long as the process runs.
@@ -800,7 +829,7 @@ pub(super) fn on() -> bool {
 /// done first. (At a present, by the title's thread that submits.)
 #[cfg(any(feature = "diagnostics", feature = "ab"))]
 pub(super) fn leave() {
-    LANE.wait_presents(0);
+    LANE.wait_presents(0, None);
     LANE.drain();
 }
 
@@ -901,7 +930,9 @@ fn room(queued: u64) {
     if queued > runs_most() as u64 {
         let began = Instant::now();
         let _waiting = crate::timeline::span("a submission waits for room in the line");
-        LANE.wait_runs(runs_most());
+        if !LANE.wait_runs(runs_most(), keepalive()) {
+            gave_up("a submission");
+        }
         STATS[ROOM].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
     }
 }
@@ -970,8 +1001,37 @@ pub(super) fn present(
     LANE.push(this as usize, [Job::Present(texture, overlay, shown)]);
     let began = Instant::now();
     let _waiting = crate::timeline::span("a present waits for the one before it to be sent");
-    LANE.wait_presents(frames_most());
+    if !LANE.wait_presents(frames_most(), keepalive()) {
+        gave_up("a present");
+    }
     STATS[AT_PRESENT].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
+}
+
+/// How long a call of the title's waits on a line that stands still before
+/// it returns anyway, with what it gave still in the line
+/// (`VICTORY_PRESENT_KEEPALIVE=1`; `VICTORY_PRESENT_KEEPALIVE_MS`, 10000).
+/// Nothing is dropped or shown twice: the frame is sent when the line moves.
+///
+/// Why: the title kills itself after 30 s with no frame of its own (ff-held
+/// r140, ff-se r126). Its watchdog thread counts a tick that only the title's
+/// frame and load code writes, so a present made again by the host cannot
+/// restart it; the title's thread has to get out of its present.
+fn keepalive() -> Option<Duration> {
+    static BOUND: OnceLock<Option<Duration>> = OnceLock::new();
+    *BOUND.get_or_init(|| {
+        std::env::var_os("VICTORY_PRESENT_KEEPALIVE").is_some_and(|v| v == "1").then(|| {
+            let ms = number("VICTORY_PRESENT_KEEPALIVE_MS").unwrap_or(10_000).max(1);
+            tracing::info!(ms, "a present or submission that waits this long on a line that stands still returns (VICTORY_PRESENT_KEEPALIVE=1)");
+            Duration::from_millis(ms as u64)
+        })
+    })
+}
+
+fn gave_up(what: &str) {
+    static TIMES: AtomicU64 = AtomicU64::new(0);
+    let times = TIMES.fetch_add(1, Relaxed) + 1;
+    let (presents, runs) = LANE.held();
+    tracing::warn!(times, presents, runs, "{what} returned to the title with the line standing still: what it gave stays in the line");
 }
 
 /// For the frame-rate line.
@@ -1304,7 +1364,7 @@ mod tests {
         lane.push_behind(1, false, T::Signal(f, 1, log.clone()), || panic!("behind the submission"));
         lane.push(1, [T::Present("present 1", log.clone())]);
         // One present may be in the line: this returns with it there.
-        lane.wait_presents(1);
+        lane.wait_presents(1, None);
         assert_eq!(value(f), 0);
         assert!(log.lock().unwrap().is_empty());
         // A fence behind a submission being done (no longer in the line).
@@ -1321,7 +1381,7 @@ mod tests {
                 gate.1.notify_all();
             })
         };
-        lane.wait_presents(1);
+        lane.wait_presents(1, None);
         assert!(value(f) == 1, "the first frame was done");
         lane.drain();
         assert_eq!(*log.lock().unwrap(), ["slow", "signal 1", "present 1", "second", "present 2"]);
@@ -1331,7 +1391,7 @@ mod tests {
         lane.push(1, [T::Wait(f, 5), T::Run("after the wait", log.clone())]);
         lane.drain();
         assert_eq!(log.lock().unwrap().len(), 5);
-        lane.wait_runs(0);
+        lane.wait_runs(0, None);
         crate::fence::set(f as This, 5);
         while log.lock().unwrap().len() < 6 {
             std::thread::yield_now();
