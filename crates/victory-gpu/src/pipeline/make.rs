@@ -953,6 +953,26 @@ fn graphics_first() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_GRAPHICS_FIRST").is_none_or(|v| v != "0"))
 }
 
+/// `VICTORY_COMPUTE_FIRST=1`: compute pipelines draws have asked for go
+/// ahead of every graphics request, and one the slow list does not name
+/// goes past the compute cap. Run 139: `CS_DepthCopy` (a full-screen depth
+/// copy, 1 ms to make) waited 245 s behind 7 to 25 s ray-tracing creates
+/// that held every compute place, and the world was black until it was made.
+fn compute_first() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_COMPUTE_FIRST").is_some_and(|v| v == "1"))
+}
+
+/// For [`compute_first`]: the quickest asked-for compute pipeline while
+/// compute has places, else the first one the slow list does not name.
+fn compute_ahead(list: &mut VecDeque<Arc<Pending>>, compute_free: bool) -> Option<Arc<Pending>> {
+    if compute_free {
+        return quickest(list);
+    }
+    let at = list.iter().position(|p| !super::library::slow(&p.key))?;
+    list.remove(at)
+}
+
 /// Of the compute pipelines draws have asked for, the one the slow list says
 /// is made soonest (one not on it first; in the order asked among equals).
 /// In the 980073cbe run draws asked for 323: 107 of them took the driver
@@ -1096,7 +1116,12 @@ impl Queue {
         let mut p = self.screen.pop_front();
         let mut from = TAKEN_SCREEN;
         if p.is_none() && !screens_only {
-            p = newest(&mut self.requested);
+            if compute_first() {
+                p = compute_ahead(&mut self.requested_compute, compute_free);
+            }
+            if p.is_none() {
+                p = newest(&mut self.requested);
+            }
             from = TAKEN_REQUESTED;
             if p.is_none() && compute_free {
                 p = quickest(&mut self.requested_compute);
