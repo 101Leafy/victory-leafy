@@ -99,30 +99,67 @@ struct Pass {
     pso: ID3D12PipelineState,
 }
 
+/// Whether the submitting thread leaves the pass to a thread of its own
+/// (`VICTORY_SEND_PASS_AWAY=1`; off by default): until it is made, the
+/// changed words go up as copies, as with `VICTORY_SEND_OWN=0`.
+///
+/// Why: in ff-se r126 the submitting thread made the pass at its first use,
+/// 56 s in, while 26 pipeline workers compiled. The driver's create waited
+/// on its shader cache lock (NvMemMapStoragex) for over 30 s, the title's
+/// present waited on the submitting thread (`Lane::wait_presents`), and the
+/// title's watchdog ended the run.
+fn away() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SEND_PASS_AWAY").is_some_and(|v| v == "1"))
+}
+
 fn pass(host: &Host) -> Option<&'static Pass> {
     static PASS: OnceLock<Option<Pass>> = OnceLock::new();
-    PASS.get_or_init(|| {
-        let code = compile(SCATTER, windows::core::s!("main"), windows::core::s!("cs_5_1")).ok()?;
-        // SAFETY: the code lives through the calls; the root signature is
-        // inside it.
-        unsafe {
-            let root: ID3D12RootSignature = host.device.CreateRootSignature(0, &code).ok()?;
-            let pso: ID3D12PipelineState = host
-                .device
-                .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
-                    pRootSignature: std::mem::transmute_copy(&root),
-                    CS: D3D12_SHADER_BYTECODE {
-                        pShaderBytecode: code.as_ptr().cast(),
-                        BytecodeLength: code.len(),
-                    },
-                    ..Default::default()
-                })
-                .ok()?;
-            name(&pso, || "victory: changed words sent to the card".into());
-            Some(Pass { root, pso })
+    if !away() {
+        return PASS.get_or_init(|| make_pass(&host.device)).as_ref();
+    }
+    if let Some(made) = PASS.get() {
+        return made.as_ref();
+    }
+    static ASKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !ASKED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        let device = host.device.clone();
+        let began = std::time::Instant::now();
+        let spawned = std::thread::Builder::new()
+            .name("victory-send-pass".into())
+            .spawn(move || {
+                PASS.get_or_init(|| make_pass(&device));
+                tracing::info!(
+                    ms = began.elapsed().as_millis() as u64,
+                    "the pass for changed words is made (VICTORY_SEND_PASS_AWAY)"
+                );
+            });
+        if spawned.is_err() {
+            return PASS.get_or_init(|| make_pass(&host.device)).as_ref();
         }
-    })
-    .as_ref()
+    }
+    None
+}
+
+fn make_pass(device: &ID3D12Device) -> Option<Pass> {
+    let code = compile(SCATTER, windows::core::s!("main"), windows::core::s!("cs_5_1")).ok()?;
+    // SAFETY: the code lives through the calls; the root signature is
+    // inside it.
+    unsafe {
+        let root: ID3D12RootSignature = device.CreateRootSignature(0, &code).ok()?;
+        let pso: ID3D12PipelineState = device
+            .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::transmute_copy(&root),
+                CS: D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: code.as_ptr().cast(),
+                    BytecodeLength: code.len(),
+                },
+                ..Default::default()
+            })
+            .ok()?;
+        name(&pso, || "victory: changed words sent to the card".into());
+        Some(Pass { root, pso })
+    }
 }
 
 /// Memory a submission's sends come from, mapped.
