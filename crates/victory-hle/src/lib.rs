@@ -24,6 +24,10 @@ pub mod runtime;
 pub use host::HostPolicy;
 pub use registry::{HleExport, HleModule, registry};
 pub use victory_gpu::console;
+/// The title's acceleration-structure builder, watched for sizes answered
+/// at its call (`VICTORY_BVH_SIZE_ANSWER`).
+#[cfg(windows)]
+pub use victory_gpu::dxr;
 #[cfg(windows)]
 pub use victory_gpu::reserve_upload_space;
 #[cfg(all(windows, feature = "diagnostics"))]

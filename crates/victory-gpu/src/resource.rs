@@ -120,6 +120,17 @@ pub(crate) struct AllocationInfo {
     alignment: u64,
 }
 
+#[cfg(test)]
+pub(crate) fn readback_test_descriptions() -> (HeapProperties, ResourceDesc) {
+    (
+        HeapProperties { kind: 1, cpu_pages: 0, pool: 0, creation_nodes: 0, visible_nodes: 0 },
+        ResourceDesc {
+            dimension: 3, alignment: 0, width: 256, height: 256, depth_or_array_size: 1,
+            mip_levels: 1, format: 41, sample_count: 1, sample_quality: 0, layout: 0, flags: 4,
+        },
+    )
+}
+
 const _: () = assert!(size_of::<HeapProperties>() == 20);
 const _: () = assert!(size_of::<HeapDesc>() == 48);
 const _: () = assert!(size_of::<ResourceDesc>() == 56);
@@ -885,17 +896,54 @@ pub(crate) extern "system" fn allocation_info(
     out
 }
 
-/// The newer description: the plain one, then a sampler feedback mip
-/// region (width, height, depth).
+/// The newer description: the plain one's fields, then a sampler feedback
+/// mip region (width, height, depth). As a C structure the region follows
+/// the flags at once, in the 4 bytes the plain description ends with as
+/// padding: 64 bytes, as the host's `D3D12_RESOURCE_DESC1`, not the 72 of
+/// a plain description with the region after it. An array of them is read
+/// at that stride.
 #[repr(C)]
+#[derive(Debug, Clone, Copy)]
 pub(crate) struct ResourceDesc1 {
-    desc: ResourceDesc,
+    dimension: u32,
+    alignment: u64,
+    width: u64,
+    height: u32,
+    depth_or_array_size: u16,
+    mip_levels: u16,
+    format: u32,
+    sample_count: u32,
+    sample_quality: u32,
+    layout: u32,
+    flags: u32,
     mip_region: [u32; 3],
 }
-const _: () = assert!(size_of::<ResourceDesc1>() == 72);
+const _: () = assert!(size_of::<ResourceDesc1>() == 64);
+const _: () = assert!(std::mem::offset_of!(ResourceDesc1, flags) == 48);
+const _: () = assert!(std::mem::offset_of!(ResourceDesc1, mip_region) == 52);
+
+impl ResourceDesc1 {
+    /// The plain description it starts with.
+    fn plain(&self) -> ResourceDesc {
+        ResourceDesc {
+            dimension: self.dimension,
+            alignment: self.alignment,
+            width: self.width,
+            height: self.height,
+            depth_or_array_size: self.depth_or_array_size,
+            mip_levels: self.mip_levels,
+            format: self.format,
+            sample_count: self.sample_count,
+            sample_quality: self.sample_quality,
+            layout: self.layout,
+            flags: self.flags,
+        }
+    }
+}
 
 /// Where one resource goes in [`allocation_info2`]'s placement.
 #[repr(C)]
+#[derive(Debug, Clone, Copy)]
 pub(crate) struct AllocationInfo1 {
     offset: u64,
     alignment: u64,
@@ -918,7 +966,8 @@ pub(crate) extern "system" fn allocation_info2(
         // SAFETY: the title passes `count` descriptions.
         unsafe { std::slice::from_raw_parts(descs, count as usize) }
     };
-    let total = place(descs.iter().map(|d| &d.desc), |i, info| {
+    let plain: Vec<ResourceDesc> = descs.iter().map(ResourceDesc1::plain).collect();
+    let total = place(plain.iter(), |i, info| {
         if !each.is_null() {
             // SAFETY: the title passes room for `count` entries.
             unsafe { each.add(i).write(info) };
@@ -1425,6 +1474,14 @@ pub(crate) fn want_level(this: This, first: u32) {
 #[cfg(windows)]
 pub(crate) static KINDS: [std::sync::atomic::AtomicU64; 7] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 7];
+
+/// Title textures the host renders to or writes ([`fills`] false), since the
+/// start: made, and released by the title. For the memory line: if the title
+/// goes on making them and releases few, the host copies the sweep never lets
+/// go are ones the title still holds (#791).
+#[cfg(windows)]
+pub(crate) static TARGET_TEXTURES: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 /// Every title texture alive (not buffers), by address: for the sweep and
 /// the memory line. A texture leaves the table before it is freed.
@@ -2536,14 +2593,19 @@ pub(crate) static SWEPT_US: [std::sync::atomic::AtomicU64; 3] = [const { std::sy
 /// first page); those nothing has used for 30 seconds and 60 frames and
 /// that no list and no slot holds; those that are both; the copies of
 /// textures the title fills that the host copied into; and, of the first,
-/// the placed ones. Render-target copies grew from 2,319 MB at the world's
+/// the placed ones, those whose title memory holds another target views
+/// there show ([`superseded`]), and those whose title memory is not mapped now,
+/// placed or not. Render-target copies grew from 2,319 MB at the world's
 /// first frame to 3,075 MB 150 s later in run 197 and never shrank, while
 /// 26,517 copies of filled textures were let go to stay under the card's
-/// line.
+/// line; on an 8 GB card they grew by 1.4 GB over a session (#791).
 #[cfg(all(windows, feature = "diagnostics"))]
-pub(crate) fn targets_census() -> [u64; 12] {
+pub(crate) fn targets_census() -> [u64; 16] {
     use std::sync::atomic::Ordering::Relaxed;
-    let mut c = [0u64; 12];
+    let mut c = [0u64; 16];
+    // The targets at each address, copied before the textures' lock is
+    // taken, so that the two are never held together.
+    let newest = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let all = textures();
     for &at in all.iter() {
         // SAFETY: as in `let_go_idle`.
@@ -2584,8 +2646,25 @@ pub(crate) fn targets_census() -> [u64; 12] {
         if placed {
             add(10);
         }
+        if superseded(&newest, at, r.data() as u64) {
+            add(12);
+        }
+        if !crate::texture::committed(r.data().cast_const(), 1) {
+            add(14);
+        }
     }
     c
+}
+
+/// Whether the target `at`, whose title memory is at `address`, is not the
+/// one a view placed there shows: another target lies in the same memory
+/// and is preferred ([`TARGETS_AT`], `newest`, holds the targets at each
+/// address, the preferred one last). Its host copy then holds what views
+/// there do not show.
+#[cfg(windows)]
+#[cfg_attr(not(any(test, feature = "diagnostics")), allow(dead_code))]
+fn superseded(newest: &std::collections::BTreeMap<u64, Vec<usize>>, at: usize, address: u64) -> bool {
+    newest.get(&address).and_then(|owners| owners.last()).is_some_and(|&n| n != at)
 }
 
 /// For the memory line: title textures with a host copy the host renders
@@ -3152,6 +3231,7 @@ fn hand_out_resource(
         textures().insert(at);
         crate::texback::replaced(resource.data() as usize);
         if !fills(&desc) {
+            TARGET_TEXTURES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let address = resource.data() as u64;
             let mut targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
             // Title allocations stay last (preferred over synthetic ones).
@@ -3184,6 +3264,7 @@ impl Drop for Resource {
             crate::texback::released(address);
             textures().remove(&address);
             if !fills(&self.desc) {
+                TARGET_TEXTURES[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let mut targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
                 let at = self.data() as u64;
                 let me = std::ptr::from_ref::<Resource>(self) as usize;
@@ -3983,6 +4064,48 @@ mod tests {
         }
     }
 
+    #[cfg(all(windows, feature = "diagnostics"))]
+    #[test]
+    #[ignore = "requires VICTORY_D3D12_WARP=1 and a texture readback for 256x256f41"]
+    fn only_addressable_textures_record_readbacks() {
+        use victory_formats::texture::Swizzle;
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_FLOAT;
+        use windows::Win32::Graphics::Dxgi::IDXGIAdapter1;
+        use windows::core::Interface;
+
+        assert!(crate::switch::on("VICTORY_D3D12_WARP"));
+        let adapter: IDXGIAdapter1 = crate::host::warp_adapter().unwrap().cast().unwrap();
+        let host = crate::host::host().expect("D3D12 software device");
+        // SAFETY: these are live DXGI adapter and device queries.
+        let (adapter_desc, device_luid) = unsafe { (adapter.GetDesc1().unwrap(), host.device.GetAdapterLuid()) };
+        assert_eq!(adapter_desc.VendorId, 0x1414);
+        assert_eq!(adapter_desc.AdapterLuid.HighPart, device_luid.HighPart);
+        assert_eq!(adapter_desc.AdapterLuid.LowPart, device_luid.LowPart);
+
+        for (swizzle, supported) in [(Swizzle::SW_4KB_S, true), (Swizzle::SW_64KB_S_X, false)] {
+            let desc = ResourceDesc {
+                layout: 0x100 | swizzle.0,
+                ..texture(256, 256, DXGI_FORMAT_R32_FLOAT.0 as u32, 1)
+            };
+            let null = std::ptr::null();
+            let mut title = null;
+            assert_eq!(
+                create_committed(null, &PROPERTIES, 0, &desc, 0, null.cast(), &RESOURCE_IIDS[0], &mut title),
+                S_OK
+            );
+            assert!(crate::texback::wanted(title));
+            assert!(host_copy(title).is_some(), "both layouts have a host texture");
+            let list = host.new_list().unwrap();
+            list.texture_written(title);
+            list.texture_written(title);
+            list.close();
+            let recorded = list.has_recorded_work();
+            drop(list);
+            resource_release(title);
+            assert_eq!(recorded, supported, "swizzle {}", swizzle.0);
+        }
+    }
+
     fn heap(size: u64) -> This {
         let desc = HeapDesc {
             size,
@@ -4171,6 +4294,63 @@ mod tests {
         );
         allocation_info(&mut info, std::ptr::null(), 0, 1, &texture(1, 1, 999, 1));
         assert_eq!(info.size, u64::MAX);
+    }
+
+    /// The newer description has the host's C layout: the mip region right
+    /// after the flags, 64 bytes in all, so an array of them is read at the
+    /// stride the caller wrote it with.
+    #[cfg(windows)]
+    #[test]
+    fn newer_descriptions_have_the_host_layout() {
+        use std::mem::offset_of;
+        use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DESC1;
+        assert_eq!(size_of::<ResourceDesc1>(), size_of::<D3D12_RESOURCE_DESC1>());
+        assert_eq!(
+            offset_of!(ResourceDesc1, flags),
+            offset_of!(D3D12_RESOURCE_DESC1, Flags)
+        );
+        assert_eq!(
+            offset_of!(ResourceDesc1, mip_region),
+            offset_of!(D3D12_RESOURCE_DESC1, SamplerFeedbackMipRegion)
+        );
+    }
+
+    /// Two newer descriptions, laid out one after another as a C array:
+    /// both are read whole, and placed as the plain ones are.
+    #[test]
+    fn newer_descriptions_place_as_the_plain_ones() {
+        let newer = |d: ResourceDesc| ResourceDesc1 {
+            dimension: d.dimension,
+            alignment: d.alignment,
+            width: d.width,
+            height: d.height,
+            depth_or_array_size: d.depth_or_array_size,
+            mip_levels: d.mip_levels,
+            format: d.format,
+            sample_count: d.sample_count,
+            sample_quality: d.sample_quality,
+            layout: d.layout,
+            flags: d.flags,
+            mip_region: [0; 3],
+        };
+        let plain = [buffer(100), texture(256, 256, 28, 0)];
+        let descs = plain.map(newer);
+        let no_info = AllocationInfo {
+            size: 0,
+            alignment: 0,
+        };
+        let (mut want, mut got) = (no_info, no_info);
+        allocation_info(&mut want, std::ptr::null(), 0, 2, plain.as_ptr());
+        let mut each = [AllocationInfo1 {
+            offset: 0,
+            alignment: 0,
+            size: 0,
+        }; 2];
+        allocation_info2(&mut got, std::ptr::null(), 0, 2, descs.as_ptr(), each.as_mut_ptr());
+        assert_eq!(got, want);
+        assert_eq!(each[0].offset, 0);
+        assert_eq!(each[1].offset, KIB_64);
+        assert_eq!(each[1].size, footprint(&plain[1]).unwrap().size);
     }
 
     #[test]
@@ -5512,5 +5692,52 @@ float4 lit() : SV_Target { return 1.0; }
         assert!(twin_room(0));
         assert!(twin_room(65_535));
         assert!(!twin_room(65_536));
+    }
+
+    /// A target with another, preferred one at the same memory is told apart
+    /// from that one (the memory line's census, #791).
+    #[cfg(windows)]
+    #[test]
+    fn a_target_not_preferred_at_its_memory_is_superseded() {
+        let newest = std::collections::BTreeMap::from([(0x1000u64, vec![1usize, 2])]);
+        assert!(superseded(&newest, 1, 0x1000), "the one not preferred");
+        assert!(!superseded(&newest, 2, 0x1000), "the preferred one");
+        assert!(!superseded(&newest, 1, 0x2000), "no target there");
+    }
+
+    /// Targets count as made and as released (the memory line's census,
+    /// #791); a target made at another's memory stays first, the title's own
+    /// allocation last.
+    #[cfg(windows)]
+    #[test]
+    fn targets_at_one_memory_are_counted_made_and_released() {
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let Some(_host) = crate::host::host() else {
+            return;
+        };
+        let null = std::ptr::null();
+        // Unordered access: a texture the host writes, not one the title fills.
+        let target = ResourceDesc { flags: 4, ..texture(4, 4, 28, 1) };
+        assert!(!fills(&target));
+        let [made, released] = TARGET_TEXTURES.each_ref().map(|n| n.load(Relaxed));
+        let (mut older, mut newer) = (null, null);
+        assert_eq!(
+            create_committed(null, &PROPERTIES, 0, &target, 0, null.cast(), &RESOURCE_IIDS[0], &mut older),
+            S_OK
+        );
+        let at = resource(older).data() as u64;
+        assert_eq!(
+            create_at_address(null, at, &target, 0, null.cast(), &RESOURCE_IIDS[0], &mut newer),
+            S_OK
+        );
+        let newest = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        assert!(superseded(&newest, newer as usize, at), "the one made at its memory");
+        assert!(!superseded(&newest, older as usize, at), "the title's own");
+        // (Other tests make and release textures meanwhile: at least ours.)
+        assert!(TARGET_TEXTURES[0].load(Relaxed) >= made + 2);
+        resource_release(newer);
+        resource_release(older);
+        assert!(TARGET_TEXTURES[1].load(Relaxed) >= released + 2);
     }
 }

@@ -473,11 +473,16 @@ pub(crate) enum C {
     /// at the next refresh).
     TakenWholeBytes,
     TakenPartBytes,
+    /// The title's barrier group calls by what they say of unordered
+    /// access: one ends, one only begins, none named.
+    GroupsEndWrites,
+    GroupsBeginWrites,
+    GroupsOther,
 }
 const COUNTERS: usize = 256;
 
 /// The counters' names, in the order of [`C`], for the frame recorder's columns.
-pub(crate) const NAMES: [&str; 249] = [
+pub(crate) const NAMES: [&str; 252] = [
     "Submissions", "Copies", "CopyBytes", "Refreshes", "RefreshBytes", "Skipped", "SkippedBytes", "Runs",
     "RunUs", "Queries", "QueryUs", "MoveUs", "Unmapped", "Watches", "WatchUs", "Checked", "Unchanged",
     "Fallbacks", "GuardFaults", "TexWatched", "TexHashed", "TexChanged", "TexHot", "Frames", "RecordCalls",
@@ -534,6 +539,7 @@ pub(crate) const NAMES: [&str; 249] = [
     "TableEntries", "TableEntriesSame",
     "BatchArgsWritten", "WaitsLeftOut",
     "TakenWholeBytes", "TakenPartBytes",
+    "GroupsEndWrites", "GroupsBeginWrites", "GroupsOther",
 ];
 /// One of some sets of counters, each in lines of the processor's memory of
 /// its own: a set for all threads had them wait for each other's lines at
@@ -704,6 +710,16 @@ pub(crate) fn card_waited(us: u64, what: impl FnOnce() -> String) {
     if us > longest.0 {
         *longest = (us, text);
     }
+}
+
+/// The barriers of the title's groups by `(kind, [sync before, sync after,
+/// access before, access after])`, counted.
+static GROUP_BARRIERS: Mutex<Option<HashMap<(u32, [u32; 4]), u64>>> = Mutex::new(None);
+
+/// A barrier of one of the title's groups.
+pub(crate) fn group_barrier(kind: u32, values: [u32; 4]) {
+    let mut seen = GROUP_BARRIERS.lock().unwrap_or_else(|e| e.into_inner());
+    *seen.get_or_insert_with(HashMap::new).entry((kind, values)).or_default() += 1;
 }
 
 /// Whether an experiment on barriers is on (`VICTORY_BARRIER_TEST`): bit 0
@@ -912,7 +928,7 @@ mod command_tests {
     #[test]
     fn every_counter_is_named() {
         use super::{C, COUNTERS, NAMES};
-        assert_eq!(C::TakenPartBytes as usize + 1, NAMES.len());
+        assert_eq!(C::GroupsOther as usize + 1, NAMES.len());
         assert_eq!(NAMES[C::Frames as usize], "Frames");
         assert!(NAMES.len() <= COUNTERS);
     }
@@ -1292,8 +1308,9 @@ fn log_memory() {
         );
     }
     let targets = crate::resource::targets_census();
+    let [targets_made, targets_released] = crate::resource::TARGET_TEXTURES.each_ref().map(|n| n.load(Relaxed));
     tracing::info!(
-        "host copies the sweep never lets go: {} the host renders to or writes {:.0} MB ({} of them placed {:.0} MB);          of them {} have title memory that is not mapped now {:.0} MB, {} were not used for 30 s and are held by no          list and no slot {:.0} MB, {} are both {:.0} MB; and {} copies of textures the title fills that the host          copied into {:.0} MB",
+        "host copies the sweep never lets go: {} the host renders to or writes {:.0} MB ({} of them placed {:.0} MB);          of them {} have title memory that is not mapped now {:.0} MB, {} were not used for 30 s and are held by no          list and no slot {:.0} MB, {} are both {:.0} MB; and {} copies of textures the title fills that the host          copied into {:.0} MB. Of the first, {} whose title memory holds another target views there show {:.0} MB and {} whose title          memory is not mapped now, placed or not, {:.0} MB; title textures the host renders to or writes since the          start: {targets_made} made, {targets_released} released",
         targets[0],
         mb(targets[1]),
         targets[10],
@@ -1306,6 +1323,10 @@ fn log_memory() {
         mb(targets[7]),
         targets[8],
         mb(targets[9]),
+        targets[12],
+        mb(targets[13]),
+        targets[14],
+        mb(targets[15]),
     );
     {
         use std::sync::atomic::Ordering::Relaxed;
@@ -2030,6 +2051,23 @@ pub(crate) fn log(frames: f64) {
         barrier_test()
     );
     barrier_next();
+    tracing::info!(
+        "  the title's barrier group calls, per frame: {:.0} end an unordered access, {:.0} only begin one, \
+         {:.0} name none",
+        c[C::GroupsEndWrites as usize],
+        c[C::GroupsBeginWrites as usize],
+        c[C::GroupsOther as usize]
+    );
+    let barriers = GROUP_BARRIERS.lock().unwrap_or_else(|e| e.into_inner()).take();
+    let mut barriers: Vec<_> = barriers.into_iter().flatten().collect();
+    barriers.sort_by_key(|&(_, n)| std::cmp::Reverse(n));
+    for ((kind, [sync_before, sync_after, before, after]), n) in barriers.into_iter().take(24) {
+        tracing::info!(
+            "  barriers in groups: {:.1} a frame of kind {kind} (0 global, 1 texture, 2 buffer), sync \
+             {sync_before:#x} -> {sync_after:#x}, access {before:#x} -> {after:#x}",
+            n as f64 / frames
+        );
+    }
     // What is compared after submissions, largest first, and how much of
     // it shaders had written.
     let compared = COMPARED.lock().unwrap_or_else(|e| e.into_inner()).take();

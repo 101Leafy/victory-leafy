@@ -106,6 +106,10 @@ pub(crate) struct Shadow {
     wc: AtomicU8,
     /// A window in card memory the CPU maps ([`window_mapped_for`]).
     mapped: bool,
+    /// A copy by address ([`by_address`]) whose card side lies in the card's
+    /// own memory: its bytes are counted in [`BY_ADDRESS_CARD_BYTES`] until
+    /// it goes.
+    by_address_card: bool,
     /// With `crate::inplace`: not a copy at all. `buffer` is placed in a
     /// heap opened on the title memory itself, so shaders read and write
     /// the title's own bytes and nothing is copied either way. The heap,
@@ -243,6 +247,23 @@ fn resolve_card_limits(
     (min_bytes, max_bytes)
 }
 
+/// The least size `VICTORY_CARD_BUFFERS_MIN_KB` may set, `asked` bytes, over
+/// the budget-scaled `default` minimum. Under 10 GiB of local budget (8 GB
+/// cards, budget about 7.1 GB) it keeps the default: the launchers set 64 KiB
+/// for every card, and on an RTX 5070 Laptop 8 GB, Series S, that put the
+/// title's small buffers on the card past its budget, frames went from about
+/// 220-290 ms to 310-340 ms and faces were missing and vehicles drawn several
+/// times over (the same overflow an RX 7600 8 GB saw, fxceless/victory-fork
+/// #1417). 12 GB cards (budget about 11 GB) keep what they asked for.
+fn min_kb_floor(default: u64, asked: u64, local_vram_budget: Option<u64>) -> u64 {
+    const SMALL_CARD: u64 = 10 << 30;
+    if local_vram_budget.is_some_and(|b| b < SMALL_CARD) {
+        asked.max(default)
+    } else {
+        asked
+    }
+}
+
 /// The smallest title buffer whose copy goes to the card's memory, and the
 /// most bytes of such copies (their "before" twins not counted: a copy
 /// shaders write takes its size twice), both in bytes:
@@ -268,7 +289,15 @@ fn card_limits() -> (u64, u64) {
         if let Some(kib) = std::env::var("VICTORY_CARD_BUFFERS_MIN_KB").ok().and_then(|v| v.trim().parse::<u64>().ok())
             && kib > 0
         {
-            min_bytes = kib << 10;
+            let asked = kib << 10;
+            min_bytes = min_kb_floor(min_bytes, asked, vram_budget);
+            if min_bytes != asked {
+                tracing::warn!(
+                    asked_kb = kib,
+                    kept_kb = min_bytes >> 10,
+                    "VICTORY_CARD_BUFFERS_MIN_KB left out: on a card with under 10 GiB of budget the small copies overflow it"
+                );
+            }
         }
         if card_all() {
             min_bytes = 0;
@@ -285,6 +314,20 @@ fn card_limits() -> (u64, u64) {
 
 /// Bytes alive of copies' card sides, and of their "before" twins.
 static CARD_BYTES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// Bytes alive of title-memory-by-address (RT BVH) arenas placed in local
+/// VRAM: what [`by_address`] holds against `VICTORY_MEMORY_CARD_MB`, given
+/// back when such a copy goes.
+static BY_ADDRESS_CARD_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Takes `len` bytes of `counter`'s room if they keep it at `most` or under.
+fn take_card_room(counter: &AtomicU64, len: u64, most: u64) -> bool {
+    if counter.fetch_add(len, Ordering::Relaxed) + len <= most {
+        return true;
+    }
+    counter.fetch_sub(len, Ordering::Relaxed);
+    false
+}
 
 /// Whether the texture queue leaves room on the card for the card copies
 /// of title buffers that are not made yet
@@ -416,7 +459,8 @@ pub(crate) fn card_stats() -> [u64; 10] {
 /// for each 64 KiB piece (a copy that does not start on a piece boundary
 /// has one piece more).
 pub(crate) fn card_hash_bytes(size: u64) -> u64 {
-    (size / PIECE as u64 + 2) * 16
+    let each = if crate::host::card_pages() { 64 * 16 } else { 16 };
+    (size / PIECE as u64 + 2) * each
 }
 
 /// A buffer of `size` bytes in the card's memory for a title buffer's
@@ -1196,6 +1240,22 @@ fn card_piece_of(start: usize, len: usize, span: &CardSpan, i: u32) -> (usize, u
     (lo.max(span.from as usize), hi.min(span.to as usize))
 }
 
+/// The runs of `lo..hi` in the pages of `mask`, page p `base + 4096 * p` on.
+fn pages_of(base: usize, lo: usize, hi: usize, mask: u16) -> Vec<(usize, usize)> {
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    for p in (0..16).filter(|p| mask & (1 << p) != 0) {
+        let (a, b) = ((base + p * 4096).max(lo), (base + (p + 1) * 4096).min(hi));
+        if a >= b {
+            continue;
+        }
+        match runs.last_mut() {
+            Some(last) if last.1 == a => last.1 = b,
+            _ => runs.push((a, b)),
+        }
+    }
+    runs
+}
+
 /// The offsets [`Shadow::card_hashed`] gives, for a card's buffer of `size`
 /// bytes for title memory from `start` on.
 fn card_hashed_of(start: usize, size: usize, piece: usize) -> (usize, usize) {
@@ -1205,7 +1265,16 @@ fn card_hashed_of(start: usize, size: usize, piece: usize) -> (usize, usize) {
 
 #[cfg(test)]
 mod card_tests {
-    use super::{CardSpan, PIECE, card_hashed_of, card_piece_of, card_span_of, joined, joined_piece_runs};
+    use super::{CardSpan, PIECE, card_hashed_of, card_piece_of, card_span_of, joined, joined_piece_runs, pages_of};
+
+    /// Changed pages come down as runs, cut to what the range holds.
+    #[test]
+    fn changed_pages_are_fetched_as_runs() {
+        assert_eq!(pages_of(0, 0, 65536, 0b1011), vec![(0, 8192), (12288, 16384)]);
+        assert_eq!(pages_of(0x1000, 0x1800, 0x3800, 0b11), vec![(0x1800, 0x3000)]);
+        assert_eq!(pages_of(0, 0, 0x800, 0b10), Vec::<(usize, usize)>::new());
+        assert_eq!(pages_of(0, 0, 65536, 0x8000), vec![(61440, 65536)]);
+    }
 
     /// `card_dirty` takes the copies touched since its last call, from the
     /// list they went into when touched ([`super::TOUCHED`]), each once, and
@@ -3277,6 +3346,10 @@ fn under_wide() -> bool {
 /// shortcut: a piece with very many runs has them joined over small gaps,
 /// where the old race is left.
 fn put_changed(at: usize, title: &[u8], merged: &[u8]) -> usize {
+    // A size answered at the builder's call stays: the builder's own store
+    // lands frames later (`crate::dxr`).
+    let kept = crate::dxr::keep_answers(at, title, merged);
+    let merged = kept.as_deref().unwrap_or(merged);
     let put = put_bytes(at, title, merged);
     crate::watch::told(&changed_spans(at, title, merged));
     put
@@ -3616,6 +3689,9 @@ impl Drop for Shadow {
             CARD_BYTES[0].fetch_sub(self.width(), Ordering::Relaxed);
         }
         if let Some(card) = &mut self.card {
+            if self.by_address_card {
+                BY_ADDRESS_CARD_BYTES.fetch_sub(card.size, Ordering::Relaxed);
+            }
             if window {
                 WINDOW_CARD_BYTES.fetch_sub(card.size, Ordering::Relaxed);
             } else {
@@ -4473,6 +4549,7 @@ impl Shadow {
             changes_only: Default::default(),
             wc: AtomicU8::new(0),
             mapped: false,
+            by_address_card: false,
             place: None,
         }
     }
@@ -4782,6 +4859,8 @@ impl Shadow {
         let Some(first) = first_difference(now, held) else {
             return 0;
         };
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::BackDiffer, 1);
         let last = last_difference(now, held).unwrap_or(first);
         let (at, n) = (at + first, last + 1 - first);
         let (now, held) = (&now[first..=last], &mut held[first..=last]);
@@ -5854,6 +5933,17 @@ impl Shadow {
         card_piece_of(self.start as usize, self.len as usize, span, i)
     }
 
+    /// Of piece `i` of `span`, what lies in the pages `mask` names (bit p:
+    /// the 4 KiB from 4 KiB times p on from where the card hashes the piece),
+    /// joined where they touch. All of the piece for a full mask.
+    pub(crate) fn card_pages(&self, span: &CardSpan, i: u32, mask: u16) -> Vec<(usize, usize)> {
+        let (lo, hi) = self.card_piece(span, i);
+        if mask == u16::MAX {
+            return vec![(lo, hi)];
+        }
+        pages_of(self.card_hashed(span.first + i).0, lo, hi, mask)
+    }
+
     /// The piece that holds offset `at`.
     pub(crate) fn card_piece_of(&self, at: usize) -> u32 {
         self.pieces(at, at + 1).start as u32
@@ -5940,6 +6030,8 @@ impl Shadow {
             }
             return 0;
         };
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::BackDiffer, 1);
         let last = last_difference(gpu, old).unwrap_or(first);
         let (at, n) = (at + first, last + 1 - first);
         let (gpu, old) = (&gpu[first..=last], &mut old[first..=last]);
@@ -6052,6 +6144,8 @@ impl Shadow {
         let Some(first) = first_difference(gpu, held) else {
             return 0;
         };
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::BackDiffer, 1);
         let last = last_difference(gpu, held).unwrap_or(first);
         let (at, n) = (at + first, last + 1 - first);
         let (gpu, held) = (&gpu[first..=last], &mut held[first..=last]);
@@ -6903,21 +6997,25 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
         return None;
     }
     // At most so much on the card's own memory (4 GiB unless
-    // `VICTORY_MEMORY_CARD_MB` says otherwise), and while it has room; past
-    // that the side shaders see is in the PC's memory.
+    // `VICTORY_MEMORY_CARD_MB` says otherwise) of copies alive, and while it
+    // has room; past that the side shaders see is in the PC's memory.
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    static USED: AtomicU64 = AtomicU64::new(0);
     let most = *MOST.get_or_init(|| {
         let mb = std::env::var("VICTORY_MEMORY_CARD_MB").ok().and_then(|v| v.trim().parse::<u64>().ok());
         mb.unwrap_or(4096) << 20
     });
     let room = host.video_memory().is_none_or(|[budget, used, ..]| used + len < budget / 100 * 97);
     let (staging, data) = host.shared_buffer(len)?;
-    let on_card = if room && USED.fetch_add(len, Ordering::Relaxed) + len <= most {
-        host.uav_buffer(len)
+    let on_card = if room && take_card_room(&BY_ADDRESS_CARD_BYTES, len, most) {
+        let made = host.uav_buffer(len);
+        if made.is_none() {
+            BY_ADDRESS_CARD_BYTES.fetch_sub(len, Ordering::Relaxed);
+        }
+        made
     } else {
         None
     };
+    let by_address_card = on_card.is_some();
     let buffer = match on_card {
         Some(buffer) => buffer,
         None => host.shared_buffer(len)?.0,
@@ -6930,6 +7028,7 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
     let mut shadow = Shadow::new(buffer, data, gpu, start, len);
     shadow.window = true;
+    shadow.by_address_card = by_address_card;
     shadow.changes_only.store(true, Ordering::Relaxed);
     shadow.card = Some(Card {
         staging: Some(staging),
@@ -7773,9 +7872,23 @@ mod write_combined_tests {
 #[cfg(test)]
 mod window_tests {
     use super::{
-        WINDOW, cover, default_card_limits_mb, grid, holder, longest_tail, resolve_card_limits,
-        tail_of, trim, window_of,
+        WINDOW, cover, default_card_limits_mb, grid, holder, longest_tail, min_kb_floor,
+        resolve_card_limits, tail_of, trim, window_of,
     };
+
+    /// `VICTORY_CARD_BUFFERS_MIN_KB` cannot take an 8 GB card under its
+    /// default minimum; 12 GB and larger cards, and unknown budgets, get it.
+    #[test]
+    fn small_cards_keep_their_buffer_floor() {
+        const GIB: u64 = 1 << 30;
+        const MIB: u64 = 1 << 20;
+        let asked = 64 << 10;
+        assert_eq!(min_kb_floor(16 * MIB, asked, Some(7123 * MIB)), 16 * MIB);
+        assert_eq!(min_kb_floor(16 * MIB, 32 * MIB, Some(7123 * MIB)), 32 * MIB, "a larger floor is kept");
+        assert_eq!(min_kb_floor(16 * MIB, asked, Some(11229 * MIB)), asked);
+        assert_eq!(min_kb_floor(4 * MIB, asked, Some(16 * GIB)), asked);
+        assert_eq!(min_kb_floor(16 * MIB, asked, None), asked);
+    }
 
     #[test]
     fn card_limits_scale_with_local_vram_budget() {
@@ -8005,7 +8118,7 @@ mod window_tests {
 
 #[cfg(test)]
 mod card_merge_tests {
-    use super::{Card, Shadow};
+    use super::{Card, SentRuns, Shadow};
     use std::sync::Mutex;
     use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
     use windows::Win32::Graphics::Direct3D12::*;
@@ -8075,13 +8188,20 @@ mod card_merge_tests {
                 plain: None,
                 before: Mutex::new(None),
                 dirty: Mutex::default(),
-                sent: Mutex::new(vec![(title_byte, title_byte + 1, 7)]),
+                sent: Mutex::new({
+                    let mut sent = SentRuns::default();
+                    sent.note(7, vec![(title_byte, title_byte + 1)]);
+                    sent
+                }),
+                touched: Default::default(),
+                me: Default::default(),
+                changed_at: Default::default(),
                 // 0: no card bytes counted (`Drop` takes them off again).
                 size: 0,
             });
             // As `card_dirty` with the mark set by the old-way fetch.
             if let Some(card) = &shadow.card {
-                card.sent.lock().unwrap().retain(|s| s.2 > mark);
+                card.sent.lock().unwrap().forget(mark);
             }
             // Flight 6's slot: the card's bytes behind its lists, before send 7.
             let mut slot = content.clone();

@@ -24,6 +24,8 @@ mod compose;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
+#[cfg(windows)]
+mod dxc;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod sidetime;
 #[cfg(all(windows, feature = "diagnostics"))]
@@ -34,6 +36,8 @@ pub mod descriptor;
 pub mod device;
 #[cfg(windows)]
 mod draw;
+#[cfg(windows)]
+pub mod dxr;
 pub mod dxgi;
 pub mod fence;
 pub mod frame;

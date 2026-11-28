@@ -3659,6 +3659,32 @@ impl HostHeap {
         }
     }
 
+    /// Whether slot `index`, made from the placed view `view` of writable
+    /// memory, views a resource other than the one at that address now
+    /// (`VICTORY_PLACED_OWNER=1`).
+    fn owner_changed(&self, index: u32, view: &View) -> bool {
+        if !placed_owner() || !matches!(view, View::Placed(_, r, _) if r[0] != 1 && r[12] & 4 != 0) {
+            return false;
+        }
+        let owner = placed_texture(view);
+        let candidates = match owner.as_ref().map(|p| &p.view) {
+            Some(View::Shader(resource, _)) => [crate::resource::host_resource(*resource as _), None, None],
+            Some(View::Unordered(resource, _, _)) => {
+                let resource = *resource as crate::object::This;
+                [
+                    crate::resource::host_resource(resource),
+                    crate::resource::twin_resource(resource),
+                    crate::resource::twin_plane_resource(resource),
+                ]
+            }
+            _ => [None; 3],
+        };
+        match self.kept_in(index) {
+            Some(shown) => !candidates.into_iter().flatten().any(|c| *c == shown),
+            None => owner.is_some(),
+        }
+    }
+
     /// What slot `index` views.
     fn kept_in(&self, index: u32) -> Option<ID3D12Resource> {
         self.kept.get(index as usize)?.lock().unwrap_or_else(|e| e.into_inner()).clone()
@@ -4086,6 +4112,7 @@ impl HostHeap {
             && quick_mirror()
             && self.quick.get(index as usize).is_some_and(|k| k.load(std::sync::atomic::Ordering::Acquire) == key)
             && let Some(view) = view_at(i, generation)
+            && !(for_draw && self.owner_changed(index, &view))
         {
             return Some(view);
         }
@@ -4106,7 +4133,10 @@ impl HostHeap {
             }
             return None;
         };
-        if shown != key {
+        // A title can replace the resource at a placed UAV's address without
+        // changing a single byte of its descriptors (its SRV's either).
+        let changed_owner = shown == key && for_draw && self.owner_changed(index, &view);
+        if shown != key || changed_owner {
             // Views of other textures in the memory this one describes
             // are stale: their host slots read nothing from here on, and
             // let go of the host copies they held.
@@ -5717,6 +5747,11 @@ pub(crate) fn pop_causes() -> [u64; 4] {
 
 /// Whether a slot already made from its record is told so without the lock
 /// (`VICTORY_QUICK_MIRROR=0`: with it, as before).
+fn placed_owner() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PLACED_OWNER").is_some_and(|v| v == "1"))
+}
+
 fn quick_mirror() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_QUICK_MIRROR").is_none_or(|v| v != "0"))
@@ -6759,8 +6794,15 @@ mod tests {
         let Some(host) = host() else {
             return; // no host GPU here
         };
-        let memory = vec![0u64; 1 << 13];
-        let start = (memory.as_ptr() as u64).next_multiple_of(4096);
+        // The host copy of this memory is the 4 MiB window over it
+        // (`crate::shadow`), and a view is off its elements by where it lies
+        // in that copy. The views are placed from a window's start, so that
+        // this does not depend on where the allocator put `memory`: from a
+        // page start, the 456-byte structured view at +8 lay on its elements
+        // in some runs (about one in ten), and got the window.
+        const WINDOW: u64 = 4 << 20;
+        let memory = vec![0u64; (2 * WINDOW / 8) as usize];
+        let start = (memory.as_ptr() as u64).next_multiple_of(WINDOW);
         // SAFETY: a plain CPU-side heap of one view.
         let cpu: ID3D12DescriptorHeap = unsafe {
             host.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {

@@ -84,6 +84,8 @@
 //!   It binds nothing.
 
 mod bitcode;
+#[cfg(test)]
+mod census_tests;
 pub(crate) mod container;
 #[cfg(all(test, windows))]
 mod cube_lod_tests;
@@ -157,7 +159,7 @@ pub use shader::{
 /// The first run after a source change without a raise translates its first
 /// 64 cached shaders again and compares the entries byte for byte; if one
 /// differs, that build keys on the whole source instead, as before.
-pub const VERSION: u32 = 35;
+pub const VERSION: u32 = 37;
 
 static HELPER_LANE_WAVES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 

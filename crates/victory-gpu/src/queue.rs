@@ -1012,7 +1012,7 @@ fn system_timestamp() -> u64 {
 /// Frames presented so far.
 static FRAMES: AtomicU64 = AtomicU64::new(0);
 
-#[cfg(feature = "diagnostics")]
+/// Frames presented so far (also for `crate::host::awake`, in every build).
 pub(crate) fn presented() -> u64 {
     FRAMES.load(Ordering::Relaxed)
 }
@@ -1062,6 +1062,8 @@ extern "system" fn present(
     }
     #[cfg(all(windows, feature = "diagnostics"))]
     planes_seen(frame, planes, plane_parameters);
+    #[cfg(all(windows, feature = "diagnostics"))]
+    crate::capture::poll_request(frame);
     if frame.is_power_of_two() {
         let (draws, dispatches) = crate::list::take_counts();
         #[cfg(windows)]
@@ -1125,7 +1127,7 @@ extern "system" fn present(
             None
         };
         let resource = texture.as_ref().map_or(0, |t| t.0);
-        let overlay = (crate::compose::on() && planes > 1 && !plane_parameters.is_null())
+        let overlay = (crate::compose::passed() && planes > 1 && !plane_parameters.is_null())
             .then(|| second_plane(plane_parameters))
             .flatten()
             .filter(|&over| over as usize != resource)
@@ -1157,7 +1159,7 @@ extern "system" fn present(
         const COPY_SOURCE: u32 = 0x800;
         let state = crate::resource::host_transition(resource, COPY_SOURCE)
             .map_or(COPY_SOURCE, |(_, before)| before);
-        let overlay = (crate::compose::on() && planes > 1)
+        let overlay = (crate::compose::passed() && planes > 1)
             .then(|| second_plane(plane_parameters))
             .flatten()
             .filter(|&over| over != resource)
@@ -1228,6 +1230,9 @@ fn ab_frame_ends() {
         if switch == "VICTORY_ASYNC_SUBMIT" && was && !will {
             behind::leave();
         }
+        if switch == "VICTORY_CCD_CORES" && was != will {
+            crate::cores::settle();
+        }
     });
 }
 
@@ -1239,6 +1244,10 @@ fn frame_ends() {
     crate::ab::presented(|switch, was, will| {
         if switch == "VICTORY_ASYNC_SUBMIT" && was && !will {
             behind::leave();
+        }
+        // Where our threads run follows the switch as it changes.
+        if switch == "VICTORY_CCD_CORES" && was != will {
+            crate::cores::settle();
         }
     });
 }

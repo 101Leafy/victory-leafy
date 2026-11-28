@@ -5104,6 +5104,33 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
+    /// A scalar move copies all 32 bits of each word whatever EXEC holds: the
+    /// number a word of a console lane mask was copied from, through `s_mov`s,
+    /// where that word already has one (wave64 only). A join ends the search.
+    fn copied_mask_word(&self, mut v: Value) -> Option<Value> {
+        let low = self.x.st.highs.get(&v).copied().unwrap_or(v);
+        if self.mask_data != MaskData::Console || self.s.wave_size != Some(64)
+            || !self.x.st.masks.contains_key(&low) || self.x.st.active.contains(&low)
+        {
+            return None;
+        }
+        loop {
+            let block = &self.x.p.blocks[*self.def_block.get(&v)?];
+            let inst = block.insts.iter().find(|i| i.writes.iter().any(|&(_, out)| out == v))?;
+            if !matches!(inst.name(), "s_mov_b32" | "s_mov_b64") {
+                return None;
+            }
+            let Fields::Sop { dst: Some(Operand::Scalar { code: dst, dwords }), ref src, .. } =
+                inst.fields else { return None };
+            let [Operand::Scalar { code: src, .. }] = src.as_slice() else { return None };
+            let word = (0..dwords).find(|half| inst.write(Reg::S(dst + half)) == Some(v))?;
+            v = inst.read(Reg::S(src + word))?;
+            if matches!(self.vals.get(&v), Some(Val::I32(_))) {
+                return Some(v);
+            }
+        }
+    }
+
     /// A dword of a lane mask as a number: the ballot of the lanes' bits,
     /// taken in the block that writes the mask (see [`MaskData`]).
     fn mask_dword(&mut self, v: Value) -> Result<V, Why> {
@@ -5113,6 +5140,9 @@ impl<'a> Lower<'a> {
         };
         let &m = self.x.st.masks.get(&lo).ok_or(LANE_MASK)?;
         if self.elsewhere(lo) {
+            if let Some(source) = self.copied_mask_word(v) {
+                return self.i32_of(source);
+            }
             if self.exchange.is_some() && !self.local {
                 need(self.def_block.get(&lo).copied().unwrap_or(0));
             }
@@ -15084,6 +15114,28 @@ impl<'a> Lower<'a> {
             for &a in &p.blocks[b].phis[i].args {
                 if self.phi_at.contains_key(&a) && self.read_phis.insert(a) {
                     work.push(a);
+                }
+            }
+        }
+        // A numeric join can take a scalar copy of another join's mask: keep
+        // the words it was copied from and the joins feeding them before any
+        // join is filled, or an earlier one gets the unused-value fallback.
+        if self.mask_data == MaskData::Console && self.s.wave_size == Some(64) {
+            let mut work: Vec<_> = self.read_phis.iter().copied().collect();
+            let mut copied = HashSet::new();
+            while let Some(v) = work.pop() {
+                let Some(&(b, i)) = self.phi_at.get(&v) else { continue };
+                for &arg in &p.blocks[b].phis[i].args {
+                    let source = match self.vals.get(&arg) {
+                        Some(Val::I32(_)) => None,
+                        _ => self.copied_mask_word(arg),
+                    };
+                    let Some(source) = source.or_else(|| copied.contains(&v).then_some(arg))
+                    else { continue };
+                    if self.phi_at.contains_key(&source) && copied.insert(source) {
+                        self.read_phis.insert(source);
+                        work.push(source);
+                    }
                 }
             }
         }

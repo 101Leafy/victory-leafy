@@ -269,6 +269,21 @@ const BAKE_SYNC_PIXEL_SHADERS: [&str; 7] = [
 /// [`bake_sync`]: they catch pixel shaders not named above.
 const BAKE_GEOMETRY_SHADERS: [&str; 2] = ["089d6271be6650ef", "d4111a6e6ea49d91"];
 
+/// Whether `shader` is a program of the title's decoration bake.
+fn bake_shader(shader: &crate::pipeline::Shader) -> bool {
+    let h = shader.hash.as_str();
+    BAKE_SYNC_PIXEL_SHADERS.contains(&h) || BAKE_GEOMETRY_SHADERS.contains(&h)
+}
+
+/// Whether a draw with the title pipeline `pipeline` bound gets the pass of
+/// its own ahead of a bake ([`State::early_textures`]) by its programs:
+/// written-down lists (`crate::list::thin`) translate such draws at the
+/// title's call. The bakes [`State::is_bake_draw`] finds by their targets
+/// alone are not known at the bind.
+pub(crate) fn bake_pipeline(pipeline: This) -> bool {
+    early_budgets().1 > 0 && crate::pipeline::shaders_any(pipeline, bake_shader)
+}
+
 /// Since the start: early runs of the texture pass, and those of them
 /// made for a bake draw.
 pub(crate) static EARLY_TEXTURE_PASSES: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
@@ -1674,6 +1689,34 @@ impl State {
         crate::draw::depth_bounds(list, min, max);
     }
 
+    /// A pass of ours was recorded into the title's list
+    /// (`HostList::planes_now`): it set a heap, a graphics root signature, a
+    /// pipeline, a depth target, a viewport, a scissor and the topology.
+    /// The title's targets, viewports, scissors and topology are set again
+    /// here; heaps, root signatures and pipeline by the next `bind`. The
+    /// tables stay (they are in this host list), and the pass leaves the
+    /// blend factor, stencil reference and depth bounds alone.
+    fn after_our_pass(&mut self, list: &HostList) {
+        self.host_pipeline = 0;
+        self.host_roots = [0; 2];
+        self.host_heaps = [0; 2];
+        self.host_heaps_set = false;
+        if self.topology_set {
+            self.set_topology(list, self.topology);
+        }
+        self.host_targets = None;
+        if self.targets_set {
+            self.bind_targets(list);
+        }
+        if !self.viewports.is_empty() {
+            crate::draw::viewports(list, &self.viewports);
+        }
+        if !self.scissors.is_empty() {
+            let rects = std::mem::take(&mut self.scissors);
+            self.set_scissors(list, &rects);
+        }
+    }
+
     /// `list` is a new host list that continues the title's list (it was
     /// cut at a wait for a memory value, `crate::list::cut`): a new host
     /// list has nothing set, so what the title set so far is set again.
@@ -1891,6 +1934,9 @@ impl State {
             return false;
         }
         let Some(p) = crate::pipeline::host_pipeline_for(self.pipeline as This, &self.target_formats) else {
+            if self.pipeline == 0 {
+                once!("a draw with no pipeline set is dropped");
+            }
             return false;
         };
         if p.compute || p.mesh != mesh {
@@ -1937,6 +1983,10 @@ impl State {
         if indexed {
             let v = self.index;
             let Some(shadow) = crate::shadow::find_any(v.address, u64::from(v.size)) else {
+                once!(
+                    address = format_args!("{:#x}", v.address),
+                    "an indexed draw whose index buffer has no host copy is dropped"
+                );
                 return refuse(Refused::NoIndex);
             };
             shadow.refresh(list, v.address, u64::from(v.size));
@@ -2002,6 +2052,11 @@ impl State {
     /// False if the draw or dispatch must not run: a root SRV it reads
     /// could not be given a view.
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+        // Depth planes this list's shaders wrote (the material classes),
+        // drawn into their planes before anything of the title's is set.
+        if list.planes_now() {
+            self.after_our_pass(list);
+        }
         let l = &list.list;
         #[cfg(feature = "diagnostics")]
         let began = std::time::Instant::now();
@@ -2393,6 +2448,7 @@ impl State {
             None => {
                 let shadow = address.and_then(|a| find(a).map(|s| (a, s)));
                 let Some(index) = dynamic_slots(key.0, host, 1) else {
+                    once!("a root UAV found no free dynamic view slot: the draw is dropped");
                     return false;
                 };
                 self.dynamic.push((key.0, host.id(), index, 1));
@@ -2464,6 +2520,7 @@ impl State {
             None => {
                 let shadow = address.and_then(|a| crate::shadow::find(a, 1).map(|s| (a, s)));
                 let Some(index) = dynamic_slots(key.0, host, 1) else {
+                    once!("a root SRV found no free dynamic view slot: the draw is dropped");
                     return false;
                 };
                 self.dynamic.push((key.0, host.id(), index, 1));
@@ -2755,10 +2812,7 @@ impl State {
     /// (`>= 512x512`) so unseen NPC/head/clothing shader permutations never
     /// bake `neutral()` or `null` stand-ins into permanent ped textures.
     fn is_bake_draw(&self, p: &HostPipeline) -> bool {
-        if p.stages.iter().any(|s| {
-            let h = s.shader.hash.as_str();
-            BAKE_SYNC_PIXEL_SHADERS.contains(&h) || BAKE_GEOMETRY_SHADERS.contains(&h)
-        }) {
+        if p.stages.iter().any(|s| bake_shader(&s.shader)) {
             return true;
         }
         self.depth == 0
@@ -3826,6 +3880,8 @@ impl State {
         }
         if !self.bind(list, p, true) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            crate::pipeline::note_drop(self.pipeline as This);
             // A stage of the structure builder that cannot be bound is a
             // dropped stage: the others stop too.
             if crate::pipeline::is_builder(self.pipeline as This) {
@@ -3891,7 +3947,9 @@ impl State {
         #[cfg(feature = "diagnostics")]
         crate::copystat::lap(crate::copystat::C::DrawAfterNs, began);
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
-        self.after_dispatch(list, p);
+        if ![x, y, z].contains(&0) {
+            self.after_dispatch(list, p);
+        }
     }
 
     /// What follows a dispatch of `p`, direct or indirect: the stand-in for
@@ -3948,6 +4006,22 @@ impl State {
                 })
             }),
         };
+        // The optional neutral probe pass has no depth dependency. It has
+        // its own root signature and must also work when real depth exists.
+        let neutral_view = || {
+            let Some(Root::Table(table)) = self.roots_ref(true).get(usize::from(LIGHT.0)) else { return false };
+            let Some(view) = crate::descriptor::view(table + u64::from(LIGHT.1) * 4) else { return false };
+            match crate::descriptor::host::placed_texture(&view).map_or(view, |placed| placed.view) {
+                View::Unordered(_, _, words) => crate::ambient::neutral_uav(words.as_ref()),
+                _ => false,
+            }
+        };
+        if role == Role::Resolve && crate::ambient::neutral_level().is_some() && neutral_view()
+            && let Some((desc, handle)) = image.as_ref()
+            && crate::ambient::neutral_after(list, role, desc, *handle)
+        {
+            return true;
+        }
         let Some((of, image)) = image else {
             once!(?role, "no stand-in for the indirect light: missing image UAV");
             return false;
@@ -7267,7 +7341,7 @@ void lighting_consume(uint3 id : SV_DispatchThreadID) {
         };
         let (table, scratch) = crate::indirect::open_batch(&list, (1, &src), &[], true).unwrap();
         let mut state = State::default();
-        state.batch = Some(Batch { table, scratch: scratch.clone(), wrote: false });
+        state.batch = Some(Batch { table, scratch: scratch.clone(), wrote: false, anywhere: false });
         state.window = Some(Window {
             copy: 1,
             kind: 2,
@@ -7554,7 +7628,7 @@ void lighting_consume(uint3 id : SV_DispatchThreadID) {
                 state.host_pipeline = 0;
                 state.host_roots[1] = 0;
                 let at = table.place(1, offset, 2).unwrap();
-                state.batch = Some(Batch { table, scratch: scratch.clone(), wrote: false });
+                state.batch = Some(Batch { table, scratch: scratch.clone(), wrote: false, anywhere: false });
                 (scratch, at)
             };
 
