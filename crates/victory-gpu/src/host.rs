@@ -940,9 +940,36 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
 static HOST: OnceLock<Option<Host>> = OnceLock::new();
 
 /// The host GPU if it is made already.
-#[cfg(feature = "diagnostics")]
 pub(crate) fn made_host() -> Option<&'static Host> {
     HOST.get()?.as_ref()
+}
+
+/// Capture the budgets at the failing reset; an earlier periodic sample may
+/// describe a different frame. The original error survives unavailable counters.
+fn reset_error(part: &str, error: &windows::core::Error) -> String {
+    use std::fmt::Write;
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+
+    let mut text = format!("a host command {part} did not reset ({error})");
+    if error.code() == windows::Win32::Foundation::E_OUTOFMEMORY {
+        // SAFETY: plain data the call fills in.
+        let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+        m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+        // SAFETY: a sized structure.
+        if unsafe { GlobalMemoryStatusEx(&mut m) } != 0 {
+            let _ = write!(
+                text, "; available RAM {} MiB, available commit {} MiB",
+                m.ullAvailPhys >> 20, m.ullAvailPageFile >> 20
+            );
+        }
+        if let Some([local, shared]) = made_host().and_then(Host::video_memory_groups) {
+            let _ = write!(
+                text, "; DXGI usage/budget: local {}/{} MiB, non-local {}/{} MiB",
+                local[1] >> 20, local[0] >> 20, shared[1] >> 20, shared[0] >> 20
+            );
+        }
+    }
+    text
 }
 
 /// The host GPU, created on first use; `None` without one (a run then
@@ -1716,6 +1743,33 @@ mod tests {
         list.close();
         host.execute(&[&list]);
         list.reset();
+    }
+
+    #[test]
+    fn reset_error_preserves_the_operation_and_hresult() {
+        use windows::Win32::Foundation::{E_INVALIDARG, E_OUTOFMEMORY};
+        use windows::core::Error;
+        let oom = reset_error("allocator", &Error::from_hresult(E_OUTOFMEMORY));
+        assert!(oom.starts_with("a host command allocator did not reset"));
+        assert!(oom.contains("0x8007000E"));
+        let invalid = Error::from_hresult(E_INVALIDARG);
+        assert_eq!(reset_error("list", &invalid), format!("a host command list did not reset ({invalid})"));
+    }
+
+    #[test]
+    #[ignore = "requires a D3D12 adapter with DXGI memory budgets"]
+    fn reset_error_reports_live_memory_budgets() {
+        let device = host().expect("D3D12 adapter");
+        // SAFETY: the adapter belongs to the live device.
+        let desc = unsafe { device.adapter.as_ref().expect("DXGI adapter").GetDesc1() }.unwrap();
+        let n = desc.Description.iter().position(|&c| c == 0).unwrap_or(desc.Description.len());
+        eprintln!("D3D12 adapter: {}", String::from_utf16_lossy(&desc.Description[..n]));
+        let error = windows::core::Error::from_hresult(windows::Win32::Foundation::E_OUTOFMEMORY);
+        let report = reset_error("list", &error);
+        eprintln!("{report}");
+        for field in ["available RAM ", "available commit ", "DXGI usage/budget: local ", "non-local "] {
+            assert!(report.contains(field), "{report}");
+        }
     }
 
     #[test]
@@ -8060,13 +8114,12 @@ impl HostList {
             (readbacks.current, readbacks.used) = (0, 0);
         }
         // SAFETY: the list is not executing.
-        let reset = unsafe {
-            self.allocator
-                .Reset()
-                .and_then(|()| self.list.Reset(&self.allocator, None))
-        };
-        if let Err(e) = reset {
-            fail(format_args!("a host command list did not reset ({e})"));
+        if let Err(e) = unsafe { self.allocator.Reset() } {
+            fail(format_args!("{}", reset_error("allocator", &e)));
+        }
+        // SAFETY: the list is not executing and its allocator is ready.
+        if let Err(e) = unsafe { self.list.Reset(&self.allocator, None) } {
+            fail(format_args!("{}", reset_error("list", &e)));
         }
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::ResetNs, started.elapsed().as_nanos() as u64);
