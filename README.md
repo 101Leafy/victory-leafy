@@ -277,6 +277,7 @@ FSR, no upscaling of any kind, and no frame generation.
 Known issues:
 
 - The first run builds every shader and stutters for a while.
+- On that first run the first open world scene can stay black. From the second run on (2026-11-28) both opening scenes come up lit.
 - Cutscene faces don't animate yet: heads and bodies move, mouths and brows stay still. It is being fixed.
 
 ## Where it stood on 2026-11-26
