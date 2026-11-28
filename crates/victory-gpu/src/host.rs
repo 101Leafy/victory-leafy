@@ -1207,6 +1207,26 @@ fn host_adapter() -> Option<IDXGIAdapter> {
                 );
             }
         }
+        // VICTORY_MONITOR_CARD=1: of the cards with memory of their own, the
+        // first in Windows' order that a monitor is plugged into. A PC with
+        // two cards then plays on the one its monitor is on instead of
+        // sending every frame across to it.
+        if crate::switch::on("VICTORY_MONITOR_CARD") {
+            let mut index = 0;
+            while let Ok(a) = factory.EnumAdapters1(index) {
+                index += 1;
+                let Ok(desc) = a.GetDesc1() else { continue };
+                if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0
+                    || (desc.DedicatedVideoMemory as u64) < CARD_MEMORY
+                    || a.EnumOutputs(0).is_err()
+                {
+                    continue;
+                }
+                let name = adapter_name(&desc);
+                tracing::info!(adapter = %name, "host adapter (the card the monitor is on, VICTORY_MONITOR_CARD)");
+                return a.cast().ok();
+            }
+        }
         let high = factory
             .cast::<IDXGIFactory6>()
             .and_then(|f| {
@@ -1231,6 +1251,9 @@ fn adapter_name(desc: &DXGI_ADAPTER_DESC1) -> String {
 
 /// Whether `wanted` names `adapter`: a case-insensitive substring of its
 /// description, ignoring surrounding spaces. An empty `wanted` names none.
+/// Own memory from which a card counts as one of its own, not an integrated GPU.
+const CARD_MEMORY: u64 = 2 << 30;
+
 fn names_adapter(adapter: &str, wanted: &str) -> bool {
     let wanted = wanted.trim();
     !wanted.is_empty() && adapter.to_lowercase().contains(&wanted.to_lowercase())
