@@ -6090,7 +6090,9 @@ pub(crate) mod indirects;
 pub(crate) mod panel;
 #[cfg(feature = "diagnostics")]
 mod frames;
+mod font;
 mod lazy;
+mod menu;
 mod place;
 #[cfg(feature = "diagnostics")]
 pub(crate) mod pstats;
@@ -13009,6 +13011,7 @@ struct Presenter {
     composer: Option<crate::compose::Composer>,
     #[cfg(feature = "diagnostics")]
     panel: panel::Panel,
+    menu: menu::Menu,
     #[cfg(feature = "diagnostics")]
     frames: frames::Frames,
     /// The debug overlay (Ctrl+F10), drawn into each frame it shows.
@@ -13037,6 +13040,9 @@ fn frame_times_line(mut ms: Vec<f32>) {
         over(100.0)
     );
 }
+
+/// The last second's frame rate in tenths, for the F1 menu's line.
+pub(crate) static METER_FPS_TENTHS: AtomicU32 = AtomicU32::new(0);
 
 /// The frame rate, shown in the window's caption every second and logged
 /// every few seconds.
@@ -13123,6 +13129,7 @@ impl Meter {
         let drawn = crate::draw::drawn();
         let frames = f64::from(self.frames);
         let fps = frames / elapsed.as_secs_f64();
+        METER_FPS_TENTHS.store((fps * 10.0).round() as u32, Ordering::Relaxed);
         let ms = elapsed.as_secs_f64() * 1000.0 / frames;
         let draws = (drawn - self.drawn) as f64 / frames;
         (self.since, self.frames, self.drawn) = (std::time::Instant::now(), 0, drawn);
@@ -13676,6 +13683,7 @@ impl Host {
             let watched = if composed { None } else { crate::popwatch::take(&self.device, list, texture) };
             #[cfg(feature = "diagnostics")]
             p.panel.draw(self, copy, &back, (width, height), format);
+            p.menu.draw(self, copy, &back, (width, height), format);
             #[cfg(not(feature = "diagnostics"))]
             let _ = frame;
             if composed {
@@ -13731,6 +13739,7 @@ impl Host {
             p.frames.frame(self, presenting.elapsed());
             #[cfg(feature = "diagnostics")]
             p.panel.frame(line);
+            p.menu.frame();
             p.meter.frame(p.hwnd);
             #[cfg(feature = "diagnostics")]
             if line {
@@ -13821,6 +13830,7 @@ impl Host {
                 composer: None,
                 #[cfg(feature = "diagnostics")]
                 panel: panel::Panel::new(),
+                menu: menu::Menu::new(),
                 #[cfg(feature = "diagnostics")]
                 frames: frames::Frames::new(self),
                 overlay: crate::overlay::Overlay::default(),

@@ -1645,11 +1645,15 @@ mod host {
         }
 
         fn keys(&mut self) -> Vec<KeyState> {
-            let focus = focused();
+            // The F1 settings menu takes the keyboard while it is shown.
+            let menu = victory_gpu::SETTINGS_MENU_OPEN.load(std::sync::atomic::Ordering::Relaxed);
+            let focus = focused() && !menu;
             self.cursor(focus);
             let mut down = scripted();
             #[cfg(feature = "diagnostics")]
-            down.extend(self.kbm.keys(&self.counts));
+            if !menu {
+                down.extend(self.kbm.keys(&self.counts));
+            }
             if focus {
                 // Left/right modifier keys only, as devices report them; no
                 // mouse buttons (below 0x08).
