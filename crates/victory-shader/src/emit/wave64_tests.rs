@@ -1569,4 +1569,24 @@ fn lds_unresolved_dynamic_waw_stays_wave64_by_default_and_lowers_only_with_opt_i
         let mut dxil = shader.dxil.clone();
         v.validate(&mut dxil).unwrap();
     }
+/// A select on a lane mask held as a number takes the lane's own bit of it, so the program
+/// needs the console's lanes, as one reading the mask through a guard or as data does. It
+/// was lowered without them: in a release build each lane took the bit of its host lane
+/// (with no wave size, whatever the host's waves are); a debug build stopped on the
+/// assertion in `cross_lane`.
+#[test]
+fn a_select_on_a_mask_held_as_a_number_keeps_the_consoles_lanes() {
+    let words = [
+        0xBEEA_03FF, // s_mov_b32 vcc_lo, 0x55555555 (every other lane)
+        0x5555_5555,
+        0x7E0A_0281, // v_mov_b32 v5, 1
+        0x0200_0A80, // v_cndmask_b32 v0, 0, v5, vcc_lo
+        0x38 << 26 | 0x1C << 18,
+        0x80 << 24 | 2 << 16, // buffer_store_dword v0, off, s[8:11], 0
+    ];
+    // 64 threads in waves of 32: two console waves, and no LDS
+    let native = native_of(&words, false, 64);
+    let p = crate::spill::build(&native).expect("build");
+    let (wave, _) = lowered_with_wave(&native, &p, &HashSet::new());
+    assert_eq!(wave, Some(32));
 }
