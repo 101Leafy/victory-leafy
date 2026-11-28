@@ -234,6 +234,19 @@ pub(crate) fn preload(exe: &Path) {
     }
 }
 
+/// `path` without the verbatim prefix `fs::canonicalize` gives it on Windows:
+/// `\\?\C:\x` becomes `C:\x`, and a network share's `\\?\UNC\server\share\x`
+/// (or a mapped drive's) becomes `\\server\share\x`.
+fn without_verbatim_prefix(path: &Path) -> PathBuf {
+    let Some(text) = path.to_str() else {
+        return path.to_path_buf();
+    };
+    match text.strip_prefix(r"\\?\UNC\") {
+        Some(rest) => PathBuf::from(format!(r"\\{rest}")),
+        None => PathBuf::from(text.strip_prefix(r"\\?\").unwrap_or(text)),
+    }
+}
+
 /// `%LOCALAPPDATA%\victory`, or the folder `VICTORY_HOME` names.
 fn home() -> Result<PathBuf> {
     if let Some(home) = victory_core::config::home_override() {
@@ -857,9 +870,8 @@ pub(crate) fn prepare(o: &Play) -> Result<Ready> {
         })?,
     };
     anyhow::ensure!(exe.is_file(), "no {}", exe.display());
-    let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
-    // (Windows' own long form `\\?\C:\...` back to the plain one.)
-    let exe = PathBuf::from(exe.to_string_lossy().trim_start_matches(r"\\?\").to_owned());
+    let exe =
+        std::fs::canonicalize(&exe).map_or(exe, |canonical| without_verbatim_prefix(&canonical));
 
     check_shader_model()?;
 
@@ -1067,6 +1079,24 @@ mod tests {
         assert_eq!(
             restart_args(&plain, exe),
             r"play 'C:\Games\GTA VI''s\game_scarlett_master.exe' --res '1440' --dlss 'quality' --fg-type 'auto' --fps 1000"
+        );
+    }
+
+    #[test]
+    fn the_verbatim_prefix_goes_and_a_share_keeps_its_server() {
+        let plain = |p: &str| without_verbatim_prefix(Path::new(p));
+        assert_eq!(
+            plain(r"\\?\C:\Games\GTA6\game_scarlett_master.exe"),
+            Path::new(r"C:\Games\GTA6\game_scarlett_master.exe")
+        );
+        // What `canonicalize` gives a title on a network share or mapped drive: still a share.
+        assert_eq!(
+            plain(r"\\?\UNC\nas\games\GTA6\game_scarlett_master.exe"),
+            Path::new(r"\\nas\games\GTA6\game_scarlett_master.exe")
+        );
+        assert_eq!(
+            plain(r"D:\dump\game_scarlett_master.exe"),
+            Path::new(r"D:\dump\game_scarlett_master.exe")
         );
     }
 
