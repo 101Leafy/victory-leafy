@@ -115,6 +115,7 @@ fn build(translator: &str) -> [u8; 32] {
             "VICTORY_BVH_MISS",
             "VICTORY_NAN_SCRUB",
             "VICTORY_MEMORY_NEAR",
+            "VICTORY_LDS_BOUNDS_EXEMPT",
         ] {
             append_switch(&mut bytes, name, std::env::var_os(name).as_deref());
         }
@@ -380,11 +381,15 @@ pub(crate) fn host_shader_finite(container: &[u8], mask: u8) -> Result<HostShade
 fn host_shader_by(container: &[u8], mask: u8) -> Result<(HostShader, bool), String> {
     let hash = blake3::hash(container).to_hex();
     let (wide, own) = (wave_wide(&hash), firstlane_own(&hash));
+    // (The container's name as run logs give it, for the settings that name programs.)
+    let name = hash[..16].to_owned();
     let translate = move |c: &[u8]| {
         let _turn = worker_turn();
         let plain = || {
-            victory_shader::emit::with_wave_wide(wide, || {
-                victory_shader::emit::with_firstlane_own(own, || victory_shader::emit::translate(c))
+            victory_shader::emit::with_program(&name, || {
+                victory_shader::emit::with_wave_wide(wide, || {
+                    victory_shader::emit::with_firstlane_own(own, || victory_shader::emit::translate(c))
+                })
             })
         };
         if mask == 0 { plain() } else { victory_shader::emit::with_finite_targets(mask, plain) }
