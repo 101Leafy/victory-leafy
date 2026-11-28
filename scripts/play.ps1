@@ -5,11 +5,13 @@
 # -Borderless   the window covers the primary display, no border or title bar (VICTORY_BORDERLESS=1)
 # -Build        target\diag (the default, the build all measurements are of) or target\release
 # -More         other settings: -More @{VICTORY_PANEL='1'}
+# It runs as the Series S, at 1280x720, as README.md says.
 # Run it from a normal window, not as administrator: the driver then keeps its shader cache elsewhere.
 param(
     [Parameter(Mandatory)][string]$Exe,
     [switch]$Safe,
     [switch]$RayTracing,
+    [switch]$Borderless,
     [ValidateSet('diag', 'release')][string]$Build = 'diag',
     [hashtable]$More = @{}
 )
@@ -18,6 +20,7 @@ $settings = @{
     VICTORY_JOIN_COPIES = '1'; VICTORY_INDIRECT_WINDOW = '1'; VICTORY_RELAY_COPY = '1'; VICTORY_CARD_STEPS = '2'
     VICTORY_INDIRECT_BATCH = '2'; VICTORY_MAP_THREADS = '1'; VICTORY_TITLE_PRIORITIES = '0'; VICTORY_CARD_AWAKE = '1'
     VICTORY_SHOW_AFTER = '1'; VICTORY_AMBIENT = '0.8'; VICTORY_D3D12_DRED = 'light'; VICTORY_SKIP_PIPELINES = 'none'
+    VICTORY_OUTPUT = '1280x720'; VICTORY_DISPLAY_MODE = '1280x720'; VICTORY_RT_RESOLVE = '0'
 }
 if ($Safe) {
     $settings.VICTORY_UNDER_WIDE = '0'; $settings.VICTORY_LAND_ECHO = '0'; $settings.VICTORY_CARD_WINDOWS_MB = '0'
@@ -37,5 +40,5 @@ Get-ChildItem Env:VICTORY_* | Where-Object { $_.Name -notin $paths } | ForEach-O
 foreach ($k in $settings.Keys) { Set-Item "Env:$k" $settings[$k] }
 $Exe = (Resolve-Path $Exe).Path
 Push-Location (Join-Path $PSScriptRoot '..')   # victory.toml is looked for here
-try { & $victory run $Exe --execute } finally { Pop-Location }
+try { & $victory run $Exe --console series-s --execute } finally { Pop-Location }
 exit $LASTEXITCODE

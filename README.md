@@ -278,6 +278,7 @@ Known issues:
 
 - The first run builds every shader and stutters for a while.
 - On that first run the first open world scene can stay black. From the second run on (2026-11-28) both opening scenes come up lit.
+- From 2026-11-28 `play.ps1` sets `VICTORY_RT_RESOLVE=0`: with the title's ray tracing off, the 1,000 or so ray-tracing resolve programs are not made. Then both opening scenes come up lit on the first run too (2 runs of 2, from an empty cache). `-RayTracing` keeps them.
 - Cutscene faces don't animate yet: heads and bodies move, mouths and brows stay still. It is being fixed.
 
 ## Where it stood on 2026-11-26
@@ -309,6 +310,9 @@ scripts\play.ps1 -Exe <path of your copy's executable>
 something is wrong. `-RayTracing` turns the title's ray-traced indirect light on. `-Borderless`
 (`VICTORY_BORDERLESS=1`) covers the primary display with no border or title bar;
 the picture is stretched to it and the render size stays.
+
+It runs the title as the Series S (`--console series-s`) at 1280x720. Before
+2026-11-28 it passed no console, so the title ran as the Series X at 4K.
 
 Before the first run, ahead of time (both can be stopped and go on later):
 
