@@ -1598,6 +1598,8 @@ fn a_select_on_a_mask_held_as_a_number_keeps_the_consoles_lanes() {
     let p = crate::spill::build(&native).expect("build");
     let (wave, _) = lowered_with_wave(&native, &p, &HashSet::new());
     assert_eq!(wave, Some(32));
+}
+
 /// One console wave (64 threads) run as two host waves of 32: a per-lane loop (lane t adds 1
 /// to its sum (t >> 4) + 1 times), then `if ((t & 31) < s1)` the lane writes its sum to LDS
 /// and adds that of lane t ^ 32, in the other host wave. Per lane, that exchange stands where
