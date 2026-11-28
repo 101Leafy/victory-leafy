@@ -48,12 +48,13 @@ pub const MEMORY: usize = usize::MAX - 1;
 
 /// The reasons an address traces to no root parameter for which the
 /// address is then taken as it stands ([`MEMORY`]).
-const RAW: [&str; 5] = [
+const RAW: [&str; 6] = [
     "an address not from a root parameter",
     "an address from a root parameter that is no address",
     "an address in an SGPR that is no root parameter",
     "an address loaded from memory",
     "an address from a phi",
+    "an address with an untracked high half",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1101,8 +1102,44 @@ impl<'a> Tracer<'a> {
         let (a, b) = (self.vterm(inst, &f.src[0]), self.vterm(inst, &f.src[1]));
         match (a, b) {
             (Some(a), Some(b)) => {
-                a == Term::Const(0) && self.carried(b, high)
-                    || b == Term::Const(0) && self.carried(a, high)
+                (a == Term::Const(0) || self.sign_high(a)) && self.carried(b, high)
+                    || (b == Term::Const(0) || self.sign_high(b)) && self.carried(a, high)
+            }
+            _ => false,
+        }
+    }
+
+    /// `t` is the high dword of a signed 32-bit index made 64-bit: its sign
+    /// (`v_ashrrev_i32` by 31), or that pair shifted left by a constant. The
+    /// address is then the base plus a signed offset below 2 GB, which the
+    /// low half's offset modulo 2^32 gives (a table in the code read at
+    /// base + (sext(i) << 2); refused, every draw of its pixel shader was
+    /// dropped and the 3D scene went black).
+    fn sign_high(&self, t: Term) -> bool {
+        let Term::Value(v) = t else { return false };
+        let Some(inst) = self.def(v) else {
+            return false;
+        };
+        let Fields::Valu(f) = &inst.fields else {
+            return false;
+        };
+        let operand = |k: usize| f.src.get(k).and_then(|o| self.vterm(inst, o));
+        match inst.name() {
+            "v_ashrrev_i32" => inst.writes.first().is_some_and(|w| w.1 == v) && operand(0) == Some(Term::Const(31)),
+            "v_lshlrev_b64" => {
+                let Some(&Operand::Vector { reg, .. }) = f.src.get(1) else {
+                    return false;
+                };
+                let word = |k| inst.read(Reg::V(reg + k)).map(|x| self.vorigin(x));
+                inst.writes.get(1).is_some_and(|w| w.1 == v)
+                    && matches!(operand(0), Some(Term::Const(n)) if n < 32)
+                    && matches!((word(0), word(1)), (Some(lo), Some(Term::Value(hi)))
+                        if self.def(hi).is_some_and(|i| i.name() == "v_ashrrev_i32")
+                            && self.sign_high(Term::Value(hi))
+                            && self.def(hi).and_then(|i| match &i.fields {
+                                Fields::Valu(g) => g.src.get(1).and_then(|o| self.vterm(i, o)),
+                                _ => None,
+                            }) == Some(lo))
             }
             _ => false,
         }
@@ -4580,5 +4617,53 @@ pub(crate) mod tests {
         };
         assert_eq!(run(true).scalar[0].1.param, 1);
         assert_eq!(run(false).scalar[0].1.param, MEMORY);
+    }
+
+    /// A table in the code read at base + (sext(i) << 2), the high half the
+    /// index's sign (pixel 5e69b507ec27b789 at 0x1dc): translates. With the
+    /// sign of another value the high half is no carry and is refused.
+    #[test]
+    fn a_code_table_index_made_64_bit_carries_its_sign() {
+        let run = |sign_of_low: bool| {
+            let code: Vec<u8> = [
+                0x2C02_0899, // 0x00: v_lshrrev_b32 v1, 25, v4
+                0x4A14_02C1, // v_add_nc_u32 v10, -1, v1
+                if sign_of_low {
+                    0x3016_149F // v_ashrrev_i32 v11, 31, v10
+                } else {
+                    0x3016_089F // v_ashrrev_i32 v11, 31, v4
+                },
+                0xD6FF_000A,
+                0x0002_1482, // 0x0c: v_lshlrev_b64 v[10:11], 2, v[10:11]
+                0xBE8C_1F00, // 0x14: s_getpc_b64 s[12:13]
+                0x800C_FF0C,
+                0x0000_4CF8, // s_add_u32 s12, s12, 0x4cf8
+                0x820D_800D, // s_addc_u32 s13, s13, 0
+                0xD70F_0409,
+                0x0000_190A, // v_add_co_u32 v9, s[4:5], v10, s12
+                0xD528_040A,
+                0x0012_160D, // v_add_co_ci_u32 v10, s[4:5], s13, v11, s[4:5]
+                0xDC38_8000,
+                0x197D_0009, // 0x34: global_load_dwordx4 v[25:28], v[9:10], off
+                S_ENDPGM,
+            ]
+            .iter()
+            .flat_map(|w: &u32| w.to_le_bytes())
+            .collect();
+            let p = crate::ir::build(&code, true, 256).unwrap();
+            track(&p, &[], HwStage::Ps, lanes(&p).as_ref())
+        };
+        let r = run(true).unwrap();
+        assert_eq!(r.scalar.len(), 1);
+        let a = r.scalar[0].1;
+        assert_eq!((a.param, a.offset), (CODE, 0x18 + 0x4CF8));
+        assert!(a.dynamic.is_some());
+        assert_eq!(
+            run(false).unwrap_err(),
+            ShaderError::Unsupported {
+                offset: 0x34,
+                what: "an address with an untracked high half"
+            }
+        );
     }
 }
