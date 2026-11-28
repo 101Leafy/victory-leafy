@@ -115,10 +115,13 @@ struct Card {
     /// the card's side before the next submission.
     staging: ID3D12Resource,
     /// The card side's bytes as they were when the submission's shaders
-    /// started, in the card's memory too: made when shader writes are
-    /// first declared for the copy, and compared with the card's side, on
-    /// the card, after each submission that declares some.
-    before: Mutex<Option<ID3D12Resource>>,
+    /// started, in the card's memory too, with its cached GPU virtual address:
+    /// set once when shader writes are first declared for the copy, and
+    /// compared with the card's side on the card after each submission that
+    /// declares some.
+    before: std::sync::OnceLock<(ID3D12Resource, u64)>,
+    /// Serializes one-time creation of `before` in [`Shadow::card_make_before`].
+    before_lock: Mutex<()>,
     /// Offsets of the copy whose bytes changed on the CPU's side and have
     /// not gone to the card's side yet.
     dirty: Mutex<Vec<(usize, usize)>>,
@@ -767,6 +770,7 @@ pub(crate) fn stale_pages(most: usize, say: &mut dyn FnMut(&Shadow, usize, usize
 
 /// Copies of memory (from, to, bytes: apart), on several threads if they are
 /// many.
+#[allow(dead_code)]
 pub(crate) fn copy_all(copies: Vec<(usize, usize, usize)>) {
     let bytes: usize = copies.iter().map(|c| c.2).sum();
     if bytes > 4 << 20 {
@@ -2931,7 +2935,7 @@ impl Drop for Shadow {
             } else {
                 CARD_BYTES[0].fetch_sub(card.size, Ordering::Relaxed);
             }
-            if card.before.get_mut().unwrap_or_else(|e| e.into_inner()).is_some() {
+            if card.before.get_mut().is_some() {
                 CARD_BYTES[1].fetch_sub(card_hash_bytes(card.size), Ordering::Relaxed);
             }
         }
@@ -3314,6 +3318,12 @@ impl Shadow {
     /// The host GPU address of a title address inside the buffer.
     pub(crate) fn gpu(&self, address: u64) -> u64 {
         self.gpu + (address - self.start)
+    }
+
+    /// Cached GPU virtual address of `self.buffer`.
+    #[inline]
+    pub(crate) fn buffer_gpu(&self) -> u64 {
+        self.gpu
     }
 
     /// The title memory the copy is of: its start and length.
@@ -4495,7 +4505,7 @@ impl Shadow {
             }
             return self.copy(from, to);
         };
-        let whole = !known && card.before.lock().unwrap_or_else(|e| e.into_inner()).is_none();
+        let whole = !known && card.before.get().is_none();
         let start = self.start as usize;
         TITLE.with_borrow_mut(|title| {
             title.resize(PAGE, 0);
@@ -4655,10 +4665,24 @@ impl Shadow {
 
     /// Of a copy in the card's memory: the CPU's side (PC memory), the
     /// card side's bytes from before if made yet, and their size.
-    pub(crate) fn card_sides(&self) -> Option<(&ID3D12Resource, Option<ID3D12Resource>, u64)> {
+    pub(crate) fn card_sides(&self) -> Option<(&ID3D12Resource, Option<&ID3D12Resource>, u64)> {
         let card = self.card.as_ref()?;
-        let before = card.before.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let before = card.before.get().map(|(b, _)| b);
         Some((&card.staging, before, card.size))
+    }
+
+    /// Lock-free check for whether this card copy has its hash-comparison
+    /// `before` buffer created.
+    #[inline]
+    pub(crate) fn card_has_before(&self) -> bool {
+        self.card.as_ref().is_some_and(|c| c.before.get().is_some())
+    }
+
+    /// Lock-free cached GPU virtual address of this card copy's `before`
+    /// hash buffer, if created.
+    #[inline]
+    pub(crate) fn card_before_gpu(&self) -> Option<u64> {
+        self.card.as_ref()?.before.get().map(|&(_, gpu)| gpu)
     }
 
     /// Shader writes are declared for a copy in the card's memory: makes
@@ -4670,15 +4694,21 @@ impl Shadow {
         let Some(card) = &self.card else {
             return false;
         };
-        let mut before = card.before.lock().unwrap_or_else(|e| e.into_inner());
-        if before.is_some() {
+        if card.before.get().is_some() {
             return false;
         }
-        *before = make(card.size);
-        if before.is_some() {
-            CARD_BYTES[1].fetch_add(card_hash_bytes(card.size), Ordering::Relaxed);
+        let _lock = card.before_lock.lock().unwrap_or_else(|e| e.into_inner());
+        if card.before.get().is_some() {
+            return false;
         }
-        before.is_some()
+        let Some(buf) = make(card.size) else {
+            return false;
+        };
+        // SAFETY: `buf` is a live D3D12 buffer created by `make`.
+        let gpu = unsafe { buf.GetGPUVirtualAddress() };
+        let _ = card.before.set((buf, gpu));
+        CARD_BYTES[1].fetch_add(card_hash_bytes(card.size), Ordering::Relaxed);
+        true
     }
 
     /// The declared range `[address, end)` as the compare on the card
@@ -4891,7 +4921,8 @@ impl Shadow {
         if card {
             shadow.card = Some(Card {
                 staging: none(),
-                before: Mutex::default(),
+                before: std::sync::OnceLock::new(),
+                before_lock: Mutex::new(()),
                 dirty: Mutex::default(),
                 sent: Mutex::default(),
                 touched: Default::default(),
@@ -5048,7 +5079,8 @@ mod land_tests {
         let mut shadow = Shadow::new(buffer.clone(), data, 0, title as u64, len as u64);
         shadow.card = Some(Card {
             staging: buffer,
-            before: Mutex::default(),
+            before: std::sync::OnceLock::new(),
+            before_lock: Mutex::new(()),
             dirty: Mutex::default(),
             sent: Mutex::default(),
                 touched: Default::default(),
@@ -5493,7 +5525,8 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                 );
                 let card = Card {
                     staging: buffer,
-                    before: Mutex::default(),
+                    before: std::sync::OnceLock::new(),
+                    before_lock: Mutex::new(()),
                     dirty: Mutex::default(),
                     sent: Mutex::default(),
                 touched: Default::default(),
@@ -5722,7 +5755,8 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
     shadow.changes_only.store(true, Ordering::Relaxed);
     shadow.card = Some(Card {
         staging,
-        before: Mutex::default(),
+        before: std::sync::OnceLock::new(),
+        before_lock: Mutex::new(()),
         dirty: Mutex::default(),
         sent: Mutex::default(),
         touched: Default::default(),
@@ -5812,7 +5846,8 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
             crate::host::name(&on_card, || format!("title memory {start:#x}+{len:#x} on the card"));
             let card = Card {
                 staging: buffer,
-                before: Mutex::default(),
+                before: std::sync::OnceLock::new(),
+                before_lock: Mutex::new(()),
                 dirty: Mutex::default(),
                 sent: Mutex::default(),
                 touched: Default::default(),

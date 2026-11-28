@@ -1309,6 +1309,9 @@ pub(crate) struct HostList {
     /// What the list does with depth textures that have a colour twin, by
     /// twin ([`TwinUse`]).
     twins: Mutex<std::collections::HashMap<usize, TwinUse>>,
+    /// Set once `deferred.prelude_uploads` is non-empty so `prelude_uploads`
+    /// skips locking `deferred` on lists with none.
+    has_prelude_uploads: std::sync::atomic::AtomicBool,
     /// The list that runs those transitions just before this one: taken
     /// from [`PRELUDES`] when a submission of the list first needs one, given
     /// back when the list is reset (every submission of it has run).
@@ -4618,6 +4621,7 @@ impl Host {
                 scratch: Mutex::default(),
                 states: Mutex::default(),
                 twins: Mutex::default(),
+                has_prelude_uploads: std::sync::atomic::AtomicBool::new(false),
                 prelude,
                 pipelines,
                 #[cfg(feature = "diagnostics")]
@@ -4878,7 +4882,7 @@ impl Host {
                     list.SetPipelineState(&work.pso);
                     list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
                     for (shadow, ranges) in &dirty {
-                        let (Some((_, Some(before), _)), size) = (shadow.card_sides(), shadow.card_hash_size()) else {
+                        let (Some(before_gpu), size) = (shadow.card_before_gpu(), shadow.card_hash_size()) else {
                             continue;
                         };
                         // No twin (it cost the card the copy's size again,
@@ -4887,8 +4891,8 @@ impl Host {
                         // hashed again, all of them the first time; the
                         // compare after the lists hashes the declared
                         // pieces and flags those whose hash is another.
-                        list.SetComputeRootShaderResourceView(1, shadow.buffer.GetGPUVirtualAddress());
-                        list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
+                        list.SetComputeRootShaderResourceView(1, shadow.buffer_gpu());
+                        list.SetComputeRootUnorderedAccessView(2, before_gpu);
                         let joins = rehash_runs() || own.is_some();
                         let runs: Vec<crate::shadow::CardSpan> = if whole.iter().any(|s| Arc::ptr_eq(s, shadow)) {
                             vec![shadow.card_run(0, usize::MAX)]
@@ -4945,7 +4949,7 @@ impl Host {
                     _ => spans.push((from, to)),
                 }
             }
-            let twin = shadow.card_sides().is_some_and(|(_, before, _)| before.is_some());
+            let twin = shadow.card_has_before();
             for (from, to) in spans {
                 let Some(span) = shadow.card_span(from, to) else {
                     continue;
@@ -4965,7 +4969,7 @@ impl Host {
             }
         }
         for (shadow, from, len) in looked {
-            let twin = shadow.card_sides().is_some_and(|(_, before, _)| before.is_some());
+            let twin = shadow.card_has_before();
             if let Some(span) = shadow.card_span(*from, from + len)
                 && twin
                 && u64::from(at + span.pieces) * 4 <= work.differs.2
@@ -5007,12 +5011,17 @@ impl Host {
                     list.SetComputeRootSignature(&work.root);
                     list.SetPipelineState(&work.pso);
                     list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
+                    let mut last_bound = (0u64, 0u64);
                     for r in plan.ranges.iter().filter(|r| r.compared) {
-                        let (Some((_, Some(before), _)), size) = (r.shadow.card_sides(), r.shadow.card_hash_size()) else {
+                        let (Some(before_gpu), size) = (r.shadow.card_before_gpu(), r.shadow.card_hash_size()) else {
                             continue;
                         };
-                        list.SetComputeRootShaderResourceView(1, r.shadow.buffer.GetGPUVirtualAddress());
-                        list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
+                        let buf_gpu = r.shadow.buffer_gpu();
+                        if last_bound != (buf_gpu, before_gpu) {
+                            list.SetComputeRootShaderResourceView(1, buf_gpu);
+                            list.SetComputeRootUnorderedAccessView(2, before_gpu);
+                            last_bound = (buf_gpu, before_gpu);
+                        }
                         // (What is only looked at keeps its hashes: what
                         // changed there is the next declared range's to land.)
                         card_pass(list, &r.span, size as u32, r.at, if flown && !r.picked { 2 } else { 1 });
@@ -6968,6 +6977,7 @@ impl HostList {
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.has_prelude_uploads.store(false, Ordering::Relaxed);
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.indirects.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -7346,10 +7356,13 @@ impl HostList {
         const COPY_SOURCE: u32 = 0x800;
         let host_state = |state: u32| D3D12_RESOURCE_STATES(state as i32);
         let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
+        let twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
+        if twins.is_empty() && uploads.is_empty() && states.is_empty() {
+            return None;
+        }
         // The copies (depth texture, twin, whether into the twin); the
         // sides are then as this list leaves them.
         let mut syncs = Vec::new();
-        let twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
         for u in twins.values() {
             let real = u.twin.behind.load(Ordering::Relaxed);
             let mut behind = [real & 1 != 0, real & 2 != 0];
@@ -7430,7 +7443,7 @@ impl HostList {
         }
         barriers.extend(states.iter().filter_map(|(key, (first, last, copy))| {
             let real = copy.state.swap(*last, Ordering::Relaxed);
-            let real = copying.get(key).copied().unwrap_or(real);
+            let real = if copying.is_empty() { real } else { copying.get(key).copied().unwrap_or(real) };
             (real != *first)
                 .then(|| transition(&copy.texture, host_state(real), host_state(*first)))
         }));
@@ -8060,6 +8073,7 @@ impl HostList {
     /// prelude records if the check finds it due
     /// (`crate::texture::prelude_uploads`; [`HostList::prelude_uploads`]).
     pub(crate) fn defer_prelude_upload(&self, upload: crate::texture::PreludeUpload) {
+        self.has_prelude_uploads.store(true, Ordering::Relaxed);
         let mut deferred = self.deferred();
         deferred.copies.push(Step::Texture(upload.staging()));
         deferred.prelude_uploads.push(upload);
@@ -8071,6 +8085,9 @@ impl HostList {
     /// submission's steps left pending). Ported from
     /// Belobug/VIctory-Belobug-AMD 5d6bd84.
     fn prelude_uploads(&self, batch: &mut Batch) -> Vec<(crate::texture::PreludeUpload, bool)> {
+        if !self.has_prelude_uploads.load(Ordering::Relaxed) {
+            return Vec::new();
+        }
         let waiting = self.deferred().prelude_uploads.clone();
         if waiting.is_empty() {
             return Vec::new();
