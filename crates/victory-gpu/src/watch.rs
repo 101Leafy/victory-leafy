@@ -535,8 +535,11 @@ pub(crate) fn lock_waits(frames: f64) -> String {
     let p: [u64; 15] = std::array::from_fn(|i| PHASES[i].swap(0, std::sync::atomic::Ordering::Relaxed));
     let ms = |i: usize| p[i] as f64 / 1e6 / frames;
     let (long_ns, long_first, long_last) = std::mem::take(&mut *LONGEST.lock().unwrap_or_else(|e| e.into_inner()));
+    let (whole_ns, x) = std::mem::take(&mut *LONGEST_WHOLE.lock().unwrap_or_else(|e| e.into_inner()));
+    let xms = |i: usize| x[i] as f64 / 1e6;
+    let parts: u64 = (0..=8).map(|i| x[i]).sum();
     format!(
-        "ranges held {}, journal read {}, journal noted in {}, guards {};          whole submissions waiting {:.1} for {:.2} ms (longest {:.2} ms), {:.1} ranges held as each began, {:.1} taken while each waited;          held longest: whole {:.2} ms, a range {:.2} ms ({} KiB at {:#x}); ranges held 10 ms or more {:.1}, all held {:.2} ms (VICTORY_ASK_ALL_FIRST={});          refreshes held {:.1} ranges, {:.1} of them sent to the guards, held there {:.2} ms;          inside whole holds: ahead spans {:.2} ms, split {:.2} ms, runs {:.2} ms, hot {:.2} ms, journal {:.2} ms ({:.0} pieces); rest take {:.2} ms, loop {:.2} ms (longest {:.2} ms), hot {:.2} ms, journal {:.2} ms; rest calls {:.1}, {:.0} ranges, {:.0} kept, {:.0} askings",
+        "ranges held {}, journal read {}, journal noted in {}, guards {};          whole submissions waiting {:.1} for {:.2} ms (longest {:.2} ms), {:.1} ranges held as each began, {:.1} taken while each waited;          held longest: whole {:.2} ms, a range {:.2} ms ({} KiB at {:#x}); ranges held 10 ms or more {:.1}, all held {:.2} ms (VICTORY_ASK_ALL_FIRST={});          refreshes held {:.1} ranges, {:.1} of them sent to the guards, held there {:.2} ms;          inside whole holds: ahead spans {:.2} ms, split {:.2} ms, runs {:.2} ms, hot {:.2} ms, journal {:.2} ms ({:.0} pieces); rest take {:.2} ms, loop {:.2} ms (longest {:.2} ms), hot {:.2} ms, journal {:.2} ms; rest calls {:.1}, {:.0} ranges, {:.0} kept, {:.0} askings;          the longest whole hold {:.2} ms: ahead spans and split {:.2} ms, runs {:.2} ms, hot {:.2} ms, journal {:.2} ms ({} pieces); rest take {:.2} ms, loop {:.2} ms, hot {:.2} ms, journal {:.2} ms ({} askings of {} ranges); its longest kernel asking {:.2} ms; outside these parts {:.2} ms",
         of(0),
         of(1),
         of(2),
@@ -571,6 +574,20 @@ pub(crate) fn lock_waits(frames: f64) -> String {
         per(p[9]),
         per(p[10]),
         per(p[11]),
+        whole_ns as f64 / 1e6,
+        xms(0) + xms(1),
+        xms(2),
+        xms(3),
+        xms(4),
+        x[13],
+        xms(5),
+        xms(6),
+        xms(7),
+        xms(8),
+        x[11],
+        x[9],
+        xms(15),
+        whole_ns.saturating_sub(parts) as f64 / 1e6,
     )
 }
 
@@ -599,11 +616,25 @@ static REFRESH_HOLDS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::at
 #[cfg(feature = "diagnostics")]
 static PHASES: [std::sync::atomic::AtomicU64; 15] = [const { std::sync::atomic::AtomicU64::new(0) }; 15];
 
+/// [`PHASES`] of the whole hold this thread is in, and in 15 its longest
+/// kernel asking (ns); for [`LONGEST_WHOLE`].
+#[cfg(feature = "diagnostics")]
+thread_local! {
+    static HELD_NOW: std::cell::RefCell<[u64; 16]> = const { std::cell::RefCell::new([0; 16]) };
+}
+
+/// The longest whole hold since the last line: nanoseconds and its
+/// [`HELD_NOW`]. The frame means of [`PHASES`] cannot say what one long hold
+/// spent its time on (lp-ask-rh: 119 ms longest, runs 21 ms a frame).
+#[cfg(feature = "diagnostics")]
+static LONGEST_WHOLE: Mutex<(u64, [u64; 16])> = Mutex::new((0, [0; 16]));
+
 #[cfg(feature = "diagnostics")]
 fn phase(i: usize, since: &mut std::time::Instant) {
     let now = std::time::Instant::now();
     let ns = (now - *since).as_nanos() as u64;
     PHASES[i].fetch_add(ns, std::sync::atomic::Ordering::Relaxed);
+    HELD_NOW.with(|h| h.borrow_mut()[i] += ns);
     if i == 6 {
         PHASES[14].fetch_max(ns, std::sync::atomic::Ordering::Relaxed);
     }
@@ -616,6 +647,7 @@ fn phase(_: usize, _: &mut std::time::Instant) {}
 #[cfg(feature = "diagnostics")]
 fn phase_count(i: usize, n: usize) {
     PHASES[i].fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+    HELD_NOW.with(|h| h.borrow_mut()[i] += n as u64);
 }
 
 #[cfg(not(feature = "diagnostics"))]
@@ -693,7 +725,16 @@ impl Asking {
 
     /// Everything: an asking for a whole submission.
     fn hold_all() -> Asking {
-        Asking::hold(0, usize::MAX)
+        let all = Asking::hold(0, usize::MAX);
+        #[cfg(feature = "diagnostics")]
+        HELD_NOW.with(|h| {
+            // (Pieces are counted before the hold with VICTORY_ASK_HOMES.)
+            let mut h = h.borrow_mut();
+            let pieces = h[13];
+            *h = [0; 16];
+            h[13] = pieces;
+        });
+        all
     }
 }
 
@@ -712,6 +753,11 @@ impl Drop for Asking {
             HOLDS[7].fetch_add(ns, Relaxed);
             if (self.0, self.1) == (0, usize::MAX) {
                 HOLDS[5].fetch_max(ns, Relaxed);
+                let mut whole = LONGEST_WHOLE.lock().unwrap_or_else(|e| e.into_inner());
+                if ns > whole.0 {
+                    *whole = (ns, HELD_NOW.with(|h| *h.borrow()));
+                }
+                HELD_NOW.with(|h| h.borrow_mut()[13] = 0);
                 return;
             }
             if ns >= 10_000_000 {
@@ -792,6 +838,11 @@ fn kernel_written(first: usize, last: usize) -> Option<Vec<(usize, u16)>> {
             add(C::Watches, 1);
             add(C::WatchUs, started.elapsed().as_micros() as u64);
             slow(started.elapsed().as_micros() as u64);
+            let ns = started.elapsed().as_nanos() as u64;
+            HELD_NOW.with(|h| {
+                let mut h = h.borrow_mut();
+                h[15] = h[15].max(ns);
+            });
             tally(0, 1);
             tally(1, ((last - first) * (PAGE >> 10)) as u64);
         }
