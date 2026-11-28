@@ -726,6 +726,19 @@ fn wait_every_frame() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_WAIT_EVERY_FRAME").is_some_and(|v| v == "1"))
 }
 
+/// Whether a draw waits only for a pipeline a worker can make now: one
+/// being made, or one queued while a worker is free. In main-own-r1's
+/// world entry (game 41-66 s) every worker was in a driver compile of
+/// about 10 s, 250 requested pipelines queued behind them, and each new
+/// one met took the frame's whole 500 ms before its draws were dropped:
+/// 2 to 3 fps for 25 s. Its draws are dropped from the first frame on,
+/// as they were after the wait. Passes over the screen keep waiting.
+/// `VICTORY_PIPELINE_WAIT_FREE=1`: on.
+fn wait_free_only() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_WAIT_FREE").is_some_and(|v| v == "1"))
+}
+
 /// Claims `frame` as the one in which draws wait for `p`: whether it is (or
 /// already was) that frame.
 fn claim_wait(p: &Pending, frame: u64) -> bool {
@@ -805,6 +818,13 @@ fn wait(p: &Pending, frame: u64) {
     let budget = if screen { screen_budget() } else { wait_budget() };
     let room = held_room();
     if budget.is_zero() || room.is_some_and(|r| r.is_zero()) {
+        return;
+    }
+    if !screen
+        && wait_free_only()
+        && p.queue_state.load(Ordering::Relaxed) != MAKING
+        && GENERAL_BUSY.load(Ordering::Relaxed) >= workers_wanted() as u64
+    {
         return;
     }
     // The frame the budget belongs to, and what was waited of it (or is
@@ -922,6 +942,20 @@ fn slow_limit() -> usize {
         } else {
             (workers_wanted() / 4).max(1)
         }
+    })
+}
+
+/// `VICTORY_PIPELINE_KEEP_FREE=n`: early and slow pipelines, which no draw
+/// has asked for, take at most all workers but `n`, so a pipeline a draw asks
+/// for finds a free worker. In main-own-r1 (cold driver cache) early ones
+/// held all 24 workers in the minute before game 41, 6 s each, and the requested ones then
+/// queued behind them: from game 41 to 66 every frame waited its 500 ms in
+/// vain. Off (0) by default.
+fn keep_free() -> usize {
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| {
+        let n = std::env::var("VICTORY_PIPELINE_KEEP_FREE").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0);
+        n.min(workers_wanted().saturating_sub(1))
     })
 }
 
@@ -1127,6 +1161,8 @@ struct Queue {
     resolves: VecDeque<Arc<Pending>>,
     resolves_now: usize,
     resolve_cap: usize,
+    /// Early and slow pipelines being made ([`keep_free`]).
+    unasked_now: usize,
     /// When a pipeline last went into a list other than the slow one.
     others_at: Option<Instant>,
 }
@@ -1147,6 +1183,7 @@ impl Queue {
             resolves: VecDeque::new(),
             resolves_now: 0,
             resolve_cap: usize::MAX,
+            unasked_now: 0,
             others_at: None,
         }
     }
@@ -1223,14 +1260,15 @@ impl Queue {
                     self.resolves_now += 1;
                 }
             }
-            if p.is_none() {
+            let unasked_free = self.unasked_now + keep_free() < workers_wanted();
+            if p.is_none() && unasked_free {
                 p = unclaimed(&mut self.early);
                 from = TAKEN_EARLY;
             }
-            if p.is_none() && early_compute_free {
+            if p.is_none() && early_compute_free && unasked_free {
                 p = unclaimed(&mut self.early_compute);
             }
-            if p.is_none() && self.slow_now < slow_limit {
+            if p.is_none() && self.slow_now < slow_limit && unasked_free {
                 p = if longest_first() {
                     longest(&mut self.slow, super::library::slow_ms)
                 } else if super::library::hits_first() {
@@ -1252,6 +1290,9 @@ impl Queue {
         let p = p?;
         if p.graphics.is_none() {
             self.compute_now += 1;
+        }
+        if from >= TAKEN_EARLY && keep_free() > 0 {
+            self.unasked_now += 1;
         }
         p.taken_from.store(from, Ordering::Relaxed);
         p.queue_state.store(MAKING, Ordering::Relaxed);
@@ -1380,20 +1421,33 @@ fn workers() -> bool {
                             crate::cores::hold_on_fast_cores(true);
                         }
                         BUSY.fetch_add(1, Ordering::Relaxed);
+                        if !screens_only {
+                            GENERAL_BUSY.fetch_add(1, Ordering::Relaxed);
+                        }
                         {
                             let _slot = ComputeSlot(p.graphics.is_none());
                             p.make();
                         }
                         BUSY.fetch_sub(1, Ordering::Relaxed);
+                        if !screens_only {
+                            GENERAL_BUSY.fetch_sub(1, Ordering::Relaxed);
+                        }
                         if long && raise {
                             set(priority);
                         }
                         if long && hold {
                             crate::cores::hold_on_fast_cores(false);
                         }
-                        if p.was_slow.load(Ordering::Relaxed) {
+                        let slow = p.was_slow.load(Ordering::Relaxed);
+                        let unasked = keep_free() > 0 && p.taken_from.load(Ordering::Relaxed) >= TAKEN_EARLY;
+                        if slow || unasked {
                             let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
-                            queue.slow_now -= 1;
+                            if slow {
+                                queue.slow_now -= 1;
+                            }
+                            if unasked {
+                                queue.unasked_now -= 1;
+                            }
                             AVAILABLE.notify_all();
                         }
                         if p.as_resolve.load(Ordering::Relaxed) {
@@ -1452,6 +1506,9 @@ impl Drop for ComputeSlot {
 
 /// Workers making a pipeline now.
 static BUSY: AtomicU64 = AtomicU64::new(0);
+
+/// Of them, workers that take any pipeline (not passes over the screen alone).
+static GENERAL_BUSY: AtomicU64 = AtomicU64::new(0);
 
 /// The lists' lengths and the busy workers, for the workers' summary line.
 fn queues() -> super::spent::Queues {
