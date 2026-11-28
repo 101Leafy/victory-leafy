@@ -537,7 +537,9 @@ void raise(uint3 at : SV_DispatchThreadID) {
     found = all + 1.2 * float3(dot(sr.xyz, n), dot(sg.xyz, n), dot(sb.xyz, n)) / sum;
     found = clamp(found, 0.2 * all, 2.5 * all);
     found = lerp(found, cells[CELLS].rgb, 0.2) * level * open;
+    if (any(isnan(found)) || any(isinf(found)) || any(found < 0.0)) found = 0.0;
     float3 was = unpack(light[p]);
+    if (any(isnan(was)) || any(isinf(was)) || any(was < 0.0)) was = 0.0;
     // What the program left counts as far as it can be true: the sky's light
     // outdoors, not the blocks of other memory.
     // For `fresh` seconds after the light around jumped (a new room) the
