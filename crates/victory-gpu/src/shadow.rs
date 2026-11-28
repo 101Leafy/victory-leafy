@@ -4629,6 +4629,7 @@ impl Shadow {
         if (self.card.is_some() && wc_no_back_cutoff().is_some_and(|min| self.len >= min) || self.mapped && !self.window)
             && self.write_combined()
         {
+            list.note_batch_write(address, len);
             self.written.store(true, Ordering::Relaxed);
             WC_LEFT.fetch_add(len.min(self.left(address)), Ordering::Relaxed);
             return;
