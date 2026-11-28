@@ -135,6 +135,11 @@ pub(crate) fn headroom() -> Option<u64> {
     (bytes != u64::MAX).then_some(bytes)
 }
 
+/// The PC's memory free now, in bytes (0 if Windows does not say).
+pub(crate) fn physical_free() -> u64 {
+    memory_status().map_or(0, |s| s.ullAvailPhys)
+}
+
 pub(crate) fn pressured() -> bool {
     PRESSURED.load(Ordering::Relaxed)
 }
