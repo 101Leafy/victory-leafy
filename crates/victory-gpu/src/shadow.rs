@@ -247,6 +247,23 @@ fn resolve_card_limits(
     (min_bytes, max_bytes)
 }
 
+/// The least size `VICTORY_CARD_BUFFERS_MIN_KB` may set, `asked` bytes, over
+/// the budget-scaled `default` minimum. Under 10 GiB of local budget (8 GB
+/// cards, budget about 7.1 GB) it keeps the default: the launchers set 64 KiB
+/// for every card, and on an RTX 5070 Laptop 8 GB, Series S, that put the
+/// title's small buffers on the card past its budget, frames went from about
+/// 220-290 ms to 310-340 ms and faces were missing and vehicles drawn several
+/// times over (the same overflow an RX 7600 8 GB saw, fxceless/victory-fork
+/// #1417). 12 GB cards (budget about 11 GB) keep what they asked for.
+fn min_kb_floor(default: u64, asked: u64, local_vram_budget: Option<u64>) -> u64 {
+    const SMALL_CARD: u64 = 10 << 30;
+    if local_vram_budget.is_some_and(|b| b < SMALL_CARD) {
+        asked.max(default)
+    } else {
+        asked
+    }
+}
+
 /// The smallest title buffer whose copy goes to the card's memory, and the
 /// most bytes of such copies (their "before" twins not counted: a copy
 /// shaders write takes its size twice), both in bytes:
@@ -272,7 +289,15 @@ fn card_limits() -> (u64, u64) {
         if let Some(kib) = std::env::var("VICTORY_CARD_BUFFERS_MIN_KB").ok().and_then(|v| v.trim().parse::<u64>().ok())
             && kib > 0
         {
-            min_bytes = kib << 10;
+            let asked = kib << 10;
+            min_bytes = min_kb_floor(min_bytes, asked, vram_budget);
+            if min_bytes != asked {
+                tracing::warn!(
+                    asked_kb = kib,
+                    kept_kb = min_bytes >> 10,
+                    "VICTORY_CARD_BUFFERS_MIN_KB left out: on a card with under 10 GiB of budget the small copies overflow it"
+                );
+            }
         }
         if card_all() {
             min_bytes = 0;
@@ -1017,10 +1042,19 @@ fn copy_here(copies: Vec<(usize, usize, usize)>) {
     }
 }
 
+/// One-sided host copies whose CPU mapping a title buffer copy just wrote:
+/// taken by [`pc_copied`] for a submission-owned restore before the lists run.
+static PC_COPIED: Mutex<Vec<(std::sync::Weak<Shadow>, usize, usize)>> = Mutex::new(Vec::new());
+
 /// A title buffer copy was done on the CPU into `[dst, dst + len)`: all of it
 /// goes up to the copies in the card's memory that hold it, whether their
 /// CPU side held the same before or not. Left out is what shaders in the air
 /// may be writing (such a copy waits for them, or is done on the card).
+///
+/// One-sided copies (PC memory the GPU reads directly) take the same bytes
+/// into their mapping and are noted for a submission-owned snapshot: a later
+/// submission's refresh must not change what this submission's GPU commands
+/// still read (`Host::pc_before`).
 pub(crate) fn send_copied(dst: usize, len: usize) {
     for shadow in carded_copies() {
         let (start, end) = (shadow.start as usize, (shadow.start + shadow.len) as usize);
@@ -1034,6 +1068,39 @@ pub(crate) fn send_copied(dst: usize, len: usize) {
             shadow.copy(a, b);
         }
     }
+    let Some(shadow) = peek(dst as u64, len as u64) else {
+        return;
+    };
+    if shadow.carded() || shadow.in_place() {
+        return;
+    }
+    let (start, end) = (shadow.start as usize, (shadow.start + shadow.len) as usize);
+    let (from, to) = (dst.max(start), (dst + len).min(end));
+    if from >= to {
+        return;
+    }
+    let busy: Vec<(usize, usize)> =
+        shadow.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().copied().filter(|&(a, b)| a < to && b > from).collect();
+    for (a, b) in outside(from, to, busy) {
+        shadow.copy(a, b);
+        let me = std::sync::Arc::downgrade(&shadow);
+        PC_COPIED.lock().unwrap_or_else(|e| e.into_inner()).push((me, a - start, b - start));
+    }
+}
+
+/// One-sided ranges [`send_copied`] wrote this submission, joined per copy.
+/// Cleared by the taking.
+pub(crate) fn pc_copied() -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)> {
+    let noted = std::mem::take(&mut *PC_COPIED.lock().unwrap_or_else(|e| e.into_inner()));
+    let mut by: BTreeMap<usize, (Arc<Shadow>, Vec<(usize, usize)>)> = BTreeMap::new();
+    for (weak, from, to) in noted {
+        let Some(shadow) = weak.upgrade() else {
+            continue;
+        };
+        let key = Arc::as_ptr(&shadow) as usize;
+        by.entry(key).or_insert_with(|| (shadow, Vec::new())).1.push((from, to));
+    }
+    by.into_values().map(|(shadow, ranges)| (shadow, joined(ranges))).collect()
 }
 
 /// For the memory line: the CPU sides of the copies in the card's memory,
@@ -4834,6 +4901,8 @@ impl Shadow {
         let Some(first) = first_difference(now, held) else {
             return 0;
         };
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::BackDiffer, 1);
         let last = last_difference(now, held).unwrap_or(first);
         let (at, n) = (at + first, last + 1 - first);
         let (now, held) = (&now[first..=last], &mut held[first..=last]);
@@ -6003,6 +6072,8 @@ impl Shadow {
             }
             return 0;
         };
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::BackDiffer, 1);
         let last = last_difference(gpu, old).unwrap_or(first);
         let (at, n) = (at + first, last + 1 - first);
         let (gpu, old) = (&gpu[first..=last], &mut old[first..=last]);
@@ -6115,6 +6186,8 @@ impl Shadow {
         let Some(first) = first_difference(gpu, held) else {
             return 0;
         };
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::BackDiffer, 1);
         let last = last_difference(gpu, held).unwrap_or(first);
         let (at, n) = (at + first, last + 1 - first);
         let (gpu, held) = (&gpu[first..=last], &mut held[first..=last]);
@@ -6505,6 +6578,11 @@ fn buffers() -> std::sync::RwLockWriteGuard<'static, BTreeMap<(u64, usize), Entr
 
 /// How often [`BUFFERS`] was taken to be changed.
 static BUFFERS_CHANGED: AtomicU64 = AtomicU64::new(1);
+
+/// [`BUFFERS_CHANGED`]: what [`find`] answers holds while it stays.
+pub(crate) fn changes() -> u64 {
+    BUFFERS_CHANGED.load(Ordering::SeqCst)
+}
 
 /// Answers a thread remembers.
 const FOUND_MOST: usize = 1024;
@@ -7841,9 +7919,23 @@ mod write_combined_tests {
 #[cfg(test)]
 mod window_tests {
     use super::{
-        WINDOW, cover, default_card_limits_mb, grid, holder, longest_tail, resolve_card_limits,
-        tail_of, trim, window_of,
+        WINDOW, cover, default_card_limits_mb, grid, holder, longest_tail, min_kb_floor,
+        resolve_card_limits, tail_of, trim, window_of,
     };
+
+    /// `VICTORY_CARD_BUFFERS_MIN_KB` cannot take an 8 GB card under its
+    /// default minimum; 12 GB and larger cards, and unknown budgets, get it.
+    #[test]
+    fn small_cards_keep_their_buffer_floor() {
+        const GIB: u64 = 1 << 30;
+        const MIB: u64 = 1 << 20;
+        let asked = 64 << 10;
+        assert_eq!(min_kb_floor(16 * MIB, asked, Some(7123 * MIB)), 16 * MIB);
+        assert_eq!(min_kb_floor(16 * MIB, 32 * MIB, Some(7123 * MIB)), 32 * MIB, "a larger floor is kept");
+        assert_eq!(min_kb_floor(16 * MIB, asked, Some(11229 * MIB)), asked);
+        assert_eq!(min_kb_floor(4 * MIB, asked, Some(16 * GIB)), asked);
+        assert_eq!(min_kb_floor(16 * MIB, asked, None), asked);
+    }
 
     #[test]
     fn card_limits_scale_with_local_vram_budget() {

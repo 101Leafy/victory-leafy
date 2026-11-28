@@ -115,6 +115,11 @@ Tools and diagnostics:
   a copy-back is about to put back to older values: none found in 138,000
   copy-backs), `VICTORY_WALLS_TRACE`, `VICTORY_CARD_ACCOUNTING`, and a census
   of the copies the texture sweep never lets go.
+- A refused pipeline is logged once per shader set, with the reason (a shader
+  capability the device lacks, a driver crash in an earlier run, device
+  removed, or the error); the device's shader capabilities go in one line at
+  start and the failures are counted by reason at exit. `VICTORY_SHADER_CAPS=1`
+  (off by default) makes such a pipeline again without the pipeline library.
 
 ### What this fork changed (summary)
 

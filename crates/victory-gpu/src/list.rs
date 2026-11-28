@@ -755,8 +755,71 @@ extern "system" fn list_type(this: This) -> u32 {
     // SAFETY: `this` is one of our lists.
     unsafe { (*this.cast::<List>()).kind }
 }
+/// `VICTORY_LIST_PUT_CHECK=1`: logs the first time a list's put pointer
+/// or a limit is not zero at its Close, Reset or submission, with the
+/// title's caller; `=2` also sets them back to zero. Off: 0.
+fn put_check() -> u8 {
+    static ON: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("VICTORY_LIST_PUT_CHECK").as_deref() {
+        Ok("1") => 1,
+        Ok("2") => 2,
+        _ => 0,
+    })
+}
+
+/// [`put_check`] for each list at `at`, called from the title's own call.
+#[inline(never)]
+pub(crate) fn check_put(lists: &[This], at: &str) {
+    let on = put_check();
+    if on == 0 {
+        return;
+    }
+    static SEEN: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+    for &this in lists {
+        if this.is_null() {
+            continue;
+        }
+        let list = this.cast_mut().cast::<List>();
+        // SAFETY: one of our lists; the title's inlined code writes these
+        // words behind our back, so they are read as memory.
+        let put = unsafe { std::ptr::read_volatile(&raw const (*list).put) };
+        if put == [0; 5] {
+            continue;
+        }
+        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        if !seen.contains(&(this as usize)) {
+            seen.push(this as usize);
+            tracing::warn!(
+                at,
+                list = ?this,
+                // SAFETY: as above.
+                kind = unsafe { (*list).kind },
+                // SAFETY: as above.
+                list_type = match unsafe { (*list).kind } {
+                    0 => "direct",
+                    1 => "bundle",
+                    2 => "compute",
+                    3 => "copy",
+                    _ => "other",
+                },
+                // SAFETY: as above.
+                bundle = unsafe { (*list).kind } == 1,
+                put = format_args!("{:#x?}", put),
+                caller = crate::object::caller(2),
+                zeroed = on == 2,
+                "a list's put pointer or limit is not zero"
+            );
+        }
+        if on == 2 {
+            // SAFETY: as above.
+            unsafe { std::ptr::write_volatile(&raw mut (*list).put, [0; 5]) };
+        }
+    }
+}
+
 extern "system" fn close(this: This) -> HRESULT {
     let _called = crate::timeline::span("the title's Close");
+    check_put(&[this], "Close");
     #[cfg(windows)]
     if let Some(host) = host_list(this) {
         host.close();
@@ -768,6 +831,7 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
         return E_INVALIDARG;
     }
     let _called = crate::timeline::span("the title's list Reset");
+    check_put(&[this], "Reset");
     // A wait recorded and never submitted goes with the recording.
     VALUE_WAITS
         .lock()
@@ -955,6 +1019,84 @@ fn wait_shared(list: &crate::host::HostList) -> bool {
     }
 }
 
+/// `VICTORY_UAV_FOLD` (`0` turns it off): the unordered access barriers of one title call
+/// fold into one on every resource when it has one (or names a buffer,
+/// [`barrier`]), and none is kept when nothing that writes was recorded in
+/// the list since our last full wait (as `VICTORY_QUIET_WAITS` for the
+/// title's own). On by default; the census is counted either way.
+pub(crate) fn uav_fold() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_UAV_FOLD").as_deref() != Ok("0"))
+}
+
+/// Leaves out the unordered access barriers of `host` that `wrote` (a
+/// shader, copy or clear since the last full wait) and `all` (a wait for
+/// every resource asked for besides) make needless, keeping the rest in
+/// order at the front. How many stay, and whether one on every resource
+/// goes after them.
+fn fold_uavs(host: &mut [Barrier], wrote: bool, all: bool) -> (usize, bool) {
+    let all = wrote && (all || host.iter().any(|b| b.kind == 2 && b.first.is_null()));
+    let mut n = 0;
+    for i in 0..host.len() {
+        if host[i].kind == 2 && (all || !wrote) {
+            continue;
+        }
+        host[n] = host[i];
+        n += 1;
+    }
+    (n, all)
+}
+
+/// The census of [`uav_fold`] for a call's host barriers, with a wait for
+/// buffers asked for or not.
+#[cfg(feature = "diagnostics")]
+fn uav_census(host: &[Barrier], buffers: bool, wrote: bool) {
+    use crate::copystat::{C, add};
+    let globals = host.iter().filter(|b| b.kind == 2 && b.first.is_null()).count() as u64;
+    let named = host.iter().filter(|b| b.kind == 2 && !b.first.is_null()).count() as u64;
+    add(C::UavGlobals, globals);
+    add(C::UavOnResources, named);
+    let waits = globals + named + u64::from(buffers);
+    if !wrote {
+        add(C::UavQuiet, waits);
+    } else if globals > 0 || buffers {
+        add(C::UavFolded, waits - 1);
+    }
+}
+
+/// How many of a call's host barriers stay, and whether a wait for every
+/// resource goes after them: for buffers as before, or as [`uav_fold`] says.
+#[cfg(windows)]
+fn uav_waits(this: This, list: &crate::host::HostList, host: &mut [Barrier], on_buffers: bool) -> (usize, bool) {
+    let named = on_buffers || host.iter().any(|b| b.kind == 2);
+    let mut wrote = true;
+    if named && (uav_fold() || cfg!(feature = "diagnostics")) {
+        with_state(this, |list, state| wrote = state.wrote_since_wait(list));
+    }
+    #[cfg(feature = "diagnostics")]
+    if named {
+        uav_census(host, on_buffers, wrote);
+    }
+    if !uav_fold() {
+        let all = on_buffers && wait_needed(this) && (!host.is_empty() || !wait_shared(list));
+        #[cfg(feature = "diagnostics")]
+        if all {
+            crate::copystat::add(crate::copystat::C::WaitsForBuffers, 1);
+        }
+        return (host.len(), all);
+    }
+    let (n, all) = fold_uavs(host, wrote, on_buffers);
+    let all = all && (n > 0 || !wait_shared(list));
+    if all {
+        with_state(this, |_, state| state.waited());
+        #[cfg(feature = "diagnostics")]
+        if on_buffers {
+            crate::copystat::add(crate::copystat::C::WaitsForBuffers, 1);
+        }
+    }
+    (n, all)
+}
+
 /// Returns the console's barrier "actions" (none).
 extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> u32 {
     #[cfg(windows)]
@@ -997,11 +1139,13 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
                     n += 1;
                 }
             }
-            if on_buffers && wait_needed(this) && (n > 0 || !wait_shared(list)) {
+            // SAFETY: `stack[..n]` are initialized, and a barrier is plain data.
+            let host = unsafe { std::slice::from_raw_parts_mut(stack.as_mut_ptr().cast::<Barrier>(), n) };
+            let (kept, all) = uav_waits(this, list, host, on_buffers);
+            n = kept;
+            if all {
                 stack[n].write(UAV_BARRIER);
                 n += 1;
-                #[cfg(feature = "diagnostics")]
-                crate::copystat::add(crate::copystat::C::WaitsForBuffers, 1);
             }
             // SAFETY: `stack[..n]` are all initialized.
             let slice = unsafe { std::slice::from_raw_parts(stack.as_ptr().cast::<Barrier>(), n) };
@@ -1015,10 +1159,10 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
                 .iter()
                 .filter_map(|b| host_barrier(list, b))
                 .collect();
-            if on_buffers && wait_needed(this) && (!host.is_empty() || !wait_shared(list)) {
+            let (kept, all) = uav_waits(this, list, &mut host, on_buffers);
+            host.truncate(kept);
+            if all {
                 host.push(UAV_BARRIER);
-                #[cfg(feature = "diagnostics")]
-                crate::copystat::add(crate::copystat::C::WaitsForBuffers, 1);
             }
             submit(&host);
         }
@@ -2457,6 +2601,18 @@ impl ValueWait {
         (self.address as usize, if self.wide { 8 } else { 4 })
     }
 
+    /// The value waited for.
+    pub(crate) fn reference(&self) -> u64 {
+        self.reference
+    }
+
+    /// What its address holds now (None: not readable).
+    pub(crate) fn current(&self) -> Option<u64> {
+        let mut raw = [0u8; 8];
+        let bytes = if self.wide { 8 } else { 4 };
+        crate::host::read_into(self.address as *const u8, &mut raw[..bytes]).then(|| u64::from_le_bytes(raw))
+    }
+
     /// Whether the wait is met with `value` at its address (its low half
     /// for a 32-bit wait).
     pub(crate) fn holds_for(&self, value: u64) -> bool {
@@ -3143,6 +3299,30 @@ static NEWER_THIN_FUNCTIONS: Table<160> = Table(thin::table(true));
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One call's unordered access barriers fold into one on every
+    /// resource after a write, and go when nothing wrote; others stay in
+    /// order.
+    #[test]
+    fn uav_barriers_fold() {
+        let on = |r: usize| Barrier { first: r as This, ..UAV_BARRIER };
+        let moved = |r: usize| Barrier { kind: 0, first: r as This, ..UAV_BARRIER };
+        let kinds = |host: &[Barrier]| host.iter().map(|b| (b.kind, b.first as usize)).collect::<Vec<_>>();
+
+        let mut host = [moved(1), on(2), UAV_BARRIER, moved(3), UAV_BARRIER];
+        let (n, all) = fold_uavs(&mut host, true, false);
+        assert_eq!((kinds(&host[..n]), all), (vec![(0, 1), (0, 3)], true));
+
+        let mut host = [on(2), moved(1), on(4)];
+        let (n, all) = fold_uavs(&mut host, true, false);
+        assert_eq!((kinds(&host[..n]), all), (vec![(2, 2), (0, 1), (2, 4)], false));
+        let (n, all) = fold_uavs(&mut host, true, true);
+        assert_eq!((kinds(&host[..n]), all), (vec![(0, 1)], true));
+
+        let mut host = [on(2), UAV_BARRIER, moved(1)];
+        let (n, all) = fold_uavs(&mut host, false, true);
+        assert_eq!((kinds(&host[..n]), all), (vec![(0, 1)], false));
+    }
     use crate::object::slot;
 
     #[cfg(windows)]

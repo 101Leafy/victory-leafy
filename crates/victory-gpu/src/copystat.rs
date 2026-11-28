@@ -404,6 +404,10 @@ pub(crate) enum C {
     /// them (`draw.rs` `refresh_tail`).
     RootTailAsked,
     RootTailCovered,
+    /// Root views bound as the list bound them before, and looked up
+    /// (`draw.rs` `State::root_view`, `VICTORY_ROOT_SAME`).
+    RootSameHit,
+    RootSameMiss,
     /// Settles for tables that came back with too few slots, and the asks
     /// refused without one while the settles are held back after such a
     /// settle (`draw.rs` `dynamic_slots`, `VICTORY_SETTLE_BACKOFF`).
@@ -425,7 +429,9 @@ pub(crate) enum C {
     /// is a multiple of 256 (a host constant view could read the title's
     /// memory in place), with their bytes; tables holding constant views,
     /// those whose constant views all are, and their slots; slots of tables
-    /// asked again this frame whose constant views all are.
+    /// asked again this frame whose constant views all are; constant views
+    /// that found a copy of their bytes made for another
+    /// (`VICTORY_CBV_ONCE`).
     CbvViews,
     CbvAligned,
     CbvBytes,
@@ -434,6 +440,7 @@ pub(crate) enum C {
     CbvTablesAligned,
     CbvTablesAlignedSlots,
     CbvAgainAlignedSlots,
+    CbvShared,
     /// Windows given their side on the card late (`shadow.rs`
     /// `card_late_windows`, `VICTORY_CARD_WINDOWS_LATE`), and their bytes;
     /// and the times one due found no room.
@@ -478,11 +485,20 @@ pub(crate) enum C {
     GroupsEndWrites,
     GroupsBeginWrites,
     GroupsOther,
+    /// The title's own unordered access barriers (in `list::barrier`), on
+    /// every resource and on one; of them, and of the waits for buffers
+    /// with them, those a wait for every resource in the same call covers,
+    /// and those after nothing that writes since our last full wait
+    /// (`VICTORY_UAV_FOLD`).
+    UavGlobals,
+    UavOnResources,
+    UavFolded,
+    UavQuiet,
 }
-const COUNTERS: usize = 256;
+const COUNTERS: usize = 259;
 
 /// The counters' names, in the order of [`C`], for the frame recorder's columns.
-pub(crate) const NAMES: [&str; 252] = [
+pub(crate) const NAMES: [&str; 259] = [
     "Submissions", "Copies", "CopyBytes", "Refreshes", "RefreshBytes", "Skipped", "SkippedBytes", "Runs",
     "RunUs", "Queries", "QueryUs", "MoveUs", "Unmapped", "Watches", "WatchUs", "Checked", "Unchanged",
     "Fallbacks", "GuardFaults", "TexWatched", "TexHashed", "TexChanged", "TexHot", "Frames", "RecordCalls",
@@ -527,11 +543,12 @@ pub(crate) const NAMES: [&str; 252] = [
     "TexRowsDetiled", "PlacedUavRefused",
     "HeapTexMirrorNs", "HeapTexHostNs", "HeapTexPrintNs",
     "RootTailAsked", "RootTailCovered",
+    "RootSameHit", "RootSameMiss",
     "SettlesBare", "SettlesHeld",
     "TableCacheHit", "TableCacheHitSlots", "TableCacheMiss", "TableCacheStale",
     "TableCacheChanged", "TableCacheRetired", "TableCacheRetiredSlots",
     "CbvViews", "CbvAligned", "CbvBytes", "CbvAlignedBytes",
-    "CbvTables", "CbvTablesAligned", "CbvTablesAlignedSlots", "CbvAgainAlignedSlots",
+    "CbvTables", "CbvTablesAligned", "CbvTablesAlignedSlots", "CbvAgainAlignedSlots", "CbvShared",
     "CardLateMoved", "CardLateMovedBytes", "CardLateRefused",
     "WaitsQuiet", "WaitsGroupsRead", "WaitsGroupsTexture",
     "TexPartialWritten", "TexPartialSkipped",
@@ -540,6 +557,7 @@ pub(crate) const NAMES: [&str; 252] = [
     "BatchArgsWritten", "WaitsLeftOut",
     "TakenWholeBytes", "TakenPartBytes",
     "GroupsEndWrites", "GroupsBeginWrites", "GroupsOther",
+    "UavGlobals", "UavOnResources", "UavFolded", "UavQuiet",
 ];
 /// One of some sets of counters, each in lines of the processor's memory of
 /// its own: a set for all threads had them wait for each other's lines at
@@ -928,7 +946,7 @@ mod command_tests {
     #[test]
     fn every_counter_is_named() {
         use super::{C, COUNTERS, NAMES};
-        assert_eq!(C::GroupsOther as usize + 1, NAMES.len());
+        assert_eq!(C::UavQuiet as usize + 1, NAMES.len());
         assert_eq!(NAMES[C::Frames as usize], "Frames");
         assert!(NAMES.len() <= COUNTERS);
     }
@@ -2057,6 +2075,15 @@ pub(crate) fn log(frames: f64) {
         c[C::GroupsEndWrites as usize],
         c[C::GroupsBeginWrites as usize],
         c[C::GroupsOther as usize]
+    );
+    tracing::info!(
+        "  the title's own unordered access barriers, per frame: {:.0} on every resource, {:.0} on one; \
+         {:.0} covered by another in the same call, {:.0} after nothing that writes (VICTORY_UAV_FOLD {})",
+        c[C::UavGlobals as usize],
+        c[C::UavOnResources as usize],
+        c[C::UavFolded as usize],
+        c[C::UavQuiet as usize],
+        if crate::list::uav_fold() { "on" } else { "off" }
     );
     let barriers = GROUP_BARRIERS.lock().unwrap_or_else(|e| e.into_inner()).take();
     let mut barriers: Vec<_> = barriers.into_iter().flatten().collect();

@@ -190,13 +190,16 @@ impl Shader {
                         ms,
                         "shader translated"
                     ),
-                    Err(e) => tracing::warn!(
-                        stage = self.stage,
-                        hash = %self.hash,
-                        error = %e,
-                        ms,
-                        "shader does not translate; its pipelines' draws are dropped"
-                    ),
+                    Err(e) => {
+                        refused::untranslated(&self.hash);
+                        tracing::warn!(
+                            stage = self.stage,
+                            hash = %self.hash,
+                            error = %e,
+                            ms,
+                            "shader does not translate; its pipelines' draws are dropped"
+                        )
+                    }
                 }
                 done.ok()
             })
@@ -921,6 +924,8 @@ mod make;
 mod samplers;
 #[cfg(windows)]
 mod spent;
+#[cfg(windows)]
+pub(crate) mod refused;
 
 /// Lets the pipeline library's mapped file go from memory when no pipeline
 /// has loaded for a while (`library::trim`); called by the host's sweep.
@@ -946,6 +951,7 @@ pub fn use_pipeline_cache(dir: std::path::PathBuf) {
 /// Saves the pipeline cache now if anything was added (at the end of a run).
 #[cfg(windows)]
 pub fn save_pipeline_cache() {
+    refused::summary(true);
     library::save(true);
     known::flush();
 }

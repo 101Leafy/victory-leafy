@@ -110,6 +110,23 @@ pub(super) trait Work: Send {
     /// Told just before [`Work::go`] of a submission: the highest mark of
     /// what it is made of and of the waits its queue went past.
     fn marked(&mut self, _mark: u64) {}
+    /// How long the oldest wait the valve may pass ([`Work::passable`]) may
+    /// hold the line, with nothing else free to run and no present in it,
+    /// before it goes unmet. None: it waits until a present.
+    fn valve() -> Option<Duration> {
+        None
+    }
+    /// Whether the valve may pass this wait.
+    fn passable(_: &Self::Ask) -> bool {
+        true
+    }
+    /// The fence and value it signals, if it is a signal.
+    fn signal(&self) -> Option<(usize, u64)> {
+        None
+    }
+    /// Told when the valve passes a wait it held for `held`; `urged`: a
+    /// thread of the title's waits for a fence signaled behind it.
+    fn passed(_: &Self::Ask, _held: Duration, _urged: bool) {}
 }
 
 struct Entry<W> {
@@ -139,6 +156,16 @@ struct State<W> {
     /// what is behind a wait may have been written only before the wait was
     /// met, not before it was put in the line.
     floors: Vec<(usize, u64)>,
+    /// The oldest wait the valve may pass that stood with nothing free to
+    /// run (its queue and number), and since when; cleared when an entry of
+    /// that queue is taken out (parts of a submission share a number).
+    stuck: Option<(usize, u64, Instant)>,
+    /// Fences (and values) a thread of the title's waits for whose signal is
+    /// in the line ([`Lane::urge`]).
+    urged: Vec<(usize, u64)>,
+    /// Since when a present has stood behind work whose parts are not known
+    /// yet, with nothing going.
+    stuck_present: Option<Instant>,
 }
 
 impl<W> State<W> {
@@ -161,6 +188,20 @@ pub(super) struct Lane<W: Work> {
     work: Condvar,
     /// Something was done, or a look at the line ended.
     moved: Condvar,
+    /// [`fold_force`] for this line.
+    fold_force: OnceLock<Option<Duration>>,
+}
+
+/// `VICTORY_FOLD_FORCE_MS=n`: a present that has stood n ms behind work
+/// whose parts are not known yet goes on without it, as one goes past a
+/// wait nobody meets. Off by default. A list thread held long (a driver
+/// creating pipelines on a cold library takes 20 to 49 s) holds every
+/// present behind it, and the title's watchdog writes to 0 once no frame
+/// was shown for 30 s. A present that goes this way shows the image as the
+/// card has it: the frame without the draws of what it went past.
+fn fold_force() -> Option<Duration> {
+    let ms: u64 = std::env::var("VICTORY_FOLD_FORCE_MS").ok()?.trim().parse().ok()?;
+    (ms > 0).then(|| Duration::from_millis(ms))
 }
 
 impl<W: Work> Lane<W> {
@@ -175,9 +216,13 @@ impl<W: Work> Lane<W> {
                 presents: 0,
                 runs: 0,
                 floors: Vec::new(),
+                stuck: None,
+                urged: Vec::new(),
+                stuck_present: None,
             }),
             work: Condvar::new(),
             moved: Condvar::new(),
+            fold_force: OnceLock::new(),
         }
     }
 
@@ -235,6 +280,40 @@ impl<W: Work> Lane<W> {
         self.work.notify_one();
     }
 
+    /// A thread of the title's waits for `fence` to reach `value`: if the
+    /// signal is in the line, and the line stands at waits nothing meets,
+    /// they go unmet at once instead of after [`Work::valve`].
+    pub(super) fn urge(&self, fence: usize, value: u64) {
+        if W::valve().is_none() {
+            return;
+        }
+        let mut guard = self.lock();
+        let state = &mut *guard;
+        Self::trim(&mut state.urged, &state.items);
+        if state.urged.contains(&(fence, value)) || !Self::signaled(&state.items, None, fence, value) {
+            return;
+        }
+        state.urged.push((fence, value));
+        state.asked += 1;
+        drop(guard);
+        self.work.notify_one();
+    }
+
+    /// Whether a signal of `fence` to `value` or past it is in the line (of
+    /// `queue`, if given).
+    fn signaled(items: &VecDeque<Entry<W>>, queue: Option<usize>, fence: usize, value: u64) -> bool {
+        items.iter().any(|e| {
+            queue.is_none_or(|q| q == e.queue) && e.what.signal().is_some_and(|(f, v)| f == fence && v >= value)
+        })
+    }
+
+    /// Drops urges whose fence was reached or whose signal left the line.
+    fn trim(urged: &mut Vec<(usize, u64)>, items: &VecDeque<Entry<W>>) {
+        urged.retain(|&(fence, value)| {
+            crate::fence::completed(fence as This) < value && Self::signaled(items, None, fence, value)
+        });
+    }
+
     /// Waits until everything in the line that is free to run has been done
     /// (what comes in after this call may not be).
     pub(super) fn drain(&self) {
@@ -253,21 +332,50 @@ impl<W: Work> Lane<W> {
         }
     }
 
-    /// Waits until at most `most` presents are in the line.
-    pub(super) fn wait_presents(&self, most: usize) {
-        let mut state = self.lock();
-        while state.presents > most {
-            state = self.moved.wait(state).unwrap_or_else(|e| e.into_inner());
-        }
+    /// Waits until at most `most` presents are in the line, or for `bound`
+    /// with nothing taken from the line: whether it got there.
+    pub(super) fn wait_presents(&self, most: usize, bound: Option<Duration>) -> bool {
+        self.wait_while(bound, |state| state.presents > most)
     }
 
     /// Waits until at most `most` submissions are in the line, or what is
-    /// left of it stands at something.
-    pub(super) fn wait_runs(&self, most: usize) {
+    /// left of it stands at something, or for `bound` with nothing taken:
+    /// whether it got there.
+    pub(super) fn wait_runs(&self, most: usize, bound: Option<Duration>) -> bool {
+        self.wait_while(bound, |state| state.runs > most && state.served < state.asked)
+    }
+
+    /// Presents and submissions in the line or being done.
+    pub(super) fn held(&self) -> (usize, usize) {
+        let state = self.lock();
+        (state.presents, state.runs)
+    }
+
+    fn wait_while(&self, bound: Option<Duration>, waits: impl Fn(&State<W>) -> bool) -> bool {
         let mut state = self.lock();
-        while state.runs > most && state.served < state.asked {
-            state = self.moved.wait(state).unwrap_or_else(|e| e.into_inner());
+        let Some(bound) = bound else {
+            while waits(&state) {
+                state = self.moved.wait(state).unwrap_or_else(|e| e.into_inner());
+            }
+            return true;
+        };
+        let taken = |state: &State<W>| state.next - state.items.len() as u64;
+        let mut seen = taken(&state);
+        let mut since = Instant::now();
+        while waits(&state) {
+            let left = bound.saturating_sub(since.elapsed());
+            if left.is_zero() {
+                return false;
+            }
+            state = self.moved.wait_timeout(state, left).unwrap_or_else(|e| e.into_inner()).0;
+            // Anything taken from the line restarts the clock: only a line
+            // that stands still is given up on.
+            if taken(&state) != seen {
+                seen = taken(&state);
+                since = Instant::now();
+            }
         }
+        true
     }
 
     /// Looks at the line for as long as the process runs.
@@ -328,6 +436,23 @@ impl<W: Work> Lane<W> {
         }
     }
 
+    /// The number of the oldest present before `limit`, once it has stood
+    /// [`fold_force`] behind work whose parts are not known yet.
+    fn past_folded(&self, limit: u64) -> Option<u64> {
+        let most = (*self.fold_force.get_or_init(fold_force))?;
+        let mut state = self.lock();
+        let present = state.items.iter().find(|e| e.number < limit && e.what.shows())?.number;
+        let since = *state.stuck_present.get_or_insert_with(Instant::now);
+        if since.elapsed() < most {
+            return None;
+        }
+        tracing::warn!(
+            ms = since.elapsed().as_millis() as u64,
+            "a present went past work whose parts are not known yet: the frame is shown without its draws"
+        );
+        Some(present)
+    }
+
     /// Does one entry: the oldest that is the first of its queue and free to
     /// run. Whether there was one. Only one thread calls this.
     fn step(&self, limit: u64) -> bool {
@@ -360,13 +485,55 @@ impl<W: Work> Lane<W> {
                 // frames (`super::present`). (Not while there is work whose
                 // parts are not known: it may be what is waited for.)
                 if folded {
-                    return false;
+                    let Some(present) = self.past_folded(limit) else {
+                        return false;
+                    };
+                    (present, true)
+                } else {
+                    let mut state = self.lock();
+                    if super::forces() && state.items.iter().any(|e| e.number < limit && e.what.shows()) {
+                        (first, true)
+                    } else {
+                        // No present comes while a thread of the title's waits
+                        // for a fence signaled behind a wait nothing meets (one
+                        // we do not make): the oldest such wait goes unmet after
+                        // a while, or at once if the title waits for that fence.
+                        // What it holds still runs.
+                        let Some(after) = W::valve() else {
+                            return false;
+                        };
+                        let passable: Vec<_> =
+                            heads.iter().filter_map(|h| h.2.as_ref().filter(|a| W::passable(a)).map(|a| (h.0, h.1, a))).collect();
+                        let Some(&(oldest, queue, _)) = passable.first() else {
+                            return false;
+                        };
+                        let state = &mut *state;
+                        Self::trim(&mut state.urged, &state.items);
+                        // Urged: a head whose own queue holds the signal waited for.
+                        let urged = passable.iter().find(|&&(_, q, _)| {
+                            state.urged.iter().any(|&(f, v)| Self::signaled(&state.items, Some(q), f, v))
+                        });
+                        let now = Instant::now();
+                        let since = match state.stuck {
+                            Some((q, n, since)) if q == queue && n == oldest => since,
+                            _ => {
+                                state.stuck = Some((queue, oldest, now));
+                                now
+                            }
+                        };
+                        match urged {
+                            Some(&(number, _, ask)) => {
+                                W::passed(ask, Duration::ZERO, true);
+                                (number, true)
+                            }
+                            None if now - since >= after => {
+                                W::passed(passable[0].2, now - since, false);
+                                (oldest, true)
+                            }
+                            None => return false,
+                        }
+                    }
                 }
-                let state = self.lock();
-                if !super::forces() || !state.items.iter().any(|e| e.number < limit && e.what.shows()) {
-                    return false;
-                }
-                (first, true)
             }
         };
         let mut entry = {
@@ -377,6 +544,10 @@ impl<W: Work> Lane<W> {
             let Some(entry) = state.items.remove(at) else {
                 return false;
             };
+            if state.stuck.is_some_and(|s| s.0 == entry.queue) {
+                state.stuck = None;
+            }
+            state.stuck_present = None;
             state.running = Some(entry.queue);
             entry
         };
@@ -579,6 +750,38 @@ impl Work for Job {
         crate::port_journal::set_mark(mark);
     }
 
+    fn valve() -> Option<Duration> {
+        held_wait()
+    }
+
+    fn passable(ask: &Ask) -> bool {
+        matches!(ask, Ask::Value(_))
+    }
+
+    fn signal(&self) -> Option<(usize, u64)> {
+        match *self {
+            Job::Signal(ref fence, value) => Some((fence.at(), value)),
+            _ => None,
+        }
+    }
+
+    fn passed(ask: &Ask, held: Duration, urged: bool) {
+        let Ask::Value(wait) = ask else { return };
+        static SEEN: AtomicU64 = AtomicU64::new(0);
+        let seen = SEEN.fetch_add(1, Relaxed);
+        if seen < 16 || seen.is_multiple_of(256) {
+            tracing::warn!(
+                address = format_args!("{:#x}", wait.place().0),
+                reference = wait.reference(),
+                now = ?wait.current(),
+                held_ms = held.as_millis() as u64,
+                urged,
+                seen = seen + 1,
+                "held work runs without its unmet wait (VICTORY_HELD_WAIT_MS): no present in the line"
+            );
+        }
+    }
+
     fn met(ask: &Ask) -> bool {
         match ask {
             Ask::Wait(fence, value) => crate::fence::completed(fence.this()) >= *value,
@@ -669,7 +872,7 @@ impl Work for Job {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::Forced, 1);
             static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!("a queue still stood at a wait at a present: it was not met"));
+            ONCE.call_once(|| tracing::warn!("a queue still stood at a wait at a present (or the held-wait valve): it was not met"));
         }
         match self {
             // (A folded one is unfolded, never done.)
@@ -717,6 +920,7 @@ impl Work for Job {
                     let over = overlay.as_ref().map(|(over, state)| (&over.texture, left(over, *state)));
                     super::show(&texture.texture, left(&texture, state), over, shown);
                 }
+                crate::frame::shown(shown.token, shown.entered);
                 QUEUED.fetch_sub(1, Relaxed);
             }
         }
@@ -781,6 +985,14 @@ thread_local! {
     static OURS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// How long a wait nothing meets may hold the line when no present is in it
+/// (`VICTORY_HELD_WAIT_MS`, 1500 by default; 0: until a present, as before).
+fn held_wait() -> Option<Duration> {
+    static MS: OnceLock<u64> = OnceLock::new();
+    let ms = *MS.get_or_init(|| number("VICTORY_HELD_WAIT_MS").map_or(1500, |n| n as u64));
+    (ms > 0).then(|| Duration::from_millis(ms))
+}
+
 /// Whether submissions are prepared by a thread of ours
 /// (`VICTORY_ASYNC_SUBMIT=1`; needs flights with the present sent ahead, as
 /// the relay has them, and lists cut at their waits).
@@ -800,7 +1012,7 @@ pub(super) fn on() -> bool {
 /// done first. (At a present, by the title's thread that submits.)
 #[cfg(any(feature = "diagnostics", feature = "ab"))]
 pub(super) fn leave() {
-    LANE.wait_presents(0);
+    LANE.wait_presents(0, None);
     LANE.drain();
 }
 
@@ -901,7 +1113,9 @@ fn room(queued: u64) {
     if queued > runs_most() as u64 {
         let began = Instant::now();
         let _waiting = crate::timeline::span("a submission waits for room in the line");
-        LANE.wait_runs(runs_most());
+        if !LANE.wait_runs(runs_most(), keepalive()) {
+            gave_up("a submission");
+        }
         STATS[ROOM].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
     }
 }
@@ -940,6 +1154,11 @@ fn jobs_of(this: This, lists: &[This]) -> Vec<Job> {
     jobs
 }
 
+/// A thread of the title's waits for `fence` to reach `value` ([`Lane::urge`]).
+pub(super) fn urge(fence: This, value: u64) {
+    LANE.urge(fence as usize, value);
+}
+
 /// A signal of queue `this`: behind what it has in the line; if that is
 /// nothing, behind the flights in the air, or now.
 pub(super) fn signal(this: This, fence: This, value: u64) {
@@ -970,8 +1189,37 @@ pub(super) fn present(
     LANE.push(this as usize, [Job::Present(texture, overlay, shown)]);
     let began = Instant::now();
     let _waiting = crate::timeline::span("a present waits for the one before it to be sent");
-    LANE.wait_presents(frames_most());
+    if !LANE.wait_presents(frames_most(), keepalive()) {
+        gave_up("a present");
+    }
     STATS[AT_PRESENT].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
+}
+
+/// How long a call of the title's waits on a line that stands still before
+/// it returns anyway, with what it gave still in the line
+/// (`VICTORY_PRESENT_KEEPALIVE=1`; `VICTORY_PRESENT_KEEPALIVE_MS`, 10000).
+/// Nothing is dropped or shown twice: the frame is sent when the line moves.
+///
+/// Why: the title kills itself after 30 s with no frame of its own (ff-held
+/// r140, ff-se r126). Its watchdog thread counts a tick that only the title's
+/// frame and load code writes, so a present made again by the host cannot
+/// restart it; the title's thread has to get out of its present.
+fn keepalive() -> Option<Duration> {
+    static BOUND: OnceLock<Option<Duration>> = OnceLock::new();
+    *BOUND.get_or_init(|| {
+        std::env::var_os("VICTORY_PRESENT_KEEPALIVE").is_some_and(|v| v == "1").then(|| {
+            let ms = number("VICTORY_PRESENT_KEEPALIVE_MS").unwrap_or(10_000).max(1);
+            tracing::info!(ms, "a present or submission that waits this long on a line that stands still returns (VICTORY_PRESENT_KEEPALIVE=1)");
+            Duration::from_millis(ms as u64)
+        })
+    })
+}
+
+fn gave_up(what: &str) {
+    static TIMES: AtomicU64 = AtomicU64::new(0);
+    let times = TIMES.fetch_add(1, Relaxed) + 1;
+    let (presents, runs) = LANE.held();
+    tracing::warn!(times, presents, runs, "{what} returned to the title with the line standing still: what it gave stays in the line");
 }
 
 /// For the frame-rate line.
@@ -1024,13 +1272,15 @@ mod tests {
         Present(&'static str, Log),
         /// Takes others of its kind, waits that are met, and signals along.
         Group(Vec<&'static str>, Log, Vec<(usize, u64)>),
+        /// Stands for its parts, which are known once the fence has the value.
+        Folded(usize, u64, Vec<T>),
     }
 
     impl Work for T {
         type Ask = (usize, u64);
         fn ask(&self) -> Option<(usize, u64)> {
             match self {
-                &T::Wait(fence, value) => Some((fence, value)),
+                &T::Wait(fence, value) | &T::Folded(fence, value, _) => Some((fence, value)),
                 _ => None,
             }
         }
@@ -1041,7 +1291,16 @@ mod tests {
             matches!(self, T::Present(..))
         }
         fn runs(&self) -> bool {
-            matches!(self, T::Run(..) | T::Slow(..) | T::Group(..))
+            matches!(self, T::Run(..) | T::Slow(..) | T::Group(..) | T::Folded(..))
+        }
+        fn folded(&self) -> bool {
+            matches!(self, T::Folded(..))
+        }
+        fn unfold(self) -> Vec<T> {
+            match self {
+                T::Folded(_, _, parts) => parts,
+                other => vec![other],
+            }
         }
         fn take_along(&mut self, next: T) -> Result<bool, T> {
             let T::Group(names, _, signals) = self else {
@@ -1062,6 +1321,7 @@ mod tests {
         }
         fn go(self, forced: bool) {
             match self {
+                T::Folded(..) => unreachable!("a folded one is unfolded"),
                 T::Wait(..) => {
                     if forced {
                         FORCED_HERE.with(|f| f.set(f.get() + 1));
@@ -1101,6 +1361,18 @@ mod tests {
             };
             MARKS.with(|m| m.borrow_mut().push((name, mark)));
         }
+        fn valve() -> Option<Duration> {
+            VALVE.get()
+        }
+        fn signal(&self) -> Option<(usize, u64)> {
+            match *self {
+                T::Signal(fence, value, _) => Some((fence, value)),
+                _ => None,
+            }
+        }
+        fn passed(_: &(usize, u64), _: Duration, urged: bool) {
+            PASSED.with(|p| p.borrow_mut().push(urged));
+        }
     }
 
     thread_local! {
@@ -1110,6 +1382,126 @@ mod tests {
         static LATER: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
         /// The marks submissions were done with, by name.
         static MARKS: std::cell::RefCell<Vec<(String, u64)>> = const { std::cell::RefCell::new(Vec::new()) };
+        /// What [`Work::valve`] gives in a test, and what it passed (urged).
+        static VALVE: std::cell::Cell<Option<Duration>> = const { std::cell::Cell::new(None) };
+        static PASSED: std::cell::RefCell<Vec<bool>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    /// With no present in the line, a wait nothing meets holds its queue for
+    /// the valve's time, then goes unmet; what it held still runs, in order.
+    /// Without a valve it holds until a present, as before.
+    #[test]
+    fn a_wait_nothing_meets_goes_unmet_after_a_while() {
+        let lane = Lane::new();
+        let log: Log = Default::default();
+        let f = fence();
+        let g = fence();
+        let run = |name| T::Run(name, log.clone());
+        lane.push(2, [T::Wait(f, 9), run("held"), T::Signal(g, 1, log.clone())]);
+        lane.push(1, [run("draw")]);
+        look(&lane);
+        std::thread::sleep(Duration::from_millis(30));
+        look(&lane);
+        assert_eq!(*log.lock().unwrap(), ["draw"], "no valve: held until a present");
+        VALVE.set(Some(Duration::from_millis(20)));
+        look(&lane);
+        assert_eq!(*log.lock().unwrap(), ["draw"], "the valve's time begins when it is first seen stuck");
+        std::thread::sleep(Duration::from_millis(30));
+        look(&lane);
+        assert_eq!(*log.lock().unwrap(), ["draw", "held", "signal 1"]);
+        assert_eq!((value(f), value(g)), (0, 1), "the wait was passed, not met");
+        assert_eq!(PASSED.take(), [false]);
+        assert_eq!(FORCED_HERE.get(), 1);
+        let state = lane.lock();
+        assert_eq!((state.presents, state.runs, state.items.len(), state.stuck), (0, 0, 0, None));
+    }
+
+    /// An urge passes only a wait whose own queue holds the signal; another
+    /// queue's wait keeps the valve's time.
+    #[test]
+    fn an_urge_passes_only_the_wait_in_front_of_its_signal() {
+        let lane = Lane::new();
+        let log: Log = Default::default();
+        let (f, g, k) = (fence(), fence(), fence());
+        let run = |name| T::Run(name, log.clone());
+        VALVE.set(Some(Duration::from_secs(3600)));
+        lane.push(1, [T::Wait(f, 9), run("other queue")]);
+        lane.push(2, [T::Wait(k, 9), T::Signal(g, 1, log.clone())]);
+        look(&lane);
+        lane.urge(g, 1);
+        look(&lane);
+        assert_eq!(*log.lock().unwrap(), ["signal 1"]);
+        assert_eq!(PASSED.take(), [true]);
+        look(&lane);
+        assert_eq!(*log.lock().unwrap(), ["signal 1"], "the other queue's wait is not hurried");
+        assert!(lane.lock().urged.is_empty());
+    }
+
+    /// Urges are kept once, only while their signal is in the line and the
+    /// fence not reached, and not at all without a valve.
+    #[test]
+    fn urges_do_not_pile_up() {
+        let lane = Lane::new();
+        let log: Log = Default::default();
+        let (f, g) = (fence(), fence());
+        lane.push(1, [T::Wait(f, 9), T::Signal(g, 2, log.clone())]);
+        lane.urge(g, 1);
+        assert!(lane.lock().urged.is_empty(), "no valve");
+        VALVE.set(Some(Duration::from_secs(3600)));
+        lane.urge(g, 1);
+        lane.urge(g, 1);
+        assert_eq!(lane.lock().urged, [(g, 1)]);
+        crate::fence::set(g as This, 1);
+        lane.urge(g, 2);
+        assert_eq!(lane.lock().urged, [(g, 2)], "the reached one was dropped");
+    }
+
+    /// Parts of one submission share a number: a second wait of it gets its
+    /// own time once the first was met.
+    #[test]
+    fn each_wait_gets_its_own_time() {
+        let lane = Lane::new();
+        let log: Log = Default::default();
+        let (f, g) = (fence(), fence());
+        let run = |name| T::Run(name, log.clone());
+        VALVE.set(Some(Duration::from_millis(40)));
+        lane.push(1, [T::Wait(f, 1), run("a"), T::Wait(g, 1), run("b")]);
+        lane.lock().items.iter_mut().for_each(|e| e.number = 0);
+        look(&lane);
+        std::thread::sleep(Duration::from_millis(50));
+        crate::fence::set(f as This, 1);
+        look(&lane);
+        assert_eq!(*log.lock().unwrap(), ["a"], "the second wait was not held long enough");
+        std::thread::sleep(Duration::from_millis(50));
+        look(&lane);
+        assert_eq!(*log.lock().unwrap(), ["a", "b"]);
+        assert_eq!(PASSED.take(), [false]);
+    }
+
+    /// A thread of the title's waits for a fence signaled behind a wait
+    /// nothing meets: the wait goes at once. A fence with no signal in the
+    /// line, or a line with something free to run, is not hurried.
+    #[test]
+    fn a_title_waiting_for_a_held_signal_lets_the_wait_go() {
+        let lane = Lane::new();
+        let log: Log = Default::default();
+        let (f, g, h) = (fence(), fence(), fence());
+        let run = |name| T::Run(name, log.clone());
+        VALVE.set(Some(Duration::from_secs(3600)));
+        lane.push(2, [T::Wait(f, 9), run("held"), T::Signal(g, 2, log.clone())]);
+        look(&lane);
+        lane.urge(h, 1);
+        look(&lane);
+        assert!(log.lock().unwrap().is_empty(), "no signal of that fence in the line");
+        lane.urge(g, 2);
+        look(&lane);
+        assert_eq!(*log.lock().unwrap(), ["held", "signal 2"]);
+        assert_eq!(PASSED.take(), [true]);
+        // Met since: the next wait is not hurried by the old urge.
+        lane.push(2, [T::Wait(f, 9), run("held again")]);
+        look(&lane);
+        assert_eq!(log.lock().unwrap().len(), 2);
+        assert!(lane.lock().urged.is_empty());
     }
 
     /// Renderer port #7: a submission is done with the mark taken when it
@@ -1290,6 +1682,37 @@ mod tests {
         assert_eq!((state.presents, state.runs, state.items.len()), (0, 0, 0));
     }
 
+    /// Work whose parts are not known holds a present, which is not forced
+    /// past it; with `VICTORY_FOLD_FORCE_MS` it is, after that long, and the
+    /// work keeps its place and goes once it is known.
+    #[test]
+    fn a_present_goes_past_folded_work_only_after_the_limit() {
+        let lane = Lane::new();
+        let log: Log = Default::default();
+        let f = fence();
+        let run = |name| T::Run(name, log.clone());
+        lane.push(1, [T::Folded(f, 1, vec![run("lists")])]);
+        lane.push(1, [T::Present("present", log.clone())]);
+        look(&lane);
+        assert!(log.lock().unwrap().is_empty(), "without the switch it stands");
+        let lane = Lane::new();
+        lane.fold_force.set(Some(Duration::from_millis(30))).unwrap();
+        lane.push(1, [T::Folded(f, 1, vec![run("lists")])]);
+        lane.push(1, [T::Present("present", log.clone())]);
+        lane.push(1, [run("next frame")]);
+        look(&lane);
+        assert!(log.lock().unwrap().is_empty(), "not before the limit");
+        std::thread::sleep(Duration::from_millis(40));
+        look(&lane);
+        assert_eq!(*log.lock().unwrap(), ["present"], "what is behind the folded work on its queue stays");
+        assert_eq!(lane.lock().presents, 0);
+        crate::fence::set(f as This, 1);
+        look(&lane);
+        assert_eq!(*log.lock().unwrap(), ["present", "lists", "next frame"]);
+        let state = lane.lock();
+        assert_eq!((state.presents, state.runs, state.items.len(), state.stuck), (0, 0, 0, None));
+    }
+
     /// With the thread: a fence behind a submission is not reached before the
     /// submission has been done, presents hold the title back a frame later,
     /// and a drain comes back when everything was done.
@@ -1304,7 +1727,7 @@ mod tests {
         lane.push_behind(1, false, T::Signal(f, 1, log.clone()), || panic!("behind the submission"));
         lane.push(1, [T::Present("present 1", log.clone())]);
         // One present may be in the line: this returns with it there.
-        lane.wait_presents(1);
+        lane.wait_presents(1, None);
         assert_eq!(value(f), 0);
         assert!(log.lock().unwrap().is_empty());
         // A fence behind a submission being done (no longer in the line).
@@ -1321,7 +1744,7 @@ mod tests {
                 gate.1.notify_all();
             })
         };
-        lane.wait_presents(1);
+        lane.wait_presents(1, None);
         assert!(value(f) == 1, "the first frame was done");
         lane.drain();
         assert_eq!(*log.lock().unwrap(), ["slow", "signal 1", "present 1", "second", "present 2"]);
@@ -1331,7 +1754,7 @@ mod tests {
         lane.push(1, [T::Wait(f, 5), T::Run("after the wait", log.clone())]);
         lane.drain();
         assert_eq!(log.lock().unwrap().len(), 5);
-        lane.wait_runs(0);
+        lane.wait_runs(0, None);
         crate::fence::set(f as This, 5);
         while log.lock().unwrap().len() < 6 {
             std::thread::yield_now();

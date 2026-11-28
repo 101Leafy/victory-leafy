@@ -28,6 +28,12 @@
 //! - a number: that share of the estimate (1: all of it).
 //! - `constant:<level>`: the constant, as beloooo's fork has it.
 //!
+//! `VICTORY_PROBE_NEUTRAL=<level>` replaces diffuse screen-probe light with
+//! neutral irradiance (positive finite, capped at 2; unset/0: unchanged).
+//! This opt-in workaround removes stale flashing colour and valid indirect
+//! colour alike. It follows only direct, nonempty diffuse resolves, requires
+//! the existing stand-in to be enabled, and does not read depth or UI pixels.
+//!
 //! `VICTORY_AMBIENT_SHADE=<strength>,<radius in metres>` sets the creases.
 //! `VICTORY_AMBIENT_ONCE=1`: one bounce of the title's own light, without the
 //! stand-in's light coming back to it ([`once`]).
@@ -52,6 +58,18 @@
 //! beloooo's (VIctory-Belobug-AMD 44dcd437, which holds them after
 //! `CS_UpdateHistory` to a part of its constant); here it is before the copy
 //! the transparent materials read, to the frame's own estimate.
+//!
+//! Before that resolve the rays are at half the picture's size: rays the
+//! title's screen-space march resolves (`CS_ResolveScreenSpace`) take the
+//! light seen on screen; the others go to the structures, find nothing, and
+//! `CS_RayMiss` gives each the sky's light from the sky's cube maps (in a
+//! cutscene frame, capture haze2: 10 to 30 against 0.01 to 0.1 for the room
+//! the eyes and floors are in, and blue). `VICTORY_AMBIENT_SPECULAR` puts in,
+//! right after that program, the same estimate taken along the reflected
+//! direction ([`Role::Miss`]); the screen-space resolve that comes next
+//! still writes what it found over it.
+
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 use std::sync::{Mutex, OnceLock};
 
@@ -72,6 +90,9 @@ pub(crate) enum Role {
     Air,
     /// Resolves the traced reflections.
     Reflect,
+    /// Gives the reflection rays that found nothing the sky's light
+    /// (`CS_RayMiss`, not `CS_RayMiss_Volumetrics` nor the screen probes').
+    Miss,
 }
 
 /// The program's part in this, by its name in the container.
@@ -85,9 +106,19 @@ pub(crate) fn role(container: &[u8]) -> Option<Role> {
         Some(Role::Radiance)
     } else if has(b"CS_AccumulateLocalLightInscatteringVolume") {
         Some(Role::Air)
+    } else if is_miss(container) {
+        Some(Role::Miss)
     } else {
         None
     }
+}
+
+/// `CS_RayMiss_` and the eight hex digits of a variant's hash.
+fn is_miss(container: &[u8]) -> bool {
+    const NAME: &[u8] = b"CS_RayMiss_";
+    container.windows(NAME.len() + 9).any(|w| {
+        w.starts_with(NAME) && w[NAME.len()..NAME.len() + 8].iter().all(u8::is_ascii_hexdigit) && w[NAME.len() + 8] == b'_'
+    })
 }
 
 /// Where the resolve writes the diffuse light (R9G9B9E5 as 32-bit integers)
@@ -102,6 +133,14 @@ pub(crate) const AIR: (u8, u32) = (1, 32);
 /// that holds a 2D image of their format (the opaque surfaces' resolve has it
 /// at the first, the transparent ones' at the second; a buffer at the first).
 pub(crate) const REFLECTIONS: [(u8, u32); 2] = [(1, 128), (1, 136)];
+/// Where the miss program writes the reflected light (R11G11B10, half the
+/// picture's size) and where it reads the depth it is given (a 32-bit depth
+/// of the picture's size).
+pub(crate) const MISS_LIGHT: (u8, u32) = (1, 104);
+pub(crate) const MISS_DEPTH: (u8, u32) = (0, 1000);
+/// The miss program's first root constant: which surfaces its rays are of.
+pub(crate) const MISS_OPAQUE: u32 = 0;
+pub(crate) const MISS_ALPHA: u32 = 1;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Set {
@@ -140,9 +179,33 @@ fn set() -> Set {
     *SET.get_or_init(|| parse(&std::env::var("VICTORY_AMBIENT").unwrap_or_default()))
 }
 
-/// Whether the stand-in is on: set, and the title's rays find nothing.
+/// Whether a stand-in is on (for the diffuse light or for reflections):
+/// set, and the title's rays find nothing.
 pub(crate) fn on() -> bool {
-    set() != Set::Off && !crate::pipeline::builder_runs()
+    (set() != Set::Off || specular().is_some()) && !crate::pipeline::builder_runs()
+}
+
+/// `VICTORY_AMBIENT_SPECULAR=<share>[,<sky>]`: reflections whose rays found
+/// nothing take `share` of the estimate along the reflected direction
+/// instead of the sky's light; `sky` (0 to 1, 0 if not given) of them stays
+/// the title's sky, made no brighter than the estimate. Unset or 0: the
+/// title's sky.
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct Specular {
+    share: f32,
+    sky: f32,
+}
+
+fn parse_specular(set: &str) -> Option<Specular> {
+    let mut parts = set.split(',').map(|t| t.trim().parse::<f32>().ok().filter(|v| v.is_finite()));
+    let share = parts.next().flatten().filter(|v| *v > 0.0)?;
+    let sky = parts.next().flatten().map_or(0.0, |v| v.clamp(0.0, 1.0));
+    Some(Specular { share, sky })
+}
+
+fn specular() -> Option<Specular> {
+    static SET: OnceLock<Option<Specular>> = OnceLock::new();
+    *SET.get_or_init(|| parse_specular(&std::env::var("VICTORY_AMBIENT_SPECULAR").unwrap_or_default()))
 }
 
 /// `VICTORY_AMBIENT_ONCE=1`: the estimate is one bounce of the light the
@@ -431,6 +494,62 @@ void clear_air(uint3 at : SV_DispatchThreadID) {
 }
 #endif
 
+#ifdef REFLECT
+RWTexture2D<float3> reflected : register(u0);
+// Each texel of the reflections' image (half the picture's size): the light
+// the points around send along the reflected direction, as `raise` takes it
+// along the normal; `level` is the share, `constant` the share of the
+// title's sky kept, made no brighter than that.
+[RootSignature(RS)]
+[numthreads(8, 8, 1)]
+void reflect_light(uint3 at : SV_DispatchThreadID) {
+    uint w, h;
+    reflected.GetDimensions(w, h);
+    if (at.x >= w || at.y >= h) return;
+    float2 size = float2(width, height);
+    int2 p = int2((float2(at.xy) + 0.5) * size / float2(w, h));
+    float3 c = seen(p, size);
+    // Nothing is reflected by the sky.
+    if (c.z >= 999.0) return;
+    float3 l = seen(p + int2(-1, 0), size), r = seen(p + int2(1, 0), size);
+    float3 u = seen(p + int2(0, -1), size), d = seen(p + int2(0, 1), size);
+    float3 dx = abs(l.z - c.z) < abs(r.z - c.z) ? c - l : r - c;
+    float3 dy = abs(u.z - c.z) < abs(d.z - c.z) ? c - u : d - c;
+    float3 n = normalize(cross(dy, dx) + float3(0, 0, -1e-9));
+    if (dot(n, c) > 0.0) n = -n;
+    float3 v = normalize(c);
+    float3 ray = v - 2.0 * dot(v, n) * n;
+    float2 g = (float2(p) + 0.5) / size * float2(PX, PY) - 0.5;
+    int2 g0 = int2(floor(g));
+    float2 f = g - float2(g0);
+    float4 sr = 0, sg = 0, sb = 0;
+    float sum = 0;
+    for (int k = 0; k < 4; k++) {
+        int2 q = clamp(g0 + int2(k & 1, k >> 1), int2(0, 0), int2(PX, PY) - 1);
+        float z = seen(int2((float2(q) + 0.5) * size / float2(PX, PY)), size).z;
+        float2 b = float2(k & 1 ? f.x : 1 - f.x, k >> 1 ? f.y : 1 - f.y);
+        float wgt = (b.x * b.y + 1e-3) / (0.02 + abs(z - c.z) / c.z);
+        uint at0 = (q.y * PX + q.x) * 3;
+        sr += wgt * points[at0];
+        sg += wgt * points[at0 + 1];
+        sb += wgt * points[at0 + 2];
+        sum += wgt;
+    }
+    float3 all = float3(sr.w, sg.w, sb.w) / sum;
+    // Radiance from the first moments: three times the direction's share
+    // for an even spread of directions, a little less for a smooth image.
+    float3 found = all + 2.0 * float3(dot(sr.xyz, ray), dot(sg.xyz, ray), dot(sb.xyz, ray)) / sum;
+    found = clamp(found, 0.1 * all, 3.0 * all);
+    found = lerp(found, cells[CELLS].rgb, 0.2) * level;
+    found = any(isnan(found)) || any(isinf(found)) ? 0.0 : max(found, 0.0);
+    float3 was = reflected[at.xy];
+    was = any(isnan(was)) || any(isinf(was)) ? 0.0 : max(was, 0.0);
+    float has = dot(was, LUMA);
+    was *= min(1.0, dot(found, LUMA) / max(has, 1e-6));
+    reflected[at.xy] = lerp(found, was, constant);
+}
+#endif
+
 #if defined(RAISE) || defined(HOLD)
 RWTexture2D<uint> light : register(u0);
 float3 unpack(uint v) {
@@ -597,6 +716,7 @@ struct Pass {
     raise: ID3D12PipelineState,
     air: ID3D12PipelineState,
     hold: ID3D12PipelineState,
+    reflect: ID3D12PipelineState,
     cells: ID3D12Resource,
     points: ID3D12Resource,
 }
@@ -629,6 +749,7 @@ fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -
     let raise = pipeline("RAISE", s!("raise"))?;
     let air = pipeline("AIR", s!("clear_air"))?;
     let hold = pipeline("HOLD", s!("hold"))?;
+    let reflect = pipeline("REFLECT", s!("reflect_light"))?;
     let made = |bytes| buffer(bytes).ok_or_else(windows::core::Error::empty);
     Ok(Pass {
         root: root.ok_or_else(windows::core::Error::empty)?,
@@ -639,6 +760,7 @@ fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -
         raise,
         air,
         hold,
+        reflect,
         cells: made(CELL_BYTES)?,
         points: made(POINT_BYTES)?,
     })
@@ -717,6 +839,99 @@ fn uav_barrier(list: &ID3D12GraphicsCommandList) {
     unsafe { list.ResourceBarrier(&[barrier]) };
 }
 
+fn parse_neutral(value: &str) -> Option<f32> {
+    value.trim().parse::<f32>().ok().filter(|v| v.is_finite() && *v > 0.0).map(|v| v.min(2.0))
+}
+
+pub(crate) fn neutral_level() -> Option<f32> {
+    static LEVEL: OnceLock<Option<f32>> = OnceLock::new();
+    *LEVEL.get_or_init(|| parse_neutral(&std::env::var("VICTORY_PROBE_NEUTRAL").unwrap_or_default()))
+}
+
+fn neutral_image(role: Role, desc: &D3D12_RESOURCE_DESC) -> bool {
+    role == Role::Resolve
+        && desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
+        && desc.Format == windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_UINT
+        && desc.SampleDesc.Count == 1
+        && desc.DepthOrArraySize == 1
+        && desc.Width > 0 && desc.Width <= u64::from(u32::MAX) && desc.Height > 0
+}
+
+/// A default UAV uses mip zero; explicit views must name a 2D R32_UINT
+/// mip-zero colour plane so full-resource dispatch bounds are valid.
+pub(crate) fn neutral_uav(words: Option<&[u32; 10]>) -> bool {
+    words.is_none_or(|d| crate::resource::pc_format(d[0]) == 42 && d[1] == 4 && d[4] == 0 && d[5] == 0)
+}
+
+const NEUTRAL_SOURCE: &str = r#"
+#define RS "RootConstants(num32BitConstants=3, b0), DescriptorTable(UAV(u0))"
+cbuffer Params : register(b0) { float level; uint width; uint height; };
+RWTexture2D<uint> light : register(u0);
+uint pack(float3 c) {
+    float peak = max(c.r, max(c.g, c.b));
+    int exponent = max(-16, int(floor(log2(max(peak, 1e-9))))) + 1;
+    float scale = exp2(float(exponent - 9));
+    uint3 m = uint3(floor(c / scale + 0.5));
+    if (max(m.r, max(m.g, m.b)) > 511) {
+        exponent++; scale *= 2; m = uint3(floor(c / scale + 0.5));
+    }
+    return (uint(exponent + 15) << 27) | m.r | (m.g << 9) | (m.b << 18);
+}
+[RootSignature(RS)]
+[numthreads(8, 8, 1)]
+void neutral(uint3 at : SV_DispatchThreadID) {
+    if (at.x >= width || at.y >= height) return;
+    light[at.xy] = pack(float3(1.0, 0.98, 0.94) * level);
+}
+"#;
+
+struct NeutralPass {
+    root: ID3D12RootSignature,
+    pipeline: ID3D12PipelineState,
+}
+
+fn make_neutral(device: &ID3D12Device) -> windows::core::Result<NeutralPass> {
+    let code = crate::host::compile(NEUTRAL_SOURCE, s!("neutral"), s!("cs_5_1"))?;
+    // SAFETY: the shader contains its root signature; the code lives through creation.
+    unsafe {
+        let root: ID3D12RootSignature = device.CreateRootSignature(0, &code)?;
+        let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+            pRootSignature: std::mem::transmute_copy(&root),
+            CS: D3D12_SHADER_BYTECODE { pShaderBytecode: code.as_ptr().cast(), BytecodeLength: code.len() },
+            ..Default::default()
+        };
+        Ok(NeutralPass { root, pipeline: device.CreateComputePipelineState(&desc)? })
+    }
+}
+
+/// Replaces only the diffuse probe UAV, before materials and the UI are composed.
+/// Called after a direct nonempty dispatch, even when no matching depth exists.
+pub(crate) fn neutral_after(list: &HostList, role: Role, desc: &D3D12_RESOURCE_DESC, image: D3D12_GPU_DESCRIPTOR_HANDLE) -> bool {
+    let Some(level) = neutral_level().filter(|_| neutral_image(role, desc)) else { return false };
+    static PASS: OnceLock<Option<NeutralPass>> = OnceLock::new();
+    let Some(pass) = PASS.get_or_init(|| {
+        make_neutral(&host()?.device)
+            .inspect_err(|error| tracing::warn!(%error, "neutral probe replacement unavailable"))
+            .ok()
+    }) else { return false };
+    let words = [level.to_bits(), desc.Width as u32, desc.Height];
+    let l = &list.list;
+    // SAFETY: the title just wrote this UAV; its heap remains set and its
+    // lifetime is held by the title's dispatch. No depth descriptor is bound.
+    unsafe {
+        uav_barrier(l);
+        l.SetComputeRootSignature(&pass.root);
+        l.SetComputeRoot32BitConstants(0, 3, words.as_ptr().cast(), 0);
+        l.SetComputeRootDescriptorTable(1, image);
+        l.SetPipelineState(&pass.pipeline);
+        l.Dispatch((desc.Width as u32).div_ceil(8), desc.Height.div_ceil(8), 1);
+        uav_barrier(l);
+    }
+    static SAID: std::sync::Once = std::sync::Once::new();
+    SAID.call_once(|| tracing::info!(level, "neutral probe replacement recorded (VICTORY_PROBE_NEUTRAL)"));
+    true
+}
+
 /// Whether the light of a frame has been kept: the estimate has something
 /// to begin with.
 static KEPT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -730,6 +945,95 @@ pub(crate) struct Views {
     /// The size of the image, and how many slices it has.
     pub(crate) size: [u32; 2],
     pub(crate) slices: u32,
+    /// The size of the depth (the image's but for [`Role::Miss`]).
+    pub(crate) depth_size: [u32; 2],
+}
+
+/// For the line every ten seconds: what the stand-in for reflections did.
+struct Said {
+    /// Dispatches of the miss program it followed, frames they were in,
+    /// and those it left as they were: of water, and before a frame's
+    /// light was kept (or no tables).
+    ran: AtomicU64,
+    frames: AtomicU64,
+    water: AtomicU64,
+    not_ready: AtomicU64,
+    last_frame: AtomicU64,
+    /// Bit 0 opaque surfaces, 1 alpha, 2 water, 3 others.
+    layers: AtomicU64,
+}
+
+static SAID_MISS: Said = Said {
+    ran: AtomicU64::new(0),
+    frames: AtomicU64::new(0),
+    water: AtomicU64::new(0),
+    not_ready: AtomicU64::new(0),
+    last_frame: AtomicU64::new(u64::MAX),
+    layers: AtomicU64::new(0),
+};
+
+/// What came of a dispatch of the miss program, counted for the line.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) enum MissNote {
+    Ran(u32),
+    Water,
+    NotReady,
+}
+
+/// Counts what came of a dispatch of the miss program; every ten seconds an
+/// info line says it, so a run shows that the stand-in ran and where.
+pub(crate) fn note_miss(note: MissNote) {
+    use AtomicOrdering::Relaxed;
+    if specular().is_none() {
+        return;
+    }
+    let s = &SAID_MISS;
+    match note {
+        MissNote::Ran(layer) => {
+            s.ran.fetch_add(1, Relaxed);
+            s.layers.fetch_or(1 << layer.min(3), Relaxed);
+            let frame = crate::frame::current();
+            if s.last_frame.swap(frame, Relaxed) != frame {
+                s.frames.fetch_add(1, Relaxed);
+            }
+        }
+        MissNote::Water => {
+            s.water.fetch_add(1, Relaxed);
+        }
+        MissNote::NotReady => {
+            s.not_ready.fetch_add(1, Relaxed);
+        }
+    }
+    static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    let now = std::time::Instant::now();
+    let Some(since) = *last else {
+        *last = Some(now);
+        return;
+    };
+    if now.duration_since(since).as_secs_f32() < 10.0 {
+        return;
+    }
+    *last = Some(now);
+    let layers = s.layers.swap(0, Relaxed);
+    let named: Vec<&str> = [(1, "opaque"), (2, "alpha"), (4, "water"), (8, "other")]
+        .iter()
+        .filter(|(bit, _)| layers & bit != 0)
+        .map(|(_, name)| *name)
+        .collect();
+    let Specular { share, sky } = specular().unwrap_or(Specular { share: 0.0, sky: 0.0 });
+    tracing::info!(
+        "a stand-in for reflections (VICTORY_AMBIENT_SPECULAR={share},{sky}) in the last {:.0} s: \
+         {} frames, {} dispatches of CS_RayMiss followed (surfaces: {}), each by an estimate along \
+         the reflected direction put in right after it (before CS_ResolveScreenSpace); {} of water or the alpha layer \
+         and {} before a frame's light was kept left as the title had them",
+        now.duration_since(since).as_secs_f32(),
+        s.frames.swap(0, Relaxed),
+        s.ran.swap(0, Relaxed),
+        if named.is_empty() { "none".to_owned() } else { named.join(", ") },
+        s.water.swap(0, Relaxed),
+        s.not_ready.swap(0, Relaxed),
+    );
 }
 
 /// After the title's program of that role, in `list` with the program's view
@@ -740,12 +1044,21 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     let Some(pass) = pass() else {
         return false;
     };
-    let (level, constant) = match set() {
-        Set::Off => return false,
-        Set::Estimate(level) => (level, 0.0f32),
-        Set::Constant(level) => (0.0, level),
+    // The share of the estimate, and the constant (for reflections: the
+    // share of the title's sky kept); the keep runs for either stand-in.
+    let (level, constant) = match (role, set(), specular()) {
+        (Role::Miss, _, Some(s)) => (s.share, s.sky),
+        (Role::Miss, _, None) => return false,
+        (Role::Radiance, Set::Off, Some(_)) => (0.0, 0.0),
+        (_, Set::Off, _) => return false,
+        (_, Set::Estimate(level), _) => (level, 0.0f32),
+        (_, Set::Constant(level), _) => (0.0, level),
     };
-    if role != Role::Radiance && constant == 0.0 && !KEPT.load(Ordering::Relaxed) {
+    let estimate = role == Role::Miss || constant == 0.0;
+    if role != Role::Radiance && estimate && !KEPT.load(Ordering::Relaxed) {
+        if role == Role::Miss {
+            note_miss(MissNote::NotReady);
+        }
         return false;
     }
     if role == Role::Air && (constant > 0.0 || air() == 0.0) {
@@ -757,7 +1070,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     static SAID: Mutex<u32> = Mutex::new(0);
     {
         let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
-        if *said < 4 {
+        if *said < 5 {
             *said += 1;
             tracing::info!(?role, size = ?views.size, level, constant, "a stand-in for the indirect light");
         }
@@ -770,8 +1083,8 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     for (to, v) in words.iter_mut().zip(floats) {
         *to = v.to_bits();
     }
-    words[6] = views.size[0];
-    words[7] = views.size[1];
+    words[6] = views.depth_size[0];
+    words[7] = views.depth_size[1];
     words[8] = follow(role).to_bits();
     // The most the light the title left may hold, or a reflection.
     let most = match role {
@@ -822,6 +1135,13 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
                 }
                 run(&pass.raise, views.size[0].div_ceil(8), views.size[1].div_ceil(8), 1);
             }
+            Role::Miss => {
+                // The points afresh, from this frame's depth: the diffuse
+                // stand-in makes them later in the frame.
+                run(&pass.place, 8, 9, 1);
+                run(&pass.gather, 20, 45, 1);
+                run(&pass.reflect, views.size[0].div_ceil(8), views.size[1].div_ceil(8), 1);
+            }
         }
     }
     true
@@ -830,6 +1150,139 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn neutral_probe_settings_and_image_scope() {
+        for value in ["", "0", "off", "-1", "nan", "inf", "constant:0.3"] {
+            assert_eq!(parse_neutral(value), None, "{value}");
+        }
+        assert_eq!(parse_neutral(" 0.3 "), Some(0.3));
+        assert_eq!(parse_neutral("100"), Some(2.0));
+        assert!(neutral_uav(None));
+        let mut view = [0u32; 10];
+        view[0] = 42;
+        view[1] = 4;
+        assert!(neutral_uav(Some(&view)));
+        for (word, value) in [(0, 26), (1, 5), (4, 1), (5, 1)] {
+            let mut invalid = view;
+            invalid[word] = value;
+            assert!(!neutral_uav(Some(&invalid)));
+        }
+        let image = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_UINT,
+            Width: 1280, Height: 720, DepthOrArraySize: 1,
+            SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            ..Default::default()
+        };
+        assert!(neutral_image(Role::Resolve, &image));
+        for role in [Role::Radiance, Role::Air, Role::Reflect] {
+            assert!(!neutral_image(role, &image));
+        }
+        for bad in [
+            D3D12_RESOURCE_DESC { Width: 0, ..image },
+            D3D12_RESOURCE_DESC { DepthOrArraySize: 2, ..image },
+            D3D12_RESOURCE_DESC { Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R11G11B10_FLOAT, ..image },
+            D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE3D, ..image },
+        ] {
+            assert!(!neutral_image(Role::Resolve, &bad));
+        }
+    }
+
+    #[test]
+    fn neutral_probe_replaces_colour_without_depth_and_preserves_bounds() {
+        use crate::indirect::tests::WarpHarness;
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R32_UINT, DXGI_SAMPLE_DESC};
+
+        let mut gpu = WarpHarness::new().expect("a D3D12 WARP adapter");
+        let pass = make_neutral(&gpu.device).unwrap();
+        let (initial, initial_bytes, _) = gpu.shared_buffer(256);
+        let (readback, readback_bytes, _) = gpu.shared_buffer(256);
+        // Synthetic RGB9E5: ~0.6 gray, bright gray, saturated RGB and magenta.
+        // These catch both accidental luminance caps and colour rejection.
+        let gray = (15u32 << 27) | 307 | (307 << 9) | (307 << 18);
+        let bright = (19u32 << 27) | 256 | (256 << 9) | (256 << 18);
+        let red = (19u32 << 27) | 256;
+        let green = (19u32 << 27) | (256 << 9);
+        let blue = (19u32 << 27) | (256 << 18);
+        let magenta = red | blue;
+        let sentinel = 0xdeadbeef;
+        // SAFETY: live mapped buffers and D3D12 objects, all kept until the
+        // submitted command list completes. No depth descriptor exists here.
+        unsafe {
+            std::ptr::copy_nonoverlapping([0, gray, bright, red, green, blue, magenta, sentinel].as_ptr(), initial_bytes.cast(), 8);
+            let mut texture = None;
+            gpu.device.CreateCommittedResource(
+                &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+                D3D12_HEAP_FLAG_NONE,
+                &D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                    Width: 8, Height: 1, DepthOrArraySize: 1, MipLevels: 1,
+                    Format: DXGI_FORMAT_R32_UINT,
+                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                    Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                    ..Default::default()
+                },
+                D3D12_RESOURCE_STATE_COPY_DEST, None, &mut texture,
+            ).unwrap();
+            let texture: ID3D12Resource = texture.unwrap();
+            let heap: ID3D12DescriptorHeap = gpu.device.CreateDescriptorHeap(
+                &D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, NumDescriptors: 1,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, ..Default::default()
+                },
+            ).unwrap();
+            gpu.device.CreateUnorderedAccessView(
+                &texture, None::<&ID3D12Resource>, None, heap.GetCPUDescriptorHandleForHeapStart(),
+            );
+            let placed = |r: &ID3D12Resource| D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(r),
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                        Offset: 0,
+                        Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                            Format: DXGI_FORMAT_R32_UINT, Width: 8, Height: 1, Depth: 1, RowPitch: 256,
+                        },
+                    },
+                },
+            };
+            let image = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(&texture),
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+            };
+            let l = &gpu.list;
+            l.CopyTextureRegion(&image, 0, 0, 0, &placed(&initial), None);
+            l.ResourceBarrier(&[crate::host::transition(&texture, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)]);
+            l.SetDescriptorHeaps(&[Some(heap.clone())]);
+            l.SetComputeRootSignature(&pass.root);
+            let mut words = [0u32; 3];
+            words[0] = 0.3f32.to_bits();
+            words[1] = 7;
+            words[2] = 1;
+            l.SetComputeRoot32BitConstants(0, 3, words.as_ptr().cast(), 0);
+            l.SetComputeRootDescriptorTable(1, heap.GetGPUDescriptorHandleForHeapStart());
+            l.SetPipelineState(&pass.pipeline);
+            l.Dispatch(1, 1, 1);
+            l.ResourceBarrier(&[crate::host::transition(&texture, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+            l.CopyTextureRegion(&placed(&readback), 0, 0, 0, &image, None);
+            gpu.submit_and_wait();
+            let pixels = std::slice::from_raw_parts(readback_bytes.cast::<u32>(), 8);
+            let rgb = |v: u32| {
+                let scale = 2.0f32.powi((v >> 27) as i32 - 24);
+                [v & 511, (v >> 9) & 511, (v >> 18) & 511].map(|n| n as f32 * scale)
+            };
+            let neutral = |pixel| {
+                for (value, wanted) in rgb(pixel).iter().zip([0.3, 0.294, 0.282]) {
+                    assert!((value - wanted).abs() < 0.002, "neutral ambient {:?}", rgb(pixel));
+                }
+            };
+            for pixel in &pixels[..7] { neutral(*pixel); }
+            assert_eq!(pixels[7], sentinel, "pixels outside the declared size stay intact");
+            eprintln!("depth-free ambient readback: {:?}", rgb(pixels[0]));
+        }
+    }
 
     #[test]
     fn settings() {
@@ -856,6 +1309,17 @@ mod tests {
     }
 
     #[test]
+    fn specular_settings() {
+        assert_eq!(parse_specular(""), None);
+        assert_eq!(parse_specular("0"), None);
+        assert_eq!(parse_specular("off"), None);
+        assert_eq!(parse_specular("1"), Some(Specular { share: 1.0, sky: 0.0 }));
+        assert_eq!(parse_specular("0.6, 0.25"), Some(Specular { share: 0.6, sky: 0.25 }));
+        assert_eq!(parse_specular("0.6,7"), Some(Specular { share: 0.6, sky: 1.0 }));
+        assert_eq!(parse_specular("0.6,x"), Some(Specular { share: 0.6, sky: 0.0 }));
+    }
+
+    #[test]
     fn roles_by_name() {
         assert_eq!(role(b"..CS_ScreenProbes_TemporalResolve_a911b49c_Wrapped.."), Some(Role::Resolve));
         assert_eq!(role(b"..CS_CacheScreenSpaceRadiance_eed2fc35.."), Some(Role::Radiance));
@@ -864,6 +1328,9 @@ mod tests {
         assert_eq!(role(opaque), Some(Role::Reflect));
         assert_eq!(role(b"CS_TemporalResolve1_Alpha_68979fba"), Some(Role::Reflect));
         assert_eq!(role(b"CS_TemporalResolve"), None);
+        assert_eq!(role(b"..CS_RayMiss_de6b91a6_Wrapped.."), Some(Role::Miss));
+        assert_eq!(role(b"..CS_RayMiss_Volumetrics_3c5d8c00_Wrapped.."), None);
+        assert_eq!(role(b"..CS_ScreenProbe_RayMiss_80a88544_Wrapped.."), None);
     }
 
     /// The keep and raise as they act on the light, frame after frame, for

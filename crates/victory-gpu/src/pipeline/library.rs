@@ -801,7 +801,7 @@ pub(crate) fn name(kind: &str, root: &[u8], code: &[&[u8]], state: &str) -> Stri
 const CRASHED_FILE: &str = "crashed.txt";
 
 /// Whether the driver crashed making the pipeline named `name` before.
-fn crashed(name: &str) -> bool {
+pub(super) fn crashed(name: &str) -> bool {
     static NAMES: OnceLock<std::collections::HashSet<String>> = OnceLock::new();
     NAMES
         .get_or_init(|| {

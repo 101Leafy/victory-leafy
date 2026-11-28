@@ -349,6 +349,108 @@ impl Priority {
     }
 }
 
+/// `VICTORY_CPU_LOG=1`: once a second, for the title memory copies and the
+/// heap pass, the time each thread spent at them by the logical processor it
+/// was on when a piece ended (`GetCurrentProcessorNumber`), and the share of
+/// it on the fast cores. Off by default.
+pub(crate) mod log {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, LazyLock, Mutex};
+
+    pub(crate) const COPIES: usize = 0;
+    pub(crate) const HEAP: usize = 1;
+    const WHAT: [&str; 2] = ["copies", "heap pass"];
+    const CPUS: usize = 64;
+
+    static ON: LazyLock<bool> = LazyLock::new(|| std::env::var_os("VICTORY_CPU_LOG").is_some_and(|v| v == "1"));
+
+    struct Thread {
+        name: String,
+        micros: [[AtomicU64; CPUS]; 2],
+    }
+
+    static THREADS: Mutex<Vec<Arc<Thread>>> = Mutex::new(Vec::new());
+
+    thread_local! {
+        static THIS: Arc<Thread> = {
+            let this = Arc::new(Thread {
+                name: std::thread::current().name().unwrap_or("title").to_owned(),
+                micros: std::array::from_fn(|_| std::array::from_fn(|_| AtomicU64::new(0))),
+            });
+            THREADS.lock().unwrap_or_else(|e| e.into_inner()).push(this.clone());
+            this
+        };
+    }
+
+    pub(crate) fn on() -> bool {
+        *ON
+    }
+
+    /// `us` spent at `what` by the calling thread.
+    pub(crate) fn note(what: usize, us: u64) {
+        if !*ON {
+            return;
+        }
+        static WATCHER: std::sync::Once = std::sync::Once::new();
+        WATCHER.call_once(|| {
+            std::thread::Builder::new().name("victory-cpu-log".into()).spawn(watch).ok();
+        });
+        // SAFETY: no arguments; the calling thread's processor number.
+        let cpu = unsafe { windows_sys::Win32::System::Threading::GetCurrentProcessorNumber() } as usize;
+        THIS.with(|t| t.micros[what][cpu.min(CPUS - 1)].fetch_add(us, Ordering::Relaxed));
+    }
+
+    fn watch() {
+        let sets = super::cpu_sets();
+        let best = sets.iter().map(|c| c.1).max().unwrap_or(0);
+        let fast = |cpu: usize| sets.iter().any(|c| c.2 as usize == cpu && c.1 == best);
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            let threads = THREADS.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            for (what, name) in WHAT.iter().enumerate() {
+                let (mut all, mut on_fast) = (0u64, 0u64);
+                let mut by = std::collections::BTreeMap::<&str, ([u64; CPUS], usize)>::new();
+                for t in &threads {
+                    let taken: Vec<u64> = t.micros[what].iter().map(|m| m.swap(0, Ordering::Relaxed)).collect();
+                    if taken.iter().all(|&us| us == 0) {
+                        continue;
+                    }
+                    let entry = by.entry(&t.name).or_insert(([0; CPUS], 0));
+                    entry.1 += 1;
+                    for (cpu, &us) in taken.iter().enumerate() {
+                        entry.0[cpu] += us;
+                        all += us;
+                        if fast(cpu) {
+                            on_fast += us;
+                        }
+                    }
+                }
+                if all == 0 {
+                    continue;
+                }
+                let threads: Vec<String> = by
+                    .iter()
+                    .map(|(name, (cpus, n))| {
+                        let at: Vec<String> = cpus
+                            .iter()
+                            .enumerate()
+                            .filter(|&(_, &us)| us >= 100)
+                            .map(|(cpu, &us)| format!("{cpu}:{:.1}", us as f64 / 1e3))
+                            .collect();
+                        format!("{name} x{n} {:.1} ms [{}]", cpus.iter().sum::<u64>() as f64 / 1e3, at.join(" "))
+                    })
+                    .collect();
+                tracing::info!(
+                    "cpu {name} {:.1} ms, {:.0}% on the fast cores: {}",
+                    all as f64 / 1e3,
+                    on_fast as f64 * 100.0 / all as f64,
+                    threads.join("; ")
+                );
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

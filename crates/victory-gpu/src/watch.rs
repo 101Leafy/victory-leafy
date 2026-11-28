@@ -535,8 +535,11 @@ pub(crate) fn lock_waits(frames: f64) -> String {
     let p: [u64; 15] = std::array::from_fn(|i| PHASES[i].swap(0, std::sync::atomic::Ordering::Relaxed));
     let ms = |i: usize| p[i] as f64 / 1e6 / frames;
     let (long_ns, long_first, long_last) = std::mem::take(&mut *LONGEST.lock().unwrap_or_else(|e| e.into_inner()));
+    let (whole_ns, x) = std::mem::take(&mut *LONGEST_WHOLE.lock().unwrap_or_else(|e| e.into_inner()));
+    let xms = |i: usize| x[i] as f64 / 1e6;
+    let parts: u64 = (0..=8).map(|i| x[i]).sum();
     format!(
-        "ranges held {}, journal read {}, journal noted in {}, guards {};          whole submissions waiting {:.1} for {:.2} ms (longest {:.2} ms), {:.1} ranges held as each began, {:.1} taken while each waited;          held longest: whole {:.2} ms, a range {:.2} ms ({} KiB at {:#x}); ranges held 10 ms or more {:.1}, all held {:.2} ms (VICTORY_ASK_ALL_FIRST={});          refreshes held {:.1} ranges, {:.1} of them sent to the guards, held there {:.2} ms;          inside whole holds: ahead spans {:.2} ms, split {:.2} ms, runs {:.2} ms, hot {:.2} ms, journal {:.2} ms ({:.0} pieces); rest take {:.2} ms, loop {:.2} ms (longest {:.2} ms), hot {:.2} ms, journal {:.2} ms; rest calls {:.1}, {:.0} ranges, {:.0} kept, {:.0} askings",
+        "ranges held {}, journal read {}, journal noted in {}, guards {};          whole submissions waiting {:.1} for {:.2} ms (longest {:.2} ms), {:.1} ranges held as each began, {:.1} taken while each waited;          held longest: whole {:.2} ms, a range {:.2} ms ({} KiB at {:#x}); ranges held 10 ms or more {:.1}, all held {:.2} ms (VICTORY_ASK_ALL_FIRST={});          refreshes held {:.1} ranges, {:.1} of them sent to the guards, held there {:.2} ms;          inside whole holds: ahead spans {:.2} ms, split {:.2} ms, runs {:.2} ms, hot {:.2} ms, journal {:.2} ms ({:.0} pieces); rest take {:.2} ms, loop {:.2} ms (longest {:.2} ms), hot {:.2} ms, journal {:.2} ms; rest calls {:.1}, {:.0} ranges, {:.0} kept, {:.0} askings;          the longest whole hold {:.2} ms: ahead spans and split {:.2} ms, runs {:.2} ms, hot {:.2} ms, journal {:.2} ms ({} pieces); rest take {:.2} ms, loop {:.2} ms, hot {:.2} ms, journal {:.2} ms ({} askings of {} ranges); its longest kernel asking {:.2} ms; outside these parts {:.2} ms",
         of(0),
         of(1),
         of(2),
@@ -571,6 +574,20 @@ pub(crate) fn lock_waits(frames: f64) -> String {
         per(p[9]),
         per(p[10]),
         per(p[11]),
+        whole_ns as f64 / 1e6,
+        xms(0) + xms(1),
+        xms(2),
+        xms(3),
+        xms(4),
+        x[13],
+        xms(5),
+        xms(6),
+        xms(7),
+        xms(8),
+        x[11],
+        x[9],
+        xms(15),
+        whole_ns.saturating_sub(parts) as f64 / 1e6,
     )
 }
 
@@ -599,11 +616,25 @@ static REFRESH_HOLDS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::at
 #[cfg(feature = "diagnostics")]
 static PHASES: [std::sync::atomic::AtomicU64; 15] = [const { std::sync::atomic::AtomicU64::new(0) }; 15];
 
+/// [`PHASES`] of the whole hold this thread is in, and in 15 its longest
+/// kernel asking (ns); for [`LONGEST_WHOLE`].
+#[cfg(feature = "diagnostics")]
+thread_local! {
+    static HELD_NOW: std::cell::RefCell<[u64; 16]> = const { std::cell::RefCell::new([0; 16]) };
+}
+
+/// The longest whole hold since the last line: nanoseconds and its
+/// [`HELD_NOW`]. The frame means of [`PHASES`] cannot say what one long hold
+/// spent its time on (lp-ask-rh: 119 ms longest, runs 21 ms a frame).
+#[cfg(feature = "diagnostics")]
+static LONGEST_WHOLE: Mutex<(u64, [u64; 16])> = Mutex::new((0, [0; 16]));
+
 #[cfg(feature = "diagnostics")]
 fn phase(i: usize, since: &mut std::time::Instant) {
     let now = std::time::Instant::now();
     let ns = (now - *since).as_nanos() as u64;
     PHASES[i].fetch_add(ns, std::sync::atomic::Ordering::Relaxed);
+    HELD_NOW.with(|h| h.borrow_mut()[i] += ns);
     if i == 6 {
         PHASES[14].fetch_max(ns, std::sync::atomic::Ordering::Relaxed);
     }
@@ -616,6 +647,7 @@ fn phase(_: usize, _: &mut std::time::Instant) {}
 #[cfg(feature = "diagnostics")]
 fn phase_count(i: usize, n: usize) {
     PHASES[i].fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+    HELD_NOW.with(|h| h.borrow_mut()[i] += n as u64);
 }
 
 #[cfg(not(feature = "diagnostics"))]
@@ -693,7 +725,16 @@ impl Asking {
 
     /// Everything: an asking for a whole submission.
     fn hold_all() -> Asking {
-        Asking::hold(0, usize::MAX)
+        let all = Asking::hold(0, usize::MAX);
+        #[cfg(feature = "diagnostics")]
+        HELD_NOW.with(|h| {
+            // (Pieces are counted before the hold with VICTORY_ASK_HOMES.)
+            let mut h = h.borrow_mut();
+            let pieces = h[13];
+            *h = [0; 16];
+            h[13] = pieces;
+        });
+        all
     }
 }
 
@@ -712,6 +753,11 @@ impl Drop for Asking {
             HOLDS[7].fetch_add(ns, Relaxed);
             if (self.0, self.1) == (0, usize::MAX) {
                 HOLDS[5].fetch_max(ns, Relaxed);
+                let mut whole = LONGEST_WHOLE.lock().unwrap_or_else(|e| e.into_inner());
+                if ns > whole.0 {
+                    *whole = (ns, HELD_NOW.with(|h| *h.borrow()));
+                }
+                HELD_NOW.with(|h| h.borrow_mut()[13] = 0);
                 return;
             }
             if ns >= 10_000_000 {
@@ -792,6 +838,11 @@ fn kernel_written(first: usize, last: usize) -> Option<Vec<(usize, u16)>> {
             add(C::Watches, 1);
             add(C::WatchUs, started.elapsed().as_micros() as u64);
             slow(started.elapsed().as_micros() as u64);
+            let ns = started.elapsed().as_nanos() as u64;
+            HELD_NOW.with(|h| {
+                let mut h = h.borrow_mut();
+                h[15] = h[15].max(ns);
+            });
             tally(0, 1);
             tally(1, ((last - first) * (PAGE >> 10)) as u64);
         }
@@ -1507,10 +1558,21 @@ pub(crate) fn noting() -> bool {
 /// The blocks of `[at, at + len)` whose pages the title shows at other
 /// addresses too, and there.
 fn elsewhere(at: usize, len: usize) -> Vec<(usize, Vec<usize>)> {
-    if !view_guard() || len == 0 {
+    elsewhere_in([(at, len)])
+}
+
+fn elsewhere_in(spans: impl IntoIterator<Item = (usize, usize)>) -> Vec<(usize, Vec<usize>)> {
+    if !view_guard() {
         return Vec::new();
     }
-    crate::inplace::shown_elsewhere(at / BLOCK * BLOCK, at.saturating_add(len))
+    let mut spans = spans.into_iter()
+        .filter(|&(_, len)| len != 0)
+        .map(|(at, len)| (at / BLOCK * BLOCK, at.saturating_add(len)))
+        .peekable();
+    if spans.peek().is_none() {
+        return Vec::new();
+    }
+    crate::inplace::shown_elsewhere_in(spans)
 }
 
 /// One kernel asking for `pieces` (page ranges in order); by halves if it
@@ -1589,6 +1651,12 @@ pub(crate) fn would_wait(start: usize, end: usize, guarded: bool) -> bool {
 /// kernel just reported. `None` if the memory is not write-watched (nor,
 /// with `guarded`, view memory, which is then guarded).
 pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
+    // Guarding asks Windows about the pages and protects them: a lazy view
+    // is none to it yet. (Not so a view in the books alone, which is
+    // guarded there: [`use_soft_views`].)
+    if guarded && soft().is_none() {
+        materialize(start, end.saturating_sub(start));
+    }
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     // Asked ahead with the submission's other ranges: the journal has it.
     // (The standing number changes only with the journal held alone, so its
@@ -3068,7 +3136,7 @@ pub(crate) fn landed_beside(pages: &[usize], spans: &[(usize, usize)]) -> (u64, 
     let noted;
     // The same pages at other addresses: copies of the memory there have not
     // what was put in either.
-    let elsewhere: Vec<(usize, Vec<usize>)> = spans.iter().flat_map(|&(at, len)| elsewhere(at, len)).collect();
+    let elsewhere = elsewhere_in(spans.iter().copied());
     {
         let frame = crate::frame::current();
         for &page in pages {
@@ -3116,13 +3184,9 @@ pub(crate) fn landed_beside(pages: &[usize], spans: &[(usize, usize)]) -> (u64, 
             }
         }
     }
-    for &(at, len) in spans {
-        // A placed texture there changes with no descriptor written.
-        crate::descriptor::host::remapped(at, len);
-    }
-    for other in elsewhere.into_iter().flat_map(|(_, others)| others) {
-        crate::descriptor::host::remapped(other, BLOCK);
-    }
+    // A placed texture there changes with no descriptor written.
+    let aliases = elsewhere.into_iter().flat_map(|(_, others)| others).map(|other| (other, BLOCK));
+    crate::descriptor::host::remapped_ranges(spans.iter().copied().chain(aliases));
     (noted, before)
 }
 
@@ -4255,7 +4319,24 @@ fn protect_alias(g: &mut Guards, block: usize, plan: Option<(&mut Aliases, usize
         }
         return closed;
     }
-    if g.left_alone(block) || g.rests(block, rest()) {
+    if g.left_alone(block) {
+        return false;
+    }
+    // A view in the runtime's books alone ([`use_soft_views`]): nothing
+    // writes through it before a fault makes it a mapping of the host's,
+    // which opens it and every other view of its page
+    // ([`title_memory_made_real`]). Guarded in the books, with no call to
+    // the host, which has a placeholder there and would refuse: then the
+    // view guarded with it was never clean and copied again at every asking
+    // (run xw-lazy, `VICTORY_LAZY_VIEWS=1`: 2.4 to 3.4 GB of copies a frame,
+    // 2 fps).
+    if soft_block(block) {
+        PROTECTED.set(block);
+        g.protected.insert(block);
+        SOFT_GUARDS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return true;
+    }
+    if g.rests(block, rest()) {
         return false;
     }
     // Ahead of the protection.
@@ -4406,6 +4487,13 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
                 // (A block that only begins as a hole is left for the next
                 // asking, as before.)
                 for block in block..whole {
+                    // A view in the runtime's books alone is a placeholder
+                    // to the host, a hole by what Windows says: guarded in
+                    // the books ([`protect_views`]), not noted absent.
+                    if soft_block(block) {
+                        protect_views(g, block, block + 1);
+                        continue;
+                    }
                     g.absent.insert(block);
                     if known_holes() && placeholder(block) {
                         g.held.insert(block);
@@ -4449,12 +4537,24 @@ fn protect_views(g: &mut Guards, from: usize, to: usize) {
     };
     // Ahead of the protection (`PROTECTED`).
     (from..to).for_each(|block| PROTECTED.set(block));
-    if set(from, to) {
+    // Views in the runtime's books alone ([`use_soft_views`]) are guarded
+    // there: the host has a placeholder at their addresses, would refuse,
+    // and the block would count as not there. Nothing writes through one
+    // before a fault makes it real, which opens it
+    // ([`title_memory_made_real`]).
+    let soft = soft_runs(from * BLOCK, (to - from) * BLOCK);
+    let in_books = |block: usize| soft.iter().any(|&(at, n)| at <= block * BLOCK && (block + 1) * BLOCK <= at + n);
+    if soft.is_empty() && set(from, to) {
         note(g, from, to);
         return;
     }
     let mut uncommitted_until = from;
     for block in from..to {
+        if in_books(block) {
+            note(g, block, block + 1);
+            SOFT_GUARDS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            continue;
+        }
         // (Not one question a block of a region that is not there.)
         if block >= uncommitted_until && set(block, block + 1) {
             note(g, block, block + 1);
@@ -4775,6 +4875,8 @@ pub struct KernelWrite(usize, usize);
 /// write fail (the kernel does not fault into our handler): a read cut
 /// short, which the title takes for what the file holds.
 pub fn kernel_writing(at: usize, len: usize) -> KernelWrite {
+    // The kernel's write does not fault into the handler.
+    materialize(at, len);
     let (first, last) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
     {
         let mut g = guards_timed();
@@ -5355,6 +5457,112 @@ fn title_memory_changed(at: usize, len: usize) -> std::sync::MutexGuard<'static,
     g
 }
 
+/// The runtime's way to make title memory it mapped only in its books
+/// real (`xmem`, `VICTORY_LAZY_VIEWS=1`): `(address, bytes)` makes every
+/// such view that overlaps the range a mapping of the host's, and says
+/// whether there was one (and all of them could be made).
+static LAZY_VIEWS: std::sync::OnceLock<fn(usize, usize) -> bool> = std::sync::OnceLock::new();
+
+/// The runtime maps title memory lazily: views it tells of (as mapped, by
+/// [`title_memory_remapped`] and `title_memory_view`) may be no mapping of
+/// the host's until something touches them. `materialize` makes them one.
+pub fn use_lazy_views(materialize: fn(usize, usize) -> bool) {
+    let _ = LAZY_VIEWS.set(materialize);
+}
+
+/// Makes title memory `[at, at + len)` that the runtime mapped lazily a
+/// mapping of the host's ([`use_lazy_views`]); whether any of it was lazy.
+/// Called before every touch of title memory the fault handler below does
+/// not see: reads and writes through the kernel, protection changes, and
+/// questions to Windows about the pages. (A fault in title memory, the
+/// title's or ours, comes to [`install`]'s handler, which asks first.)
+pub(crate) fn materialize(at: usize, len: usize) -> bool {
+    match soft() {
+        Some(soft) => (soft.materialize)(at, len.max(1)),
+        None => LAZY_VIEWS.get().is_some_and(|f| f(at, len.max(1))),
+    }
+}
+
+/// What the runtime gives for the views it keeps in its books alone
+/// (`xmem`, `VICTORY_SOFT_VIEWS`): title memory it tells of as mapped
+/// ([`title_memory_remapped`], `title_memory_view`) where the host has a
+/// placeholder and no view, until the title's CPU touches it.
+///
+/// With these the GPU side leaves such a view as it is where it can: it
+/// reads its bytes from the pages ([`SoftViews::read`], `crate::host`'s
+/// reads; a texture all or partly in such views is read through a copy),
+/// takes it for committed (`crate::texture::committed`) and guards it in
+/// the books ([`protect_here`], [`protect_alias`]: no protection change, no
+/// question to the host). Whatever else touches one makes it a mapping of
+/// the host's first: a fault, the title's or ours (the handler below), and
+/// what that handler does not see ([`materialize`]: our writes through the
+/// kernel, the kernel's writes the runtime announces).
+pub struct SoftViews {
+    /// `(address, bytes)`: makes every such view that overlaps the range a
+    /// mapping of the host's; whether there was one and all could be made.
+    pub materialize: fn(usize, usize) -> bool,
+    /// The same for an access that faulted: `(address, the code's address)`.
+    pub fault: fn(usize, usize) -> bool,
+    /// `(address, to, bytes)`: if such a view holds `address`, copies its
+    /// bytes from there on to `to`, to the view's end at most, and says
+    /// `(true, bytes copied)`; else `(false, n)`: the next `n` bytes (up to
+    /// `bytes`) are in no such view, and are read as other memory is.
+    pub read: fn(usize, *mut u8, usize) -> (bool, usize),
+    /// `(address, bytes)`: the parts of the range such views show, in
+    /// order, those that touch as one: `(address, bytes)`.
+    pub runs: fn(usize, usize) -> Vec<(usize, usize)>,
+}
+
+static SOFT_VIEWS: std::sync::OnceLock<SoftViews> = std::sync::OnceLock::new();
+
+/// The runtime keeps views in its books alone ([`SoftViews`]).
+pub fn use_soft_views(hooks: SoftViews) {
+    let _ = SOFT_VIEWS.set(hooks);
+}
+
+pub(crate) fn soft() -> Option<&'static SoftViews> {
+    SOFT_VIEWS.get()
+}
+
+/// The parts of `[at, at + len)` that views in the runtime's books alone
+/// show ([`SoftViews::runs`]); none without such views.
+pub(crate) fn soft_runs(at: usize, len: usize) -> Vec<(usize, usize)> {
+    match soft() {
+        Some(soft) if len != 0 => (soft.runs)(at, len),
+        _ => Vec::new(),
+    }
+}
+
+/// Whether a view in the runtime's books alone shows all of `block`.
+fn soft_block(block: usize) -> bool {
+    soft_runs(block * BLOCK, BLOCK) == [(block * BLOCK, BLOCK)]
+}
+
+/// Since the start: blocks of views in the runtime's books alone guarded
+/// there ([`protect_here`]), and such blocks guarded there as another view
+/// of a page that is guarded ([`protect_alias`]).
+static SOFT_GUARDS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// [`SOFT_GUARDS`], for the runtime's line about its views.
+pub fn soft_view_guards() -> [u64; 2] {
+    [0, 1].map(|i| SOFT_GUARDS[i].load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// The runtime made a view it had in its books alone a mapping of the
+/// host's, read-write, at `[at, at + len)` ([`SoftViews`]): from now on the
+/// title writes through it without a fault. What was guarded of it in the
+/// books is opened, and with it every other view of its pages
+/// ([`open`]): all of them count as written at the next asking. Called when
+/// the view is there (as [`title_memory_remapped`] is), with the runtime's
+/// lock on its views held.
+pub fn title_memory_made_real(at: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let mut g = guards();
+    open(&mut g, at, at.saturating_add(len));
+}
+
 /// Registers the handler that takes writes to guarded blocks, once, ahead
 /// of the crash reporter's.
 pub(crate) fn install() {
@@ -5381,6 +5589,19 @@ pub(crate) fn install() {
             unsafe { (*context).Rip = exit as u64 };
             EXCEPTION_CONTINUE_EXECUTION
         };
+        // Memory the runtime mapped lazily: mapped now, and the access is
+        // made again (any access, the title's or ours).
+        if r.ExceptionCode == EXCEPTION_ACCESS_VIOLATION as NTSTATUS
+            && r.NumberParameters >= 2
+            && match soft() {
+                // (Counted by whose code it was: the title's own touch of a
+                // view is what the books cannot spare it.)
+                Some(soft) => (soft.fault)(r.ExceptionInformation[1], r.ExceptionAddress as usize),
+                None => materialize(r.ExceptionInformation[1], 1),
+            }
+        {
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
         if r.ExceptionCode != EXCEPTION_ACCESS_VIOLATION as NTSTATUS
             || r.NumberParameters < 2
             || r.ExceptionInformation[0] != WRITE
@@ -5541,6 +5762,48 @@ fn writable(at: usize) -> bool {
     // SAFETY: a valid out pointer of the right size.
     let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
     n != 0 && info.State == MEM_COMMIT && info.Protect == PAGE_READWRITE
+}
+
+/// A runtime that keeps views in its books alone, for tests
+/// ([`use_soft_views`]; one set of hooks for the whole test process).
+#[cfg(test)]
+pub(crate) mod test_books {
+    /// What that runtime keeps in its books alone: address, bytes, and
+    /// where their pages are (0: nowhere, never read); apart from each other.
+    pub(crate) static IN_BOOKS: std::sync::Mutex<Vec<(usize, usize, usize)>> = std::sync::Mutex::new(Vec::new());
+
+    /// Its hooks: the views are [`IN_BOOKS`], read from their pages; it
+    /// makes none real itself.
+    pub(crate) fn books() {
+        super::use_soft_views(super::SoftViews {
+            materialize: |_, _| false,
+            fault: |_, _| false,
+            read: |at, to, len| {
+                let views = IN_BOOKS.lock().unwrap_or_else(|e| e.into_inner());
+                let readable = |view: &&(usize, usize, usize)| view.2 != 0 && (view.0..view.0 + view.1).contains(&at);
+                if let Some(&(base, bytes, pages)) = views.iter().find(readable) {
+                    let n = (base + bytes - at).min(len);
+                    // SAFETY: the test's pages hold the view's bytes, and
+                    // its `to` as many as it asked for.
+                    unsafe { std::ptr::copy_nonoverlapping((pages + (at - base)) as *const u8, to, n) };
+                    return (true, n);
+                }
+                let next = views.iter().filter(|view| view.2 != 0).map(|view| view.0).filter(|&base| base > at).min();
+                (false, next.map_or(len, |next| (next - at).min(len)))
+            },
+            runs: |at, len| {
+                let views = IN_BOOKS.lock().unwrap_or_else(|e| e.into_inner());
+                let mut runs: Vec<(usize, usize)> = views
+                    .iter()
+                    .map(|&(base, bytes, _)| (base.max(at), (base + bytes).min(at + len)))
+                    .filter(|&(from, to)| from < to)
+                    .map(|(from, to)| (from, to - from))
+                    .collect();
+                runs.sort_unstable();
+                runs
+            },
+        });
+    }
 }
 
 #[cfg(test)]
@@ -5993,10 +6256,11 @@ mod tests {
             assert!(!g.protected.contains(at / BLOCK) && !g.clean.contains(at / BLOCK));
         }
         assert!(!published(at, at + BLOCK));
-        // SAFETY: our view.
-        unsafe { UnmapViewOfFile(view) };
         drop(changing);
         assert!(!guards().left_alone(at / BLOCK));
+        // SAFETY: our view. (Not during the change: another test would take
+        // the address for a view the guards leave alone as changing.)
+        unsafe { UnmapViewOfFile(view) };
     }
 
     /// Memory at an address where blocks were guarded or absent is not
@@ -6631,6 +6895,9 @@ mod tests {
                 })
             };
         }
+        // As the runtime lets go (`xmem.rs`): told before the handle is
+        // closed, or a test that gets the number next loses its own view.
+        crate::title_memory_section_gone(section);
         // SAFETY: the section's last reference.
         unsafe { CloseHandle(section as *mut std::ffi::c_void) };
     }
@@ -6671,6 +6938,107 @@ mod tests {
         assert_eq!(guard(guarded, guarded + SIZE), Some(vec![pages(0), pages(1)]));
         assert_eq!(guard(guarded, guarded + SIZE), Some(Vec::new()));
         drop_views(section, &[guarded, other], SIZE);
+    }
+
+    use super::test_books::{IN_BOOKS, books};
+
+    /// A view the runtime keeps in its books alone (`VICTORY_SOFT_VIEWS`): a
+    /// placeholder to the host. It is guarded in the books, on its own and
+    /// as another view of a guarded page, so that both it and that view come
+    /// clean; a write told of at it, or through the other view, is reported
+    /// at both; and made a view of the host's, it and the other view count
+    /// as written, and it is guarded as any view from then on.
+    #[test]
+    fn a_view_in_the_books_alone_is_guarded_there() {
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MEM_REPLACE_PLACEHOLDER, MEM_RESERVE_PLACEHOLDER, MEMORY_MAPPED_VIEW_ADDRESS,
+            MapViewOfFile, MapViewOfFile3, PAGE_NOACCESS, UnmapViewOfFile, VirtualAlloc2,
+        };
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        const SIZE: usize = 2 * BLOCK;
+        books();
+        // SAFETY: a fresh placeholder of two blocks, and a pagefile section
+        // of two with one view of the host's.
+        let (soft, section, real) = unsafe {
+            let soft = VirtualAlloc2(
+                GetCurrentProcess(),
+                std::ptr::null(),
+                SIZE,
+                MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
+                PAGE_NOACCESS,
+                std::ptr::null_mut(),
+                0,
+            ) as usize;
+            assert_ne!(soft, 0);
+            let section = CreateFileMappingW(-1isize as _, std::ptr::null(), PAGE_READWRITE, 0, SIZE as u32, std::ptr::null());
+            assert!(!section.is_null());
+            let real = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, SIZE).Value as usize;
+            assert_ne!(real, 0);
+            (soft, section, real)
+        };
+        // As the runtime tells of them: the one in the books first known as
+        // such, then told of as mapped.
+        IN_BOOKS.lock().unwrap().push((soft, SIZE, 0));
+        title_memory_remapped(soft, SIZE);
+        crate::inplace::title_memory_view(soft, SIZE, section as usize, 0);
+        title_memory_remapped(real, SIZE);
+        crate::inplace::title_memory_view(real, SIZE, section as usize, 0);
+        let blocks = |at: usize| vec![at / BLOCK, at / BLOCK + 1];
+        let block = |at: usize, k: usize| vec![at / BLOCK + k];
+        let none = Some(Vec::new());
+        // Guarded in the books: told once, then clean, with the host never
+        // asked to protect the placeholder (which it refuses).
+        assert_eq!(guard(soft, soft + SIZE), Some(blocks(soft)));
+        assert_eq!(guard(soft, soft + SIZE), none);
+        assert!(guards().absent.range(soft / BLOCK..soft / BLOCK + 2).next().is_none(), "there, as far as the title goes");
+        // The view of the host's comes clean beside it.
+        assert_eq!(guard(real, real + SIZE), Some(blocks(real)));
+        assert_eq!(guard(real, real + SIZE), none);
+        assert_eq!(guard(soft, soft + SIZE), none);
+        assert!(!writable(real));
+        // A write through the view of the host's: reported at both.
+        // SAFETY: the view, read-write once the handler has opened it.
+        unsafe { ((real + BLOCK + 8) as *mut u8).write_volatile(1) };
+        assert_eq!(guard(soft, soft + SIZE), Some(block(soft, 1)));
+        assert_eq!(guard(real, real + SIZE), Some(block(real, 1)));
+        assert_eq!(guard(soft, soft + SIZE), none);
+        assert_eq!(guard(real, real + SIZE), none);
+        // A write the runtime tells of at the view in its books (bytes
+        // DirectStorage put into the pages): reported at both.
+        writing(soft, BLOCK);
+        assert_eq!(guard(real, real + SIZE), Some(block(real, 0)));
+        assert_eq!(guard(soft, soft + SIZE), Some(block(soft, 0)));
+        assert_eq!(guard(real, real + SIZE), none);
+        assert_eq!(guard(soft, soft + SIZE), none);
+        // The title's CPU touched it: the runtime maps it, read-write, and
+        // tells. Both views count as written, whatever was written.
+        // SAFETY: the placeholder takes a view of the section.
+        let view = unsafe {
+            MapViewOfFile3(section, GetCurrentProcess(), soft as *const _, 0, SIZE, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, std::ptr::null_mut(), 0)
+        };
+        assert_eq!(view.Value as usize, soft);
+        IN_BOOKS.lock().unwrap().retain(|view| view.0 != soft);
+        title_memory_made_real(soft, SIZE);
+        assert!(writable(soft));
+        assert_eq!(guard(real, real + SIZE), Some(blocks(real)));
+        assert_eq!(guard(soft, soft + SIZE), Some(blocks(soft)));
+        assert_eq!(guard(real, real + SIZE), none);
+        // A view as any other now: read-only by our hand, and a write
+        // through it faults and is reported at both.
+        assert!(!writable(soft));
+        // SAFETY: the view, read-write once the handler has opened it.
+        unsafe { ((soft + 8) as *mut u8).write_volatile(2) };
+        assert_eq!(guard(real, real + SIZE), Some(block(real, 0)));
+        assert_eq!(guard(soft, soft + SIZE), Some(block(soft, 0)));
+        // SAFETY: the bytes went into the section's page.
+        assert_eq!(unsafe { ((real + 8) as *const u8).read_volatile() }, 2);
+        for at in [soft, real] {
+            title_memory_remapped(at, SIZE);
+            // SAFETY: our views.
+            unsafe { UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: at as *mut _ }) };
+        }
+        // SAFETY: the section's last reference.
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(section) };
     }
 
     /// A write of the runtime's own, told at one view of the pages
@@ -7079,7 +7447,6 @@ mod tests {
         assert_eq!(guard(one, one + BLOCK), Some(vec![page(one)]));
         assert_eq!(guard(one, one + BLOCK), Some(Vec::new()));
         drop_views(section, &[one, two], BLOCK);
-        crate::title_memory_section_gone(section);
     }
 
     /// Bytes put in beside a guard leave no mark at the address once the
@@ -7183,7 +7550,6 @@ mod tests {
         assert!(writable(one));
         crate::titlewrite::ON_IN_TEST.set(false);
         drop_views(section, &[one, two], SIZE);
-        crate::title_memory_section_gone(section);
     }
 
     /// Of a page taken before, what is taken again is the kernel's pages
@@ -7572,8 +7938,12 @@ mod many_askers_tests {
                         {
                             let _changing = super::title_memory_remapping();
                             super::title_memory_unmapping(one, PAGE);
-                            unsafe { UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: one as *mut _ }) };
                         }
+                        // Let go of once the change is done: an address freed
+                        // during it is another test's next view, which the
+                        // guards would leave alone as still changing. (The
+                        // runtime maps into placeholders of its own.)
+                        unsafe { UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: one as *mut _ }) };
                         last = [last[asked]; VIEWS];
                     }
                 });
