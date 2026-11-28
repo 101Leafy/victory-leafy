@@ -1967,11 +1967,12 @@ fn targets_seen(last: u64, since: u64, targets: u64, now: u64) -> (u64, u64) {
 }
 
 /// What [`targets_room_kept`] keeps of `most`: what the targets do not
-/// hold yet, or nothing once they hold half of it or more and have not
-/// grown for `settle` ms (`still_ms`; `settle` 0: always kept).
+/// hold yet, or nothing once they hold enough of it (`(most / 4).min(1 GiB)`)
+/// and have not grown for `settle` ms (`still_ms`; `settle` 0: always kept).
 #[cfg(any(windows, test))]
 fn targets_kept(most: u64, targets: u64, still_ms: u64, settle: u64) -> u64 {
-    if settle > 0 && targets >= most / 2 && still_ms >= settle {
+    let world_floor = (most / 4).min(1024 << 20);
+    if settle > 0 && targets >= world_floor && still_ms >= settle {
         0
     } else {
         most.saturating_sub(targets)
@@ -2588,6 +2589,10 @@ fn slot_evict(video: Option<[u64; 4]>, idle_ms: u64, frames: u64) {
         frame_at(&ring, now_ms.saturating_sub(idle_ms))
     };
     static EVICTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let line_pct = (room_line(budget) * 100 / budget.max(1)).clamp(50, 97);
+    let high = high.min(line_pct);
+    let low = low.min(high.saturating_sub(5).max(40));
+    let used = used.saturating_sub(crate::pool::texture_room());
     let (on, need) = slot_plan(EVICTING.load(Relaxed), budget, used, high, low, cap);
     EVICTING.store(on, Relaxed);
     SLOT_STATE[0].store(u64::from(on), Relaxed);
@@ -5219,7 +5224,9 @@ float4 lit() : SV_Target { return 1.0; }
         const MIB: u64 = 1 << 20;
         let most = 3072 * MIB;
         // Before the world: kept, however long.
-        assert_eq!(targets_kept(most, 652 * MIB, 60_000, 20_000), 2420 * MIB);
+        assert_eq!(targets_kept(most, 652 * MIB, 300_000, 20_000), 2420 * MIB);
+        // On 8 GB GPUs / Series S / DLSS, world targets settle around 1,185-1,450 MB.
+        assert_eq!(targets_kept(most, 1185 * MIB, 25_000, 20_000), 0);
         // The world's first frames: still growing.
         assert_eq!(targets_kept(most, 2083 * MIB, 5_000, 20_000), 989 * MIB);
         // Settled: nothing kept.
