@@ -1674,17 +1674,22 @@ pub(crate) fn make_waiting() {
 /// `VICTORY_SAMPLED_MARKS=1`, the textures left out for the third reason
 /// that no shader marked since `cutoff` through any of their slots, and no
 /// table showed (`crate::sampled`): those eviction could take if it trusted
-/// the marks.
+/// the marks. With `VICTORY_SAMPLED_EVICT=1` it does, for those whose
+/// other slots are all a draw's to make again: their slots picked by index
+/// come with the others, flagged (the third field), and are queued again
+/// once a shader reads them (`crate::sampled::evicted`).
 #[cfg(windows)]
 #[allow(clippy::type_complexity)]
 pub(crate) fn evictable_slots(
     raws: &std::collections::HashMap<usize, usize>,
     frame: u64,
     cutoff: u64,
-) -> (std::collections::HashMap<usize, Vec<(usize, u32)>>, u64, u64, Vec<usize>) {
+) -> (std::collections::HashMap<usize, Vec<(usize, u32, bool)>>, u64, u64, Vec<usize>) {
     let set: std::collections::HashSet<usize> = raws.keys().copied().collect();
-    let mut by_texture: std::collections::HashMap<usize, Vec<(usize, u32)>> = std::collections::HashMap::new();
+    let mut by_texture: std::collections::HashMap<usize, Vec<(usize, u32, bool)>> = std::collections::HashMap::new();
     let mut blocked = std::collections::HashSet::new();
+    // Blocked for another reason than being picked by index.
+    let mut other = std::collections::HashSet::new();
     let mut seen = std::collections::HashSet::new();
     let mut sampled = std::collections::HashSet::new();
     {
@@ -1695,17 +1700,21 @@ pub(crate) fn evictable_slots(
             let Some(Some(host)) = unsafe { &*(at as *const Heap) }.host.get() else {
                 continue;
             };
-            for (index, raw, ok, lately) in host.slots_showing(&set, frame, cutoff) {
+            for (index, raw, ok, lately, indexed) in host.slots_showing(&set, frame, cutoff) {
                 if lately {
                     seen.insert(raw);
                 }
                 if crate::sampled::sampled_since(index, cutoff).unwrap_or(true) {
                     sampled.insert(raw);
                 }
-                if ok {
-                    by_texture.entry(raw).or_default().push((at, index));
-                } else {
+                if ok || indexed {
+                    by_texture.entry(raw).or_default().push((at, index, indexed));
+                }
+                if !ok {
                     blocked.insert(raw);
+                }
+                if !ok && !indexed {
+                    other.insert(raw);
                 }
             }
         }
@@ -1716,7 +1725,10 @@ pub(crate) fn evictable_slots(
         .filter(|raw| !sampled.contains(raw) && !seen.contains(raw))
         .filter_map(|raw| raws.get(raw).copied())
         .collect();
-    by_texture.retain(|raw, _| !blocked.contains(raw) && !seen.contains(raw));
+    let trusted = crate::sampled::evict_on();
+    by_texture.retain(|raw, _| {
+        !seen.contains(raw) && (!blocked.contains(raw) || trusted && !other.contains(raw) && !sampled.contains(raw))
+    });
     (
         by_texture.into_iter().filter_map(|(raw, slots)| Some((*raws.get(&raw)?, slots))).collect(),
         kept,
@@ -1730,9 +1742,9 @@ pub(crate) fn evictable_slots(
 /// ([`make_waiting`]) or after the draw that reads them through a table.
 /// Returns how many were made. Called before the host copy is let go.
 #[cfg(windows)]
-pub(crate) fn evict_slots(resource: usize, slots: &[(usize, u32)]) -> u64 {
+pub(crate) fn evict_slots(resource: usize, slots: &[(usize, u32, bool)]) -> u64 {
     let mut n = 0;
-    for &(at, index) in slots {
+    for &(at, index, indexed) in slots {
         // (The heap stays while the lock is held: `mirror`.)
         let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
         if !heaps.iter().any(|&(_, _, h)| h == at) {
@@ -1745,6 +1757,9 @@ pub(crate) fn evict_slots(resource: usize, slots: &[(usize, u32)]) -> u64 {
         };
         if host.texture_slot_evicted(index) {
             drop(heaps);
+            if indexed {
+                crate::sampled::evicted(at, index);
+            }
             let mut waiting = WAITING.lock().unwrap_or_else(|e| e.into_inner());
             let handles = waiting.entry(resource).or_default();
             if !handles.contains(&handle) {
@@ -1754,6 +1769,22 @@ pub(crate) fn evict_slots(resource: usize, slots: &[(usize, u32)]) -> u64 {
         }
     }
     n
+}
+
+/// Slot `index` of heap `at`, picked by index and put back to null by slot
+/// eviction, was read by a shader since (`crate::sampled`): queued again
+/// ([`HostHeap::texture_slot_sampled_again`]) if the heap is still there.
+#[cfg(windows)]
+pub(crate) fn sampled_again(at: usize, index: u32) {
+    // (The heap stays while the lock is held: `mirror`.)
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+    if !heaps.iter().any(|&(_, _, h)| h == at) {
+        return;
+    }
+    // SAFETY: a registered heap, live while the lock is held.
+    if let Some(Some(host)) = unsafe { &*(at as *const Heap) }.host.get() {
+        host.texture_slot_sampled_again(index);
+    }
 }
 
 fn record(handle: u64, view: View) {

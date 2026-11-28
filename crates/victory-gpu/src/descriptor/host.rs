@@ -3571,7 +3571,7 @@ impl HostHeap {
         raws: &std::collections::HashSet<usize>,
         frame: u64,
         cutoff: u64,
-    ) -> Vec<(u32, usize, bool, bool)> {
+    ) -> Vec<(u32, usize, bool, bool, bool)> {
         self.kept
             .iter()
             .enumerate()
@@ -3583,11 +3583,23 @@ impl HostHeap {
                 };
                 raws.contains(&raw).then(|| {
                     let i = i as u32;
-                    let ok = i < self.count && !self.sampler && self.tabled_lately(i, frame);
-                    (i, raw, ok, seen_since(self.tabled_stamp(i), cutoff, frame))
+                    let title = i < self.count && !self.sampler;
+                    let ok = title && self.tabled_lately(i, frame);
+                    // The fifth: a title slot shaders pick by index (no
+                    // table showed it lately).
+                    (i, raw, ok, seen_since(self.tabled_stamp(i), cutoff, frame), title && !ok)
                 })
             })
             .collect()
+    }
+
+    /// Title slot `index`, picked by index, was put back to null by slot
+    /// eviction and a shader has read it since (`crate::sampled`): it is
+    /// queued as a title write now is, so that the pass over textures
+    /// picked by index makes its texture and the slot again.
+    pub(crate) fn texture_slot_sampled_again(&self, index: u32) {
+        let frame = crate::frame::current();
+        self.queue(super::queue_site::WRITE).written(index, frame, 0, false);
     }
 
     /// Title slot `index` goes back to null at once, its host copy about to

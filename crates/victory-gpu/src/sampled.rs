@@ -4,8 +4,9 @@
 //! sample a texture picked from the heap; once a frame the bits are taken
 //! into the frame each slot was last marked in. Slot eviction cannot tell
 //! otherwise whether a texture picked by index is used
-//! (`crate::resource::slot_evict`); for now this only counts how many such
-//! textures it could let go, nothing changes by it.
+//! (`crate::resource::slot_evict`). The marks alone only count how many
+//! such textures it could let go; with `VICTORY_SAMPLED_EVICT=1` it lets
+//! them go ([`evict_on`]).
 
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
 use victory_shader::emit::SAMPLED_MARKS;
@@ -90,18 +91,69 @@ pub(crate) fn gpu() -> Option<u64> {
 
 /// The marks are taken a [`PARTS`]th at a time, one part a frame: reading
 /// all 512 KiB of card memory from the CPU took 20 ms (RTX 5070 Laptop).
-/// A bit waits up to that many frames, far less than slot eviction's idle
-/// time.
-const PARTS: usize = 32;
+/// Only the dwords of slots a view heap has are read (to the null slot
+/// shaders clamp to: 125 KiB with NVIDIA's 1,000,000 views, under 1 ms a
+/// part). A bit waits up to that many frames, far less than slot
+/// eviction's idle time; a texture slot eviction let go that a shader
+/// reads shows nothing for that long and until it is made again.
+const PARTS: usize = 8;
+
+/// The dwords [`take`] reads: those of the slots a view heap has, a
+/// multiple of `4 * PARTS`.
+fn used_words() -> usize {
+    used_words_for(victory_shader::emit::view_heap_limit())
+}
+
+/// [`used_words`] for a heap whose null slot is `null` (0: no limit).
+fn used_words_for(null: u32) -> usize {
+    let slots = match null {
+        0 => SAMPLED_MARKS as usize * 32,
+        null => null as usize + 1,
+    };
+    slots.div_ceil(32).next_multiple_of(4 * PARTS).min(SAMPLED_MARKS as usize)
+}
+
+/// With `VICTORY_SAMPLED_EVICT=1` (and the marks): slot eviction lets go
+/// of textures picked by index that no shader marked within its idle time
+/// (`crate::descriptor::evictable_slots`), and a slot of theirs a shader
+/// reads again is queued as a title write (see [`evicted`]).
+pub(crate) fn evict_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        victory_shader::emit::sampled_marks_on() && std::env::var_os("VICTORY_SAMPLED_EVICT").is_some_and(|v| v == "1")
+    })
+}
+
+/// Slots picked by index that slot eviction put back to null, by index,
+/// with the heaps (addresses) they are of.
+static EVICTED: std::sync::Mutex<std::collections::BTreeMap<u32, Vec<usize>>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// Slots of [`EVICTED`] noted, and queued again when a shader read them.
+pub(crate) static AGAIN: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// Slot `index` of heap `heap`, picked by index, was put back to null by
+/// slot eviction: the next mark of it queues it again.
+pub(crate) fn evicted(heap: usize, index: u32) {
+    let mut e = EVICTED.lock().unwrap_or_else(|e| e.into_inner());
+    let heaps = e.entry(index).or_default();
+    if !heaps.contains(&heap) {
+        heaps.push(heap);
+        AGAIN[0].fetch_add(1, Relaxed);
+    }
+}
 
 /// Moves the bits set in this frame's part since it was last taken into
-/// `seen` (as of this frame) and clears them.
+/// `seen` (as of this frame) and clears them; slots of [`EVICTED`] among
+/// them are queued again.
 fn take(m: &Marks, frame: u64) {
     let stamp = (frame as u32).max(1);
     let mut n = 0u64;
     let mut chunk = [0u32; 4];
-    let part = SAMPLED_MARKS as usize / PARTS;
+    let part = used_words() / PARTS;
     let from = (COUNTS[0].load(Relaxed) as usize % PARTS) * part;
+    let watched = !EVICTED.lock().unwrap_or_else(|e| e.into_inner()).is_empty();
+    let mut again = Vec::new();
     for w in (from..from + part).step_by(4) {
         // SAFETY: inside the mapping (above), 16-byte aligned (a buffer
         // starts on 64 KiB); the card may be writing it.
@@ -117,8 +169,24 @@ fn take(m: &Marks, frame: u64) {
             let mut bits = word;
             n += u64::from(bits.count_ones());
             while bits != 0 {
-                m.seen[(w + k) * 32 + bits.trailing_zeros() as usize].store(stamp, Relaxed);
+                let slot = (w + k) * 32 + bits.trailing_zeros() as usize;
+                m.seen[slot].store(stamp, Relaxed);
+                if watched {
+                    again.push(slot as u32);
+                }
                 bits &= bits - 1;
+            }
+        }
+    }
+    if !again.is_empty() {
+        let back: Vec<(u32, Vec<usize>)> = {
+            let mut e = EVICTED.lock().unwrap_or_else(|e| e.into_inner());
+            again.iter().filter_map(|&i| Some((i, e.remove(&i)?))).collect()
+        };
+        for (index, heaps) in back {
+            for heap in heaps {
+                crate::descriptor::sampled_again(heap, index);
+                AGAIN[1].fetch_add(1, Relaxed);
             }
         }
     }
@@ -133,11 +201,21 @@ fn take(m: &Marks, frame: u64) {
     if now >= COUNTS[2].load(Relaxed) + 5000 {
         COUNTS[2].store(now, Relaxed);
         let [blocked, cold, bytes] = COLD.each_ref().map(|c| c.load(Relaxed));
+        let [noted, queued] = AGAIN.each_ref().map(|c| c.load(Relaxed));
+        let waiting = EVICTED.lock().unwrap_or_else(|e| e.into_inner()).len();
         tracing::info!(
             "texture slots shaders sampled (VICTORY_SAMPLED_MARKS=1): {sweep} marked over the last {PARTS} frames; \
-             slot eviction's last pass: of {blocked} textures it may not take as a slot shaders pick by index shows them, \
-             {cold} were marked by no shader within its idle time ({} MB)",
-            bytes >> 20
+             slot eviction's last pass: of {blocked} textures shown by a slot shaders pick by index, \
+             {cold} were marked by no shader within its idle time ({} MB){}",
+            bytes >> 20,
+            if evict_on() {
+                format!(
+                    "; let go with them (VICTORY_SAMPLED_EVICT=1), since the start: {noted} slots picked by index put back to null, \
+                     {queued} of them queued again as a shader read them, {waiting} null now"
+                )
+            } else {
+                String::new()
+            }
         );
     }
 }
@@ -211,6 +289,17 @@ mod tests {
             }
         }
         println!("reading {} KiB: {:.2} ms ({sum})", bytes >> 10, t.elapsed().as_secs_f64() * 100.0);
+    }
+
+    #[test]
+    fn the_used_words_cover_the_heap_in_whole_parts() {
+        use super::{PARTS, SAMPLED_MARKS, used_words_for};
+        for null in [0, 999_999, (1 << 21) - 1, (1 << 22) - 1, 31] {
+            let w = used_words_for(null);
+            assert!(w.is_multiple_of(4 * PARTS) && w <= SAMPLED_MARKS as usize, "{null}");
+            assert!(null == 0 || w * 32 > null as usize, "{null}");
+        }
+        assert_eq!(used_words_for(0), SAMPLED_MARKS as usize);
     }
 
     #[test]
