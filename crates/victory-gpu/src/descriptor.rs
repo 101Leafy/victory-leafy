@@ -1800,6 +1800,9 @@ pub(crate) fn forget(resource: usize) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(&resource);
+    if !views_read().by_resource.contains_key(&resource) {
+        return;
+    }
     let freed = views_write().release(resource);
     for i in freed {
         note_forgotten(i);
