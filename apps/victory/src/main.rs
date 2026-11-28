@@ -137,6 +137,24 @@ pub(crate) fn windows_build() -> Option<u32> {
     (unsafe { RtlGetVersion(&mut info) } == 0).then_some(info.build)
 }
 
+/// Whether this runs under Wine (Proton included): its ntdll exports
+/// `wine_get_version`. Wine reports Windows 10 by default, but its Direct3D
+/// 12 is vkd3d-proton, not Microsoft's.
+#[cfg(windows)]
+pub(crate) fn on_wine() -> bool {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetModuleHandleW(name: *const u16) -> *mut core::ffi::c_void;
+        fn GetProcAddress(module: *mut core::ffi::c_void, name: *const u8) -> *const core::ffi::c_void;
+    }
+    let ntdll: Vec<u16> = "ntdll.dll\0".encode_utf16().collect();
+    // SAFETY: both names end in NUL; ntdll is loaded in every process.
+    unsafe {
+        let module = GetModuleHandleW(ntdll.as_ptr());
+        !module.is_null() && !GetProcAddress(module, c"wine_get_version".as_ptr().cast()).is_null()
+    }
+}
+
 /// Asks Windows for the Agility SDK version of the `D3D12\D3D12Core.dll`
 /// beside this program, or for its own runtime where there is none. First
 /// thing in `main`, and again after `victory play` fetched the file: Windows
@@ -593,6 +611,12 @@ pub(crate) fn default_paths(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
 
 #[cfg(test)]
 mod tests {
+    /// Real Windows is not Wine, so the Direct3D 12 check still runs here.
+    #[test]
+    fn windows_is_not_wine() {
+        assert!(!super::on_wine());
+    }
+
     /// A D3D12Core.dll's VS_FIXEDFILEINFO: signature, structure version, then
     /// the file version's high and low words (1.620.2.0 here).
     fn core_bytes(major: u32, minor: u32) -> Vec<u8> {

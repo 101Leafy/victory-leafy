@@ -161,6 +161,7 @@ const ITEMS: &[Item] = &[
     Item { var: "VICTORY_MOUSE_CAPTURE", label: "MOUSE CAPTURE", values: UNSET_ON, live: false },
     // Keys and sensitivity in bindings.ini in %LOCALAPPDATA%\victory (apps\victory\src\play.rs).
     Item { var: "VICTORY_MNK", label: "MOUSE AND KEYBOARD", values: UNSET_ON, live: false },
+    Item { var: BINDS, label: "KEY BINDINGS", values: &[("", "ENTER OPENS")], live: false },
     Item { var: "VICTORY_IME_ENGLISH", label: "ENGLISH KEYBOARD", values: UNSET_ON, live: false },
     Item { var: "VICTORY_MENU_CONSOLE", label: "CONSOLE", values: &[("series-x", "SERIES X"), ("series-s", "SERIES S (FASTER)")], live: false },
     Item { var: X_RES, label: "SERIES X PICTURE", values: &[("1440", "2560X1440"), ("1080to1440", "1080P TO 1440P"), ("4k", "3840X2160")], live: false },
@@ -193,18 +194,18 @@ const ITEMS: &[Item] = &[
     Item { var: "VICTORY_ASYNC_SUBMIT", label: "ASYNC SUBMIT (FRAME GEN WITHOUT THIN)", values: UNSET_ON, live: false },
 ];
 /// The lines after the settings.
-const ACTIONS: [&str; 8] = [
+const ACTIONS: [&str; 7] = [
     "SAVE AND RESTART NOW",
     "SAVE FOR NEXT START",
     "PRELOAD SHADERS (RESTARTS THE GAME)",
     "RESET ALL TO PLAY DEFAULTS",
     "EXPORT SAVE (TO SAVES IN THE GAME FOLDER)",
     "IMPORT SAVE (PICK FROM SAVES)",
-    "KEY BINDINGS (MOUSE AND KEYBOARD)",
     "CLOSE",
 ];
-/// The action that opens the list of key bindings ([`binds`]).
-const BINDS: usize = 6;
+/// The line under MOUSE AND KEYBOARD that opens the list of key bindings ([`binds`]):
+/// a setting of one value, never saved.
+const BINDS: &str = "VICTORY_MENU_KEY_BINDINGS";
 const BINDS_TITLE: &str = "KEY BINDINGS                      ESC GOES BACK";
 const BINDS_HELP: &str = "UP/DOWN PICK  ENTER, THEN A KEY OR MOUSE BUTTON";
 const BINDS_BACK: &str = "BACK TO THE SETTINGS";
@@ -1008,6 +1009,13 @@ impl Menu {
                 VK_DOWN => self.at = self.step(1),
                 VK_LEFT if self.at < ITEMS.len() => self.change_and_save(self.at, -1),
                 VK_RIGHT if self.at < ITEMS.len() => self.change_and_save(self.at, 1),
+                VK_RETURN if ITEMS.get(self.at).is_some_and(|i| i.var == BINDS) => match binds::Binds::open() {
+                    Some(b) => {
+                        self.binds = Some(b);
+                        self.note.clear();
+                    }
+                    None => BINDS_OFF.clone_into(&mut self.note),
+                },
                 VK_RETURN if self.at < ITEMS.len() => self.change_and_save(self.at, 1),
                 VK_RETURN => match self.at - ITEMS.len() {
                     0 => {
@@ -1031,13 +1039,6 @@ impl Menu {
                         self.import_at = 0;
                         self.picking = true;
                     }
-                    BINDS => match binds::Binds::open() {
-                        Some(b) => {
-                            self.binds = Some(b);
-                            self.note.clear();
-                        }
-                        None => BINDS_OFF.clone_into(&mut self.note),
-                    },
                     _ => crate::SETTINGS_MENU_OPEN.store(false, Ordering::Relaxed),
                 },
                 _ => {}

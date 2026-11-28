@@ -729,7 +729,15 @@ pub(crate) fn get_d3d12() -> Result<()> {
 /// heaps indexed directly), and the title closed a second after its first
 /// frame (2026-11-27, Windows 10 21H2 LTSC with an RTX 4060, issue #290;
 /// #123 and discussion #186 found the same refusal).
+///
+/// Under Wine and Proton nothing is checked or fetched: Wine says Windows 10,
+/// but its Direct3D 12 is vkd3d-proton, which never loads Microsoft's
+/// D3D12Core.dll and takes those root signatures (and the fetcher needs a
+/// PowerShell that Proton does not have, so it asked at every start).
 fn check_shader_model() -> Result<()> {
+    if crate::on_wine() {
+        return Ok(());
+    }
     let needed = victory_hle::streamline::SHADER_MODEL_NEEDED;
     let Some(found) = shader_model() else { return Ok(()) };
     let to = d3d12_dir()?;
