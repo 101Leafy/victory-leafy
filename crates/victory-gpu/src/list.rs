@@ -955,14 +955,14 @@ fn wait_shared(list: &crate::host::HostList) -> bool {
     }
 }
 
-/// `VICTORY_UAV_FOLD=1`: the unordered access barriers of one title call
+/// `VICTORY_UAV_FOLD` (`0` turns it off): the unordered access barriers of one title call
 /// fold into one on every resource when it has one (or names a buffer,
 /// [`barrier`]), and none is kept when nothing that writes was recorded in
 /// the list since our last full wait (as `VICTORY_QUIET_WAITS` for the
-/// title's own). Off by default; the census is counted either way.
+/// title's own). On by default; the census is counted either way.
 pub(crate) fn uav_fold() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("VICTORY_UAV_FOLD").as_deref() == Ok("1"))
+    *ON.get_or_init(|| std::env::var("VICTORY_UAV_FOLD").as_deref() != Ok("0"))
 }
 
 /// Leaves out the unordered access barriers of `host` that `wrote` (a

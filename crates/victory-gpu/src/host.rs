@@ -2874,16 +2874,16 @@ fn card_budget() -> bool {
 /// What a list leaves out when it closes (`VICTORY_CLOSE_LEAN`): `notes` 1,
 /// the copy of the clamp's notes out of the card's budget and the barriers
 /// around it (the notes only feed the log: largest mesh group count,
-/// records refused); any other value but `0`, 2, also the moves of the
+/// records refused); unset or any other value but `0`, 2, also the moves of the
 /// list's indirect scratch buffers back to common. Each of these buffers
 /// is the list's own and decays to common when the submission finishes,
 /// as every buffer does, so the next recording finds it there anyway.
 fn close_lean() -> u8 {
     static LEAN: OnceLock<u8> = OnceLock::new();
     *LEAN.get_or_init(|| match std::env::var("VICTORY_CLOSE_LEAN").as_deref() {
-        Err(_) | Ok("0") => 0,
+        Ok("0") => 0,
         Ok("notes") => 1,
-        Ok(_) => 2,
+        _ => 2,
     })
 }
 
