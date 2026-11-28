@@ -139,6 +139,9 @@ struct State<W> {
     /// what is behind a wait may have been written only before the wait was
     /// met, not before it was put in the line.
     floors: Vec<(usize, u64)>,
+    /// Since when a present has stood behind work whose parts are not known
+    /// yet, with nothing going.
+    stuck: Option<Instant>,
 }
 
 impl<W> State<W> {
@@ -161,6 +164,20 @@ pub(super) struct Lane<W: Work> {
     work: Condvar,
     /// Something was done, or a look at the line ended.
     moved: Condvar,
+    /// [`fold_force`] for this line.
+    fold_force: OnceLock<Option<Duration>>,
+}
+
+/// `VICTORY_FOLD_FORCE_MS=n`: a present that has stood n ms behind work
+/// whose parts are not known yet goes on without it, as one goes past a
+/// wait nobody meets. Off by default. A list thread held long (a driver
+/// creating pipelines on a cold library takes 20 to 49 s) holds every
+/// present behind it, and the title's watchdog writes to 0 once no frame
+/// was shown for 30 s. A present that goes this way shows the image as the
+/// card has it: the frame without the draws of what it went past.
+fn fold_force() -> Option<Duration> {
+    let ms: u64 = std::env::var("VICTORY_FOLD_FORCE_MS").ok()?.trim().parse().ok()?;
+    (ms > 0).then(|| Duration::from_millis(ms))
 }
 
 impl<W: Work> Lane<W> {
@@ -175,9 +192,11 @@ impl<W: Work> Lane<W> {
                 presents: 0,
                 runs: 0,
                 floors: Vec::new(),
+                stuck: None,
             }),
             work: Condvar::new(),
             moved: Condvar::new(),
+            fold_force: OnceLock::new(),
         }
     }
 
@@ -315,6 +334,23 @@ impl<W: Work> Lane<W> {
         }
     }
 
+    /// The number of the oldest present before `limit`, once it has stood
+    /// [`fold_force`] behind work whose parts are not known yet.
+    fn past_folded(&self, limit: u64) -> Option<u64> {
+        let most = (*self.fold_force.get_or_init(fold_force))?;
+        let mut state = self.lock();
+        let present = state.items.iter().find(|e| e.number < limit && e.what.shows())?.number;
+        let since = *state.stuck.get_or_insert_with(Instant::now);
+        if since.elapsed() < most {
+            return None;
+        }
+        tracing::warn!(
+            ms = since.elapsed().as_millis() as u64,
+            "a present went past work whose parts are not known yet: the frame is shown without its draws"
+        );
+        Some(present)
+    }
+
     /// Does one entry: the oldest that is the first of its queue and free to
     /// run. Whether there was one. Only one thread calls this.
     fn step(&self, limit: u64) -> bool {
@@ -347,13 +383,17 @@ impl<W: Work> Lane<W> {
                 // frames (`super::present`). (Not while there is work whose
                 // parts are not known: it may be what is waited for.)
                 if folded {
-                    return false;
+                    let Some(present) = self.past_folded(limit) else {
+                        return false;
+                    };
+                    (present, true)
+                } else {
+                    let state = self.lock();
+                    if !super::forces() || !state.items.iter().any(|e| e.number < limit && e.what.shows()) {
+                        return false;
+                    }
+                    (first, true)
                 }
-                let state = self.lock();
-                if !super::forces() || !state.items.iter().any(|e| e.number < limit && e.what.shows()) {
-                    return false;
-                }
-                (first, true)
             }
         };
         let mut entry = {
@@ -364,6 +404,7 @@ impl<W: Work> Lane<W> {
             let Some(entry) = state.items.remove(at) else {
                 return false;
             };
+            state.stuck = None;
             state.running = Some(entry.queue);
             entry
         };
@@ -996,13 +1037,15 @@ mod tests {
         Present(&'static str, Log),
         /// Takes others of its kind, waits that are met, and signals along.
         Group(Vec<&'static str>, Log, Vec<(usize, u64)>),
+        /// Stands for its parts, which are known once the fence has the value.
+        Folded(usize, u64, Vec<T>),
     }
 
     impl Work for T {
         type Ask = (usize, u64);
         fn ask(&self) -> Option<(usize, u64)> {
             match self {
-                &T::Wait(fence, value) => Some((fence, value)),
+                &T::Wait(fence, value) | &T::Folded(fence, value, _) => Some((fence, value)),
                 _ => None,
             }
         }
@@ -1013,7 +1056,16 @@ mod tests {
             matches!(self, T::Present(..))
         }
         fn runs(&self) -> bool {
-            matches!(self, T::Run(..) | T::Slow(..) | T::Group(..))
+            matches!(self, T::Run(..) | T::Slow(..) | T::Group(..) | T::Folded(..))
+        }
+        fn folded(&self) -> bool {
+            matches!(self, T::Folded(..))
+        }
+        fn unfold(self) -> Vec<T> {
+            match self {
+                T::Folded(_, _, parts) => parts,
+                other => vec![other],
+            }
         }
         fn take_along(&mut self, next: T) -> Result<bool, T> {
             let T::Group(names, _, signals) = self else {
@@ -1034,6 +1086,7 @@ mod tests {
         }
         fn go(self, forced: bool) {
             match self {
+                T::Folded(..) => unreachable!("a folded one is unfolded"),
                 T::Wait(..) => {
                     if forced {
                         FORCED_HERE.with(|f| f.set(f.get() + 1));
@@ -1217,6 +1270,37 @@ mod tests {
         assert_eq!(FORCED_HERE.get(), 1);
         let state = lane.lock();
         assert_eq!((state.presents, state.runs, state.items.len()), (0, 0, 0));
+    }
+
+    /// Work whose parts are not known holds a present, which is not forced
+    /// past it; with `VICTORY_FOLD_FORCE_MS` it is, after that long, and the
+    /// work keeps its place and goes once it is known.
+    #[test]
+    fn a_present_goes_past_folded_work_only_after_the_limit() {
+        let lane = Lane::new();
+        let log: Log = Default::default();
+        let f = fence();
+        let run = |name| T::Run(name, log.clone());
+        lane.push(1, [T::Folded(f, 1, vec![run("lists")])]);
+        lane.push(1, [T::Present("present", log.clone())]);
+        look(&lane);
+        assert!(log.lock().unwrap().is_empty(), "without the switch it stands");
+        let lane = Lane::new();
+        lane.fold_force.set(Some(Duration::from_millis(30))).unwrap();
+        lane.push(1, [T::Folded(f, 1, vec![run("lists")])]);
+        lane.push(1, [T::Present("present", log.clone())]);
+        lane.push(1, [run("next frame")]);
+        look(&lane);
+        assert!(log.lock().unwrap().is_empty(), "not before the limit");
+        std::thread::sleep(Duration::from_millis(40));
+        look(&lane);
+        assert_eq!(*log.lock().unwrap(), ["present"], "what is behind the folded work on its queue stays");
+        assert_eq!(lane.lock().presents, 0);
+        crate::fence::set(f as This, 1);
+        look(&lane);
+        assert_eq!(*log.lock().unwrap(), ["present", "lists", "next frame"]);
+        let state = lane.lock();
+        assert_eq!((state.presents, state.runs, state.items.len(), state.stuck), (0, 0, 0, None));
     }
 
     /// With the thread: a fence behind a submission is not reached before the
