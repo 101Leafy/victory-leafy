@@ -34,9 +34,14 @@
 
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
-/// Whether the switch is on (`crate::watch::port_journal`).
+/// Whether the heaps' records part is on: with the switch
+/// (`crate::watch::port_journal`), or alone with
+/// `VICTORY_HEAP_SYNC_AT_SUBMIT=1`, the name trustno1-coder/VIctory-NVIDIA
+/// gives this part (d2e24b3bc3 by readmet3xt-lab; there `heap_marks`), off by
+/// default.
 pub(crate) fn on() -> bool {
-    crate::watch::port_journal()
+    static AT_SUBMIT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    crate::watch::port_journal() || *AT_SUBMIT.get_or_init(|| crate::switch::on("VICTORY_HEAP_SYNC_AT_SUBMIT"))
 }
 
 // ---------------------------------------------------------------------------
