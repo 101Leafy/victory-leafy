@@ -1,4 +1,4 @@
-use super::{Lowered, Numeric, Parts, buffer_format, half_shift, lds_bounds_exempt, lower, with_program};
+use super::{Lowered, Numeric, Parts, buffer_format, half_shift, lds_bounds_exempt, lds_clamped, lower, with_program};
 use crate::native::{
     ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
 };
@@ -657,6 +657,9 @@ fn lds_accesses_are_bounded_by_the_allocation() {
     ];
     let l = lower_with(&words, vec![], vec![]).unwrap();
     assert_eq!(l.lds_bounds, 3, "one bound per LDS access");
+    let clamped = |hash| with_program(hash, || (lower_with(&words, vec![], vec![]).unwrap(), lds_clamped()).1);
+    assert_eq!(clamped("0123456789abcdef"), 3, "held to the header's size, counted");
+    assert_eq!(clamped("38a65783327c30b6"), 0, "a face program keeps none");
 }
 
 /// Tables of 2D textures at s0 and samplers at s1.

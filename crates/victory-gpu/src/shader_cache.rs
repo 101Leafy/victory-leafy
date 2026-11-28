@@ -387,9 +387,16 @@ fn host_shader_by(container: &[u8], mask: u8) -> Result<(HostShader, bool), Stri
         let _turn = worker_turn();
         let plain = || {
             victory_shader::emit::with_program(&name, || {
-                victory_shader::emit::with_wave_wide(wide, || {
+                let out = victory_shader::emit::with_wave_wide(wide, || {
                     victory_shader::emit::with_firstlane_own(own, || victory_shader::emit::translate(c))
-                })
+                });
+                // (The programs still held to their header's LDS size, to find the face ones
+                // missing from the exempt list.)
+                #[cfg(feature = "diagnostics")]
+                if victory_shader::emit::lds_clamped() > 0 {
+                    tracing::info!(shader = %name, accesses = victory_shader::emit::lds_clamped(), "LDS bounds kept");
+                }
+                out
             })
         };
         if mask == 0 { plain() } else { victory_shader::emit::with_finite_targets(mask, plain) }

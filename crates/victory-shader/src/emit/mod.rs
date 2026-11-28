@@ -133,7 +133,7 @@ use crate::{ShaderError, io, ir, resource, structure};
 pub use bitcode::census;
 pub use link::{link_mesh, mesh_fits};
 pub use sampler::StaticSampler;
-pub use lower::{host_settings, set_host_max_wave, set_host_rdna, with_program};
+pub use lower::{host_settings, lds_clamped, set_host_max_wave, set_host_rdna, with_program};
 pub use rect::rect_list_gs;
 pub use shader::{
     mesh_payload_bytes,

@@ -1651,7 +1651,8 @@ fn lane_constant_masks(st: &Structured) -> bool {
 
 /// Programs whose shared memory accesses are not held to the size their headers give
 /// (`VICTORY_LDS_BOUNDS_EXEMPT=<16 hex digits>[,..]`, the BLAKE3 of the title's container as run
-/// logs name shaders; `0` or empty: none; unset: the face programs below). The face network's
+/// logs name shaders; `all`: every program, for finding the ones missing below, at about half the
+/// frame rate; `0` or empty: none; unset: the face programs below). The face network's
 /// operations (`compute_graph_ops`: the matrix products, dot products and reductions) and the two
 /// programs that rebuild the face's normals from its blend shapes use shared memory past the size
 /// their headers give; held to that size, their results were zeros and cutscene faces were not
@@ -1671,12 +1672,21 @@ const FACE_PROGRAMS: [&str; 25] = [
 thread_local! {
     /// The 16 hex digits of the container being translated on this thread ([`with_program`]).
     static PROGRAM: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+    /// LDS accesses of that container held to its header's size ([`lds_clamped`]).
+    static CLAMPED: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// How many LDS accesses of the program being translated on this thread ([`with_program`]) were
+/// held to the size its header gives, so far.
+pub fn lds_clamped() -> u32 {
+    CLAMPED.get()
 }
 
 /// Runs `f` (a translation) with `hash` (16 hex digits of the container's BLAKE3) as the program
 /// being translated, for the settings that name programs ([`lds_bounds_exempt`]).
 pub fn with_program<T>(hash: &str, f: impl FnOnce() -> T) -> T {
     PROGRAM.with(|p| hash.clone_into(&mut p.borrow_mut()));
+    CLAMPED.set(0);
     let out = f();
     PROGRAM.with(|p| p.borrow_mut().clear());
     out
@@ -1692,6 +1702,9 @@ fn lds_bounds_exempt() -> bool {
             .filter(|h| !h.is_empty() && h != "0")
             .collect(),
     });
+    if list.iter().any(|h| h == "all") {
+        return true;
+    }
     !list.is_empty() && PROGRAM.with(|p| {
         let p = p.borrow();
         !p.is_empty() && list.iter().any(|h| p.starts_with(h.as_str()))
@@ -7302,7 +7315,12 @@ impl<'a> Lower<'a> {
         // writes, and the host index is clamped so it never leaves the
         // group-shared array. The face programs ([`lds_bounds_exempt`]) take every
         // dword as inside.
-        let limit = if lds_bounds_exempt() { u32::MAX } else { self.s.title_lds_dwords };
+        let limit = if lds_bounds_exempt() {
+            u32::MAX
+        } else {
+            CLAMPED.set(CLAMPED.get() + 1);
+            self.s.title_lds_dwords
+        };
         let dword = |l: &mut Self, bytes: u32| -> (V, V) {
             let c = l.cur;
             let o = l.s.m.i32(bytes);
