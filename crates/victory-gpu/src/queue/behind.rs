@@ -746,6 +746,7 @@ impl Work for Job {
                     let over = overlay.as_ref().map(|(over, state)| (&over.texture, left(over, *state)));
                     super::show(&texture.texture, left(&texture, state), over, shown);
                 }
+                crate::frame::shown(shown.token, shown.entered);
                 QUEUED.fetch_sub(1, Relaxed);
             }
         }
