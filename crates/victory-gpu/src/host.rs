@@ -5088,6 +5088,11 @@ fn copy_blocked(written: &[(usize, usize)], dst: usize, src: usize, len: usize) 
 /// may write (in order, joined); `count` whether the kind of read is
 /// counted for the frame line.
 fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Option<usize> {
+    blocked_with(written, runs, count, true)
+}
+
+/// [`blocked_by`], with fills of upload memory looked at or not.
+fn blocked_with(written: &[(usize, usize)], runs: &[&HostList], count: bool, fills: bool) -> Option<usize> {
     if written.is_empty() {
         return None;
     }
@@ -5113,7 +5118,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                     }
                 }
                 &Step::Fill(_, src, len, _) => {
-                    if read_blocked(written, src, len) && !place::forwarded(&forwards, n, i) {
+                    if fills && read_blocked(written, src, len) && !place::forwarded(&forwards, n, i) {
                         if count {
                             LATE_STATS[16].fetch_add(1, Ordering::Relaxed);
                             #[cfg(feature = "diagnostics")]
@@ -5840,6 +5845,174 @@ fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) {
     SUBMISSION_US[1].fetch_add(us, Ordering::Relaxed);
     #[cfg(feature = "diagnostics")]
     blamed(why, us);
+}
+
+/// Fills of upload memory that wait only for flights, made beside the
+/// submission (`VICTORY_TEAM_FAST=1`; off by default, and only with
+/// [`relay_exact`] and [`relay_copy`]).
+///
+/// A submission whose only reads of memory flights may write are fills
+/// waited on the submitting thread until those flights landed: 178 ms of a
+/// 340 ms frame in run ff-best r193. Here the submission is prepared without
+/// those fills and sent behind a wait on a fence of ours; a thread of ours
+/// waits for the landings, makes the fills and signals the fence. The card
+/// still reads them only once made; the title's thread goes on. The
+/// fetches that land flights go over the copy queue, not behind that wait.
+///
+/// What can go wrong: a fill takes the title's bytes as they are once the
+/// flights landed, not as they were at the submission, so what the title
+/// wrote there in between is read too (a view's constants a frame early).
+mod beside {
+    use super::*;
+    use std::sync::atomic::AtomicU64;
+
+    struct Job {
+        fills: Vec<(usize, usize, usize)>,
+        value: u64,
+    }
+
+    struct Beside {
+        fence: ID3D12Fence,
+        jobs: Mutex<std::sync::mpsc::Sender<Job>>,
+        sent: AtomicU64,
+    }
+
+    struct Fence(ID3D12Fence);
+
+    // SAFETY: D3D12 fences are free-threaded.
+    unsafe impl Send for Beside {}
+    // SAFETY: as above.
+    unsafe impl Sync for Beside {}
+    // SAFETY: as above.
+    unsafe impl Send for Fence {}
+
+    /// Jobs, fills, microseconds waited for landings.
+    static STATS: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+
+    fn on() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| relay_exact() && relay_copy() && std::env::var_os("VICTORY_TEAM_FAST").is_some_and(|v| v == "1"))
+    }
+
+    fn get(device: &ID3D12Device) -> Option<&'static Beside> {
+        static BESIDE: OnceLock<Option<Beside>> = OnceLock::new();
+        BESIDE
+            .get_or_init(|| {
+                // SAFETY: plain object creation.
+                let fence: ID3D12Fence = match unsafe { device.CreateFence(0, D3D12_FENCE_FLAG_NONE) } {
+                    Ok(fence) => fence,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "no fence for fills beside submissions: they wait as before");
+                        return None;
+                    }
+                };
+                let (jobs, receiver) = std::sync::mpsc::channel::<Job>();
+                let theirs = Fence(fence.clone());
+                let spawned = std::thread::Builder::new().name("victory fills beside".into()).spawn(move || {
+                    let fence = theirs;
+                    for job in receiver {
+                        made(&fence.0, job);
+                    }
+                });
+                if let Err(e) = spawned {
+                    tracing::warn!(error = %e, "no thread for fills beside submissions: they wait as before");
+                    return None;
+                }
+                tracing::info!("fills of upload memory that wait for flights are made beside the submission (VICTORY_TEAM_FAST=1)");
+                Some(Beside {
+                    fence,
+                    jobs: Mutex::new(jobs),
+                    sent: AtomicU64::new(0),
+                })
+            })
+            .as_ref()
+    }
+
+    fn made(fence: &ID3D12Fence, job: Job) {
+        let waiting = std::time::Instant::now();
+        let mut line = line();
+        while job.fills.iter().any(|&(_, src, len)| read_blocked(&line.written, src, len)) {
+            line = LINE_LANDED.wait(line).unwrap_or_else(|e| e.into_inner());
+        }
+        drop(line);
+        let us = waiting.elapsed().as_micros() as u64;
+        for &(dst, src, len) in &job.fills {
+            copy_mapped(dst as *mut u8, src as *const u8, len, false);
+        }
+        // SAFETY: our fence.
+        if let Err(e) = unsafe { fence.Signal(job.value) } {
+            fail(format_args!("fills made beside a submission could not be signalled ({e})"));
+        }
+        let jobs = STATS[0].fetch_add(1, Ordering::Relaxed) + 1;
+        let fills = STATS[1].fetch_add(job.fills.len() as u64, Ordering::Relaxed) + job.fills.len() as u64;
+        let waited = STATS[2].fetch_add(us, Ordering::Relaxed) + us;
+        if jobs.is_power_of_two() || jobs % 1000 == 0 {
+            tracing::info!(
+                submissions = jobs,
+                fills,
+                waited_ms = waited / 1000,
+                last_ms = us / 1000,
+                "fills made beside submissions"
+            );
+        }
+    }
+
+    /// The fill steps of `runs` (the list's address, the step) that only
+    /// wait for flights, if nothing else read does; sorted.
+    pub(super) fn steps(device: &ID3D12Device, runs: &[&HostList]) -> Option<Vec<(usize, usize)>> {
+        if !on() || get(device).is_none() {
+            return None;
+        }
+        let line = line();
+        if card_steps::copied_read(&card_steps::copies(&line), runs) || blocked_with(&line.written, runs, false, false).is_some() {
+            return None;
+        }
+        let mut steps = Vec::new();
+        for list in runs {
+            for (i, step) in list.deferred().copies.iter().enumerate() {
+                if let &Step::Fill(_, src, len, _) = step
+                    && read_blocked(&line.written, src, len)
+                {
+                    steps.push((std::ptr::from_ref::<HostList>(list) as usize, i));
+                }
+            }
+        }
+        drop(line);
+        steps.sort_unstable();
+        (!steps.is_empty()).then_some(steps)
+    }
+
+    pub(super) fn has(steps: &[(usize, usize)], list: &HostList, i: usize) -> bool {
+        !steps.is_empty() && steps.binary_search(&(std::ptr::from_ref(list) as usize, i)).is_ok()
+    }
+
+    /// Hands the fills of `steps` to the thread and puts the wait for them
+    /// on `queue`, ahead of the submission.
+    pub(super) fn send(device: &ID3D12Device, queue: &ID3D12CommandQueue, runs: &[&HostList], steps: &[(usize, usize)]) {
+        let Some(beside) = get(device) else {
+            return;
+        };
+        let mut fills = Vec::with_capacity(steps.len());
+        for list in runs {
+            for (i, step) in list.deferred().copies.iter().enumerate() {
+                if let &Step::Fill(dst, src, len, _) = step
+                    && has(steps, list, i)
+                {
+                    fills.push((dst, src, len));
+                }
+            }
+        }
+        let value = beside.sent.fetch_add(1, Ordering::Relaxed) + 1;
+        let jobs = beside.jobs.lock().unwrap_or_else(|e| e.into_inner());
+        if jobs.send(Job { fills, value }).is_err() {
+            fail(format_args!("the thread that makes fills beside submissions is gone"));
+        }
+        drop(jobs);
+        // SAFETY: our fence and queue.
+        if let Err(e) = unsafe { queue.Wait(&beside.fence, value) } {
+            fail(format_args!("a submission could not wait for its fills made beside ({e})"));
+        }
+    }
 }
 
 /// What the thread that lands flights fetches card copies' pieces with
@@ -8847,13 +9020,20 @@ impl Host {
         ahead.part(12);
         stage.next("submit: waiting for flights it reads from");
         let mut waited_for_flights = false;
+        // Fills left to [`beside`].
+        let mut put_beside: Vec<(usize, usize)> = Vec::new();
         if !late {
             self.settle(&mut submitted, WHY_SYNC);
         } else if own.is_none()
             && let Some(why) = late_blocked(runs)
         {
             waited_for_flights = true;
-            if relay_exact() && why == WHY_READ {
+            if relay_exact()
+                && why == WHY_READ
+                && let Some(steps) = beside::steps(&self.device, runs)
+            {
+                put_beside = steps;
+            } else if relay_exact() && why == WHY_READ {
                 // Only until the flights that may write what is read have
                 // landed: their copy-back's end, not the card's other work.
                 relay_wait(why, |line| {
@@ -9015,7 +9195,9 @@ impl Host {
         batch.forwards = place::forwards(&air, runs);
         place::count_written_ahead(runs, &batch.forwards);
         for (n, list) in runs.iter().enumerate() {
-            list.run_deferred(&mut batch, &air, n, |i| own.as_ref().is_some_and(|own| own.takes(list, i)));
+            list.run_deferred(&mut batch, &air, n, |i| {
+                own.as_ref().is_some_and(|own| own.takes(list, i)) || beside::has(&put_beside, list, i)
+            });
             firsts.push(lists.len());
             // (None unless `VICTORY_PRELUDE_UPLOADS=1`.)
             let uploads = list.prelude_uploads(&mut batch);
@@ -9152,6 +9334,9 @@ impl Host {
                 let _ = unsafe { self.queue.Wait(&fence, value) };
             }
             // SAFETY: closed lists; the fence is ours.
+            if !put_beside.is_empty() {
+                beside::send(&self.device, &self.queue, runs, &put_beside);
+            }
             let signalled = unsafe {
                 let mut from = 0;
                 for to in cuts.into_iter().chain([lists.len()]) {
