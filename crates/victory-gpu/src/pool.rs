@@ -1104,7 +1104,7 @@ pub(crate) fn cpu_buffer(device: &ID3D12Device, kind: CpuBuffer, size: u64) -> O
         CpuBuffer::Upload => &UPLOADS,
         CpuBuffer::Shared => &SHARED,
     };
-    let (piece, heap, again) = lock(pool).take(len, ALIGN, now(), || {
+    let (piece, heap, again) = take_from(pool, len, ALIGN, || Ripe::ALL, || {
         let properties = match kind {
             CpuBuffer::Upload => D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_UPLOAD, ..Default::default() },
             CpuBuffer::Shared => D3D12_HEAP_PROPERTIES {
