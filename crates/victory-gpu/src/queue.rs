@@ -1178,12 +1178,43 @@ pub(crate) struct PageBatch {
 /// Bytes per mapped page.
 const PAGE: u64 = 64 << 10;
 
+/// Whether what the queues' line holds and is free to run is run from the
+/// caller's thread before each of the title's page-mapping copies
+/// (`VICTORY_REMAP_SYNC=1`; off). Without it, a submission the title made
+/// just before such a copy may still stand in the line ([`behind`], with
+/// `VICTORY_ASYNC_SUBMIT=1` or `VICTORY_THIN=1`) when the pages are mapped.
+///
+/// Ported from Steenax6/VIctory-NVID 9e7edae, df2c40c and b63c115, where it
+/// was a stop-gap for a day for the host device lost at the open world's
+/// entry, where the title maps pages by the thousand (removal reason: hung):
+/// 34 of 115 entries lost without it, 1 of about 65 with it. Why it helped is
+/// not known. It is not the order of the reads and the remap: with the line
+/// run behind the remap none of 13 entries was lost, and with the
+/// submissions that stood reading the pages mapped before by their physical
+/// place 4 of 18 were. What the forms that held had in common is that the
+/// caller does not go on until the line is empty. That fork turned it off
+/// again for what it costs where the player moves and the title maps pages
+/// nearly every frame: 41 ms a frame of the title's two streaming threads
+/// stood in it, single calls up to 345 ms, more with list calls only written
+/// down (`crate::list::thin`: the line waits for the translation too). Since
+/// its texture slots show a new texture only once the texture's upload has
+/// run on the card (here `crate::descriptor::host::show_after` and
+/// `show_new_later`), 16 entries without it lost none (no proof: the rate
+/// was low). If the device is lost at the world's entry, this switch is the
+/// first thing to turn on.
+#[cfg(windows)]
+fn remap_sync() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_REMAP_SYNC").is_some_and(|v| v == "1"))
+}
+
 /// `CopyPageMappingsBatchX(count, batches, pool, pool pages, flags)`: maps
 /// pages of a pool (memory the title mapped physical pages into) at the
 /// batches' addresses. The title streams textures into pool pages
 /// and maps them into its tiled heap this way (title+0xf2c470, ranges of
 /// one constant page or of unmapped pages). Done at once: every earlier
-/// submission has run.
+/// submission has run, but for those that stand in the queues' line
+/// ([`remap_sync`] runs them first).
 extern "system" fn copy_page_mappings(
     _: This,
     count: u32,
@@ -1199,6 +1230,11 @@ extern "system" fn copy_page_mappings(
         return E_INVALIDARG;
     }
     let _called = crate::timeline::span("the title's CopyPageMappings");
+    // With the switch: what the title sent before runs first (see above).
+    #[cfg(windows)]
+    if remap_sync() {
+        before_sync();
+    }
     let batches = (count > 0).then(|| {
         // SAFETY: the title passes `count` batches.
         unsafe { std::slice::from_raw_parts(batches, count as usize) }
