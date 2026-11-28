@@ -5848,7 +5848,7 @@ fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) {
 }
 
 /// Fills of upload memory that wait only for flights, made beside the
-/// submission (`VICTORY_TEAM_FAST=1`; off by default, and only with
+/// submission (`VICTORY_FILL_BESIDE=0` turns it off; only with
 /// [`relay_exact`] and [`relay_copy`]).
 ///
 /// A submission whose only reads of memory flights may write are fills
@@ -5891,7 +5891,7 @@ mod beside {
 
     fn on() -> bool {
         static ON: OnceLock<bool> = OnceLock::new();
-        *ON.get_or_init(|| relay_exact() && relay_copy() && std::env::var_os("VICTORY_TEAM_FAST").is_some_and(|v| v == "1"))
+        *ON.get_or_init(|| relay_exact() && relay_copy() && std::env::var_os("VICTORY_FILL_BESIDE").is_none_or(|v| v != "0"))
     }
 
     fn get(device: &ID3D12Device) -> Option<&'static Beside> {
@@ -5918,7 +5918,7 @@ mod beside {
                     tracing::warn!(error = %e, "no thread for fills beside submissions: they wait as before");
                     return None;
                 }
-                tracing::info!("fills of upload memory that wait for flights are made beside the submission (VICTORY_TEAM_FAST=1)");
+                tracing::info!("fills of upload memory that wait for flights are made beside the submission (VICTORY_FILL_BESIDE=0 turns it off)");
                 Some(Beside {
                     fence,
                     jobs: Mutex::new(jobs),
