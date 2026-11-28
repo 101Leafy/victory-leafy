@@ -794,6 +794,16 @@ pub(crate) fn check_put(lists: &[This], at: &str) {
                 list = ?this,
                 // SAFETY: as above.
                 kind = unsafe { (*list).kind },
+                // SAFETY: as above.
+                list_type = match unsafe { (*list).kind } {
+                    0 => "direct",
+                    1 => "bundle",
+                    2 => "compute",
+                    3 => "copy",
+                    _ => "other",
+                },
+                // SAFETY: as above.
+                bundle = unsafe { (*list).kind } == 1,
                 put = format_args!("{:#x?}", put),
                 caller = crate::object::caller(2),
                 zeroed = on == 2,
