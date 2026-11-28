@@ -35,8 +35,10 @@
 //!   (+0x7e9440) multiplies by a scale at +0x90 of it, set to 2/3 at
 //!   +0x28f1e78 (so 2560x1440 for 4K, 1280x720 for 1080p).
 //!   That constant is set to 1.0, so the title renders at the output size
-//!   and nothing is upscaled. `VICTORY_RENDER_SCALE` (pull request #53) is
-//!   still read, and only 1.0 is taken.
+//!   and nothing is upscaled. `VICTORY_RENDER_SCALE` (pull request #53, or
+//!   the F1 menu) can still put 0.5 to 1.0 there, and the title's own
+//!   upscaler fills the output. Not endorsed by 101Leafy, never used by the
+//!   developer.
 //! - **Interface.** Its layouts name a stretch mode for each panel, looked up
 //!   by name hash in a table at +0x630ff10 (fill 1, uniform 2, uniform to
 //!   fill 3, dynamic 4). Dynamic keeps the 4K pixel size whatever the
@@ -85,13 +87,14 @@ pub fn test_size((w, h): (u32, u32)) -> bool {
 /// The title's render scale: the output size, so nothing is upscaled.
 pub const NATIVE_SCALE: f32 = 1.0;
 
-/// `VICTORY_RENDER_SCALE=<s>`: only 1.0 is taken; under it the title would
-/// render smaller and upscale.
+/// `VICTORY_RENDER_SCALE=<s>`, 0.5 to 1.0; under 1.0 the title renders
+/// smaller and its own upscaler fills the output. `None` if unset or out of
+/// range (said why).
 pub fn asked_render_scale() -> Option<f32> {
     let spec = std::env::var("VICTORY_RENDER_SCALE").ok()?;
-    let scale = parse_render_scale(&spec).filter(|&s| s == NATIVE_SCALE);
+    let scale = parse_render_scale(&spec);
     if scale.is_none() {
-        eprintln!("VIctory: VICTORY_RENDER_SCALE={spec}: only 1.0 is left; the title renders at the output size anyway");
+        eprintln!("VIctory: VICTORY_RENDER_SCALE={spec}: expected 0.5 to 1.0; the title renders at the output size");
     }
     scale
 }
@@ -265,7 +268,7 @@ pub unsafe fn write(base: usize, size: usize, site: &Site, code: &[u8]) -> Patch
     Patched::Done
 }
 
-/// Applies what the switches ask for, the scale of 1.0 and the picker's 6;
+/// Applies what the switches ask for, the scale (1.0 unless asked) and the picker's 6;
 /// a line each in the log and on standard output.
 ///
 /// # Safety
@@ -284,8 +287,8 @@ pub unsafe fn apply_asked(base: usize, size: usize) {
         }
         asked.push((&POOL_LEFT, vec![0xeb, 0x01], "skipped".into()));
     }
-    asked_render_scale();
-    asked.push((&OWN_SCALE, own_scale_code(NATIVE_SCALE), format!("{NATIVE_SCALE}")));
+    let scale = asked_render_scale().unwrap_or(NATIVE_SCALE);
+    asked.push((&OWN_SCALE, own_scale_code(scale), format!("{scale}")));
     asked_upscaler();
     asked.push((&PICKER, picker_code(OWN_UPSCALER), format!("returns {OWN_UPSCALER}")));
     for (site, code, value) in asked {
