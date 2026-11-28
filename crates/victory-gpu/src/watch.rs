@@ -535,7 +535,7 @@ pub(crate) fn lock_waits(frames: f64) -> String {
     let p: [u64; 15] = std::array::from_fn(|i| PHASES[i].swap(0, std::sync::atomic::Ordering::Relaxed));
     let ms = |i: usize| p[i] as f64 / 1e6 / frames;
     let (long_ns, long_first, long_last) = std::mem::take(&mut *LONGEST.lock().unwrap_or_else(|e| e.into_inner()));
-    let (whole_ns, x) = std::mem::take(&mut *WHOLE.lock().unwrap_or_else(|e| e.into_inner()));
+    let (whole_ns, x) = std::mem::take(&mut *LONGEST_WHOLE.lock().unwrap_or_else(|e| e.into_inner()));
     let xms = |i: usize| x[i] as f64 / 1e6;
     let parts: u64 = (0..=8).map(|i| x[i]).sum();
     format!(
@@ -617,7 +617,7 @@ static REFRESH_HOLDS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::at
 static PHASES: [std::sync::atomic::AtomicU64; 15] = [const { std::sync::atomic::AtomicU64::new(0) }; 15];
 
 /// [`PHASES`] of the whole hold this thread is in, and in 15 its longest
-/// kernel asking (ns); for [`WHOLE`].
+/// kernel asking (ns); for [`LONGEST_WHOLE`].
 #[cfg(feature = "diagnostics")]
 thread_local! {
     static HELD_NOW: std::cell::RefCell<[u64; 16]> = const { std::cell::RefCell::new([0; 16]) };
@@ -627,7 +627,7 @@ thread_local! {
 /// [`HELD_NOW`]. The frame means of [`PHASES`] cannot say what one long hold
 /// spent its time on (lp-ask-rh: 119 ms longest, runs 21 ms a frame).
 #[cfg(feature = "diagnostics")]
-static WHOLE: Mutex<(u64, [u64; 16])> = Mutex::new((0, [0; 16]));
+static LONGEST_WHOLE: Mutex<(u64, [u64; 16])> = Mutex::new((0, [0; 16]));
 
 #[cfg(feature = "diagnostics")]
 fn phase(i: usize, since: &mut std::time::Instant) {
@@ -753,7 +753,7 @@ impl Drop for Asking {
             HOLDS[7].fetch_add(ns, Relaxed);
             if (self.0, self.1) == (0, usize::MAX) {
                 HOLDS[5].fetch_max(ns, Relaxed);
-                let mut whole = WHOLE.lock().unwrap_or_else(|e| e.into_inner());
+                let mut whole = LONGEST_WHOLE.lock().unwrap_or_else(|e| e.into_inner());
                 if ns > whole.0 {
                     *whole = (ns, HELD_NOW.with(|h| *h.borrow()));
                 }
