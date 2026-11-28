@@ -63,6 +63,9 @@ pub(crate) struct Pending {
     /// The title frame in which draws first waited for it (`u64::MAX`: none
     /// yet). Draws of later frames do not wait for it ([`claim_wait`]).
     waited_frame: AtomicU64,
+    /// The last title frame a draw asked for it and found it not made
+    /// ([`newest`]).
+    asked_frame: AtomicU64,
     /// The formats its state declares for what a draw draws into (zeros
     /// without a graphics state).
     pub(crate) formats: TargetFormats,
@@ -188,6 +191,7 @@ impl Pending {
             given_up: AtomicBool::new(false),
             waited_us: AtomicU64::new(0),
             waited_frame: AtomicU64::new(u64::MAX),
+            asked_frame: AtomicU64::new(0),
         }
     }
 
@@ -387,8 +391,9 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
         super::library::note_used(&p.key);
     }
     if p.made.get().is_none() {
-        start(p, REQUESTED);
         let frame = crate::frame::current();
+        p.asked_frame.store(frame, Ordering::Relaxed);
+        start(p, REQUESTED);
         if p.graphics.is_none() && compute_waits() && compute_wait_left(frame) {
             // Made here, or waited for while a worker makes it.
             let began = Instant::now();
@@ -964,6 +969,28 @@ fn quickest(list: &mut VecDeque<Arc<Pending>>) -> Option<Arc<Pending>> {
     list.remove(at)
 }
 
+/// `VICTORY_PIPELINE_NOW_FIRST=1`: of the requested graphics pipelines, the
+/// first one a draw of this frame or the one before asked for, else the
+/// oldest. In the order asked alone, r107 and r111 (cold library) had the
+/// world's requests waiting 10 to 175 s, longer the older the run, behind
+/// requests of scenes the title had left; the frame on screen got none of
+/// its own until they were made. Off: in the order asked, as before.
+fn now_first() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_NOW_FIRST").is_some_and(|v| v == "1"))
+}
+
+fn newest(list: &mut VecDeque<Arc<Pending>>) -> Option<Arc<Pending>> {
+    if !now_first() {
+        return list.pop_front();
+    }
+    let since = crate::frame::current().saturating_sub(1);
+    match list.iter().position(|p| p.asked_frame.load(Ordering::Relaxed) >= since) {
+        Some(at) => list.remove(at),
+        None => list.pop_front(),
+    }
+}
+
 struct Queue {
     /// Requested passes over the screen: before all others, and the only ones
     /// [`SCREEN_WORKERS`] take.
@@ -1054,7 +1081,7 @@ impl Queue {
         let mut p = self.screen.pop_front();
         let mut from = TAKEN_SCREEN;
         if p.is_none() && !screens_only {
-            p = self.requested.pop_front();
+            p = newest(&mut self.requested);
             from = TAKEN_REQUESTED;
             if p.is_none() && compute_free {
                 p = quickest(&mut self.requested_compute);
