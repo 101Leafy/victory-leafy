@@ -214,6 +214,17 @@ pub fn run(
                 cfg.cache_subdir("images")?
             }
         }
+    } else if std::env::var("VICTORY_RENDERER_TEMPORAL").as_deref() == Ok("1") {
+        match native_1440p::prepare_temporal(&mut prepared) {
+            Ok(()) => {
+                println!("display        the title's own temporal pass (renderer 6), not its FidelityFX path (VICTORY_RENDERER_TEMPORAL=1)");
+                cfg.cache_subdir("images/renderer-temporal")?
+            }
+            Err(e) => {
+                println!("display        the renderer was not patched: {e:#}");
+                cfg.cache_subdir("images")?
+            }
+        }
     } else {
         cfg.cache_subdir("images")?
     };
