@@ -17,7 +17,9 @@ fn threshold() -> Option<u64> {
         match asked.trim().parse::<u64>().ok()? {
             0 => None,
             1 => Some(0),
-            mebibytes => Some(mebibytes << 20),
+            // A MiB count too large to represent is a mistake in the setting, not a threshold: it
+            // takes the same path as an unreadable one rather than wrapping into a small gate.
+            mebibytes => mebibytes.checked_mul(1 << 20),
         }
     })
 }
@@ -213,6 +215,23 @@ mod tests {
         assert!(gate(Some(4 << 20), 4 << 20));
         assert!(gate(Some(4 << 20), 8 << 20));
         assert!(!gate(Some(4 << 20), (512 << 20) + 1));
+    }
+
+    #[test]
+    fn a_threshold_too_large_to_hold_is_not_a_threshold() {
+        // What `threshold` does with its MiB count, without reading the environment (which a test
+        // cannot change once the switch has been read).
+        let from_mib = |mib: u64| match mib {
+            0 => None,
+            1 => Some(0),
+            mib => mib.checked_mul(1 << 20),
+        };
+        assert_eq!(from_mib(0), None);
+        assert_eq!(from_mib(1), Some(0));
+        assert_eq!(from_mib(4), Some(4 << 20));
+        // A count that would wrap must not turn into a small gate.
+        assert_eq!(from_mib(u64::MAX), None);
+        assert_eq!(from_mib(u64::MAX / (1 << 20) + 1), None);
     }
 
     #[test]
