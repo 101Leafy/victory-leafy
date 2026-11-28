@@ -528,8 +528,117 @@ pub(crate) fn lock_waits(frames: f64) -> String {
         let [n, ns] = [0, 1].map(|i| WAITS[what][i].swap(0, std::sync::atomic::Ordering::Relaxed));
         format!("{:.0} {:.2} ms", n as f64 / frames, ns as f64 / 1e6 / frames)
     };
-    format!("ranges held {}, journal read {}, journal noted in {}, guards {}", of(0), of(1), of(2), of(3))
+    let h: [u64; 8] = std::array::from_fn(|i| HOLDS[i].swap(0, std::sync::atomic::Ordering::Relaxed));
+    let per = |v: u64| v as f64 / frames;
+    let each = |v: u64| if h[0] > 0 { v as f64 / h[0] as f64 } else { 0.0 };
+    let w: [u64; 3] = std::array::from_fn(|i| REFRESH_HOLDS[i].swap(0, std::sync::atomic::Ordering::Relaxed));
+    let p: [u64; 15] = std::array::from_fn(|i| PHASES[i].swap(0, std::sync::atomic::Ordering::Relaxed));
+    let ms = |i: usize| p[i] as f64 / 1e6 / frames;
+    let (long_ns, long_first, long_last) = std::mem::take(&mut *LONGEST.lock().unwrap_or_else(|e| e.into_inner()));
+    format!(
+        "ranges held {}, journal read {}, journal noted in {}, guards {};          whole submissions waiting {:.1} for {:.2} ms (longest {:.2} ms), {:.1} ranges held as each began, {:.1} taken while each waited;          held longest: whole {:.2} ms, a range {:.2} ms ({} KiB at {:#x}); ranges held 10 ms or more {:.1}, all held {:.2} ms (VICTORY_ASK_ALL_FIRST={});          refreshes held {:.1} ranges, {:.1} of them sent to the guards, held there {:.2} ms;          inside whole holds: ahead spans {:.2} ms, split {:.2} ms, runs {:.2} ms, hot {:.2} ms, journal {:.2} ms ({:.0} pieces); rest take {:.2} ms, loop {:.2} ms (longest {:.2} ms), hot {:.2} ms, journal {:.2} ms; rest calls {:.1}, {:.0} ranges, {:.0} kept, {:.0} askings",
+        of(0),
+        of(1),
+        of(2),
+        of(3),
+        per(h[0]),
+        h[1] as f64 / 1e6 / frames,
+        h[2] as f64 / 1e6,
+        each(h[3]),
+        each(h[4]),
+        h[5] as f64 / 1e6,
+        long_ns as f64 / 1e6,
+        (long_last - long_first) * (PAGE >> 10),
+        long_first * PAGE,
+        per(h[6]),
+        h[7] as f64 / 1e6 / frames,
+        u8::from(all_first()),
+        per(w[0]),
+        per(w[1]),
+        w[2] as f64 / 1e6 / frames,
+        ms(0),
+        ms(1),
+        ms(2),
+        ms(3),
+        ms(4),
+        per(p[13]),
+        ms(5),
+        ms(6),
+        p[14] as f64 / 1e6,
+        ms(7),
+        ms(8),
+        per(p[12]),
+        per(p[9]),
+        per(p[10]),
+        per(p[11]),
+    )
 }
+
+/// Since the last line: whole-submission holds ([`Asking::hold_all`]) that
+/// waited, their nanoseconds, the longest of them; the ranges held when each
+/// began to wait and those other threads took while it waited; the longest a
+/// whole submission was held; ranges held 10 ms or more; nanoseconds of all
+/// ranges held, summed. [`LONGEST`] is the longest range: nanoseconds and its
+/// pages.
+#[cfg(feature = "diagnostics")]
+static HOLDS: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];
+#[cfg(feature = "diagnostics")]
+static LONGEST: Mutex<(u64, usize, usize)> = Mutex::new((0, 0, 0));
+/// Ranges [`writes`] held, those of them it sent to the guards (the kernel
+/// refused them, or `VICTORY_ASK_SPANS` left them unasked), and nanoseconds
+/// at the guards with the range held.
+#[cfg(feature = "diagnostics")]
+static REFRESH_HOLDS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+/// Inside the whole-submission holds, per part, nanoseconds: [`ask_ahead`]'s
+/// reservations by spans (0), by split (1), its runs (2), `note_hot` (3), the
+/// journal (4); [`ask_rest`]'s taking the journal (5), its loop over the
+/// ranges (6), `note_hot` (7), the journal (8). Then counts: ranges
+/// `ask_rest` was given (9), ranges it held in the journal at the end (10),
+/// kernel askings it made (11), its calls (12), pieces `ask_ahead` had (13),
+/// and the longest loop of `ask_rest` in nanoseconds (14).
+#[cfg(feature = "diagnostics")]
+static PHASES: [std::sync::atomic::AtomicU64; 15] = [const { std::sync::atomic::AtomicU64::new(0) }; 15];
+
+#[cfg(feature = "diagnostics")]
+fn phase(i: usize, since: &mut std::time::Instant) {
+    let now = std::time::Instant::now();
+    let ns = (now - *since).as_nanos() as u64;
+    PHASES[i].fetch_add(ns, std::sync::atomic::Ordering::Relaxed);
+    if i == 6 {
+        PHASES[14].fetch_max(ns, std::sync::atomic::Ordering::Relaxed);
+    }
+    *since = now;
+}
+
+#[cfg(not(feature = "diagnostics"))]
+fn phase(_: usize, _: &mut std::time::Instant) {}
+
+#[cfg(feature = "diagnostics")]
+fn phase_count(i: usize, n: usize) {
+    PHASES[i].fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(not(feature = "diagnostics"))]
+fn phase_count(_: usize, _: usize) {}
+
+/// Ranges held so far, for "taken while each waited".
+#[cfg(feature = "diagnostics")]
+static TAKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Whether a whole submission's asking that has to wait ([`Asking::hold_all`])
+/// goes before ranges asked for after it (`VICTORY_ASK_ALL_FIRST=1`; off by
+/// default). It waits for no range to be held, and the refreshing threads
+/// each hold one as they ask: with enough of them one is always held, and
+/// the submitting thread waited 3.6 to 16 s a frame once the world loaded
+/// (laptop run bp5-nowait). With the switch those ranges wait for it instead.
+fn all_first() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ASK_ALL_FIRST").is_some_and(|v| v == "1"))
+}
+
+/// Whole submissions waiting to be held ([`all_first`]); changed with
+/// [`ASKING`] held.
+static ALL_WAITING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// The page ranges some thread is asking about: asking forgets what it
 /// answers, so until the answer is in the journal no other thread may ask
@@ -537,23 +646,49 @@ pub(crate) fn lock_waits(frames: f64) -> String {
 /// Taken before the journal's lock, never under it.
 static ASKING: (Mutex<Vec<(usize, usize)>>, Condvar) = (Mutex::new(Vec::new()), Condvar::new());
 
-/// Pages `[first, last)` held in [`ASKING`] until dropped.
-struct Asking(usize, usize);
+/// Pages `[first, last)` held in [`ASKING`] until dropped, and since when.
+#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+struct Asking(usize, usize, std::time::Instant);
 
 impl Asking {
     fn hold(first: usize, last: usize) -> Asking {
+        use std::sync::atomic::Ordering::Relaxed;
+        let all = (first, last) == (0, usize::MAX);
+        let blocked = |held: &Vec<(usize, usize)>| {
+            held.iter().any(|&(a, b)| a < last && first < b) || (!all && ALL_WAITING.load(Relaxed) > 0)
+        };
         let mut held = ASKING.0.lock().unwrap_or_else(|e| e.into_inner());
-        if held.iter().any(|&(a, b)| a < last && first < b) {
+        if blocked(&held) {
+            let first_in = all && all_first();
+            if first_in {
+                ALL_WAITING.fetch_add(1, Relaxed);
+            }
+            #[cfg(feature = "diagnostics")]
+            let (began, holders, taken) = (std::time::Instant::now(), held.len() as u64, TAKEN.load(Relaxed));
             held = waited(0, || {
                 let mut held = held;
-                while held.iter().any(|&(a, b)| a < last && first < b) {
+                while if first_in { held.iter().any(|&(a, b)| a < last && first < b) } else { blocked(&held) } {
                     held = ASKING.1.wait(held).unwrap_or_else(|e| e.into_inner());
                 }
                 held
             });
+            if first_in {
+                ALL_WAITING.fetch_sub(1, Relaxed);
+            }
+            #[cfg(feature = "diagnostics")]
+            if all {
+                let ns = began.elapsed().as_nanos() as u64;
+                HOLDS[0].fetch_add(1, Relaxed);
+                HOLDS[1].fetch_add(ns, Relaxed);
+                HOLDS[2].fetch_max(ns, Relaxed);
+                HOLDS[3].fetch_add(holders, Relaxed);
+                HOLDS[4].fetch_add(TAKEN.load(Relaxed) - taken, Relaxed);
+            }
         }
+        #[cfg(feature = "diagnostics")]
+        TAKEN.fetch_add(1, Relaxed);
         held.push((first, last));
-        Asking(first, last)
+        Asking(first, last, std::time::Instant::now())
     }
 
     /// Everything: an asking for a whole submission.
@@ -570,6 +705,23 @@ impl Drop for Asking {
         }
         drop(held);
         ASKING.1.notify_all();
+        #[cfg(feature = "diagnostics")]
+        {
+            use std::sync::atomic::Ordering::Relaxed;
+            let ns = self.2.elapsed().as_nanos() as u64;
+            HOLDS[7].fetch_add(ns, Relaxed);
+            if (self.0, self.1) == (0, usize::MAX) {
+                HOLDS[5].fetch_max(ns, Relaxed);
+                return;
+            }
+            if ns >= 10_000_000 {
+                HOLDS[6].fetch_add(1, Relaxed);
+            }
+            let mut longest = LONGEST.lock().unwrap_or_else(|e| e.into_inner());
+            if ns > longest.0 {
+                *longest = (ns, self.0, self.1);
+            }
+        }
     }
 }
 
@@ -738,6 +890,7 @@ fn ask_split() -> bool {
 }
 
 /// The reservation `page` lies in: its allocation base, in pages.
+#[cfg(test)]
 fn reservation(page: usize) -> usize {
     use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
     // SAFETY: plain data filled in by the query.
@@ -745,6 +898,41 @@ fn reservation(page: usize) -> usize {
     // SAFETY: a valid out pointer of the right size.
     let n = unsafe { VirtualQuery((page * PAGE) as *const _, &mut info, size_of_val(&info)) };
     if n == 0 { usize::MAX } else { info.AllocationBase as usize / PAGE }
+}
+
+/// [`reservation`] of each piece's first page, `pieces` in order: one query
+/// for all the pieces that start in the region it answered for. A query
+/// stood 1.4 ms (run lp-ask-ph: 3,800 pieces a frame, 5.4 s under the whole
+/// submission's hold, while every refresh waited).
+fn reservations(pieces: &[(usize, usize)]) -> Vec<usize> {
+    use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
+    let mut homes = Vec::with_capacity(pieces.len());
+    // The last region answered: its bytes and allocation base, in pages.
+    let mut known: Option<(usize, usize, usize)> = None;
+    for &(first, _) in pieces {
+        let at = first * PAGE;
+        if let Some((start, end, base)) = known
+            && start <= at
+            && at < end
+        {
+            homes.push(base);
+            continue;
+        }
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+        if n == 0 {
+            known = None;
+            homes.push(usize::MAX);
+            continue;
+        }
+        let start = info.BaseAddress as usize;
+        let base = info.AllocationBase as usize / PAGE;
+        known = Some((start, start.saturating_add(info.RegionSize), base));
+        homes.push(base);
+    }
+    homes
 }
 
 /// Asks the kernel about many ranges `(start, end)` at once, before the
@@ -771,10 +959,14 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
         return;
     }
     let _all = Asking::hold_all();
+    let mut t = std::time::Instant::now();
+    phase_count(13, pieces.len());
     let spans = ask_spans::on();
     let bases = if spans { ask_spans::bases(&mut pieces) } else { Vec::new() };
+    phase(0, &mut t);
     let split = ask_split();
-    let homes: Vec<usize> = if split { pieces.iter().map(|p| reservation(p.0)).collect() } else { Vec::new() };
+    let homes: Vec<usize> = if split { reservations(&pieces) } else { Vec::new() };
+    phase(1, &mut t);
     let (mut asked, mut written) = (Vec::new(), Vec::new());
     let mut i = 0;
     while i < pieces.len() {
@@ -805,7 +997,9 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
         }
         i = k;
     }
+    phase(2, &mut t);
     note_hot(&written);
+    phase(3, &mut t);
     if port_journal() {
         // Renderer port #7: the pages noted shared, under their parts; then
         // the number and the ranges, alone (no shared holder with a lower
@@ -815,6 +1009,7 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
         ahead_normalize(&mut asked);
         j.ahead_asked = now;
         j.ahead = asked;
+        phase(4, &mut t);
         return;
     }
     let mut j = journal_mut();
@@ -825,6 +1020,7 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
     for (page, parts) in written {
         j.notes.note(page, parts, now);
     }
+    phase(4, &mut t);
 }
 
 /// Renderer port #7: notes `written` (pages and their parts) as found by an
@@ -1138,10 +1334,14 @@ pub(crate) fn ask_more(ranges: &[(usize, usize)]) -> bool {
 /// asking stands.
 fn ask_rest(ranges: &[(usize, usize)]) {
     let _all = Asking::hold_all();
+    let mut t = std::time::Instant::now();
     let mut ahead = {
         let mut j = journal_mut();
         std::mem::take(&mut j.ahead)
     };
+    phase(5, &mut t);
+    phase_count(12, 1);
+    phase_count(9, ranges.len());
     // `ask_ahead` leaves a range that lies alone to `writes`, which asks
     // once per flush: with one asking for the submission that was every
     // such range asked again at each of its 70 flushes (run 76: 2,300
@@ -1154,17 +1354,20 @@ fn ask_rest(ranges: &[(usize, usize)]) {
             continue;
         }
         let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-        if !ahead_holds(&ahead, first, last)
-            && !added.iter().any(|&(a, b)| a <= first && last <= b)
-            && let Some(pages) = kernel_written(first, last)
-        {
-            written.extend(pages);
-            added.push((first, last));
+        if !ahead_holds(&ahead, first, last) && !added.iter().any(|&(a, b)| a <= first && last <= b) {
+            phase_count(11, 1);
+            if let Some(pages) = kernel_written(first, last) {
+                written.extend(pages);
+                added.push((first, last));
+            }
         }
     }
     // (Added after the search: `ahead_holds` needs `ahead` in order.)
     ahead.extend(added);
+    phase(6, &mut t);
+    phase_count(10, ahead.len());
     note_hot(&written);
+    phase(7, &mut t);
     // A number of its own, and the one this asking stands under: between
     // the two parts another thread may have asked about a range of the
     // second, copied it, and the title written it since. Under the first
@@ -1177,6 +1380,8 @@ fn ask_rest(ranges: &[(usize, usize)]) {
         j.ahead_asked = now;
         j.kept = !ahead.is_empty();
         j.ahead = ahead;
+        drop(j);
+        phase(8, &mut t);
         return;
     }
     let mut j = journal_mut();
@@ -1188,6 +1393,8 @@ fn ask_rest(ranges: &[(usize, usize)]) {
     ahead_normalize(&mut ahead);
     j.kept = !ahead.is_empty();
     j.ahead = ahead;
+    drop(j);
+    phase(8, &mut t);
 }
 
 /// The submission's one asking stands no longer: its refreshes are done,
@@ -1384,6 +1591,8 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     if let Some(known) = ahead(&journal()) {
         return Some(known);
     }
+    #[cfg(feature = "diagnostics")]
+    REFRESH_HOLDS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut guards_asked = false;
     let mut loosely = false;
     // (View memory read-only by our hand: the kernel would refuse.)
@@ -1405,6 +1614,8 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
                 use crate::copystat::{C, add};
                 let us = guarding.elapsed().as_micros() as u64;
                 add(C::GuardUs, us);
+                REFRESH_HOLDS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                REFRESH_HOLDS[2].fetch_add(guarding.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
                 if written.is_some() {
                     add(C::Watches, 1);
                     add(C::WatchUs, us);
@@ -5346,6 +5557,10 @@ mod tests {
         assert_eq!(reservation(a / PAGE + 2), a / PAGE);
         assert_eq!(reservation(a / PAGE + 7), a / PAGE);
         assert_eq!(reservation(b / PAGE), b / PAGE);
+        let mut pieces = [(a / PAGE, a / PAGE + 1), (a / PAGE + 2, a / PAGE + 3), (a / PAGE + 7, a / PAGE + 8), (b / PAGE, b / PAGE + 1)];
+        pieces.sort_unstable();
+        let one: Vec<usize> = pieces.iter().map(|p| reservation(p.0)).collect();
+        assert_eq!(reservations(&pieces), one);
         // SAFETY: our reservations.
         unsafe {
             VirtualFree(a as *mut _, 0, MEM_RELEASE);
