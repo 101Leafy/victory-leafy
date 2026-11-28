@@ -35,6 +35,43 @@ fn check_cpu_features() -> Result<()> {
     check_cpu_features_with(has_avx2, skip.as_deref())
 }
 
+/// `VICTORY_KEEP_RAM_GB=<n>` (unset: nothing): a hard minimum of `n` GB for
+/// this process's working set, so that Windows does not trim the game's
+/// memory out to the page file under pressure. On a 32 GB PC the game
+/// commits about 28 GB; when the PC ran low, Windows cut its working set
+/// from 15 GB to 2 GB at once and the game ran at half speed for minutes
+/// while it read its memory back from disk. Other programs are paged out
+/// instead. Too large a number for the PC, and Windows refuses it (logged).
+#[cfg(windows)]
+fn keep_ram() {
+    let Some(gb) = std::env::var("VICTORY_KEEP_RAM_GB")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|gb| *gb > 0)
+    else {
+        return;
+    };
+    unsafe extern "system" {
+        fn GetCurrentProcess() -> isize;
+        fn SetProcessWorkingSetSizeEx(process: isize, min: usize, max: usize, flags: u32) -> i32;
+        fn GetLastError() -> u32;
+    }
+    // QUOTA_LIMITS_HARDWS_MIN_ENABLE: the minimum is kept even under
+    // pressure; QUOTA_LIMITS_HARDWS_MAX_DISABLE: the maximum is only a hint.
+    const FLAGS: u32 = 0x1 | 0x8;
+    let min = gb << 30;
+    // SAFETY: our own process's pseudo handle and plain sizes.
+    let (ok, error) = unsafe {
+        let ok = SetProcessWorkingSetSizeEx(GetCurrentProcess(), min, min.saturating_mul(2), FLAGS) != 0;
+        (ok, if ok { 0 } else { GetLastError() })
+    };
+    if ok {
+        println!("Memory: at least {gb} GB of the game's memory is kept in RAM (VICTORY_KEEP_RAM_GB).");
+    } else {
+        println!("Memory: Windows refused to keep {gb} GB in RAM (error {error}); running without it.");
+    }
+}
+
 #[cfg(windows)]
 pub fn run(
     exe: &Path,
@@ -57,6 +94,7 @@ pub fn run(
         // device, the caches) takes the space the title's 32-bit memory needs.
         victory_hle::modules::xmem::low_guards::install();
         victory_hle::modules::d3d12x::start_host();
+        keep_ram();
     }
     let cfg = victory_core::Config::load()?;
     victory_hle::modules::controls::configure(cfg.controls.as_ref())
@@ -156,6 +194,13 @@ pub fn run(
         inner: &resolver,
         dlls: &dlls,
     };
+    // The title's Bink exports go through the movie skipper when
+    // VICTORY_SKIP_BINK asks for it (bound as before otherwise).
+    let with_dlls = victory_hle::modules::bink::SkipMovies { inner: &with_dlls };
+    // The builder's two methods get wrappers when compacted sizes are
+    // answered; every other import binds as before.
+    #[cfg(windows)]
+    let with_dlls = BuilderWatch(&with_dlls);
     let show = |name: &str, report: BindReport| {
         println!(
             "bound          {name}: {} hle, {} host, {} title, {} missing",
@@ -255,6 +300,14 @@ pub fn run(
     victory_hle::runtime::use_console_timers();
     #[cfg(feature = "diagnostics")]
     diagnostics(&image, &cfg);
+    // The timer log and the capture are diagnostics only: a run set up for
+    // them on a plain build would otherwise give no line and no picture.
+    #[cfg(not(feature = "diagnostics"))]
+    for name in ["VICTORY_TIMER_LOG", "VICTORY_CAPTURE"] {
+        if std::env::var_os(name).is_some() {
+            tracing::warn!("{name} is set, but this build has no diagnostics feature: no timer lines or captures");
+        }
+    }
     let late = LateDlls {
         host: resolver.host.clone(),
         title_dir: title_dir.to_owned(),
@@ -317,7 +370,7 @@ fn watch(base: usize, size: usize) {
     let rvas: Vec<usize> = list
         .split(',')
         .filter_map(|r| usize::from_str_radix(r.trim().trim_start_matches("0x"), 16).ok())
-        .filter(|&rva| rva + 4 <= size)
+        .filter(|&rva| rva.checked_add(4).is_some_and(|end| end <= size))
         .collect();
     std::thread::spawn(move || {
         let mut seen = vec![None; rvas.len()];
@@ -409,6 +462,33 @@ fn title_dll(host: &victory_hle::HostPolicy, dll: &str) -> bool {
     !host.allows(dll) && !victory_hle::registry().iter().any(|m| m.serves(dll))
 }
 
+/// Binds imports of the title's acceleration-structure builder to the
+/// wrappers that answer its compacted-size queries, when they are on.
+#[cfg(windows)]
+struct BuilderWatch<'a>(&'a dyn victory_loader::ImportResolver);
+
+#[cfg(windows)]
+impl victory_loader::ImportResolver for BuilderWatch<'_> {
+    fn resolve(&self, dll: &str, symbol: &victory_pe::ImportSymbol) -> victory_loader::Resolution {
+        use victory_loader::{Provenance, Resolution};
+        let found = self.0.resolve(dll, symbol);
+        if let Resolution::Found {
+            address,
+            provenance: Provenance::Title,
+        } = found
+            && dll.eq_ignore_ascii_case("XboxBvhBuilder.dll")
+            && let victory_pe::ImportSymbol::Name { name, .. } = symbol
+            && let Some(wrapper) = victory_hle::dxr::hook(name, address)
+        {
+            return Resolution::Found {
+                address: wrapper,
+                provenance: Provenance::Title,
+            };
+        }
+        found
+    }
+}
+
 /// The DLLs among `imported` (the main image's static imports) that must
 /// come from the title's folder (`wanted`) but were not mapped from it:
 /// none of their imports can be bound. Each named once, case ignored.
@@ -476,6 +556,9 @@ impl LateDlls {
                     inner: &old,
                     dlls: &new,
                 };
+                // As at startup: Bink imports of DLLs loaded later too
+                // (VICTORY_SKIP_BINK; bound as before otherwise).
+                let resolver = victory_hle::modules::bink::SkipMovies { inner: &resolver };
                 for (name, dll) in &new {
                     println!(
                         "title dll      {name} at {:#x} (loaded by the title)",

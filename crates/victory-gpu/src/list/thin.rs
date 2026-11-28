@@ -52,6 +52,45 @@ pub(crate) fn on() -> bool {
     })
 }
 
+/// How a list that binds a pipeline of the title's decoration bake is
+/// translated (`VICTORY_THIN_BAKE`; 2 when unset): 0, by our threads like
+/// any other, as before; 1, at the title's calls from that bind on, until it
+/// binds another pipeline, once what was written of the list before is
+/// translated; 2, as 1, and once all that any list handed over before is
+/// translated as well.
+///
+/// Why: the pass ahead of a bake draw (`crate::draw` `State::early_textures`)
+/// uploads into the bake's list every texture slot due at that moment, and a
+/// slot that is not due any more was taken by a list recorded, and so
+/// submitted, before. That holds when each call is translated at the call.
+/// Translated later and several lists at a time, a list recorded after the
+/// bake's (and submitted after it) could take a slot first: the bake then
+/// sampled a texture whose upload had not run, blocks of coloured noise baked
+/// into clothes for the whole scene (the opening of a new game: run
+/// intro-s-fino against intro-s-grosso). A frame has a handful of bake draws.
+fn in_order() -> u8 {
+    static ON: OnceLock<u8> = OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("VICTORY_THIN_BAKE").ok().as_deref().map(str::trim) {
+        Some("0") => 0,
+        Some("1") => 1,
+        _ => 2,
+    })
+}
+
+/// Whether a draw with `pipeline` bound is translated at the call
+/// ([`in_order`]). Never with the list cache: the streams it holds back
+/// would be translated after the calls run here.
+fn bakes(pipeline: This) -> bool {
+    #[cfg(not(test))]
+    let bakes = |p| crate::draw::bake_pipeline(p);
+    #[cfg(test)]
+    let bakes = |p| {
+        let _ = crate::draw::bake_pipeline;
+        p == tests::BAKE
+    };
+    in_order() > 0 && !any_cache() && !pipeline.is_null() && bakes(pipeline)
+}
+
 /// Whether it is asked for.
 pub(crate) fn wanted() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
@@ -66,6 +105,106 @@ pub(super) struct Front {
     words: Vec<u64>,
     closed: bool,
     submitted: bool,
+    /// The stream's hash so far (FNV-1a over its words).
+    hash: u64,
+    /// Words recorded since the beginning, the bytes of some things included.
+    total: usize,
+    /// [`Front::hash`] at each stream handed over (or held back).
+    marks: Vec<u64>,
+    /// Streams held back while they still match the previous recording of
+    /// this list ([`list_cache`]), or all of them ([`full_cache`]).
+    deferred: Vec<Vec<u64>>,
+    /// The words of [`Front::deferred`].
+    held_words: usize,
+    /// The previous recording of this list: its hash, its marks, its words.
+    prev: Option<Prev>,
+    /// The stream stopped matching [`Front::prev`].
+    diverged: bool,
+    /// Calls are translated here, at the call ([`in_order`]).
+    here: bool,
+}
+
+/// A recording of a list, as the next one is compared with it
+/// ([`list_cache`]).
+struct Prev {
+    hash: u64,
+    marks: Vec<u64>,
+    total: usize,
+}
+
+/// [`Front::hash`] of nothing recorded.
+const HASH_START: u64 = 0xcbf2_9ce4_8422_2325;
+
+/// Whether a list recorded with the same stream as before is run again
+/// (`VICTORY_LIST_CACHE=1`; off by default): its host list was recorded once,
+/// and the title's re-recording of it is not translated again.
+fn list_cache() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LIST_CACHE").is_some_and(|v| v == "1"))
+}
+
+/// Whether every stream is held back to its close, so that any list whose
+/// stream was recorded before is run again, not only the one that recorded it
+/// (`VICTORY_LIST_CACHE_FULL=1`; with [`list_cache`]).
+fn full_cache() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LIST_CACHE_FULL").is_some_and(|v| v == "1"))
+}
+
+fn any_cache() -> bool {
+    list_cache() || full_cache()
+}
+
+/// Words held back for one list at most: past it the stream is handed over to
+/// translate (the memory of the words is a list's whole stream otherwise).
+const DEFER_MOST: usize = 64 << 10;
+
+/// Host lists recorded for a stream, by its hash: taken to run again, given
+/// back when that run is done with (`Recording`'s drop).
+static HASHED: Mutex<Option<Cached>> = Mutex::new(None);
+
+#[derive(Default)]
+struct Cached {
+    by_hash: std::collections::HashMap<u64, Vec<usize>>,
+    order: VecDeque<u64>,
+}
+
+/// Kept host lists at most: past it the oldest go back to the pool.
+const CACHE_MOST: usize = 128;
+
+/// A host list recorded for `hash`, if one is free.
+fn take_cached(hash: u64) -> Option<usize> {
+    let mut all = held(&HASHED);
+    let all = all.get_or_insert_with(Cached::default);
+    let list = all.by_hash.get_mut(&hash)?.pop()?;
+    if all.by_hash.get(&hash).is_some_and(Vec::is_empty) {
+        all.by_hash.remove(&hash);
+        all.order.retain(|&h| h != hash);
+    }
+    Some(list)
+}
+
+/// Gives `back` to the cache as the host list of `hash` (or back to the pool
+/// past [`CACHE_MOST`]).
+fn keep_cached(hash: u64, back: usize) {
+    let mut old = Vec::new();
+    {
+        let mut all = held(&HASHED);
+        let all = all.get_or_insert_with(Cached::default);
+        if !all.by_hash.contains_key(&hash) {
+            all.order.push_back(hash);
+        }
+        all.by_hash.entry(hash).or_default().push(back);
+        while all.order.len() > CACHE_MOST {
+            let Some(front) = all.order.pop_front() else { break };
+            if let Some(lists) = all.by_hash.remove(&front) {
+                old.extend(lists);
+            }
+        }
+    }
+    for list in old {
+        held(&BACKS).push(list);
+    }
 }
 
 impl Drop for Front {
@@ -84,15 +223,86 @@ impl Front {
             recording.abandoned.store(true, Release);
         }
         self.words.clear();
+        for words in self.deferred.drain(..) {
+            give_back(vec![words]);
+        }
+        self.hash = HASH_START;
+        self.total = 0;
+        self.marks.clear();
+        self.held_words = 0;
+        self.diverged = false;
     }
 
     /// Begins a recording, with `pipeline` bound.
     pub(super) fn begin(&mut self, kind: u32, pipeline: This) {
         self.leave();
-        self.recording = Some(Arc::new(Recording::new(kind)));
+        let recording = Arc::new(Recording::new(kind));
+        {
+            let mut live = held(&LIVE);
+            if live.len() >= 256 && live.len().is_power_of_two() {
+                live.retain(|r| r.strong_count() > 0);
+            }
+            live.push(Arc::downgrade(&recording));
+        }
+        self.recording = Some(recording);
         self.closed = false;
         self.submitted = false;
+        self.hash = HASH_START;
+        // The kind of list is part of the stream: a host list of another kind
+        // cannot be run for this one.
+        self.mix(u64::from(kind));
+        self.here = false;
+        self.bound(bakes(pipeline));
         self.put(RESET, &[pipeline as u64]);
+    }
+
+    /// A pipeline is bound: whether one of the bake's ([`in_order`]). From
+    /// one on calls are translated at the call, once what is due before is
+    /// translated; from another one on they are written down again.
+    fn bound(&mut self, bakes: bool) {
+        if bakes == self.here || self.closed {
+            return;
+        }
+        if !bakes {
+            self.here = false;
+            return;
+        }
+        let Some(recording) = self.recording.clone() else { return };
+        self.hand_over();
+        let began = std::time::Instant::now();
+        if in_order() >= 2 {
+            let live: Vec<Arc<Recording>> = held(&LIVE).iter().filter_map(std::sync::Weak::upgrade).collect();
+            for other in live.iter().filter(|r| !Arc::ptr_eq(r, &recording)) {
+                other.caught_up();
+            }
+        }
+        recording.caught_up();
+        STATS[5].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
+        self.here = true;
+    }
+
+    /// Translates what was written just now, here ([`Self::here`]).
+    fn run_here(&mut self) {
+        let Some(recording) = &self.recording else { return };
+        let words = std::mem::take(&mut self.words);
+        let draw = words.first().is_some_and(|&w| {
+            let op = w & 0xffff;
+            op == Plain::DRAW as u64 || op == Plain::DRAW_INDEXED as u64 || op == Plain::EXECUTE_INDIRECT as u64
+        });
+        STATS[4].fetch_add(u64::from(draw), Relaxed);
+        recording.translate_one(words);
+    }
+
+    #[inline]
+    fn append(&mut self, op: u64, args: &[u64]) {
+        let word = op | (args.len() as u64) << 16;
+        self.mix(word);
+        self.words.push(word);
+        for &a in args {
+            self.mix(a);
+        }
+        self.words.extend_from_slice(args);
+        self.total += 1 + args.len();
     }
 
     #[inline]
@@ -100,9 +310,10 @@ impl Front {
         if self.closed || self.recording.is_none() {
             return;
         }
-        self.words.push(op | (args.len() as u64) << 16);
-        self.words.extend_from_slice(args);
-        if self.words.len() >= CHUNK {
+        self.append(op, args);
+        if self.here {
+            self.run_here();
+        } else if self.words.len() >= CHUNK {
             self.hand_over();
         }
     }
@@ -125,38 +336,129 @@ impl Front {
         }
         let len = (self.words.len() - at - 1) as u64;
         self.words[at] = op | len << 16;
-        if self.words.len() >= CHUNK {
+        self.total += self.words.len() - at;
+        for i in at..self.words.len() {
+            let w = self.words[i];
+            self.mix(w);
+        }
+        if self.here {
+            self.run_here();
+        } else if self.words.len() >= CHUNK {
             self.hand_over();
         }
     }
 
+    #[inline]
+    fn mix(&mut self, word: u64) {
+        self.hash = (self.hash ^ word).wrapping_mul(0x0000_0100_0000_01b3);
+    }
+
+    /// Whether the stream so far is still one of the previous recording's.
+    fn matches_prev(&self) -> bool {
+        let Some(prev) = &self.prev else { return false };
+        let n = self.marks.len();
+        self.marks.get(n.wrapping_sub(1)) == prev.marks.get(n.wrapping_sub(1))
+    }
+
     fn hand_over(&mut self) {
-        let Some(recording) = &self.recording else { return };
+        let Some(recording) = self.recording.clone() else { return };
         if self.words.is_empty() {
             return;
         }
-        let fresh = held(&WORDS).pop().unwrap_or_else(|| Vec::with_capacity(CHUNK + 256));
-        let words = std::mem::replace(&mut self.words, fresh);
-        CHUNKS.fetch_add(1, Relaxed);
-        let schedule = {
-            let mut inner = held(&recording.inner);
-            inner.chunks.push_back(words);
-            !std::mem::replace(&mut inner.scheduled, true)
-        };
-        if schedule {
-            held(&READY).push_back(recording.clone());
-            WORK.notify_one();
+        self.marks.push(self.hash);
+        let hold = full_cache() && self.held_words + self.words.len() <= DEFER_MOST
+            || list_cache() && !self.diverged && self.matches_prev();
+        if hold {
+            // Held back: the previous recording of this stream may be run
+            // again.
+            let fresh = held(&WORDS).pop().unwrap_or_else(|| Vec::with_capacity(CHUNK + 256));
+            let words = std::mem::replace(&mut self.words, fresh);
+            self.held_words += words.len();
+            self.deferred.push(words);
+            return;
         }
+        self.diverged = true;
+        self.hand_over_now(&recording);
+    }
+
+    /// Gives the recording the streams held back and the one being written.
+    fn hand_over_now(&mut self, recording: &Arc<Recording>) {
+        self.held_words = 0;
+        for words in self.deferred.drain(..) {
+            push_chunk(recording, words);
+        }
+        if !self.words.is_empty() {
+            let fresh = held(&WORDS).pop().unwrap_or_else(|| Vec::with_capacity(CHUNK + 256));
+            let words = std::mem::replace(&mut self.words, fresh);
+            push_chunk(recording, words);
+        }
+    }
+
+    /// After the last stream: runs the previous recording again if this one
+    /// is the same (`VICTORY_LIST_CACHE=1`), else hands it over to translate.
+    fn finish(&mut self) {
+        let recording = self.recording.clone();
+        let same = self.prev.as_ref().is_some_and(|prev| {
+            prev.hash == self.hash && prev.total == self.total && prev.marks == self.marks
+        });
+        let mut reused = false;
+        if any_cache()
+            && (full_cache() || !self.diverged && same)
+            && !self.deferred.is_empty()
+            && let Some(back) = take_cached(self.hash)
+            && let Some(recording) = &recording
+        {
+            self.deferred.clear();
+            reuse(recording, back, self.hash);
+            reused = true;
+        }
+        if !reused && let Some(recording) = &recording {
+            recording.hash.store(self.hash, Release);
+            self.diverged = true;
+            self.hand_over_now(recording);
+        }
+        self.prev = Some(Prev { hash: self.hash, marks: std::mem::take(&mut self.marks), total: self.total });
     }
 
     fn close(&mut self) {
         if self.closed {
             return;
         }
-        self.put(CLOSE, &[]);
+        if self.recording.is_none() {
+            self.closed = true;
+            return;
+        }
+        self.append(CLOSE, &[]);
         self.closed = true;
         self.hand_over();
+        self.finish();
     }
+}
+
+/// Gives `words` to `recording`, starting its translation if it was not.
+fn push_chunk(recording: &Arc<Recording>, words: Vec<u64>) {
+    CHUNKS.fetch_add(1, Relaxed);
+    let schedule = {
+        let mut inner = held(&recording.inner);
+        inner.chunks.push_back(words);
+        inner.handed += 1;
+        !std::mem::replace(&mut inner.scheduled, true)
+    };
+    if schedule {
+        held(&READY).push_back(recording.clone());
+        WORK.notify_one();
+    }
+}
+
+/// Makes `recording` the run of the host list `back`, recorded before for the
+/// same stream: nothing is translated.
+fn reuse(recording: &Arc<Recording>, back: usize, hash: u64) {
+    let mut inner = held(&recording.inner);
+    inner.back = back;
+    inner.closed = true;
+    recording.hash.store(hash, Release);
+    recording.done.store(true, Release);
+    recording.moved.notify_all();
 }
 
 /// Streams' memory to use again.
@@ -164,13 +466,16 @@ static WORDS: Mutex<Vec<Vec<u64>>> = Mutex::new(Vec::new());
 /// Recordings with words to translate.
 static READY: Mutex<VecDeque<Arc<Recording>>> = Mutex::new(VecDeque::new());
 static WORK: Condvar = Condvar::new();
+/// The recordings begun, for [`Front::bound`] (some are gone).
+static LIVE: Mutex<Vec<std::sync::Weak<Recording>>> = Mutex::new(Vec::new());
 /// Lists of ours nobody uses, closed.
 static BACKS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 /// Since the last line of the log: streams handed over; calls translated and
 /// the microseconds that took (all threads), recordings translated, and
-/// recordings let go of in the middle.
+/// recordings let go of in the middle; draws of the bake translated at the
+/// call ([`in_order`]) and the microseconds the title waited before them.
 static CHUNKS: AtomicU64 = AtomicU64::new(0);
-static STATS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+static STATS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 
 fn held<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -181,6 +486,8 @@ fn held<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 pub(crate) struct Recording {
     kind: u32,
     inner: Mutex<Inner>,
+    /// The stream's hash, once it is complete ([`Front::finish`]).
+    hash: AtomicU64,
     /// Translated to its end.
     done: AtomicBool,
     moved: Condvar,
@@ -198,6 +505,11 @@ struct Inner {
     back: usize,
     /// That list was closed by the stream.
     closed: bool,
+    /// Streams handed over, and of them translated (in order).
+    handed: u64,
+    translated: u64,
+    /// Threads waiting in [`Recording::caught_up`].
+    waiters: u32,
 }
 
 impl Recording {
@@ -205,6 +517,7 @@ impl Recording {
         Recording {
             kind,
             inner: Mutex::default(),
+            hash: AtomicU64::new(0),
             done: AtomicBool::new(false),
             moved: Condvar::new(),
             abandoned: AtomicBool::new(false),
@@ -242,22 +555,71 @@ impl Recording {
                 }
                 (chunk, inner.back as This)
             };
-            let began = std::time::Instant::now();
-            let (calls, closed) = translate(back, &chunk, || self.abandoned.load(Acquire));
-            STATS[0].fetch_add(calls, Relaxed);
-            STATS[1].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
+            let closed = self.translate_on(back, &chunk);
+            self.translated(chunk, closed, true);
+        }
+    }
+
+    /// Waits until all that was handed over of it by now is translated.
+    fn caught_up(&self) {
+        let mut inner = held(&self.inner);
+        let target = inner.handed;
+        inner.waiters += 1;
+        while inner.translated < target {
+            inner = self.moved.wait(inner).unwrap_or_else(|e| e.into_inner());
+        }
+        inner.waiters -= 1;
+    }
+
+    /// Translates `words` here: nothing of it is handed over nor being
+    /// translated elsewhere ([`Front::here`]).
+    fn translate_one(&self, words: Vec<u64>) {
+        let back = {
             let mut inner = held(&self.inner);
-            inner.kept.push(chunk);
-            if closed {
-                inner.closed = true;
-                let kept = std::mem::take(&mut inner.kept);
-                self.done.store(true, Release);
-                self.moved.notify_all();
-                drop(inner);
-                give_back(kept);
-                STATS[2].fetch_add(1, Relaxed);
-                crate::queue::line_moved();
+            if inner.back == 0 {
+                inner.back = back_list(self.kind) as usize;
             }
+            inner.back as This
+        };
+        let closed = self.translate_on(back, &words);
+        self.translated(words, closed, false);
+    }
+
+    /// [`translate`] of a stream, counted; whether it closed the list.
+    fn translate_on(&self, back: This, stream: &[u64]) -> bool {
+        let began = std::time::Instant::now();
+        #[cfg(not(test))]
+        let (calls, closed) = translate(back, stream, || self.abandoned.load(Acquire));
+        #[cfg(test)]
+        let (calls, closed) = tests::translate(back, stream);
+        STATS[0].fetch_add(calls, Relaxed);
+        STATS[1].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
+        closed
+    }
+
+    /// A stream is translated (`handed`: one that was handed over).
+    fn translated(&self, chunk: Vec<u64>, closed: bool, handed: bool) {
+        let mut inner = held(&self.inner);
+        inner.kept.push(chunk);
+        if handed {
+            inner.translated += 1;
+            if inner.waiters > 0 {
+                self.moved.notify_all();
+            }
+        }
+        if closed {
+            inner.closed = true;
+            let kept = std::mem::take(&mut inner.kept);
+            self.done.store(true, Release);
+            self.moved.notify_all();
+            drop(inner);
+            give_back(kept);
+            STATS[2].fetch_add(1, Relaxed);
+            // (Not in the tests, which have no line.)
+            #[cfg(test)]
+            let _ = crate::queue::line_moved;
+            #[cfg(not(test))]
+            crate::queue::line_moved();
         }
     }
 }
@@ -272,7 +634,14 @@ impl Drop for Recording {
                 STATS[3].fetch_add(1, Relaxed);
                 super::close(inner.back as This);
             }
-            held(&BACKS).push(inner.back);
+            let back = inner.back;
+            let hash = self.hash.load(Acquire);
+            if any_cache() && inner.closed && hash != 0 {
+                drop(inner);
+                keep_cached(hash, back);
+            } else {
+                held(&BACKS).push(back);
+            }
         }
     }
 }
@@ -287,7 +656,14 @@ fn give_back(streams: Vec<Vec<u64>>) {
     }
 }
 
+/// A list of ours, closed (in the tests: none).
+#[cfg(test)]
+fn back_list(_kind: u32) -> This {
+    std::ptr::NonNull::<u64>::dangling().as_ptr().cast_const().cast()
+}
+
 /// A list of ours, closed.
+#[cfg(not(test))]
 fn back_list(kind: u32) -> This {
     if let Some(back) = held(&BACKS).pop() {
         // SAFETY: a list of ours nobody uses.
@@ -350,12 +726,16 @@ pub(crate) fn line(frames: f64) {
     }
     let s: Vec<f64> = STATS.iter().map(|s| s.swap(0, Relaxed) as f64 / frames).collect();
     tracing::info!(
-        "list calls translated by threads of ours per frame (VICTORY_THIN): {:.0} in {:.1} ms (all threads), {:.1} lists, {:.1} pieces; left in the middle {:.2}",
+        "list calls translated by threads of ours per frame (VICTORY_THIN): {:.0} in {:.1} ms (all threads), {:.1} lists, {:.1} pieces; left in the middle {:.2}; bake draws translated at the call {:.2} ({:.0} since the last line), the title waited {:.2} ms a frame before them (VICTORY_THIN_BAKE={})",
         s[0],
         s[1] / 1000.0,
         s[2],
         CHUNKS.swap(0, Relaxed) as f64 / frames,
-        s[3]
+        s[3],
+        s[4],
+        s[4] * frames,
+        s[5] / 1000.0,
+        in_order()
     );
     #[cfg(feature = "diagnostics")]
     {
@@ -447,7 +827,7 @@ plain! {
     GRAPHICS_CONSTANT graphics_constant = state::graphics_constant, (slot: u32, value: u32, offset: u32);
     COMPUTE_VIEW compute_view = state::compute_view, (slot: u32, address: u64);
     GRAPHICS_VIEW graphics_view = state::graphics_view, (slot: u32, address: u64);
-    SET_PIPELINE set_pipeline = super::set_pipeline, (pipeline: This);
+    SET_PIPELINE put_pipeline = super::set_pipeline, (pipeline: This);
     DRAW draw = state::draw, (vertices: u32, instances: u32, first: u32, first_instance: u32);
     DRAW_INDEXED draw_indexed = state::draw_indexed, (indices: u32, instances: u32, first: u32, base: i32, first_instance: u32);
     DISPATCH dispatch = state::dispatch, (x: u32, y: u32, z: u32);
@@ -571,6 +951,12 @@ fn record(handle: u64) -> [u64; RECORD] {
 }
 const RECORD: usize = size_of::<RtvRecord>().div_ceil(8);
 
+extern "system" fn set_pipeline(this: This, pipeline: This) {
+    // Before it is written down: the bind is the first call translated at
+    // the call, or the first written down again ([`in_order`]).
+    front(this).bound(bakes(pipeline));
+    put_pipeline(this, pipeline);
+}
 extern "system" fn list_close(this: This) -> HRESULT {
     front(this).close();
     S_OK
@@ -615,7 +1001,18 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
     0
 }
 extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
-    front(this).put(BARRIER_GROUPS, &[u64::from(count)]);
+    // Diagnostics: what the groups ask for, counted here, where the title's
+    // structures are still there (`VICTORY_BARRIER_GROUPS_LOG`).
+    #[cfg(feature = "diagnostics")]
+    if count > 0 {
+        super::count_groups(count, _groups);
+        // SAFETY: the title's groups, for this call.
+        unsafe { super::group_barriers(_groups, count, crate::copystat::group_barrier) };
+    }
+    let need = if count > 0 && !_groups.is_null() { super::groups_wait(count, _groups) } else { 0 };
+    // SAFETY: as above.
+    let writes = unsafe { super::groups_writes(_groups, count) };
+    front(this).put(BARRIER_GROUPS, &[u64::from(count), u64::from(need), writes as u64]);
 }
 extern "system" fn viewports(this: This, count: u32, items: *const D3D12_VIEWPORT) {
     let count = if items.is_null() { 0 } else { count };
@@ -745,11 +1142,57 @@ extern "system" fn copy_texture_region_x(
     copy_texture_region(this, dst, x, y, z, src, source_box);
 }
 
+/// Calls that only bind or set state: the card runs nothing for them, so a
+/// full wait after them waits for no more than one before them
+/// ([`super::wait_share`]).
+fn binds_only(op: u64) -> bool {
+    [
+        Plain::TOPOLOGY as u64,
+        Plain::STENCIL_REF as u64,
+        Plain::DEPTH_BOUNDS as u64,
+        Plain::COMPUTE_TABLE as u64,
+        Plain::GRAPHICS_TABLE as u64,
+        Plain::COMPUTE_CONSTANT as u64,
+        Plain::GRAPHICS_CONSTANT as u64,
+        Plain::COMPUTE_VIEW as u64,
+        Plain::GRAPHICS_VIEW as u64,
+        Plain::SET_PIPELINE as u64,
+        VIEWPORTS,
+        SCISSORS,
+        BLEND_FACTOR,
+        HEAPS,
+        COMPUTE_CONSTANTS,
+        GRAPHICS_CONSTANTS,
+        INDEX_BUFFER,
+        VERTEX_BUFFERS,
+    ]
+    .contains(&op)
+}
+
+/// The calls that may record a full wait, and nothing else on the card.
+fn waits(op: u64) -> bool {
+    op == BARRIER || op == BARRIER_GROUPS || op == Plain::SYNC as u64
+}
+
+/// Ends [`super::QUIET`] when a stream is done, also if it unwinds.
+struct Quiet;
+
+impl Drop for Quiet {
+    fn drop(&mut self) {
+        super::QUIET.set(None);
+    }
+}
+
 /// Makes the calls of a stream on `list`: how many, and whether the last one
 /// closed it. Once `left` says so only what must not be lost is done.
 fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool) {
     let (mut i, mut calls, mut closed) = (0, 0, false);
     let mut skip = left();
+    let share = super::wait_share();
+    let _quiet = share.then(|| {
+        super::QUIET.set(Some(0));
+        Quiet
+    });
     while i < stream.len() {
         let (op, len) = (stream[i] & 0xffff, (stream[i] >> 16) as usize);
         let w = &stream[i + 1..i + 1 + len];
@@ -768,6 +1211,9 @@ fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool)
         }
         if skip && op != CLOSE && op != RESET {
             continue;
+        }
+        if share && !binds_only(op) && !waits(op) {
+            super::QUIET.set(Some(0));
         }
         #[cfg(feature = "diagnostics")]
         let began = std::time::Instant::now();
@@ -797,7 +1243,16 @@ fn one(list: This, op: u64, w: &[u64]) -> bool {
         BARRIER => {
             super::barrier(list, n as u32, at_or(w, 1));
         }
-        BARRIER_GROUPS => super::barrier_groups(list, n as u32, std::ptr::null()),
+        BARRIER_GROUPS => super::barrier_groups_waiting(
+            list,
+            n as u32,
+            w.get(1).map_or(0, |&need| need as u8),
+            match w.get(2) {
+                Some(1) => super::GroupWrites::Begun,
+                Some(2) => super::GroupWrites::Other,
+                _ => super::GroupWrites::Ended,
+            },
+        ),
         VIEWPORTS => state::viewports(list, n as u32, at(w, 1, n)),
         SCISSORS => state::scissors(list, n as u32, at(w, 1, n)),
         BLEND_FACTOR => state::blend_factor(list, at(w, 1, n)),
@@ -935,6 +1390,95 @@ const MINE: [(usize, *const ()); 50] = [
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+
+    /// The pipeline the tests take for one of the bake's.
+    pub(super) const BAKE: This = 0x1000 as This;
+
+    /// What the tests' translation saw: the value of each `TOPOLOGY` call,
+    /// and whether the title's thread translated it.
+    static LOG: Mutex<Vec<(u64, bool)>> = Mutex::new(Vec::new());
+    thread_local! { static TITLE: Cell<bool> = const { Cell::new(false) }; }
+
+    /// [`super::translate`] in the tests: no list is made, the calls are
+    /// written into [`LOG`].
+    pub(super) fn translate(_list: This, stream: &[u64]) -> (u64, bool) {
+        let (mut i, mut calls, mut closed) = (0, 0, false);
+        while i < stream.len() {
+            let (op, len) = (stream[i] & 0xffff, (stream[i] >> 16) as usize);
+            let w = &stream[i + 1..i + 1 + len];
+            i += 1 + len;
+            calls += 1;
+            if op == CLOSE {
+                closed = true;
+            } else if op == Plain::TOPOLOGY as u64 {
+                held(&LOG).push((w[0], TITLE.get()));
+            }
+        }
+        (calls, closed)
+    }
+
+    /// A list that binds a pipeline of the bake is translated at the
+    /// title's calls from there on, after what it and other lists handed
+    /// over before, and written down again once it binds another; the
+    /// other lists are not.
+    #[test]
+    fn a_bake_is_translated_at_the_call_after_what_came_before() {
+        TITLE.set(true);
+        let stop = Arc::new(AtomicBool::new(false));
+        // A slow thread of ours.
+        let worker = {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                loop {
+                    let next = {
+                        let ready = held(&READY);
+                        let (mut ready, _) = WORK
+                            .wait_timeout_while(ready, std::time::Duration::from_millis(10), |r| r.is_empty())
+                            .unwrap_or_else(|e| e.into_inner());
+                        ready.pop_front()
+                    };
+                    match next {
+                        Some(r) => {
+                            std::thread::sleep(std::time::Duration::from_millis(20));
+                            r.run();
+                        }
+                        None if stop.load(Acquire) => break,
+                        None => {}
+                    }
+                }
+            })
+        };
+        let topology = Plain::TOPOLOGY as u64;
+        let (mut a, mut b) = (Front::default(), Front::default());
+        a.begin(0, std::ptr::null());
+        b.begin(0, std::ptr::null());
+        b.put(topology, &[1]);
+        b.hand_over();
+        a.put(topology, &[2]);
+        assert!(held(&LOG).is_empty());
+        a.bound(bakes(BAKE));
+        {
+            let mut log = held(&LOG).clone();
+            log.sort();
+            assert_eq!(log, [(1, false), (2, false)]);
+        }
+        a.put(topology, &[3]);
+        assert_eq!(held(&LOG).last(), Some(&(3, true)));
+        b.put(topology, &[4]);
+        a.bound(bakes(std::ptr::null()));
+        a.put(topology, &[5]);
+        assert_eq!(held(&LOG).len(), 3);
+        a.close();
+        b.close();
+        a.recording.as_ref().unwrap().wait();
+        b.recording.as_ref().unwrap().wait();
+        let log = held(&LOG).clone();
+        assert_eq!(log.len(), 5);
+        assert!(log[3..].contains(&(4, false)) && log[3..].contains(&(5, false)));
+        stop.store(true, Release);
+        worker.join().unwrap();
+    }
 
     /// Every method of the tables that records is written down too: what is
     /// left in both tables alike records nothing.
@@ -976,13 +1520,55 @@ mod tests {
         assert!(at::<u32>(&w[1..], 2, 0).is_null());
     }
 
+    /// Of the calls a stream holds, only those that leave the card idle
+    /// count as bindings, and waits are told apart from them.
+    #[test]
+    fn bindings_record_no_work() {
+        let work = [
+            Plain::DRAW as u64,
+            Plain::DRAW_INDEXED as u64,
+            Plain::DISPATCH as u64,
+            Plain::DISPATCH_X as u64,
+            Plain::DISPATCH_MESH as u64,
+            Plain::DISPATCH_MESH_X as u64,
+            Plain::COPY_BUFFER as u64,
+            Plain::COPY_RESOURCE as u64,
+            Plain::COPY_RESOURCE_X as u64,
+            Plain::COPY_MEMORY as u64,
+            Plain::RESOLVE as u64,
+            Plain::RESOLVE_QUERIES as u64,
+            Plain::EXECUTE_INDIRECT as u64,
+            Plain::WRITE32 as u64,
+            Plain::WRITE64 as u64,
+            Plain::WAIT_VALUE as u64,
+            Plain::WAIT_VALUE64 as u64,
+            RESET,
+            CLOSE,
+            UPLOAD,
+            TARGETS,
+            CLEAR_RTV,
+            CLEAR_DSV,
+            COPY_TEXTURE,
+        ];
+        for op in work {
+            assert!(!binds_only(op) && !waits(op), "op {op}");
+        }
+        for op in [BARRIER, BARRIER_GROUPS, Plain::SYNC as u64] {
+            assert!(waits(op) && !binds_only(op), "op {op}");
+        }
+        let named = (0..=COPY_TEXTURE).filter(|&op| binds_only(op) || waits(op) || work.contains(&op)).count();
+        assert_eq!(named as u64, COPY_TEXTURE + 1, "a call is in no list");
+    }
+
     /// A view's record is the one at the call, also if its slot is written
     /// again right after.
     #[test]
+    #[allow(unused_assignments)] // slot[1] is written only to show the record keeps what was there at the call
     fn a_target_is_the_one_at_the_call() {
         let mut slot = [0x5256_5476u64, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
         let kept = record(slot.as_ptr() as u64);
         slot[1] = 99;
+        std::hint::black_box(&slot);
         assert_eq!(kept[1], 2);
         assert_eq!(record(0), [0; RECORD]);
     }

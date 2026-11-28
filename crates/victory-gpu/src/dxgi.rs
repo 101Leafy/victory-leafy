@@ -229,29 +229,90 @@ const _: () = assert!(size_of::<Mode>() == 32);
 
 /// The size of the display the console reports: `VICTORY_DISPLAY_MODE=WxH`
 /// if set (as a console reports the television it is plugged into: a
-/// Series X on a 1080p set lists a 1080p mode), else 3840x2160.
-/// shortcut: not yet the host display's own size by default; make it so
-/// once a title is seen to render for the mode it is given.
+/// Series X on a 1080p set lists a 1080p mode), else the host display's own
+/// size with `VICTORY_DISPLAY_HOST=1`, else 3840x2160.
+/// shortcut: 3840x2160 stays the default. A title has yet to be seen
+/// rendering for the mode it is given, and 4K is what the console reports;
+/// on a 1080p or 1440p screen the host's own size is the cheaper answer, and
+/// the switch is there to try it.
 fn display_size() -> (u32, u32) {
     static SIZE: std::sync::OnceLock<(u32, u32)> = std::sync::OnceLock::new();
     *SIZE.get_or_init(|| {
-        let asked = std::env::var("VICTORY_DISPLAY_MODE").ok().and_then(|v| {
-            let (w, h) = v.trim().split_once(['x', 'X'])?;
-            Some((w.trim().parse::<u32>().ok()?, h.trim().parse::<u32>().ok()?))
-        });
-        let size = match asked {
-            Some((w, h)) if (640..=7680).contains(&w) && (360..=4320).contains(&h) => (w, h),
-            _ => (3840, 2160),
-        };
-        tracing::info!(width = size.0, height = size.1, "display mode reported to the title");
+        let host = host_display_size();
+        let size = reported(asked_size(), host, host_wanted());
+        tracing::info!(
+            width = size.0,
+            height = size.1,
+            host = ?host,
+            "display mode reported to the title"
+        );
         size
     })
 }
 
+/// `VICTORY_DISPLAY_MODE=WxH`, the mode the title's own switch names.
+fn asked_size() -> Option<(u32, u32)> {
+    let value = std::env::var("VICTORY_DISPLAY_MODE").ok()?;
+    let (width, height) = value.trim().split_once(['x', 'X'])?;
+    Some((width.trim().parse().ok()?, height.trim().parse().ok()?))
+}
+
+/// Whether the host display's own size is reported when the title names
+/// none: `VICTORY_DISPLAY_HOST=1`.
+fn host_wanted() -> bool {
+    static WANTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *WANTED.get_or_init(|| std::env::var("VICTORY_DISPLAY_HOST").is_ok_and(|v| v != "0"))
+}
+
+/// A mode nothing would run at is not one to report: 640x360 to 8K.
+fn usable((width, height): (u32, u32)) -> Option<(u32, u32)> {
+    ((640..=7680).contains(&width) && (360..=4320).contains(&height)).then_some((width, height))
+}
+
+/// The size to report: the title's switch when it names a mode anything
+/// would run at, else the host display's when `host_wanted`, else the
+/// console's 4K. A size the host query could not read falls through the
+/// same way, so a failed query is the console's mode and not a zero one.
+fn reported(
+    asked: Option<(u32, u32)>,
+    host: Option<(u32, u32)>,
+    host_wanted: bool,
+) -> (u32, u32) {
+    if let Some(size) = asked.and_then(usable) {
+        return size;
+    }
+    if host_wanted && let Some(size) = host.and_then(usable) {
+        return size;
+    }
+    (3840, 2160)
+}
+
+/// The host display's current mode, in pixels: the primary display, whose
+/// mode a title presented to a window lands on. Read by the presentation's
+/// log line as well, so a frame that draws more pixels than the screen has
+/// says so where anyone looking at a slow run will see it.
+#[cfg(windows)]
+pub(crate) fn host_display_size() -> Option<(u32, u32)> {
+    use windows_sys::Win32::Graphics::Gdi::{
+        DEVMODEW, ENUM_CURRENT_SETTINGS, EnumDisplaySettingsW,
+    };
+    // SAFETY: a plain C structure of numbers; the call is told its size.
+    let mut mode: DEVMODEW = unsafe { std::mem::zeroed() };
+    mode.dmSize = size_of::<DEVMODEW>() as u16;
+    // SAFETY: the primary display (no name), a mode structure with its size.
+    let found = unsafe { EnumDisplaySettingsW(std::ptr::null(), ENUM_CURRENT_SETTINGS, &mut mode) };
+    (found != 0).then_some((mode.dmPelsWidth, mode.dmPelsHeight))
+}
+
+#[cfg(not(windows))]
+pub(crate) fn host_display_size() -> Option<(u32, u32)> {
+    None
+}
+
 /// The console's mode list: one 4K mode at 60 Hz (the title looks
 /// for a 120 Hz one to allow 120 Hz frame intervals).
-/// shortcut: fixed mode, not the host display's; report the host's rates if
-/// a title paces by them.
+/// shortcut: fixed refresh, not the host display's; report the host's rates
+/// if a title paces by them. The size is [`display_size`]'s.
 extern "system" fn modes(
     _: This,
     _format: u32,
@@ -359,5 +420,52 @@ mod tests {
             assert_eq!(enumerate(object, 1, &mut out), NOT_FOUND, "{method}");
             assert!(out.is_null(), "{method} left a stale output pointer");
         }
+    }
+
+    /// The mode the title is given is its own switch's, else the host
+    /// display's when that is asked for, else the console's 4K: a size
+    /// nothing would run at, and a host query that read nothing, both fall
+    /// through to it.
+    #[test]
+    fn the_mode_reported_follows_the_switch_the_host_and_the_console() {
+        let host = Some((2560, 1440));
+        assert_eq!(
+            reported(None, host, false),
+            (3840, 2160),
+            "the console's 4K by default"
+        );
+        assert_eq!(
+            reported(None, host, true),
+            (2560, 1440),
+            "the host display's own size with the switch"
+        );
+        assert_eq!(
+            reported(Some((1920, 1080)), host, true),
+            (1920, 1080),
+            "the title's own switch wins over the host's"
+        );
+        assert_eq!(
+            reported(Some((0, 0)), host, true),
+            (2560, 1440),
+            "a mode nothing runs at is not reported"
+        );
+        assert_eq!(
+            reported(Some((99_999, 2160)), host, false),
+            (3840, 2160),
+            "nor one past 8K"
+        );
+        assert_eq!(
+            reported(None, None, true),
+            (3840, 2160),
+            "a host query that read nothing leaves the console's mode"
+        );
+        assert_eq!(
+            reported(None, Some((1920, 0)), true),
+            (3840, 2160),
+            "a host mode of no height too"
+        );
+        assert_eq!(usable((7680, 4320)), Some((7680, 4320)), "8K is the most");
+        assert_eq!(usable((7681, 4320)), None);
+        assert_eq!(usable((1920, 359)), None, "and 360 lines the fewest");
     }
 }

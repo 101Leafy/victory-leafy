@@ -23,6 +23,9 @@ pub(crate) const JOBS: u32 = 256;
 pub(crate) const TABLE: u64 = 16 + 16 * JOBS as u64;
 /// The bytes of a clamped record's place in the scratch buffer.
 pub(crate) const SLOT: u32 = 32;
+/// The places a split dispatch's pieces and their count take
+/// ([`super::SPLIT`]).
+pub(crate) const SPLIT_SLOTS: u32 = (super::PIECES * 16 + 4).div_ceil(SLOT);
 /// The source buffers a pass can read.
 pub(crate) const SOURCES: usize = 4;
 /// The most executions charged by one job: the most a record costs (2^26)
@@ -41,12 +44,16 @@ ByteAddressBuffer src3 : register(t3);
 ByteAddressBuffer jobs : register(t4);
 RWByteAddressBuffer dst_args : register(u0);
 RWByteAddressBuffer budget : register(u1);
-static const uint BUDGET = 1u << 27;
+static const uint BUDGET = 1u << 30;
 static const uint GROUPS = 1u << 20;
+static const uint PIECE = 65535u;
+static const uint PIECES = 17u;
 groupshared uint costs[64];
 groupshared uint fits[64];
 groupshared uint largest_asked;
 groupshared uint all_asked;
+// Executions of records that asked for no work at all (diagnostics).
+groupshared uint empties;
 uint load(uint source, uint at) {
     if (source == 0) return src0.Load(at);
     if (source == 1) return src1.Load(at);
@@ -67,6 +74,7 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     if (gi == 0) {
         largest_asked = 0;
         all_asked = 0;
+        empties = 0;
     }
     // As the clamp of one execution (`super::SOURCE`) bounds them.
     if (active) {
@@ -93,6 +101,16 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
             record[0] = g.x;
             record[1] = g.y;
             record[2] = g.z;
+        } else if (kind == 3) {
+            // A split dispatch: every group runs, in pieces.
+            uint3 g = min(uint3(record[0], record[1], record[2]), uint3(GROUPS, 65535u, 65535u));
+            if ((g.y != 0 && g.x > GROUPS / g.y) || (g.z != 0 && g.x * g.y > GROUPS / g.z)) {
+                g = uint3(0, 0, 0);
+            }
+            cost = g.x * g.y * g.z * 64u;
+            record[0] = g.x;
+            record[1] = g.y;
+            record[2] = g.z;
         } else {
             if (record[0] > 65535u) {
                 record[0] = 0;
@@ -108,10 +126,14 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     }
     costs[gi] = cost;
     GroupMemoryBarrierWithGroupSync();
-    if (active && kind > 2) {
+    if (active && kind > 3) {
         uint was;
         InterlockedMax(largest_asked, asked, was);
         InterlockedAdd(all_asked, min(asked, 1u << 24), was);
+    }
+    if (active && cost == 0) {
+        uint was;
+        InterlockedAdd(empties, job.x >> 16, was);
     }
     uint first = id.x - gi;
     uint n = count > first ? min(64u, count - first) : 0u;
@@ -163,6 +185,10 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         budget.InterlockedMax(4, largest_asked, was);
         budget.InterlockedAdd(8, all_asked, was);
     }
+    if (gi == 0 && empties > 0) {
+        uint was;
+        budget.InterlockedAdd(20, empties, was);
+    }
     if (!active) {
         return;
     }
@@ -172,6 +198,15 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         if (kind > 1) {
             record[2] = 0;
         }
+    }
+    if (kind == 3) {
+        for (uint c = 0; c < PIECES; c++) {
+            uint begin = c * PIECE;
+            uint x = record[0] > begin ? min(record[0] - begin, PIECE) : 0u;
+            dst_args.Store4(job.z + c * 16u, uint4(begin, x, record[1], record[2]));
+        }
+        dst_args.Store(job.z + PIECES * 16u, PIECES);
+        return;
     }
     for (uint s = 0; s < words; s++) {
         dst_args.Store(job.z + s * 4, record[s]);
@@ -202,6 +237,10 @@ pub(crate) struct Table {
     sources: [u64; SOURCES],
     /// How many executions each job is charged for so far.
     times: Vec<u32>,
+    /// Each job's place in the scratch buffer.
+    places: Vec<u32>,
+    /// The places taken.
+    slots: u32,
     /// The job of a record (source, offset, kind).
     known: std::collections::HashMap<(u32, u32, u32), u32>,
 }
@@ -229,31 +268,79 @@ impl Table {
         offset.checked_add(words(kind)? * 4)?;
         let key = (source, offset, kind);
         let table = self.at as *mut u32;
-        let place = |i: u32| u64::from(self.base + i * SLOT);
         if let Some(&i) = self.known.get(&key)
             && self.times[i as usize] < TIMES
         {
             self.times[i as usize] += 1;
             // SAFETY: the job's own word of the table ([`Table::new`]).
             unsafe { table.add(4 + 4 * i as usize).write_volatile(job(source, kind, self.times[i as usize])) };
-            return Some(place(i));
+            return Some(u64::from(self.places[i as usize]));
         }
         let i = self.times.len() as u32;
-        if i == JOBS {
+        let slots = if kind == super::SPLIT { SPLIT_SLOTS } else { 1 };
+        if i == JOBS || self.slots + slots > JOBS {
             return None;
         }
+        let place = self.base + self.slots * SLOT;
+        self.slots += slots;
         self.times.push(1);
+        self.places.push(place);
         self.known.insert(key, i);
         // SAFETY: inside the table: fewer than [`JOBS`] jobs before it.
         unsafe {
             let to = table.add(4 + 4 * i as usize);
             to.write_volatile(job(source, kind, 1));
             to.add(1).write_volatile(offset);
-            to.add(2).write_volatile(self.base + i * SLOT);
+            to.add(2).write_volatile(place);
             to.add(3).write_volatile(0);
             table.write_volatile(i + 1);
         }
-        Some(place(i))
+        Some(u64::from(place))
+    }
+}
+
+/// Title ranges shaders were declared to write since a pass was recorded
+/// (`VICTORY_INDIRECT_BATCH=3`): a record in none of them is as the pass
+/// read it. Past [`WriteLog::MOST`] ranges every record counts as written.
+#[derive(Default)]
+pub(crate) struct WriteLog {
+    /// Start and end of each range.
+    ranges: Vec<(u64, u64)>,
+    full: bool,
+}
+
+impl WriteLog {
+    const MOST: usize = 4096;
+
+    /// Shaders may write `len` bytes from `address` on.
+    pub(crate) fn note(&mut self, address: u64, len: u64) {
+        let end = address.saturating_add(len);
+        if self.full || end == address {
+            return;
+        }
+        // The same views are declared by dispatch after dispatch.
+        if let Some(last) = self.ranges.last_mut()
+            && address <= last.1
+            && last.0 <= end
+        {
+            *last = (last.0.min(address), last.1.max(end));
+            return;
+        }
+        if self.ranges.iter().any(|&(a, b)| a <= address && end <= b) {
+            return;
+        }
+        if self.ranges.len() == Self::MOST {
+            self.ranges = Vec::new();
+            self.full = true;
+            return;
+        }
+        self.ranges.push((address, end));
+    }
+
+    /// Whether shaders may have written any of `len` bytes from `address` on.
+    pub(crate) fn touches(&self, address: u64, len: u64) -> bool {
+        let end = address.saturating_add(len);
+        self.full || self.ranges.iter().any(|&(a, b)| address < b && a < end)
     }
 }
 
@@ -415,5 +502,41 @@ impl Stamps {
         let ns = (u128::from(ticks) * 1_000_000_000 / u128::from(frequency)) as u64;
         crate::copystat::add(crate::copystat::C::ClampPassNs, ns);
         crate::copystat::add(crate::copystat::C::ClampPasses, passes);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::WriteLog;
+
+    #[test]
+    fn write_log() {
+        let mut log = WriteLog::default();
+        assert!(!log.touches(0x1000, 16));
+        log.note(0x1000, 0x100);
+        log.note(0x1000, 0x100);
+        log.note(0x1080, 0x100);
+        assert_eq!(log.ranges, [(0x1000, 0x1180)]);
+        assert!(log.touches(0x1170, 16));
+        assert!(log.touches(0xff8, 16));
+        assert!(!log.touches(0x1180, 16));
+        assert!(!log.touches(0xff0, 16));
+        log.note(0x8000, 0);
+        assert!(!log.touches(0x8000, 4));
+        log.note(0x9000, 0x10);
+        log.note(0x1010, 0x10);
+        assert_eq!(log.ranges, [(0x1000, 0x1180), (0x9000, 0x9010)]);
+    }
+
+    #[test]
+    fn write_log_full() {
+        let mut log = WriteLog::default();
+        for i in 0..WriteLog::MOST as u64 {
+            log.note(i * 0x100, 0x10);
+        }
+        assert!(!log.touches(0x80, 16));
+        log.note(u64::MAX - 0x100, 0x10);
+        assert!(log.full);
+        assert!(log.touches(0x80, 16));
     }
 }

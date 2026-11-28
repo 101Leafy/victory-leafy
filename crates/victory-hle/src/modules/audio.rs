@@ -101,16 +101,50 @@ impl Heap {
     }
 }
 
+/// Why the APU heap could not give a block.
+#[derive(Debug)]
+enum HeapRefusal {
+    /// No free device-address range fits the request.
+    NoDeviceRange { size: usize, align: usize },
+    /// The host allocator returned null for the block.
+    HostAllocator { len_bytes: usize },
+}
+
+impl HeapRefusal {
+    /// Reports the refusal. Called with no lock held: a host refusal is
+    /// written to `crashes.log`, so its cause is on record if the title fails
+    /// after it.
+    fn report(&self) {
+        match *self {
+            Self::NoDeviceRange { size, align } => tracing::warn!(
+                size,
+                align,
+                "no free APU device-address range fits the request"
+            ),
+            Self::HostAllocator { len_bytes } => super::xmem::report_allocator_refusal(len_bytes),
+        }
+    }
+}
+
 /// Zeroed host memory and its device address.
-fn heap_alloc(size: usize, align: usize) -> Option<(*mut u8, u32)> {
-    let layout = Layout::from_size_align(size.max(1), align.max(16)).ok()?;
+fn heap_alloc(size: usize, align: usize) -> Result<(*mut u8, u32), HeapRefusal> {
     let mut heap = lock(&HEAP);
-    let apu = heap.take(u32::try_from(layout.size()).ok()?, align as u32)?;
+    let fit = Layout::from_size_align(size.max(1), align.max(16))
+        .ok()
+        .and_then(|layout| {
+            let apu = heap.take(u32::try_from(layout.size()).ok()?, align as u32)?;
+            Some((layout, apu))
+        });
+    let Some((layout, apu)) = fit else {
+        return Err(HeapRefusal::NoDeviceRange { size, align });
+    };
     // SAFETY: non-zero size.
     let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
     if ptr.is_null() {
         heap.give_back(apu, apu + layout.size() as u32);
-        return None;
+        return Err(HeapRefusal::HostAllocator {
+            len_bytes: layout.size(),
+        });
     }
     heap.blocks
         .insert(ptr as usize, Block { size, apu, layout });
@@ -120,7 +154,7 @@ fn heap_alloc(size: usize, align: usize) -> Option<(*mut u8, u32)> {
     if size >= 32 << 20 {
         tracing::info!(mb = size >> 20, at = ?ptr, "audio memory for the title from our allocator");
     }
-    Some((ptr, apu))
+    Ok((ptr, apu))
 }
 
 fn heap_free(ptr: *mut u8) {
@@ -201,8 +235,12 @@ pub extern "system" fn ApuAlloc(
     if out.is_null() || size == 0 || align < 4 || !align.is_power_of_two() {
         return E_INVALIDARG;
     }
-    let Some((ptr, address)) = heap_alloc(size as usize, align as usize) else {
-        return E_OUTOFMEMORY;
+    let (ptr, address) = match heap_alloc(size as usize, align as usize) {
+        Ok(block) => block,
+        Err(refusal) => {
+            refusal.report();
+            return E_OUTOFMEMORY;
+        }
     };
     // SAFETY: checked non-null; optional out parameter checked below.
     unsafe {
@@ -260,9 +298,14 @@ pub extern "system" fn AcpHalAllocateShapeContexts(contexts: *mut ShapeContexts)
         if counts[i] == 0 {
             continue;
         }
-        let Some((ptr, apu)) = heap_alloc(counts[i] as usize * CONTEXT_BYTES[i], 256) else {
-            arrays.iter().for_each(|&p| heap_free(p.cast()));
-            return E_OUTOFMEMORY;
+        let (ptr, apu) = match heap_alloc(counts[i] as usize * CONTEXT_BYTES[i], 256) {
+            Ok(block) => block,
+            Err(refusal) => {
+                arrays.iter().for_each(|&p| heap_free(p.cast()));
+                drop(allocated);
+                refusal.report();
+                return E_OUTOFMEMORY;
+            }
         };
         (arrays[i], addresses[i]) = (ptr.cast(), apu);
     }
@@ -562,6 +605,14 @@ impl Xma {
     }
 }
 
+/// Whether a voice that ran out decodes again when the title refills it, and
+/// the pump writes whole blocks only (`VICTORY_XMA_REFILL=1`, codec_d,
+/// pareto-residency 8cc31ab37; off, as before).
+fn refill() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_XMA_REFILL").is_some_and(|v| v == "1"))
+}
+
 /// Fills a context's output as far as it has room; false if it is not
 /// enabled. The voice's lock is held for one block at a time, so enabling
 /// or disabling it waits for one frame's decoding at most.
@@ -589,7 +640,21 @@ fn fill_block(context: Context, voice: &mut Voice, ring: &Mutex<Takes>) -> bool 
     if size == 0 || context.field(1, 31, 1) == 0 {
         return false;
     }
-    if voice.pcm.len() < SAMPLES_PER_BLOCK && !decode(context, voice) {
+    if refill() {
+        // A skipped frame or an input boundary can advance the decoder
+        // without producing samples. Publish only complete blocks, except
+        // the final padded tail. Limit empty steps so a broken looping
+        // voice cannot hold its lock or stall other voices for the whole
+        // decoding pass.
+        for _ in 0..8 {
+            if voice.pcm.len() >= SAMPLES_PER_BLOCK || !decode(context, voice) {
+                break;
+            }
+        }
+        if voice.pcm.is_empty() || (voice.pcm.len() < SAMPLES_PER_BLOCK && !voice.ended) {
+            return false;
+        }
+    } else if voice.pcm.len() < SAMPLES_PER_BLOCK && !decode(context, voice) {
         return false;
     }
     // The write block is the title's too: taken modulo the ring before the
@@ -627,12 +692,24 @@ fn fill_block(context: Context, voice: &mut Voice, ring: &Mutex<Takes>) -> bool 
 /// Decodes the next frame of the current input into `voice.pcm`; false
 /// when there is nothing left to decode.
 fn decode(context: Context, voice: &mut Voice) -> bool {
-    if voice.ended {
+    let valid = context.field(0, 20, 2);
+    if voice.ended && !refill() {
         return false;
+    }
+    if voice.ended {
+        // The title can refill either input while the context stays enabled.
+        // Flush the previous tail once and leave the ring idle until a valid
+        // buffer is published. The decoder resets its overlap when flushed.
+        if valid == 0 {
+            return false;
+        }
+        voice.ended = false;
+        if context.field(2, 26, 5) == INPUT_INVALID {
+            context.set_field(2, 26, 6, 0);
+        }
     }
     let channels = context.channels();
     let mut current = context.field(4, 31, 1);
-    let valid = context.field(0, 20, 2);
     if valid & (1 << current) == 0 {
         if valid & (1 << (1 - current)) == 0 {
             // Out of input: the overlap tail, then nothing.

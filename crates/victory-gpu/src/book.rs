@@ -146,7 +146,9 @@ impl Book {
     /// The live entry that starts last at or below `at`, and the next above.
     fn neighbours(&self, at: u64) -> [Option<&Entry>; 2] {
         let below = self.by_start.range(..=(at, u64::MAX)).next_back();
-        let above = self.by_start.range((at + 1, 0)..).next();
+        // Saturating, as the lower bounds above: `at` is an address the
+        // card reported, any u64.
+        let above = self.by_start.range((at.saturating_add(1), 0)..).next();
         [below, above].map(|e| e.and_then(|((_, id), ())| self.live.get(id)))
     }
 
@@ -240,6 +242,17 @@ fn viewable(format: i32) -> Option<i32> {
         20 | 40 | 45 | 55 => return None, // typed depth: no shader view
         f => f,
     })
+}
+
+/// The address of `texture` as its descriptor has it (its first level's),
+/// if the book is kept.
+pub(crate) fn address(texture: &ID3D12Resource) -> Option<u64> {
+    if !on() {
+        return None;
+    }
+    // SAFETY: a live resource.
+    let desc = unsafe { texture.GetDesc() };
+    texture_address(texture, &desc)
 }
 
 /// The address of a texture: the base its descriptor has.
@@ -737,5 +750,7 @@ mod tests {
         assert_eq!(b.neighbours(0x1000_0100)[1].map(|e| e.what.as_str()), Some("two"));
         b.remove(two, 3, 13);
         assert!(b.neighbours(u64::MAX - 1)[0].is_none() && b.by_object.is_empty());
+        // An address the card reports can be anything, the top one included.
+        assert!(b.neighbours(u64::MAX)[0].is_none() && b.neighbours(u64::MAX)[1].is_none());
     }
 }

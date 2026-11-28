@@ -38,7 +38,7 @@ const BATCH: (u64, usize) = (16 << 20, 64);
 
 /// Whether it is on (`VICTORY_UPLOAD_AHEAD`; off).
 pub(crate) fn on() -> bool {
-    #[cfg(feature = "diagnostics")]
+    #[cfg(any(feature = "diagnostics", feature = "ab"))]
     if let Some(on) = crate::ab::pick("VICTORY_UPLOAD_AHEAD") {
         return on;
     }
@@ -271,6 +271,7 @@ impl Worker {
                 job.record(&self.list);
             }
             self.list.Close()?;
+            crate::host::before_send(&self.queue);
             self.queue.ExecuteCommandLists(&[Some(self.list.cast()?)]);
             self.queue.Signal(&self.fence, value)?;
             // (Without an event: this waits.)

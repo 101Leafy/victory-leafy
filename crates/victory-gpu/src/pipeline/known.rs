@@ -147,7 +147,9 @@ fn read(dir: &Path) -> (HashSet<[u8; 16]>, HashSet<[u8; 32]>) {
     let mut keys = HashSet::new();
     let mut shaders = HashSet::new();
     let ends = [
-        walk_shaders(dir, |_, hash, _, _| drop(shaders.insert(hash))),
+        walk_shaders(dir, |_, hash, _, _| {
+            let _ = shaders.insert(hash);
+        }),
         walk_pipelines(dir, |_, bytes| {
             keys.extend(bytes.first_chunk::<16>().copied());
         }),
@@ -301,20 +303,58 @@ pub fn fingerprint() -> String {
     h.finalize().to_hex()[..16].to_owned()
 }
 
-/// The translations of earlier runs are in `dir` (the pipeline library is
-/// not used: what is made here is the driver's to keep).
+/// The translations of earlier runs are in `dir`.
 pub fn use_translations(dir: PathBuf) {
     crate::shader_cache::use_shader_cache(dir);
 }
 
-/// Makes the host pipelines of those of `which` (numbers in the file) and
-/// lets each go again: the driver's cache on disk keeps them. `each` is told
+/// Keeps what [`make`] makes in the pipeline library of the folder `part`,
+/// and takes what the run's library in `main` already holds from there. The
+/// driver's own cache on disk is not enough: a warm of 4,420 pipelines left
+/// the next run 191 to make again at 16 to 18 s each, and runs load from the
+/// library. Each warm process keeps its own part, since a library's save
+/// replaces the file and two processes cannot add to one; [`merge`] puts
+/// the parts into the run's library.
+pub fn keep_in(part: PathBuf, main: PathBuf) {
+    super::library::use_pipeline_cache(part);
+    super::library::use_other_libraries(vec![main], false);
+}
+
+/// For [`make`] in the last warm process: the run's library is the one in
+/// `main`, and the pipelines found in the libraries of `parts` go into it.
+pub fn merge(main: PathBuf, parts: Vec<PathBuf>) {
+    super::library::use_pipeline_cache(main);
+    super::library::use_other_libraries(parts, true);
+}
+
+/// Writes the library of [`keep_in`] or [`merge`]; how many pipelines this
+/// process stored in it.
+pub fn save() -> u64 {
+    super::library::save(true);
+    super::library::STORED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Check the shader book once before starting a worker pool.
+pub fn check_shader_book(dir: &Path) -> std::io::Result<()> {
+    std::fs::File::open(dir.join(SHADERS)).map(drop)
+}
+
+/// Makes the host pipelines of those of `which` (numbers in the file), or
+/// loads them from a library, and lets each go again. `each` is told
 /// the number before, and what came of it after: milliseconds and whether
-/// there is one.
-pub fn make(dir: &Path, which: &[usize], mut each: impl FnMut(usize, Option<(f64, bool)>)) {
+/// there is one. A missing or unreadable recipe ends the batch at that index
+/// without a completion, rather than being counted as a host refusal. An
+/// unavailable shader book is an I/O error for the whole batch.
+pub fn make(
+    dir: &Path,
+    which: &[usize],
+    mut each: impl FnMut(usize, Option<(f64, bool)>),
+) -> std::io::Result<()> {
+    let mut file = std::fs::File::open(dir.join(SHADERS))?;
     let mut places = HashMap::new();
-    walk_shaders(dir, |stage, hash, at, len| drop(places.insert(hash, (stage, at, len))));
-    let Ok(mut file) = std::fs::File::open(dir.join(SHADERS)) else { return };
+    walk_shaders(dir, |stage, hash, at, len| {
+        let _ = places.insert(hash, (stage, at, len));
+    });
     let wanted: HashSet<usize> = which.iter().copied().collect();
     let mut entries = HashMap::new();
     walk_pipelines(dir, |n, bytes| {
@@ -330,14 +370,14 @@ pub fn make(dir: &Path, which: &[usize], mut each: impl FnMut(usize, Option<(f64
         Some(bytes)
     };
     for n in which {
-        let Some(entry) = entries.get(n) else { continue };
+        let Some(entry) = entries.get(n) else { break };
         each(*n, None);
         let began = std::time::Instant::now();
-        let made = parse(entry, &mut read)
-            .and_then(|(shaders, g)| HostPipeline::new(&shaders, g.as_deref()))
-            .is_some();
+        let Some((shaders, g)) = parse(entry, &mut read) else { break };
+        let made = HostPipeline::new(&shaders, g.as_deref()).is_some();
         each(*n, Some((began.elapsed().as_secs_f64() * 1e3, made)));
     }
+    Ok(())
 }
 
 #[allow(clippy::type_complexity)]

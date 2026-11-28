@@ -83,3 +83,9 @@ codegen-units = 1
 # kept in its own folder so it does not evict the plain release build.
 [profile.diag]
 inherits = "release"
+
+# The release build with the A/B switches alone (`VICTORY_AB`,
+# `cargo build --profile ab -p victory --features ab`), in its own folder
+# beside the release and diag builds.
+[profile.ab]
+inherits = "release"

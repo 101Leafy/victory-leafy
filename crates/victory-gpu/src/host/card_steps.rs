@@ -85,22 +85,52 @@ pub(super) fn stage() -> u32 {
 
 /// Whether a copy at its place in a list ([`place`]) is only in the way of
 /// what is done on the card in front of the lists if that stands behind it in
-/// them (`VICTORY_PLACED_ORDER=1`; off: wherever it stands), and a
-/// submission where it does is cut behind the copy's list ([`cut_for`]). Off:
-/// the case did not come up once in runs submit-1 to submit-3, so it has only
-/// its tests behind it.
+/// them, and a submission where it does is cut behind the copy's list
+/// ([`cut_for`]). On with `VICTORY_CARD_STEPS=2` unless `VICTORY_PLACED_ORDER=0`
+/// (checking anywhere in the submission); `VICTORY_PLACED_ORDER=1` turns it
+/// on at any stage.
 ///
 /// The fills of constant buffers read the title's ring (7,500 a frame in the
 /// opening), and one copy of a few hundred bytes a frame writes into it at its
 /// place in a list. The whole submission was refused for it, and stood 40 to
 /// 60 ms until the flights had landed (run n19).
 fn placed_order() -> bool {
-    #[cfg(feature = "diagnostics")]
+    #[cfg(any(feature = "diagnostics", feature = "ab"))]
     if let Some(on) = crate::ab::pick("VICTORY_PLACED_ORDER") {
         return on;
     }
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| crate::switch::on("VICTORY_PLACED_ORDER"))
+    *ON.get_or_init(|| match std::env::var("VICTORY_PLACED_ORDER").ok().as_deref() {
+        Some("0") => false,
+        Some("1") => true,
+        _ => stage() == 2,
+    })
+}
+
+/// Whether a host copy kept in place (title memory as the buffer) holds a
+/// span for GPU-side copies and fills (`VICTORY_CARD_STEPS_IN_PLACE=1`).
+/// Refused, each such step settled its flights first: 7-9 ms a time.
+/// shortcut: the copy reads title memory as it is when the card runs it.
+fn in_place_held() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_CARD_STEPS_IN_PLACE"))
+}
+
+/// Whether a fill behind a copy at its place in a list that reads only bytes
+/// the copy writes is given them directly from the copy's destination host
+/// copy on the card (`VICTORY_PLACED_FILLS=1`, which takes [`placed_order`]
+/// with it; off by default: the submission waits for the flights, as before).
+///
+/// It points the fill's own constant-buffer descriptor slot at the
+/// destination shadow on the card, behind the copy's `wait_for_all` barrier
+/// (`place.rs`), with no extra copy on the card, and also for placed copies
+/// whose source has no host copy on the card. On an RTX 3060 12 GB
+/// (Series X, 1440p) this reduced card-steps refusals from 0.8-1.0 to 0.00
+/// per frame, `waiting_flights` from 72 ms to 0.1 ms, and median frametime
+/// from 192.6 ms to 100.8 ms.
+fn placed_fills() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_PLACED_FILLS"))
 }
 
 /// Why [`plan`] refuses for [`place`].
@@ -185,26 +215,161 @@ pub(super) fn copies(line: &Line) -> Vec<Writer> {
         shadow: w.shadow.clone(),
         ..*w
     });
-    flying.flat_map(Taken::copied).chain(landing).collect()
+    // (In the order they were sent: those being landed first.)
+    landing.chain(flying.flat_map(Taken::copied)).collect()
 }
 
 /// Whether `runs` refresh another host copy of a destination in `copies`,
 /// or read it in a step that flights are not waited for otherwise
 /// (`Step::Host`): that reads title memory, where the copy is not yet.
 pub(super) fn copied_read(copies: &[Writer], runs: &[&HostList]) -> bool {
-    if copies.is_empty() {
-        return false;
-    }
-    runs.iter().any(|list| {
-        list.deferred().copies.iter().any(|step| match step {
-            Step::Refresh(shadow, at, len) => copies
-                .iter()
-                .any(|w| w.from < *at + *len && *at < w.to && w.shadow.as_ref().is_none_or(|s| !Arc::ptr_eq(s, shadow))),
-            Step::Host(_, (from, to)) => copies.iter().any(|w| w.from < *to && *from < w.to),
-            _ => false,
-        })
-    })
+    copied_reads(copies, runs, None).is_some()
 }
+
+/// Whether a copy done on the card that has not landed is refreshed through
+/// another host copy (`VICTORY_CARD_FORWARD=1`; off by default): the bytes
+/// are copied on the card from the host copy the copy wrote into the other
+/// one, in the list in front of the submission ([`Forward`]), and the
+/// submission does not wait for the copy's flight.
+///
+/// Why: in Leafy's run leafy-0314 such a refresh was the first reason
+/// submissions waited for flights in play, 68 ms a frame of a 225 ms frame
+/// (the fill at +0x50 that came first in the submission was named for it).
+///
+/// Why that is what the CPU would have read after the wait. The other
+/// host copy is brought up to date on the CPU while the submission is
+/// prepared, from title memory, where the copy is not yet. Our list runs
+/// after the copy's flight on the queue and before the submission's lists,
+/// and puts the copy's bytes over it; after the landing title memory holds
+/// the same bytes. Nothing is declared written there: what the CPU knows of
+/// the other host copy is older than what it holds, and its next refresh
+/// after the landing finds title memory changed and copies the same bytes,
+/// or finds nothing and leaves them. A later submission that refreshes it
+/// before the copy has landed gets the same done again. Not: a host copy in
+/// the card's memory (its CPU side goes up apart from our list), title
+/// memory in place, or a range shaders of a flight may be writing in the
+/// other host copy (the old wait).
+fn forward_on() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_CARD_FORWARD") {
+        return on;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_CARD_FORWARD"))
+}
+
+/// A copy of an earlier flight brought on the card from the host copy it
+/// wrote into another that the submission refreshes ([`forward_on`]):
+/// title memory `[at, end)`.
+pub(super) struct Forward {
+    from: Arc<Shadow>,
+    to: Arc<Shadow>,
+    at: usize,
+    end: usize,
+}
+
+/// What [`copied_reads`] found in the way: whether by a step that reads on
+/// the CPU, the span of the host copy the copy wrote, and the span of the
+/// one refreshed (none for a read on the CPU).
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct Seen {
+    host: bool,
+    copy: (u64, u64),
+    other: (u64, u64),
+}
+
+/// Why a submission is refused for [`Seen`].
+const REFRESHED: &str = "a copy done on the card is refreshed through another host copy";
+const READ_ON_CPU: &str = "a copy done on the card is read on the CPU by a step of ours (rectangle vertices)";
+
+impl Seen {
+    fn why(&self) -> &'static str {
+        if self.host { READ_ON_CPU } else { REFRESHED }
+    }
+
+    /// The same with both spans, once for each.
+    #[cfg(feature = "diagnostics")]
+    fn named(&self) -> &'static str {
+        static NAMED: Mutex<Option<std::collections::HashMap<Seen, &'static str>>> = Mutex::new(None);
+        let mut named = NAMED.lock().unwrap_or_else(|e| e.into_inner());
+        let named = named.get_or_insert_with(Default::default);
+        if let Some(why) = named.get(self) {
+            return why;
+        }
+        if named.len() >= 256 {
+            return self.why();
+        }
+        let (start, len) = self.copy;
+        let why = if self.host {
+            format!("{READ_ON_CPU}; the copy into {start:#x}+{len:#x}")
+        } else {
+            let (other, other_len) = self.other;
+            format!("{REFRESHED}; the copy into {start:#x}+{len:#x}, the one refreshed {other:#x}+{other_len:#x}")
+        };
+        let why: &'static str = Box::leak(why.into_boxed_str());
+        named.insert(*self, why);
+        why
+    }
+}
+
+/// [`copied_read`]: the first such read. With `forwards` a refresh that can
+/// be given the copy's bytes on the card ([`forward_on`]) is not one, and is
+/// added to them.
+fn copied_reads(copies: &[Writer], runs: &[&HostList], mut forwards: Option<&mut Vec<Forward>>) -> Option<Seen> {
+    if copies.is_empty() {
+        return None;
+    }
+    let span = |w: &Writer| w.shadow.as_ref().map_or((0, 0), |s| s.span());
+    for list in runs {
+        for step in list.deferred().copies.iter() {
+            match step {
+                Step::Refresh(shadow, at, len) => {
+                    for w in copies.iter().filter(|w| meet((w.from, w.to), (*at, *at + *len))) {
+                        if w.shadow.as_ref().is_some_and(|s| Arc::ptr_eq(s, shadow)) {
+                            continue;
+                        }
+                        let (start, size) = shadow.span();
+                        let (from, to) = (w.from.max(*at).max(start as usize), w.to.min(*at + *len).min((start + size) as usize));
+                        if let (Some(forwards), Some(copy)) = (forwards.as_deref_mut(), &w.shadow)
+                            && (from >= to || (!shadow.carded() && !shadow.in_place() && !shadow.writes_pending_in(from, to)))
+                        {
+                            if from < to {
+                                forwards.push(Forward {
+                                    from: copy.clone(),
+                                    to: shadow.clone(),
+                                    at: from,
+                                    end: to,
+                                });
+                            }
+                            continue;
+                        }
+                        return Some(Seen {
+                            host: false,
+                            copy: span(w),
+                            other: (start, size),
+                        });
+                    }
+                }
+                Step::Host(_, (from, to)) => {
+                    if let Some(w) = copies.iter().find(|w| meet((w.from, w.to), (*from, *to))) {
+                        return Some(Seen {
+                            host: true,
+                            copy: span(w),
+                            other: (0, 0),
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    None
+}
+
+/// Since the last frame-rate line: submissions refused for a copy done on
+/// the card refreshed through another host copy, for one read on the CPU;
+/// copies brought into another host copy ([`forward_on`]), their bytes.
+static COPIED: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
 /// What a step of a submission does to title memory, as the plan sees it.
 /// `asked`: flights in the air stop it from being done on the CPU now.
@@ -217,8 +382,9 @@ enum Does {
     Read { from: usize, to: usize, asked: bool },
     /// A refresh of a host copy (named by its address).
     Refresh { shadow: usize, from: usize, to: usize },
-    /// A copy that its list does on the card ([`place`]).
-    Placed { dst: usize, src: usize, len: usize },
+    /// A copy that its list does on the card ([`place`]). Its upload scratch
+    /// may still need source bytes from the CPU before that list is sent.
+    Placed { dst: usize, src: usize, len: usize, cpu_source_wait: bool },
     /// Anything, anywhere.
     Run,
 }
@@ -255,7 +421,21 @@ fn touched(ranges: &[(usize, usize)], r: (usize, usize)) -> bool {
 /// Steps of a level are done together, every read before every write; a
 /// step that writes what an earlier one reads or writes, or reads what it
 /// writes, is of a higher level. Our list does them level by level.
-fn plan(does: &[Does], stage: u32, by_order: bool, behind: &mut Option<(usize, usize)>) -> Result<Vec<(usize, u32)>, &'static str> {
+///
+/// With `serve` ([`placed_fills`]) also the taken fills behind a copy at its
+/// place that read only bytes it writes, as `(fill, copy)` in `served`: such
+/// a fill is left out of what is done in front of the lists and is in no
+/// copy's way. The copy is the last one ahead of the fill that writes any of
+/// its bytes, and nothing else behind the copy reads its bytes on the CPU.
+/// The caller leaves served fills to the CPU no more than taken ones.
+fn plan_with(
+    does: &[Does],
+    stage: u32,
+    by_order: bool,
+    serve: bool,
+    behind: &mut Option<(usize, usize)>,
+    served: &mut Vec<(usize, usize)>,
+) -> Result<Vec<(usize, u32)>, &'static str> {
     let takes = |d: &Does| match *d {
         Does::Copy { .. } if stage < 2 => Err("a buffer copy (VICTORY_CARD_STEPS=2 does it on the card)"),
         Does::Fill { to: false, .. } => Err("a fill of memory the card cannot be given the bytes of"),
@@ -267,6 +447,9 @@ fn plan(does: &[Does], stage: u32, by_order: bool, behind: &mut Option<(usize, u
     for (i, d) in does.iter().enumerate() {
         match *d {
             Does::Run => return Err("a step of ours runs"),
+            Does::Placed { cpu_source_wait: true, .. } => {
+                return Err("a placed copy's CPU source is still being written");
+            }
             Does::Read { asked: true, .. } => return Err("a texture reads it"),
             Does::Copy { asked: true, .. } | Does::Fill { asked: true, .. } => more.push(i),
             _ => {}
@@ -306,16 +489,24 @@ fn plan(does: &[Does], stage: u32, by_order: bool, behind: &mut Option<(usize, u
             }
         }
     }
+    let mut given = vec![false; does.len()];
+    if serve {
+        served_fills(does, &taken, served);
+        for &(i, _) in served.iter() {
+            given[i] = true;
+        }
+    }
     // A copy at its place in a list comes after what is done in front of all
     // of them: as it should after the steps ahead of it, but not after those
     // behind it that read or write its bytes.
     for (p, d) in does.iter().enumerate() {
-        if let Does::Placed { dst, src, len } = *d
+        if let Does::Placed { dst, src, len, .. } = *d
             && (touched(&read, (dst, dst + len)) || touched(&written, (dst, dst + len)) || touched(&written, (src, src + len)))
         {
             let (to, from) = ((dst, dst + len), (src, src + len));
             let in_the_way = |i: usize| {
-                reads_writes(&does[i]).is_some_and(|(r, w)| meet(r, to) || w.0 < w.1 && (meet(w, to) || meet(w, from)))
+                !given[i]
+                    && reads_writes(&does[i]).is_some_and(|(r, w)| meet(r, to) || w.0 < w.1 && (meet(w, to) || meet(w, from)))
             };
             let found = (p + 1..does.len()).find(|&i| taken[i] && in_the_way(i));
             *behind = found.map(|i| (p, i));
@@ -324,7 +515,7 @@ fn plan(does: &[Does], stage: u32, by_order: bool, behind: &mut Option<(usize, u
             }
         }
     }
-    let order: Vec<usize> = (0..does.len()).filter(|&i| taken[i]).collect();
+    let order: Vec<usize> = (0..does.len()).filter(|&i| taken[i] && !given[i]).collect();
     // What stays on the CPU and reads what an earlier taken copy writes
     // would read it too early.
     let mut behind: Vec<(usize, usize)> = Vec::new();
@@ -378,6 +569,57 @@ fn plan(does: &[Does], stage: u32, by_order: bool, behind: &mut Option<(usize, u
     Ok(out)
 }
 
+/// For [`plan_with`]: the fills of `does` that are `taken` and read only bytes
+/// that the last copy at its place ahead of them writes, as `(fill, copy)`, in
+/// `served`. Not by a copy whose bytes something behind it that stays on the
+/// CPU reads (including another placed copy that may read from CPU memory):
+/// that reads title memory, where the copy's bytes are only after the flights
+/// have landed.
+fn served_fills(does: &[Does], taken: &[bool], served: &mut Vec<(usize, usize)>) {
+    // Each copy at its place: where it stands, what it writes, and whether it
+    // can serve. (One or two a submission, against thousands of fills.)
+    let placed: Vec<(usize, (usize, usize), bool)> = does
+        .iter()
+        .enumerate()
+        .filter_map(|(p, d)| match *d {
+            Does::Placed { dst, len, .. } => Some((p, (dst, dst + len))),
+            _ => None,
+        })
+        .map(|(p, to)| {
+            let read_on_cpu = does.iter().enumerate().skip(p + 1).any(|(i, d)| {
+                !taken[i]
+                    && match *d {
+                        Does::Read { from, to: end, .. } => meet((from, end), to),
+                        Does::Placed { src, len: n, .. } => meet((src, src + n), to),
+                        _ => reads_writes(d).is_some_and(|(r, _)| meet(r, to)),
+                    }
+            });
+            (p, to, !read_on_cpu)
+        })
+        .collect();
+    if !placed.iter().any(|&(.., can)| can) {
+        return;
+    }
+    for (i, d) in does.iter().enumerate() {
+        let Does::Fill { src, len, .. } = *d else {
+            continue;
+        };
+        let reads = (src, src + len);
+        if !taken[i] || len == 0 {
+            continue;
+        }
+        // The last copy at its place ahead of it that writes any of its
+        // bytes; one that cannot serve leaves it where it was.
+        let last = placed.iter().rev().find(|&&(p, to, _)| p < i && meet(to, reads));
+        if let Some(&(p, to, true)) = last
+            && to.0 <= reads.0
+            && reads.1 <= to.1
+        {
+            served.push((i, p));
+        }
+    }
+}
+
 /// Whether a refresh of `does` brings a host copy other than `shadow` up to
 /// date in `[from, to)`.
 fn elsewhere(does: &[Does], shadow: usize, from: usize, to: usize) -> bool {
@@ -404,7 +646,7 @@ fn holder(writers: &[Writer], from: usize, to: usize) -> Result<Arc<Shadow>, &'s
         None => crate::shadow::find(from as u64, (to - from) as u64).ok_or("no host copy of it")?,
     };
     let (start, len) = shadow.span();
-    if shadow.in_place() || (from as u64) < start || to as u64 > start + len {
+    if (shadow.in_place() && !in_place_held()) || (from as u64) < start || to as u64 > start + len {
         return Err("no host copy holds all of it");
     }
     Ok(shadow)
@@ -417,7 +659,9 @@ fn does_of(written: &[(usize, usize)], runs: &[&HostList]) -> (Vec<Does>, Vec<(u
     // Which step each is. One list's lock at a time: a submission may
     // name a list twice.
     let mut steps = Vec::new();
-    for list in runs {
+    // Fills that take a copy's bytes are not stopped by flights.
+    let forwards = place::forwards(written, runs);
+    for (n, list) in runs.iter().enumerate() {
         for (i, step) in list.deferred().copies.iter().enumerate() {
             does.push(match step {
                 &Step::Copy(dst, src, len) => Does::Copy {
@@ -429,7 +673,7 @@ fn does_of(written: &[(usize, usize)], runs: &[&HostList]) -> (Vec<Does>, Vec<(u
                 Step::Fill(_, src, len, to) => Does::Fill {
                     src: *src,
                     len: *len,
-                    asked: read_blocked(written, *src, *len),
+                    asked: read_blocked(written, *src, *len) && !place::forwarded(&forwards, n, i),
                     to: to.is_some(),
                 },
                 Step::Texture(staging) => {
@@ -447,8 +691,13 @@ fn does_of(written: &[(usize, usize)], runs: &[&HostList]) -> (Vec<Does>, Vec<(u
                     to: *at + *len,
                 },
                 Step::Run(_) => Does::Run,
-                Step::Placed(p) => Does::Placed { dst: p.dst, src: p.src, len: p.len },
-                Step::GpuWrite(..) | Step::Host(..) => continue,
+                Step::Placed(p) => Does::Placed {
+                    dst: p.dst,
+                    src: p.src,
+                    len: p.len,
+                    cpu_source_wait: matches!(p.waits(written), place::Waits::Yes),
+                },
+                Step::GpuWrite(..) | Step::Host(..) | Step::Checked(_) => continue,
             });
             steps.push((std::ptr::from_ref::<HostList>(list) as usize, i));
         }
@@ -461,7 +710,7 @@ fn does_of(written: &[(usize, usize)], runs: &[&HostList]) -> (Vec<Does>, Vec<(u
 /// list ([`BEHIND_PLACED`]) is done on the card in front of a submission of
 /// its own, behind that copy.
 pub(super) fn cut_for(runs: &[&HostList]) -> Option<usize> {
-    if stage() == 0 || !relay_exact() || !placed_order() || runs.len() < 2 {
+    if stage() == 0 || !relay_exact() || !(placed_order() || placed_fills()) || runs.len() < 2 {
         return None;
     }
     // (Most submissions have none.)
@@ -469,11 +718,11 @@ pub(super) fn cut_for(runs: &[&HostList]) -> Option<usize> {
     if first + 1 == runs.len() {
         return None;
     }
-    let written = line().written.clone();
+    let written = line().blocking().clone();
     blocked_by(&written, runs, false)?;
     let (does, steps) = does_of(&written, runs);
     let mut behind = None;
-    if plan(&does, stage(), true, &mut behind) != Err(BEHIND_PLACED) {
+    if plan_with(&does, stage(), true, placed_fills(), &mut behind, &mut Vec::new()) != Err(BEHIND_PLACED) {
         return None;
     }
     let (placed, reader) = behind?;
@@ -510,6 +759,68 @@ fn fill_to(runs: &[&HostList], step: (usize, usize)) -> Option<FillTo> {
         Step::Fill(_, _, _, to) => to.clone(),
         _ => None,
     }
+}
+
+/// A fill's slot made to show a copy at its place's bytes ([`placed_fills`]):
+/// the slot (title heap, slot), the host copy the copy writes, and the card
+/// address and bytes of the fill's part of it.
+struct Shown {
+    heap: usize,
+    index: u32,
+    shadow: Arc<Shadow>,
+    gpu: u64,
+    len: u32,
+}
+
+/// Since the last frame-rate line: fills shown a copy at its place's bytes.
+static SERVED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// For [`Host::take_steps`]: where each fill of `served` (fill, copy at its
+/// place, by place in `does` and `steps`) is shown its bytes. Refused unless
+/// every one can be: the fill has a slot of its own (not a buffer, which
+/// our list would have to fill at the copy's place); flights in the air do
+/// not hold the copy up (it would take a source on the CPU they may write:
+/// [`place::Placed::waits`]); the card address is one a constant buffer view
+/// may start at, and the view's bytes lie in the host copy's buffer.
+fn show_placed(
+    written: &[(usize, usize)],
+    runs: &[&HostList],
+    does: &[Does],
+    steps: &[(usize, usize)],
+    served: &[(usize, usize)],
+) -> Result<Vec<Shown>, &'static str> {
+    // A constant buffer view starts at a multiple of 256 bytes and covers a
+    // multiple of 256 bytes (`descriptor/host.rs` `constant_bytes`).
+    const ALIGN: u64 = 256;
+    let mut shown = Vec::with_capacity(served.len());
+    for &(i, p) in served {
+        let Does::Fill { src, len, .. } = does[i] else {
+            continue;
+        };
+        let slot = match fill_to(runs, steps[i]) {
+            Some(FillTo::Slot(heap, index)) => Some((heap, index)),
+            _ => None,
+        };
+        let placed = runs.iter().find(|l| std::ptr::from_ref::<HostList>(l) as usize == steps[p].0).and_then(|list| {
+            match list.deferred().copies.get(steps[p].1) {
+                Some(Step::Placed(placed)) => Some((placed.shadow.clone(), matches!(placed.waits(written), place::Waits::Yes))),
+                _ => None,
+            }
+        });
+        let view = (len as u64).min(64 << 10).next_multiple_of(ALIGN);
+        match (slot, placed) {
+            (Some((heap, index)), Some((shadow, false)))
+                if !shadow.in_place()
+                    && shadow.gpu(src as u64).is_multiple_of(ALIGN)
+                    && shadow.offset(src as u64) + view <= shadow.width() =>
+            {
+                let gpu = shadow.gpu(src as u64);
+                shown.push(Shown { heap, index, shadow, gpu, len: len as u32 });
+            }
+            _ => return Err("a fill behind a copy at its place cannot be shown that copy's bytes"),
+        }
+    }
+    Ok(shown)
 }
 
 /// A step done on the card.
@@ -621,12 +932,17 @@ pub(super) struct Taken {
     own: Own,
     steps: std::collections::HashSet<(usize, usize), std::hash::BuildHasherDefault<AddressHash>>,
     copied: Vec<(Arc<Shadow>, usize, usize)>,
+    /// Copies of earlier flights it brought into other host copies.
+    forwards: Vec<Forward>,
     /// The fills' places, lengths and places in the buffer between
     /// ([`late`]).
     sent: Vec<(usize, usize, u64)>,
     /// The fills of the submission done on the CPU: upload memory, place,
     /// length ([`late`]).
     cpu: Vec<(usize, usize, usize)>,
+    /// Those of them on learned pages, done when the card gets to the
+    /// submission ([`put_off`]).
+    put_off: Vec<(usize, usize, usize)>,
 }
 
 /// Places the title writes after the submission that reads them was sent.
@@ -657,27 +973,102 @@ pub(super) struct Taken {
 /// steps took: 88 ms a frame against 94 without the check, and 95 without card
 /// steps (the frame waits on the card; runs at one place, within their
 /// spread). `VICTORY_CARD_STEPS_LEARN=0`: not.
+///
+/// A page learned in loading stays learned (leafy-0314: 11 pages from 09:17
+/// on, three submissions a frame waiting on them, 137 ms). With
+/// `VICTORY_LEARN_FORGET=N` a submission refused for a learned page keeps
+/// what its fills there read when it was refused; once the wait is over that
+/// is compared with title memory, and a page found the same N times running
+/// is forgotten. A difference starts its count again. A forgotten page is
+/// back on the card, compared at landing, and learned again if it differs.
 mod late {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Mutex, OnceLock};
 
     const PAGE: usize = 4096;
 
-    static PAGES: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
+    /// Learned pages, and how many waits running each was found the same
+    /// after ([`waited`]).
+    static PAGES: Mutex<Option<std::collections::HashMap<usize, u32>>> = Mutex::new(None);
+    /// Pages forgotten ([`waited`]), for counting the ones learned again.
+    static FORGOTTEN: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
+    /// What the refused submission's fills of learned pages read (place,
+    /// bytes) when it was refused.
+    static HELD: Mutex<Vec<(usize, Vec<u8>)>> = Mutex::new(Vec::new());
     /// Fills done on the card compared, found written again, submissions
     /// refused for a learned page; pages learned in all; fills done on the CPU
-    /// compared, found written again.
-    pub(super) static COUNTS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+    /// compared, found written again; fills put off to the card's turn, and
+    /// the submissions with them ([`super::put_off`]); fills of learned pages
+    /// compared after a wait, found written; pages forgotten in all, learned
+    /// again in all.
+    pub(super) static COUNTS: [AtomicU64; 12] = [const { AtomicU64::new(0) }; 12];
 
     pub(super) fn on() -> bool {
         static ON: OnceLock<bool> = OnceLock::new();
         *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_STEPS_LEARN").is_none_or(|v| v != "0"))
     }
 
+    /// `VICTORY_LEARN_FORGET`: the waits a learned page is found the same
+    /// after before it is forgotten; 0 never.
+    pub(super) fn forget() -> u32 {
+        static N: OnceLock<u32> = OnceLock::new();
+        *N.get_or_init(|| std::env::var("VICTORY_LEARN_FORGET").ok().and_then(|v| v.parse().ok()).unwrap_or(0))
+    }
+
     /// Whether the title was found writing a page of `[from, to)` late.
     pub(super) fn written(from: usize, to: usize) -> bool {
         let pages = PAGES.lock().unwrap_or_else(|e| e.into_inner());
-        pages.as_ref().is_some_and(|p| (from / PAGE..to.div_ceil(PAGE)).any(|page| p.contains(&page)))
+        pages.as_ref().is_some_and(|p| (from / PAGE..to.div_ceil(PAGE)).any(|page| p.contains_key(&page)))
+    }
+
+    /// A submission is refused for a learned page: what its fill of
+    /// `[src, src + len)` reads now is kept for [`waited`].
+    pub(super) fn hold(src: usize, len: usize) {
+        let mut now = vec![0; len];
+        if crate::host::read_into(src as *const u8, &mut now) {
+            HELD.lock().unwrap_or_else(|e| e.into_inner()).push((src, now));
+        }
+    }
+
+    /// The refused submission's wait is over (`waited`), or it did not wait:
+    /// what [`hold`] kept compared with title memory now.
+    pub(super) fn waited(waited: bool) {
+        let held = std::mem::take(&mut *HELD.lock().unwrap_or_else(|e| e.into_inner()));
+        if !waited || held.is_empty() {
+            return;
+        }
+        let n = forget();
+        let mut now = Vec::new();
+        let mut pages = PAGES.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(pages) = pages.as_mut() else { return };
+        for (src, then) in held {
+            now.clear();
+            now.resize(then.len(), 0);
+            if !crate::host::read_into(src as *const u8, &mut now) {
+                continue;
+            }
+            COUNTS[8].fetch_add(1, Ordering::Relaxed);
+            let same = now == then;
+            if !same {
+                COUNTS[9].fetch_add(1, Ordering::Relaxed);
+            }
+            for page in src / PAGE..(src + then.len()).div_ceil(PAGE) {
+                let Some(clean) = pages.get_mut(&page) else { continue };
+                *clean = if same { *clean + 1 } else { 0 };
+                if *clean < n {
+                    continue;
+                }
+                pages.remove(&page);
+                FORGOTTEN.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).insert(page);
+                COUNTS[10].fetch_add(1, Ordering::Relaxed);
+                tracing::info!(
+                    page = format_args!("{:#x}", page * PAGE),
+                    fill = format_args!("{src:#x}+{:#x}", then.len()),
+                    "card steps: a learned page was found the same after {n} waits running (VICTORY_LEARN_FORGET); \
+                     fills there go on the card again"
+                );
+            }
+        }
     }
 
     /// The submission has landed: what the fills of `sent` (place, length,
@@ -744,12 +1135,18 @@ mod late {
         let mut pages = PAGES.lock().unwrap_or_else(|e| e.into_inner());
         let pages = pages.get_or_insert_with(Default::default);
         for page in from / PAGE..to.div_ceil(PAGE) {
-            if pages.insert(page) {
+            if pages.insert(page, 0).is_none() {
                 COUNTS[3].fetch_add(1, Ordering::Relaxed);
+                let mut forgotten = FORGOTTEN.lock().unwrap_or_else(|e| e.into_inner());
+                let again = forgotten.as_mut().is_some_and(|f| f.remove(&page));
+                if again {
+                    COUNTS[11].fetch_add(1, Ordering::Relaxed);
+                }
                 tracing::info!(
                     page = format_args!("{:#x}", page * PAGE),
                     fill = format_args!("{from:#x}+{:#x}", to - from),
                     by,
+                    again,
                     "card steps: the title wrote a constant buffer after the submission that reads it was sent; fills \
                      there wait from now on"
                 );
@@ -761,6 +1158,146 @@ mod late {
 /// Why a submission is refused for [`late`].
 const WRITTEN_LATE: &str = "a fill reads a place the title was found writing after sending";
 
+/// `VICTORY_LATE_FILLS=1`: a submission with fills on learned pages
+/// ([`late`]) is not refused when those fills read nothing a flight writes
+/// and none is done on the card. The CPU leaves them out when it prepares the
+/// submission; the card waits on a fence of ours before running it, and a
+/// thread of ours does them and signals that fence once the card has run
+/// everything sent before. So they read title memory when the card gets to
+/// the submission, as on the console, and the rest of it no longer waits.
+///
+/// In Leafy's 9-minute run (game 300-480 s) every submission that waited
+/// (3 a frame, 130-146 ms) waited for this, with the card idle behind us
+/// 31-48 ms a frame.
+pub(super) mod put_off {
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Condvar, Mutex, OnceLock};
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Graphics::Direct3D12::{D3D12_FENCE_FLAG_NONE, ID3D12Device, ID3D12Fence};
+    use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
+
+    pub(in super::super) fn on() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("VICTORY_LATE_FILLS").is_some_and(|v| v == "1"))
+    }
+
+    struct Fence(ID3D12Fence);
+    // SAFETY: D3D12 fences are free-threaded.
+    unsafe impl Send for Fence {}
+    unsafe impl Sync for Fence {}
+
+    struct Job {
+        card: Fence,
+        after: u64,
+        fills: Vec<(usize, usize, usize)>,
+        value: u64,
+    }
+
+    static JOBS: Mutex<VecDeque<Job>> = Mutex::new(VecDeque::new());
+    static MOVED: Condvar = Condvar::new();
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+
+    fn ours(device: &ID3D12Device) -> Option<&'static Fence> {
+        static OURS: OnceLock<Option<Fence>> = OnceLock::new();
+        OURS.get_or_init(|| {
+            // SAFETY: a plain fence of our own.
+            let fence = Fence(unsafe { device.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE) }.ok()?);
+            let signals = Fence(fence.0.clone());
+            if let Err(e) = std::thread::Builder::new().name("victory-late-fills".into()).spawn(move || worker(signals)) {
+                tracing::warn!(error = %e, "no thread for fills put off to the card's turn: they are done when prepared");
+                return None;
+            }
+            tracing::info!("fills on learned pages are done when the card gets to their submission (VICTORY_LATE_FILLS=1)");
+            Some(fence)
+        })
+        .as_ref()
+    }
+
+    /// The fills `fills` (upload memory, place, length) of the submission
+    /// sent after `card` reaches `after`: the fence and value the queue is to
+    /// wait for before it. `None`: done now.
+    pub(in super::super) fn send(
+        device: &ID3D12Device,
+        card: &ID3D12Fence,
+        after: u64,
+        fills: Vec<(usize, usize, usize)>,
+    ) -> Option<(ID3D12Fence, u64)> {
+        let Some(fence) = ours(device) else {
+            for &(dst, src, len) in &fills {
+                crate::host::copy_mapped(dst as *mut u8, src as *const u8, len, false);
+            }
+            return None;
+        };
+        super::late::COUNTS[6].fetch_add(fills.len() as u64, Ordering::Relaxed);
+        super::late::COUNTS[7].fetch_add(1, Ordering::Relaxed);
+        let value = NEXT.fetch_add(1, Ordering::Relaxed) + 1;
+        JOBS.lock().unwrap_or_else(|e| e.into_inner()).push_back(Job {
+            card: Fence(card.clone()),
+            after,
+            fills,
+            value,
+        });
+        MOVED.notify_one();
+        Some((fence.0.clone(), value))
+    }
+
+    fn worker(signals: Fence) {
+        crate::cores::keep_on_fast_cores("victory-late-fills");
+        // SAFETY: a plain event of our own.
+        let event: Option<HANDLE> = unsafe { CreateEventW(None, false, false, None) }.ok();
+        loop {
+            let job = {
+                let mut jobs = JOBS.lock().unwrap_or_else(|e| e.into_inner());
+                loop {
+                    if let Some(job) = jobs.pop_front() {
+                        break job;
+                    }
+                    jobs = MOVED.wait(jobs).unwrap_or_else(|e| e.into_inner());
+                }
+            };
+            // SAFETY: live fences and our event. (A removed device reads
+            // every value as reached.)
+            unsafe {
+                if job.card.0.GetCompletedValue() < job.after {
+                    match event {
+                        Some(event) if job.card.0.SetEventOnCompletion(job.after, event).is_ok() => {
+                            WaitForSingleObject(event, INFINITE);
+                        }
+                        _ => {
+                            while job.card.0.GetCompletedValue() < job.after {
+                                std::thread::yield_now();
+                            }
+                        }
+                    }
+                }
+            }
+            let fills = std::panic::AssertUnwindSafe(&job.fills);
+            let done = std::panic::catch_unwind(|| {
+                for &(dst, src, len) in fills.iter() {
+                    crate::host::copy_mapped(dst as *mut u8, src as *const u8, len, false);
+                }
+            });
+            if done.is_err() {
+                tracing::warn!("a fill put off to the card's turn failed: the card runs its submission anyway");
+            }
+            // (Write-combined upload memory: out to memory before the card is
+            // let go.)
+            std::sync::atomic::fence(Ordering::SeqCst);
+            // SAFETY: our fence. Always signalled: the queue waits for it.
+            let _ = unsafe { signals.0.Signal(job.value) };
+        }
+    }
+}
+
+/// The submission [`Host::card_steps`] gave nothing for is past its wait
+/// for flights (`waited`), or did not wait ([`late`]).
+pub(super) fn waited(waited: bool) {
+    if late::on() && late::forget() > 0 {
+        late::waited(waited);
+    }
+}
+
 impl Taken {
     pub(super) fn list(&self) -> &HostList {
         &self.own.list
@@ -769,6 +1306,11 @@ impl Taken {
     /// Whether step `i` of `list` is done by this.
     pub(super) fn takes(&self, list: &HostList, i: usize) -> bool {
         self.steps.contains(&(std::ptr::from_ref(list) as usize, i))
+    }
+
+    /// The fills done when the card gets to the submission ([`put_off`]).
+    pub(super) fn put_off(&self) -> Vec<(usize, usize, usize)> {
+        self.put_off.clone()
     }
 
     fn copied(&self) -> impl Iterator<Item = Writer> {
@@ -804,44 +1346,77 @@ impl Host {
         }
         let (written, copies) = {
             let line = line();
-            if line.written.is_empty() {
+            if line.blocking().is_empty() {
                 return None;
             }
-            (line.written.clone(), copies(&line))
+            (line.blocking().clone(), copies(&line))
         };
-        blocked_by(&written, runs, false)?;
-        let taken = if copied_read(&copies, runs) {
-            Err("a copy done on the card is read through another host copy")
-        } else {
-            self.take_steps(&written, runs)
+        let blocked = blocked_by(&written, runs, false).is_some();
+        let mut forwards = Vec::new();
+        let seen = copied_reads(&copies, runs, forward_on().then_some(&mut forwards));
+        if let Some(seen) = seen {
+            COPIED[usize::from(seen.host)].fetch_add(1, Ordering::Relaxed);
+        }
+        if !blocked && seen.is_none() && forwards.is_empty() {
+            return None;
+        }
+        let taken = match seen {
+            Some(seen) => Err(seen.why()),
+            None => self.take_steps(&written, runs, forwards),
         };
         match taken {
             Ok(taken) => taken,
             Err(why) => {
                 DONE[3].fetch_add(1, Ordering::Relaxed);
                 #[cfg(feature = "diagnostics")]
-                refused(why);
+                refused(seen.map_or(why, |seen| seen.named()));
                 let _ = why;
                 None
             }
         }
     }
 
-    fn take_steps(&self, written: &[(usize, usize)], runs: &[&HostList]) -> Result<Option<Taken>, &'static str> {
+    fn take_steps(&self, written: &[(usize, usize)], runs: &[&HostList], forwards: Vec<Forward>) -> Result<Option<Taken>, &'static str> {
         let mut spent = crate::timeline::span("steps on the card: chosen");
         let (does, steps) = does_of(written, runs);
-        let chosen = plan(&does, stage(), placed_order(), &mut None)?;
+        let serve = placed_fills();
+        let mut served = Vec::new();
+        let chosen = plan_with(&does, stage(), placed_order() || serve, serve, &mut None, &mut served)?;
         // Every fill of the submission, taken or not: one done on the CPU is
         // done now too, not after the wait ([`late`]).
-        if late::on()
-            && does.iter().any(|d| matches!(*d, Does::Fill { src, len, .. } if late::written(src, src + len)))
+        let mut learned = Vec::new();
+        if late::on() {
+            learned = (0..does.len())
+                .filter(|&i| matches!(does[i], Does::Fill { src, len, .. } if late::written(src, src + len)))
+                .collect();
+        }
+        // ([`put_off`]: unless one is read on the card, or reads what a flight
+        // writes.)
+        if !learned.is_empty()
+            && (!put_off::on()
+                || learned.iter().any(|&i| {
+                    matches!(does[i], Does::Fill { asked: true, .. }) || chosen.iter().any(|&(c, _)| c == i)
+                }))
         {
             late::COUNTS[2].fetch_add(1, Ordering::Relaxed);
+            if late::forget() > 0 {
+                for d in &does {
+                    if let Does::Fill { src, len, .. } = *d
+                        && late::written(src, src + len)
+                    {
+                        late::hold(src, len);
+                    }
+                }
+            }
             return Err(WRITTEN_LATE);
         }
-        if chosen.is_empty() {
+        if chosen.is_empty() && forwards.is_empty() && served.is_empty() {
             return Ok(None);
         }
+        // The fills given a copy at its place's bytes: the slot, and where in
+        // that copy's host copy on the card they are. Checked before anything
+        // is recorded or written.
+        let shown = show_placed(written, runs, &does, &steps, &served)?;
         spent.next("steps on the card: what holds their bytes");
         let mut writers = {
             let line = line();
@@ -929,6 +1504,17 @@ impl Host {
                 to,
             });
         }
+        // Copies of earlier flights brought into another host copy
+        // ([`forward_on`]): their places in the buffer between.
+        let mut forwarded = Vec::with_capacity(forwards.len());
+        for f in &forwards {
+            let len = (f.end - f.at) as u64;
+            if end + len > BETWEEN {
+                return Err("too much at once");
+            }
+            forwarded.push(end);
+            end = (end + len).next_multiple_of(256);
+        }
         spent.next("steps on the card: the list");
         let Some(own) = self.own_list() else {
             return Err("no host list or buffer for it");
@@ -962,11 +1548,30 @@ impl Host {
             }
         }
         #[cfg(feature = "diagnostics")]
-        own.list.note_op(|| format!("{} copies of title memory done on the card, {end} bytes (VICTORY_CARD_STEPS)", ops.len()));
-        let levels = ops.iter().map(|op| op.level).max().unwrap_or(0);
-        for level in 0..=levels {
+        own.list.note_op(|| {
+            format!(
+                "{} copies of title memory done on the card and {} brought into other host copies, {end} bytes (VICTORY_CARD_STEPS)",
+                ops.len(),
+                forwards.len()
+            )
+        });
+        // (No level when every taken fill is shown a copy at its place and
+        // nothing is forwarded: our list then goes to the card empty.)
+        let levels = if ops.is_empty() && forwards.is_empty() && !shown.is_empty() {
+            0
+        } else {
+            ops.iter().map(|op| op.level).max().unwrap_or(0) + 1
+        };
+        for level in 0..levels {
             let mut reads = Vec::new();
             let mut writes = Vec::new();
+            // Those first: what the submission's copies write over them
+            // comes after.
+            for (f, &at) in forwards.iter().zip(&forwarded).filter(|_| level == 0) {
+                let len = (f.end - f.at) as u64;
+                reads.push((&f.from.buffer, f.from.offset(f.at as u64), at, len));
+                writes.push((&f.to.buffer, f.to.offset(f.at as u64), at, len));
+            }
             for op in ops.iter().filter(|op| op.level == level) {
                 let len = op.len as u64;
                 let read = (&op.from.0.buffer, op.from.0.offset(op.from.1 as u64), op.at, len);
@@ -1018,18 +1623,27 @@ impl Host {
                 }
             }
         });
+        for s in &shown {
+            crate::descriptor::constant_slot(s.heap, s.index, &s.shadow.buffer, s.gpu, s.len);
+        }
         let copies = ops.iter().filter(|op| matches!(op.to, To::Copy(..))).count();
         DONE[0].fetch_add((ops.len() - copies) as u64, Ordering::Relaxed);
         DONE[1].fetch_add(copies as u64, Ordering::Relaxed);
         DONE[2].fetch_add(ops.iter().map(|op| op.len as u64).sum(), Ordering::Relaxed);
+        COPIED[2].fetch_add(forwards.len() as u64, Ordering::Relaxed);
+        COPIED[3].fetch_add(forwards.iter().map(|f| (f.end - f.at) as u64).sum(), Ordering::Relaxed);
+        SERVED.fetch_add(shown.len() as u64, Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
         noted(&ops);
         spent.end();
+        let put_off: std::collections::HashSet<(usize, usize), std::hash::BuildHasherDefault<AddressHash>> =
+            learned.iter().map(|&i| steps[i]).collect();
         let steps: std::collections::HashSet<(usize, usize), std::hash::BuildHasherDefault<AddressHash>> =
-            chosen.iter().map(|&(i, _)| steps[i]).collect();
+            chosen.iter().map(|&(i, _)| steps[i]).chain(served.iter().map(|&(i, _)| steps[i])).collect();
         // The fills left to the CPU: done when the submission is prepared,
         // now, into upload memory that holds them until its lists are reset.
         let mut cpu = Vec::new();
+        let mut later = Vec::new();
         if late::on() {
             for list in runs {
                 let at = std::ptr::from_ref::<HostList>(list) as usize;
@@ -1038,16 +1652,23 @@ impl Host {
                         && !steps.contains(&(at, i))
                     {
                         cpu.push((dst, src, len));
+                        if put_off.contains(&(at, i)) {
+                            later.push((dst, src, len));
+                        }
                     }
                 }
             }
         }
+        let mut steps = steps;
+        steps.extend(put_off);
         Ok(Some(Taken {
             own,
             steps,
             copied,
+            forwards,
             sent,
             cpu,
+            put_off: later,
         }))
     }
 
@@ -1104,23 +1725,54 @@ pub(super) fn log(frames: f64) {
         d[3],
         d[4],
     );
+    let c: Vec<f64> = COPIED.iter().map(|c| c.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+    if stage() >= 2 {
+        tracing::info!(
+            "card steps, copies done on the card read before they landed, per frame (VICTORY_CARD_FORWARD={}): {:.2}              submissions refused for a refresh of another host copy, {:.2} for a read on the CPU; {:.2} brought into the              other host copy on the card, {:.1} KB",
+            u8::from(forward_on()),
+            c[0],
+            c[1],
+            c[2],
+            c[3] / 1024.0,
+        );
+    }
     if late::on() {
         // (Index 3 counts in all, the others since the last line.)
         let c: Vec<f64> = late::COUNTS
             .iter()
             .enumerate()
-            .map(|(i, c)| if i == 3 { 0.0 } else { c.swap(0, Ordering::Relaxed) as f64 / frames })
+            .map(|(i, c)| if matches!(i, 3 | 10 | 11) { 0.0 } else { c.swap(0, Ordering::Relaxed) as f64 / frames })
             .collect();
         tracing::info!(
             "card steps, places the title writes after sending (VICTORY_CARD_STEPS_LEARN), per frame: {:.1} fills on the card \
              and {:.1} on the CPU compared at landing, {:.2} and {:.2} found written again, {:.2} submissions waited for a \
-             learned page; {} pages learned",
+             learned page; {} pages learned; {:.1} fills in {:.2} submissions done when the card got to them \
+             (VICTORY_LATE_FILLS)",
             c[0],
             c[4],
             c[1],
             c[5],
             c[2],
-            late::COUNTS[3].load(Ordering::Relaxed)
+            late::COUNTS[3].load(Ordering::Relaxed),
+            c[6],
+            c[7]
+        );
+        if late::forget() > 0 {
+            tracing::info!(
+                "card steps, learned pages let go (VICTORY_LEARN_FORGET={}), per frame: {:.2} fills of learned pages \
+                 compared after their wait, {:.2} found written; in all {} pages forgotten, {} learned again",
+                late::forget(),
+                c[8],
+                c[9],
+                late::COUNTS[10].load(Ordering::Relaxed),
+                late::COUNTS[11].load(Ordering::Relaxed)
+            );
+        }
+    }
+    let served = SERVED.swap(0, Ordering::Relaxed) as f64 / frames;
+    if placed_fills() {
+        tracing::info!(
+            "fills behind a copy at its place shown that copy's bytes on the card, per frame (VICTORY_PLACED_FILLS=1): {served:.2}"
         );
     }
     #[cfg(feature = "diagnostics")]
@@ -1160,6 +1812,11 @@ mod tests {
 
     fn stuck(src: usize, len: usize) -> Does {
         Does::Fill { src, len, asked: false, to: false }
+    }
+
+    /// [`plan_with`] without fills served by copies at their place.
+    fn plan(does: &[Does], stage: u32, by_order: bool, behind: &mut Option<(usize, usize)>) -> Result<Vec<(usize, u32)>, &'static str> {
+        plan_with(does, stage, by_order, false, behind, &mut Vec::new())
     }
 
     /// What is done on the card, as (place, level), in stage 2.
@@ -1271,11 +1928,37 @@ mod tests {
         assert_eq!(planned(&[copy(7000, 5000, 10, false), taken]), [(1, 0)]);
     }
 
+    /// A placed copy recorded before its source's first GPU writer has
+    /// upload scratch, even if an earlier submission later writes that source.
+    #[test]
+    fn a_pending_cpu_source_keeps_its_wait_with_gpu_fills() {
+        let placed = Does::Placed { dst: 2000, src: 3000, len: 64, cpu_source_wait: true };
+        for source in [9000, 2000] {
+            let fill = Does::Fill { src: source, len: 64, asked: true, to: true };
+            for by_order in [true, false] {
+                assert_eq!(
+                    plan(&[fill, placed], 2, by_order, &mut None),
+                    Err("a placed copy's CPU source is still being written"),
+                );
+            }
+        }
+    }
+
+    /// GPU-source copies, and CPU sources that have already landed, retain
+    /// the ordered forwarding path rather than forcing every placed copy to wait.
+    #[test]
+    fn an_available_placed_source_keeps_gpu_forwarding() {
+        let placed = Does::Placed { dst: 2000, src: 3000, len: 64, cpu_source_wait: false };
+        let fill = Does::Fill { src: 2000, len: 64, asked: true, to: true };
+        assert_eq!(plan(&[fill, placed], 2, true, &mut None), Ok(vec![(0, 0)]));
+        assert_eq!(plan(&[placed, fill], 2, true, &mut None), Err(BEHIND_PLACED));
+    }
+
     /// A copy at its place in a list is in the way of what reads or writes its
     /// bytes behind it, not of what did ahead of it.
     #[test]
     fn copies_at_their_place_stand_in_the_way_of_what_is_behind_them() {
-        let placed = Does::Placed { dst: 2000, src: 3000, len: 64 };
+        let placed = Does::Placed { dst: 2000, src: 3000, len: 64, cpu_source_wait: false };
         let behind = |does: &[Does]| {
             let mut found = None;
             let refused = plan(does, 2, true, &mut found);
@@ -1292,6 +1975,44 @@ mod tests {
         assert_eq!(behind(&[placed, copy(3000, 5000, 8, true)]), Some((0, 1)));
         assert_eq!(behind(&[copy(2060, 5000, 8, true), placed]), None);
         assert_eq!(behind(&[placed, copy(2060, 5000, 8, true)]), Some((0, 1)));
+    }
+
+    /// With `VICTORY_PLACED_FILLS`: (what is done in front, fills served by a
+    /// copy at its place), or why not.
+    fn serving(does: &[Does]) -> Result<(Vec<(usize, u32)>, Vec<(usize, usize)>), &'static str> {
+        let mut served = Vec::new();
+        plan_with(does, 2, true, true, &mut None, &mut served).map(|chosen| (chosen, served))
+    }
+
+    /// A fill behind a copy at its place that reads only what the copy writes
+    /// is given the copy's bytes and stands in nobody's way; anything else
+    /// behind the copy that touches its bytes refuses as before.
+    #[test]
+    fn fills_behind_a_copy_at_its_place_are_shown_its_bytes() {
+        let placed = Does::Placed { dst: 2000, src: 3000, len: 64, cpu_source_wait: false };
+        // Inside it, at its ends, and twice.
+        assert_eq!(serving(&[placed, fill(2032, 32, true)]), Ok((vec![], vec![(1, 0)])));
+        assert_eq!(serving(&[placed, fill(2000, 64, true), fill(2000, 8, true)]), Ok((vec![], vec![(1, 0), (2, 0)])));
+        // Beside it, the others are still done in front; ahead of it, it
+        // reads what was there before.
+        assert_eq!(serving(&[placed, fill(2000, 8, true), fill(5000, 8, true)]), Ok((vec![(2, 0)], vec![(1, 0)])));
+        assert_eq!(serving(&[fill(2000, 8, true), placed]), Ok((vec![(0, 0)], vec![])));
+        // Without the switch, refused as before.
+        assert_eq!(plan(&[placed, fill(2032, 32, true)], 2, true, &mut None), Err(BEHIND_PLACED));
+        // Past its end: part of it is not the copy's.
+        assert_eq!(serving(&[placed, fill(2032, 64, true)]), Err(BEHIND_PLACED));
+        // A later copy at its place over part of it decides, and does not
+        // hold all of it.
+        let over = Does::Placed { dst: 2040, src: 4000, len: 8, cpu_source_wait: false };
+        assert_eq!(serving(&[placed, over, fill(2000, 64, true)]), Err(BEHIND_PLACED));
+        assert_eq!(serving(&[placed, over, fill(2040, 8, true)]), Ok((vec![], vec![(2, 1)])));
+        // Something behind it reads its bytes on the CPU: title memory, where
+        // they are only once the flights have landed.
+        assert_eq!(serving(&[placed, fill(2000, 8, true), Does::Read { from: 2010, to: 2012, asked: false }]), Err(BEHIND_PLACED));
+        assert_eq!(serving(&[placed, fill(2000, 8, true), fill(2050, 4, false)]), Err(BEHIND_PLACED));
+        assert_eq!(serving(&[placed, fill(2000, 8, true), Does::Placed { dst: 6000, src: 2010, len: 8, cpu_source_wait: false }]), Err(BEHIND_PLACED));
+        // A copy behind it in its way still refuses.
+        assert_eq!(serving(&[placed, fill(2000, 8, true), copy(2000, 5000, 8, true)]), Err(BEHIND_PLACED));
     }
 
     /// Whatever the steps, done level by level (in a level every read

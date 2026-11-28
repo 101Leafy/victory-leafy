@@ -115,7 +115,26 @@ pub(crate) mod stat {
     pub(crate) const HAD_BYTES: usize = 24;
     /// Jobs.
     pub(crate) const JOBS: usize = 25;
-    pub(crate) const COUNT: usize = 26;
+    /// Parts of [`READ_BACKS`]: textures shaders wrote that the title reads
+    /// (`texback::land`), buffer read-backs (map and copy into title memory),
+    /// and the flight's card plan and own work told done.
+    pub(crate) const RB_TEXTURES: usize = 26;
+    pub(crate) const RB_BUFFERS: usize = 27;
+    pub(crate) const RB_DONE: usize = 28;
+    /// Counts for those: texture read-backs landed, buffer read-backs and
+    /// their bytes.
+    pub(crate) const RB_TEXTURE_COUNT: usize = 29;
+    pub(crate) const RB_BUFFER_COUNT: usize = 30;
+    pub(crate) const RB_BUFFER_BYTES: usize = 31;
+    /// Writing texture read-backs into title memory (`texback::write`, on
+    /// its own thread unless `VICTORY_TEXBACK_ASYNC=0`): waiting for the
+    /// locks against mapping changes, the work after, read-backs written,
+    /// and those replaced by a newer one before they were.
+    pub(crate) const TB_WAIT: usize = 32;
+    pub(crate) const TB_WORK: usize = 33;
+    pub(crate) const TB_WRITTEN: usize = 34;
+    pub(crate) const TB_REPLACED: usize = 35;
+    pub(crate) const COUNT: usize = 36;
 }
 
 static STATS: [AtomicU64; stat::COUNT] = [const { AtomicU64::new(0) }; stat::COUNT];
@@ -172,6 +191,25 @@ pub(crate) fn log(frames: f64) {
         ms(stat::READ_BACKS),
         ms(stat::TOLD),
         ms(stat::REST),
+    );
+    tracing::info!(
+        "read-backs and lists per frame: textures shaders wrote {:.2} ms ({:.1} landed), buffer read-backs {:.2} ms \
+         ({:.1} of them, {:.2} MB), card plans and own work done {:.2} ms",
+        ms(stat::RB_TEXTURES),
+        s[stat::RB_TEXTURE_COUNT],
+        ms(stat::RB_BUFFERS),
+        s[stat::RB_BUFFER_COUNT],
+        mb(s[stat::RB_BUFFER_BYTES]),
+        ms(stat::RB_DONE),
+    );
+    tracing::info!(
+        "texture read-backs written per frame (VICTORY_TEXBACK_ASYNC={}): {:.1}, {:.1} replaced by a newer one first; \
+         waiting for the mapping locks {:.2} ms, tiling and writing {:.2} ms",
+        u8::from(std::env::var_os("VICTORY_TEXBACK_ASYNC").is_none_or(|v| v != "0")),
+        s[stat::TB_WRITTEN],
+        s[stat::TB_REPLACED],
+        ms(stat::TB_WAIT),
+        ms(stat::TB_WORK),
     );
     tracing::info!(
         "landed per frame: {:.0} pieces, {:.0} with a new byte; of their {:.0} pages of 4 KiB {:.0} with a new byte ({:.1} MB), \
@@ -251,6 +289,8 @@ impl Pool {
     }
 
     fn help(&self) {
+        // (The thread that calls `each` waits for this one's share.)
+        let mut priority = crate::cores::Priority::new();
         let mut state = self.state();
         loop {
             let Some((work, i)) = take(&mut state) else {
@@ -263,6 +303,7 @@ impl Pool {
             // SAFETY: counted in `running`, so `each` has not returned.
             let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { (*work.0)(i) }));
             working.end();
+            priority.keep();
             state = self.state();
             state.running -= 1;
             state.panicked |= ran.is_err();
@@ -301,6 +342,15 @@ impl Pool {
         let mut state = self.state();
         // (After a panic here: nothing more is begun.)
         state.work = None;
+        // Awake a little while for the helpers' last calls, if that is asked
+        // for (`crate::shadow::wait_spin`): no helper can begin another now,
+        // so `running` only falls; the wait below is the one that counts.
+        let most = crate::shadow::wait_spin();
+        if most > 0 && state.running > 0 {
+            drop(state);
+            crate::shadow::spin_for(most, || self.state.try_lock().is_ok_and(|state| state.running == 0));
+            state = self.state();
+        }
         while state.running > 0 {
             state = self.idle.wait(state).unwrap_or_else(|e| e.into_inner());
         }
@@ -570,6 +620,7 @@ pub(crate) unsafe fn piece(
 ///
 /// # Safety
 /// [`piece`]'s.
+#[allow(clippy::too_many_arguments)] // one call carries the piece's whole description
 unsafe fn piece_at(
     title: usize,
     now: *const u8,

@@ -63,6 +63,16 @@ pub fn use_pipeline_cache(dir: PathBuf) {
     let _ = DIR.set(dir);
 }
 
+/// Libraries of other folders, looked in when this run's own library has
+/// no pipeline by that name: `victory warm`'s processes look in the cache
+/// folder's library, so that what a run already keeps is not made again,
+/// and its last process in theirs, keeping what it finds (`keep`).
+static OTHER_DIRS: OnceLock<(Vec<PathBuf>, bool)> = OnceLock::new();
+
+pub fn use_other_libraries(dirs: Vec<PathBuf>, keep: bool) {
+    let _ = OTHER_DIRS.set((dirs, keep));
+}
+
 /// The folder the library is kept in.
 pub(super) fn folder() -> Option<PathBuf> {
     DIR.get().cloned()
@@ -73,8 +83,9 @@ pub(super) fn folder() -> Option<PathBuf> {
 /// driver compile once (each folder made the same 1,300 slow pipelines
 /// again, about 14 minutes). The early and slow lists stay per folder.
 /// Two runs that both save keep the last one's library: the host cannot
-/// list or merge another library's pipelines.
-fn library_dir() -> Option<PathBuf> {
+/// list or merge another library's pipelines. The list of static samplers
+/// the library was filled with goes beside it (`super::samplers`).
+pub(super) fn library_dir() -> Option<PathBuf> {
     static SHARED: OnceLock<Option<PathBuf>> = OnceLock::new();
     let shared = SHARED.get_or_init(|| std::env::var_os("VICTORY_LIBRARY_DIR").filter(|v| !v.is_empty()).map(PathBuf::from));
     shared.clone().or_else(folder)
@@ -99,9 +110,12 @@ fn writer(dir: &std::path::Path, wait: std::time::Duration) -> Option<std::fs::F
 }
 
 /// Host pipelines created, loaded from the library, and title pipelines
-/// started at creation, since the start.
+/// started at creation, since the start; loaded from another folder's
+/// library ([`use_other_libraries`]), and stored in this run's.
 pub(crate) static MADE: AtomicU64 = AtomicU64::new(0);
 pub(crate) static LOADED: AtomicU64 = AtomicU64::new(0);
+pub(crate) static LOADED_OTHER: AtomicU64 = AtomicU64::new(0);
+pub(crate) static STORED: AtomicU64 = AtomicU64::new(0);
 pub(crate) static EARLY: AtomicU64 = AtomicU64::new(0);
 /// For the memory lines: the bytes of the library's file, kept in memory
 /// while the library lives, and the bytes the last save wrote (a buffer of
@@ -525,7 +539,17 @@ fn library() -> Option<&'static Library> {
         .get_or_init(|| {
             let device = crate::host::host()?.device.cast::<ID3D12Device1>().ok()?;
             let library = match library_dir() {
-                Some(dir) => open_dir(&dir, keeps_other(), |blob| load(&device, blob)).or_else(|| empty(&device)),
+                Some(dir) => {
+                    // A library filled before static samplers were made in a
+                    // kept order (`super::samplers`) holds pipelines of any
+                    // order: a pipeline loaded from it may sample with other
+                    // samplers than its root signature names
+                    // (fxceless/victory-fork#1459). It is let go once.
+                    if super::samplers::on() && !super::samplers::listed_at_start(&dir) {
+                        unlisted(&dir);
+                    }
+                    open_dir(&dir, keeps_other(), |blob| load(&device, blob)).or_else(|| empty(&device))
+                }
                 None => open(&device, Blob::None),
             };
             if library.is_none() {
@@ -534,6 +558,54 @@ fn library() -> Option<&'static Library> {
             library
         })
         .as_ref()
+}
+
+/// The libraries of [`use_other_libraries`] the host takes, read only.
+fn others() -> &'static [Library] {
+    static OTHERS: OnceLock<Vec<Library>> = OnceLock::new();
+    OTHERS.get_or_init(|| {
+        let Some((dirs, _)) = OTHER_DIRS.get() else { return Vec::new() };
+        let Some(device) = crate::host::host().and_then(|h| h.device.cast::<ID3D12Device1>().ok()) else {
+            return Vec::new();
+        };
+        let mut all = Vec::new();
+        for dir in dirs {
+            let blob = Blob::at(&dir.join(LIBRARY_FILE));
+            if blob.bytes().is_empty() {
+                continue;
+            }
+            match make(&device, blob.bytes()) {
+                Ok(library) => {
+                    tracing::info!(dir = %dir.display(), bytes = blob.bytes().len(), "other host pipeline library loaded");
+                    all.push(Library {
+                        library,
+                        _blob: blob,
+                        added: AtomicU64::new(0),
+                        saving: RwLock::new(()),
+                    });
+                }
+                Err(e) => tracing::warn!(dir = %dir.display(), error = %e, "other host pipeline library rejected"),
+            }
+        }
+        all
+    })
+}
+
+/// Removes the library in `dir`, one a save left beside it, and another
+/// setup's: they were filled with no list of static samplers beside them.
+fn unlisted(dir: &std::path::Path) {
+    for name in [LIBRARY_FILE, NEXT_FILE, OTHER_FILE] {
+        let path = dir.join(name);
+        let Ok(meta) = std::fs::metadata(&path) else { continue };
+        match std::fs::remove_file(&path) {
+            Ok(()) => tracing::info!(
+                file = name,
+                mb = meta.len() >> 20,
+                "the host pipeline library of before the static samplers' kept order is let go: its pipelines are made again"
+            ),
+            Err(e) => tracing::warn!(error = %e, file = name, "an old host pipeline library could not be removed; it is used as it is"),
+        }
+    }
 }
 
 /// The library of the cache folder `dir`, made by `load` (which hands back
@@ -657,10 +729,31 @@ fn load(device: &ID3D12Device1, blob: Blob) -> Result<Library, (Blob, String)> {
     }
 }
 
+/// vkd3d-proton refuses a zero-length blob whose pointer is not null; a Rust
+/// empty slice's pointer never is.
+fn null_when_empty(bytes: &[u8]) -> *const std::ffi::c_void {
+    if bytes.is_empty() {
+        return std::ptr::null();
+    }
+    bytes.as_ptr().cast()
+}
+
 /// The host's library made from `bytes` (none: an empty one).
 fn make(device: &ID3D12Device1, bytes: &[u8]) -> windows::core::Result<ID3D12PipelineLibrary1> {
+    let pointer = null_when_empty(bytes);
+    let mut library: Option<ID3D12PipelineLibrary> = None;
     // SAFETY: the bytes outlive the library (kept beside it).
-    unsafe { device.CreatePipelineLibrary::<ID3D12PipelineLibrary>(bytes)?.cast() }
+    unsafe {
+        (Interface::vtable(device).CreatePipelineLibrary)(
+            Interface::as_raw(device),
+            pointer,
+            bytes.len(),
+            &ID3D12PipelineLibrary::IID,
+            (&raw mut library).cast(),
+        )
+        .ok()?;
+    }
+    library.ok_or_else(|| windows::core::Error::from(windows::Win32::Foundation::E_POINTER))?.cast()
 }
 
 /// An empty library.
@@ -780,11 +873,41 @@ unsafe extern "system" fn compiler_crashed(
     }
 }
 
+/// How this thread's host pipeline came about, over the library calls of
+/// one make ([`came_of`]): the most telling of them (a compile tells more
+/// than a load).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Came {
+    /// No library call (refused before, a pipeline on the bad list).
+    Nothing,
+    /// Loaded from the library.
+    Loaded,
+    /// Created by the driver (not in the library, or no library).
+    Compiled,
+}
+
+thread_local! {
+    /// Within [`came_of`]: what the library calls did so far.
+    static CAME: std::cell::Cell<Came> = const { std::cell::Cell::new(Came::Nothing) };
+}
+
+fn came(c: Came) {
+    CAME.with(|v| v.set(v.get().max(c)));
+}
+
+/// Runs `make` (a host pipeline's make on this thread) and says how it came
+/// about.
+pub(crate) fn came_of<R>(make: impl FnOnce() -> R) -> (R, Came) {
+    let before = CAME.replace(Came::Nothing);
+    let made = make();
+    (made, CAME.replace(before))
+}
+
 /// The pipeline named `name`: loaded from the library by `load` if it is
 /// there with the same description, else made by `create` and stored.
 pub(crate) fn pipeline(
     name: &str,
-    load: impl FnOnce(&ID3D12PipelineLibrary1, PCWSTR) -> windows::core::Result<ID3D12PipelineState>,
+    load: impl Fn(&ID3D12PipelineLibrary1, PCWSTR) -> windows::core::Result<ID3D12PipelineState>,
     create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
 ) -> windows::core::Result<ID3D12PipelineState> {
     if crashed(name) {
@@ -798,6 +921,7 @@ pub(crate) fn pipeline(
     let wide = HSTRING::from(name);
     let Some(library) = library() else {
         MADE.fetch_add(1, Ordering::Relaxed);
+        came(Came::Compiled);
         let began = std::time::Instant::now();
         let pso = create();
         super::spent::add(|p| {
@@ -822,6 +946,7 @@ pub(crate) fn pipeline(
         Ok(pso) => {
             LOADED.fetch_add(1, Ordering::Relaxed);
             super::spent::add(|p| p.loaded += 1);
+            came(Came::Loaded);
             crate::host::trail(|| {
                 let label = LABEL.with(|l| l.borrow().clone());
                 format!("pipeline library: loaded {label} in {:.1} ms", began.elapsed().as_secs_f64() * 1e3)
@@ -830,6 +955,20 @@ pub(crate) fn pipeline(
         }
         Err(e) => e,
     };
+    if let Some(pso) = others().iter().find_map(|other| {
+        let _all = one_call();
+        load(&other.library, PCWSTR(wide.as_ptr())).ok()
+    }) {
+        LOADED_OTHER.fetch_add(1, Ordering::Relaxed);
+        came(Came::Loaded);
+        if OTHER_DIRS.get().is_some_and(|(_, keep)| *keep) {
+            let _all = one_call();
+            let _stores = library.saving.read().unwrap_or_else(|e| e.into_inner());
+            store(library, &wide, &pso);
+        }
+        return Ok(pso);
+    }
+    came(Came::Compiled);
     // Compiles take up to seconds. Keep only this name held.
     let pso = {
         let _call = call("make", name);
@@ -895,6 +1034,7 @@ fn store(library: &Library, name: &HSTRING, pso: &ID3D12PipelineState) {
     // differs) is refused, which leaves the library as it was.
     if unsafe { library.library.StorePipeline(PCWSTR(name.as_ptr()), pso) }.is_ok() {
         library.added.fetch_add(1, Ordering::Relaxed);
+        STORED.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -904,6 +1044,54 @@ fn store_later(library: &Library) {
     for Later(name, pso) in &later {
         store(library, name, pso);
     }
+}
+
+/// As [`save`], from a worker while more pipelines are still queued.
+///
+/// Every save serialises the whole library (over a gigabyte once it is warm)
+/// and, while it does, holds off every store; in the middle of a burst of new
+/// pipelines (a new area, a cutscene) that is exactly when the title is
+/// waiting on them, and the write competes with texture streaming for the
+/// disk. Saves in a burst are kept to one every `VICTORY_LIBRARY_SAVE_BUSY_S`
+/// seconds (default 180; 20 as before); the save when the queue runs dry and
+/// the one at exit are as they were.
+pub(crate) fn save_while_busy() {
+    static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+    static EVERY: OnceLock<std::time::Duration> = OnceLock::new();
+    let every = *EVERY.get_or_init(|| {
+        let secs = std::env::var("VICTORY_LIBRARY_SAVE_BUSY_S").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(180);
+        std::time::Duration::from_secs(secs)
+    });
+    // A cold run is one burst from start to end, so it saved nothing until
+    // its first 180 s: bs-bp3 r53 made 708 pipelines, died at game 43 and
+    // left the library as it was at launch (8,262 bytes), and the next run
+    // was cold again. With VICTORY_LIBRARY_SAVE_MADE=N a library that was
+    // under 64 MB at launch is saved in a burst too, once N pipelines were
+    // added (at most every 20 s).
+    static MADE_EVERY: OnceLock<u64> = OnceLock::new();
+    let made_every = *MADE_EVERY.get_or_init(|| {
+        let n = std::env::var("VICTORY_LIBRARY_SAVE_MADE").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0);
+        let dir = library_dir().or_else(|| DIR.get().cloned());
+        let at_launch = dir.and_then(|d| std::fs::metadata(d.join(LIBRARY_FILE)).ok()).map_or(0, |m| m.len());
+        if at_launch < 64 << 20 { n } else { 0 }
+    });
+    if made_every > 0 && library().is_some_and(|l| l.added.load(Ordering::Relaxed) >= made_every) {
+        save(false);
+        return;
+    }
+    {
+        let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+        match *last {
+            // The first busy save of the run waits a full interval too.
+            None => {
+                *last = Some(std::time::Instant::now());
+                return;
+            }
+            Some(t) if t.elapsed() < every => return,
+            _ => *last = Some(std::time::Instant::now()),
+        }
+    }
+    save(false);
 }
 
 /// Writes the library and the early list if pipelines were added since the
@@ -1108,13 +1296,68 @@ pub(crate) fn slow_ms(key: &str) -> u64 {
     slow_ones().as_ref().and_then(|s| s.get(key).copied()).unwrap_or(0)
 }
 
-/// The title pipeline with `key` took `ms` to make.
-pub(crate) fn note_time(key: &str, ms: u64) {
-    if ms < SLOW_MS {
+/// Keys put on the slow list and taken off it in this run.
+pub(crate) static SLOW_ADDED: AtomicU64 = AtomicU64::new(0);
+pub(crate) static SLOW_REMOVED: AtomicU64 = AtomicU64::new(0);
+
+/// Whether the slow list holds compile times only: a load from the library
+/// neither puts a key on it nor takes one off, and a compile under
+/// [`SLOW_MS`] takes it off. The list is there for the compiles that hold
+/// every worker for tens of seconds, but any make of a second went on it,
+/// loads too, and nothing came off: 1,817 of 3,224 early keys were on it in
+/// one cache, most of them loads that met a cold page of the mapped
+/// library, and they waited behind the others in the slow queue.
+/// On by default (a fix of what is counted); `VICTORY_PIPELINE_SLOW_LIST=0`:
+/// every make of a second is added, nothing removed, as before.
+fn compiles_only() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_SLOW_LIST").is_none_or(|v| v != "0"))
+}
+
+/// `VICTORY_PIPELINE_HITS_FIRST=1`: a load from the library takes its key
+/// off the slow list, and the slow list is taken shortest first. In main-all
+/// 703 of 731 pipelines came from the slow list, most of them library loads
+/// put there by a cold run, and loads of 0.2-0.7 s waited 12-21 s behind
+/// driver compiles of 4-13 s while the game clock stood still.
+pub(crate) fn hits_first() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_HITS_FIRST").is_some_and(|v| v == "1"))
+}
+
+/// What a make of `ms` that came about as `came` does to the slow list:
+/// `Some(true)` adds (or raises) the key, `Some(false)` takes it off.
+fn slow_change(ms: u64, came: Came, compiles_only: bool, hits_first: bool) -> Option<bool> {
+    if !compiles_only {
+        return (ms >= SLOW_MS).then_some(true);
+    }
+    match came {
+        Came::Compiled => Some(ms >= SLOW_MS),
+        Came::Loaded if hits_first => Some(false),
+        Came::Nothing | Came::Loaded => None,
+    }
+}
+
+/// The title pipeline with `key` took `ms` to make, and came about as `came`.
+pub(crate) fn note_time(key: &str, ms: u64, came: Came) {
+    let Some(add) = slow_change(ms, came, compiles_only(), hits_first()) else { return };
+    let mut slow = slow_ones();
+    let slow = slow.get_or_insert_default();
+    if !add {
+        if slow.remove(key).is_some() {
+            SLOW_REMOVED.fetch_add(1, Ordering::Relaxed);
+            // With the next save of the early list.
+            USED_CHANGED.store(true, Ordering::Relaxed);
+        }
         return;
     }
-    let mut slow = slow_ones();
-    let known = slow.get_or_insert_default().entry(key.to_owned()).or_insert(0);
+    let mut new = false;
+    let known = slow.entry(key.to_owned()).or_insert_with(|| {
+        new = true;
+        0
+    });
+    if new {
+        SLOW_ADDED.fetch_add(1, Ordering::Relaxed);
+    }
     if ms > *known {
         *known = ms;
         // With the next save of the early list.
@@ -1171,6 +1414,67 @@ mod tests {
     fn a_save_buffer_the_host_cannot_give_is_refused() {
         assert!(zeroed(usize::MAX / 2).is_none());
         assert_eq!(zeroed(100).as_deref(), Some(&[0u8; 100][..]));
+    }
+
+    /// Only compiles go on the slow list or come off it; with the switch
+    /// off, as before, any make of a second goes on and nothing comes off.
+    #[test]
+    fn the_slow_list_counts_compiles_only() {
+        assert_eq!(slow_change(SLOW_MS, Came::Compiled, true, false), Some(true));
+        assert_eq!(slow_change(SLOW_MS - 1, Came::Compiled, true, false), Some(false));
+        for came in [Came::Loaded, Came::Nothing] {
+            assert_eq!(slow_change(5 * SLOW_MS, came, true, false), None, "{came:?}");
+            assert_eq!(slow_change(1, came, true, false), None, "{came:?}");
+        }
+        assert_eq!(slow_change(SLOW_MS, Came::Loaded, false, false), Some(true));
+        assert_eq!(slow_change(SLOW_MS - 1, Came::Compiled, false, false), None);
+    }
+
+    /// With hits first a load, quick or slow, takes the key off; compiles
+    /// and the old way are as without it.
+    #[test]
+    fn a_library_load_comes_off_the_slow_list_with_hits_first() {
+        assert_eq!(slow_change(5 * SLOW_MS, Came::Loaded, true, true), Some(false));
+        assert_eq!(slow_change(1, Came::Loaded, true, true), Some(false));
+        assert_eq!(slow_change(5 * SLOW_MS, Came::Nothing, true, true), None);
+        assert_eq!(slow_change(SLOW_MS, Came::Compiled, true, true), Some(true));
+        assert_eq!(slow_change(SLOW_MS, Came::Loaded, false, true), Some(true));
+    }
+
+    #[test]
+    fn a_slow_key_that_compiles_quickly_comes_off_the_list() {
+        let key = "slow-list-test-key";
+        let before = SLOW_REMOVED.load(Ordering::Relaxed);
+        note_time(key, 2 * SLOW_MS, Came::Compiled);
+        assert!(slow(key));
+        // A quick load says nothing of the compile.
+        note_time(key, 10, Came::Loaded);
+        assert!(slow(key));
+        note_time(key, 10, Came::Compiled);
+        assert!(!slow(key));
+        assert!(SLOW_REMOVED.load(Ordering::Relaxed) > before);
+        // Loads alone never put one on.
+        note_time(key, 5 * SLOW_MS, Came::Loaded);
+        assert!(!slow(key));
+    }
+
+    /// What a make's library calls did, the most telling of them, kept
+    /// apart from an enclosing make's.
+    #[test]
+    fn came_of_tells_the_most_telling_call() {
+        let ((), c) = came_of(|| {
+            came(Came::Loaded);
+            came(Came::Compiled);
+            came(Came::Loaded);
+        });
+        assert_eq!(c, Came::Compiled);
+        let ((), outer) = came_of(|| {
+            came(Came::Loaded);
+            let ((), inner) = came_of(|| came(Came::Compiled));
+            assert_eq!(inner, Came::Compiled);
+        });
+        assert_eq!(outer, Came::Loaded);
+        assert_eq!(came_of(|| ()).1, Came::Nothing);
     }
 
     #[test]

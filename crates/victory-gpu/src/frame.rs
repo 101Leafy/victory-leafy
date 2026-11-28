@@ -132,6 +132,28 @@ fn last(kind: u32) -> &'static AtomicU64 {
     &LAST[(kind as usize).min(LAST.len() - 1)]
 }
 
+/// When the frame now running began, in nanoseconds after the first wait
+/// (0: no frame begun yet).
+static BEGUN: AtomicU64 = AtomicU64::new(0);
+
+fn since_base() -> u64 {
+    static BASE: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    (BASE.get_or_init(Instant::now).elapsed().as_nanos() as u64).max(1)
+}
+
+/// `VICTORY_OVERRUN_WAITS=1`: once a frame has run longer than an
+/// interval, every wait of that frame ends at once. Off by default.
+fn overrun_waits() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_OVERRUN_WAITS").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!("frame waits end at once in a frame longer than an interval (VICTORY_OVERRUN_WAITS)");
+        }
+        on
+    })
+}
+
 /// The next tick after now and after the last one a wait for `kind` took
 /// (an event happens once per tick: a wait woken a little early must not
 /// let the next one end on the same tick), and how long until it. A wait
@@ -153,6 +175,20 @@ fn next_tick(kind: u32, limit: Duration) -> (u64, Duration) {
     }
     let elapsed = c.start.elapsed().as_nanos();
     let interval = c.interval.as_nanos().max(1);
+    // A frame already longer than an interval: its waits end at once, on
+    // the last tick that passed (never one still to come). In the intro the
+    // title's two waits still slept about 20 ms of frames of 52 and 74 ms
+    // (main-all-r1, game 30-60: 24.0 and 21.0 ms a frame), up to 20 s of
+    // wall time; a poll shorter than the wait sleeps its whole time-out, and
+    // a second wait sharing a kind's tick sleeps to the next one.
+    if overrun_waits() {
+        let begun = BEGUN.load(Ordering::Relaxed);
+        if begun != 0 && since_base() > begun + c.interval.as_nanos() as u64 {
+            let passed = c.first + (elapsed / interval) as u64;
+            last(kind).fetch_max(passed, Ordering::Relaxed);
+            return (passed.max(last(kind).load(Ordering::Relaxed)), Duration::ZERO);
+        }
+    }
     let mut tick =
         (c.first + (elapsed / interval + 1) as u64).max(last(kind).load(Ordering::Relaxed) + 1);
     let at = u128::from(tick - c.first) * interval;
@@ -210,8 +246,10 @@ pub(crate) extern "system" fn wait(
         add(C::PaceWaits, 1);
         add(C::PaceUs, wait.min(limit).as_micros() as u64);
     }
+    pace::waited(kind, timeout_ms, flags, hr, wait.min(limit));
     // A frame begun on a time-out takes no tick: its flip still does.
     if origin && (hr == S_OK || flags & TOKEN_ON_TIMEOUT != 0) {
+        BEGUN.store(since_base(), Ordering::Relaxed);
         // Tokens count frames (consecutive), not ticks.
         let frame = FRAME.fetch_add(1, Ordering::Relaxed) + 1;
         pace::begun();
@@ -261,6 +299,51 @@ mod pace {
     fn on() -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *ON.get_or_init(|| std::env::var("VICTORY_TIMER_LOG").is_ok_and(|v| v.trim() == "1"))
+    }
+
+    /// Waits of the last 5 s by kind, time-out, flags and how they ended:
+    /// (kind, timeout_ms, flags, ended) with their count and sleep.
+    struct Waits {
+        since: Instant,
+        by: Vec<((u32, u32, u32, &'static str), u32, Duration)>,
+    }
+
+    static WAITS: Mutex<Option<Waits>> = Mutex::new(None);
+
+    /// A frame wait ended (`slept`: how long it slept).
+    pub(super) fn waited(kind: u32, timeout_ms: u32, flags: u32, hr: super::HRESULT, slept: Duration) {
+        if !on() {
+            return;
+        }
+        let ended = match (hr == super::TIMEOUT, slept.is_zero()) {
+            (true, _) => "timed out",
+            (false, true) => "at once",
+            (false, false) => "slept to the tick",
+        };
+        let key = (kind, timeout_ms, flags, ended);
+        let now = Instant::now();
+        let mut waits = WAITS.lock().unwrap_or_else(|e| e.into_inner());
+        let w = waits.get_or_insert_with(|| Waits { since: now, by: Vec::new() });
+        match w.by.iter_mut().find(|(k, ..)| *k == key) {
+            Some((_, n, sum)) => {
+                *n += 1;
+                *sum += slept;
+            }
+            None => w.by.push((key, 1, slept)),
+        }
+        if now - w.since >= Duration::from_secs(5) {
+            let list = w
+                .by
+                .iter()
+                .map(|((kind, timeout_ms, flags, ended), n, sum)| {
+                    format!("kind {kind} time-out {timeout_ms} ms flags {flags:#x} {ended}: {n}, {:.1} ms slept", sum.as_secs_f64() * 1e3)
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            tracing::info!("frame waits in the last 5 s: {list}");
+            w.since = now;
+            w.by.clear();
+        }
     }
 
     pub(super) fn begun() {

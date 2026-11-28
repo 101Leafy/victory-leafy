@@ -376,7 +376,10 @@ impl Layout {
             && d.samples.is_power_of_two()
             && d.samples <= 8
             && (d.samples == 1
-                || (d.dimension == Dimension::Tex2d && d.mips == 1 && d.swizzle != Swizzle::LINEAR))
+                || (d.block == 1
+                    && d.dimension == Dimension::Tex2d
+                    && d.mips == 1
+                    && d.swizzle != Swizzle::LINEAR))
             && (d.dimension != Dimension::Tex1d || d.height == 1)
             && (d.dimension != Dimension::Tex3d
                 || matches!(d.swizzle.0, 0 | 5 | 9 | 17 | 21 | 24..=27));
@@ -1159,7 +1162,7 @@ pub fn format(dxgi: u32) -> Option<Format> {
         1..=4 => (16, 1, false),
         9..=18 => (8, 1, false),
         19..=22 | 44..=47 => (4, 1, true),
-        23..=43 | 67 | 87..=93 | 116 | 117 | 189 => (4, 1, false),
+        23..=43 | 67 | 87..=93 | 116 | 117 | 189 | 191 => (4, 1, false),
         48..=59 | 85 | 86 | 115 => (2, 1, false),
         118..=120 => (2, 1, true),
         60..=65 | 190 => (1, 1, false),
@@ -1372,6 +1375,77 @@ mod tests {
         }
     }
 
+    const RGBA8_TEXTURE: TextureDesc = TextureDesc {
+        dimension: Dimension::Tex2d,
+        width: 4,
+        height: 4,
+        depth_or_array: 1,
+        mips: 1,
+        format: 28, // R8G8B8A8_UNORM
+        samples: 1,
+        swizzle: Swizzle::SW_4KB_S,
+    };
+
+    #[test]
+    fn bc_formats_accept_single_sample_layouts() {
+        for format in (70..=84).chain(94..=99) {
+            let desc = TextureDesc {
+                format,
+                ..RGBA8_TEXTURE
+            };
+            assert!(Texture::new(&desc).is_ok(), "DXGI format {format}");
+        }
+    }
+
+    #[test]
+    fn bc_formats_reject_multisampled_layouts() {
+        // DXGI BC1 through BC5, then BC6H and BC7.
+        for format in (70..=84).chain(94..=99) {
+            for samples in [2, 4, 8] {
+                let desc = TextureDesc {
+                    format,
+                    samples,
+                    swizzle: Swizzle::SW_64KB_R_X,
+                    ..RGBA8_TEXTURE
+                };
+                assert_eq!(
+                    Texture::new(&desc),
+                    Err(Error::Invalid),
+                    "DXGI format {format} with {samples} samples"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn uncompressed_formats_keep_multisample_layout_rules() {
+        let color = TextureDesc {
+            samples: 4,
+            swizzle: Swizzle::SW_64KB_R_X,
+            ..RGBA8_TEXTURE
+        };
+        assert!(Texture::new(&color).is_ok());
+
+        let packed = TextureDesc {
+            format: 24, // R10G10B10A2_UNORM
+            ..color
+        };
+        assert!(Texture::new(&packed).is_ok());
+
+        let depth = TextureDesc {
+            format: 40, // D32_FLOAT
+            swizzle: Swizzle::SW_64KB_Z_X,
+            ..color
+        };
+        assert!(Texture::new(&depth).is_ok());
+
+        let linear = TextureDesc {
+            swizzle: Swizzle::LINEAR,
+            ..color
+        };
+        assert_eq!(Texture::new(&linear), Err(Error::Invalid));
+    }
+
     #[test]
     fn linear_layouts_require_one_sample() {
         let linear = desc(256, 256, 1, 4, Swizzle::LINEAR);
@@ -1396,7 +1470,7 @@ mod tests {
     fn console_formats_use_the_expected_color_layouts() {
         for swizzle in [Swizzle::LINEAR, Swizzle::SW_64KB_D_X] {
             // Compare against RGBA8 (28) or R8 (61), which have the same texel size.
-            for (format, reference) in [(189, 28), (190, 61)] {
+            for (format, reference) in [(189, 28), (190, 61), (191, 28)] {
                 let desc = TextureDesc {
                     dimension: Dimension::Tex2d,
                     width: 257,
@@ -2207,6 +2281,83 @@ mod tests {
                 assert!(!Layout::new_for_model(&d, series_s).unwrap().addressable());
             }
         }
+    }
+
+    /// Detile and tile throughput of mip 0, which holds three quarters of a
+    /// texture's bytes, on the layouts a title's textures and render targets
+    /// use (no game data): `cargo test --release -p victory-formats
+    /// texture_throughput -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "benchmark"]
+    fn texture_throughput() {
+        // Big enough to leave the caches of this machine, which is what a
+        // title's uploads do: 16 MiB of BC7, 8 MiB of BC1, a 32 MiB target.
+        let cases: [(&str, Desc); 3] = [
+            (
+                "BC1 4096^2 mip 0",
+                Desc {
+                    block: 4,
+                    ..desc(4096, 4096, 1, 8, Swizzle::SW_4KB_S)
+                },
+            ),
+            (
+                "BC7 4096^2 mip 0",
+                Desc {
+                    block: 4,
+                    ..desc(4096, 4096, 1, 16, Swizzle::SW_4KB_S)
+                },
+            ),
+            (
+                "RGBA8 3840x2160, 4KB_S",
+                desc(3840, 2160, 1, 4, Swizzle::SW_4KB_S),
+            ),
+        ];
+        for (name, d) in cases {
+            let l = Layout::new(&d).unwrap();
+            let m = l.mips[0];
+            let pitch = m.width as usize * d.element_bytes as usize;
+            let depth_pitch = pitch * m.height as usize;
+            let mut tiled = vec![0u8; l.size as usize];
+            let mut linear = vec![0u8; depth_pitch];
+            let mut plain = vec![0u8; depth_pitch];
+            let bytes = depth_pitch as f64;
+            let runs = 10;
+            // What this machine copies the same bytes at: the floor any
+            // detile is measured against.
+            let started = std::time::Instant::now();
+            for _ in 0..runs {
+                let src = std::hint::black_box(&tiled[..depth_pitch]);
+                plain.copy_from_slice(src);
+            }
+            let copy = elapsed(bytes, runs, started);
+            let started = std::time::Instant::now();
+            for _ in 0..runs {
+                let src = std::hint::black_box(&tiled);
+                l.detile(src, 0, 0, &mut linear, pitch, depth_pitch)
+                    .unwrap();
+            }
+            let detile = elapsed(bytes, runs, started);
+            let started = std::time::Instant::now();
+            for _ in 0..runs {
+                let src = std::hint::black_box(&linear);
+                l.tile(&mut tiled, 0, 0, src, pitch, depth_pitch).unwrap();
+            }
+            let tile = elapsed(bytes, runs, started);
+            println!(
+                "{name}: {} KiB · copy {:.1} MB/s · detile {:.1} ({:.0}% of copy) · tile {:.1} ({:.0}% of copy)",
+                depth_pitch / 1024,
+                copy,
+                detile,
+                100.0 * detile / copy,
+                tile,
+                100.0 * tile / copy
+            );
+        }
+    }
+
+    /// Megabytes a second of `bytes` moved `runs` times since `started`.
+    fn elapsed(bytes: f64, runs: u32, started: std::time::Instant) -> f64 {
+        bytes * f64::from(runs) / started.elapsed().as_secs_f64() / 1e6
     }
 
     /// BC7 and BC1 surfaces with an odd count of element rows, detiled whole

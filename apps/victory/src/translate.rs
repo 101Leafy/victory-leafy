@@ -215,8 +215,15 @@ pub fn warm(paths: Vec<PathBuf>, file: &Path, jobs: Option<usize>) -> Result<()>
                                 counts[3].fetch_add(1, Ordering::Relaxed);
                                 break;
                             }
-                            if (!all && !wanted.contains(&hash)) || !lock(&done).insert(hash) {
+                            if (!all && !wanted.contains(&hash)) || !lock(&done).insert(hash.clone()) {
                                 continue;
+                            }
+                            // `VICTORY_SHADER_SAVE=<dir>` (outside the repository): each container asked for,
+                            // as `<hash>.cdxil`, for `shader-info --disasm` and `translate --list`.
+                            if let Some(dir) = std::env::var_os("VICTORY_SHADER_SAVE")
+                                && victory_core::ensure_outside_repo(Path::new(&dir)).is_ok()
+                            {
+                                let _ = std::fs::write(Path::new(&dir).join(format!("{hash}.cdxil")), &bytes);
                             }
                             let n = counts[4].fetch_add(1, Ordering::Relaxed) + 1;
                             if n.is_multiple_of(1000) {
@@ -434,6 +441,29 @@ pub fn run(
     Ok(())
 }
 
+/// Skip known texture, media, and metadata packs that cannot contain shader containers.
+fn may_hold_shaders(path: &std::path::Path) -> bool {
+    match path.extension().and_then(|e| e.to_str()) {
+        None => true,
+        Some(ext) => !matches!(
+            ext.to_ascii_lowercase().as_str(),
+            "ttpf"
+                | "png"
+                | "jpg"
+                | "jpeg"
+                | "dds"
+                | "bik"
+                | "bk2"
+                | "wem"
+                | "bnk"
+                | "xml"
+                | "pri"
+                | "config"
+                | "alignmentchunk"
+        ),
+    }
+}
+
 /// Every shader found into the cache runs translate from.
 pub fn precompile(paths: Vec<PathBuf>, jobs: Option<usize>) -> Result<()> {
     let cfg = victory_core::Config::load()?;
@@ -447,7 +477,10 @@ pub fn precompile(paths: Vec<PathBuf>, jobs: Option<usize>) -> Result<()> {
     let failed = Mutex::new(BTreeMap::<String, (usize, String)>::new());
     for root in &paths {
         for entry in walkdir::WalkDir::new(root).into_iter().filter_map(Result::ok) {
-            if !entry.file_type().is_file() || entry.metadata().map_or(0, |m| m.len()) > MAX_FILE {
+            if !entry.file_type().is_file()
+                || !may_hold_shaders(entry.path())
+                || entry.metadata().map_or(0, |m| m.len()) > MAX_FILE
+            {
                 continue;
             }
             let Ok(data) = std::fs::read(entry.path()) else {

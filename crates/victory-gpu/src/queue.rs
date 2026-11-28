@@ -962,6 +962,11 @@ impl Written {
             } else {
                 at.cast::<u64>().write_unaligned(value);
             }
+            // The title may wait on the address.
+            #[cfg(windows)]
+            if crate::fence::block() {
+                windows_sys::Win32::System::Threading::WakeByAddressAll(at.cast());
+            }
         }
         crate::watch::told(&[(at as usize, bytes)]);
     }
@@ -1007,7 +1012,7 @@ fn system_timestamp() -> u64 {
 /// Frames presented so far.
 static FRAMES: AtomicU64 = AtomicU64::new(0);
 
-#[cfg(feature = "diagnostics")]
+/// Frames presented so far (also for `crate::host::awake`, in every build).
 pub(crate) fn presented() -> u64 {
     FRAMES.load(Ordering::Relaxed)
 }
@@ -1120,7 +1125,7 @@ extern "system" fn present(
             None
         };
         let resource = texture.as_ref().map_or(0, |t| t.0);
-        let overlay = (crate::compose::on() && planes > 1 && !plane_parameters.is_null())
+        let overlay = (crate::compose::passed() && planes > 1 && !plane_parameters.is_null())
             .then(|| second_plane(plane_parameters))
             .flatten()
             .filter(|&over| over as usize != resource)
@@ -1134,6 +1139,8 @@ extern "system" fn present(
         called.end();
         #[cfg(feature = "diagnostics")]
         frame_ends();
+        #[cfg(all(feature = "ab", not(feature = "diagnostics")))]
+        ab_frame_ends();
         return S_OK;
     }
     #[cfg(windows)]
@@ -1150,7 +1157,7 @@ extern "system" fn present(
         const COPY_SOURCE: u32 = 0x800;
         let state = crate::resource::host_transition(resource, COPY_SOURCE)
             .map_or(COPY_SOURCE, |(_, before)| before);
-        let overlay = (crate::compose::on() && planes > 1)
+        let overlay = (crate::compose::passed() && planes > 1)
             .then(|| second_plane(plane_parameters))
             .flatten()
             .filter(|&over| over != resource)
@@ -1172,6 +1179,8 @@ extern "system" fn present(
     called.end();
     #[cfg(all(windows, feature = "diagnostics"))]
     frame_ends();
+    #[cfg(all(windows, feature = "ab", not(feature = "diagnostics")))]
+    ab_frame_ends();
     S_OK
 }
 
@@ -1211,6 +1220,20 @@ fn planes_seen(frame: u64, planes: u32, at: *const Plane) {
     tracing::info!(frame, planes, raw = words.join(" "), seen = seen.join("; "), "the title's present passes another number of planes (only the first plane's first resource is shown)");
 }
 
+/// In a build with `ab` and without diagnostics, the A/B
+/// phases move on at the title's presents as [`frame_ends`] does.
+#[cfg(all(windows, feature = "ab", not(feature = "diagnostics")))]
+fn ab_frame_ends() {
+    crate::ab::presented(|switch, was, will| {
+        if switch == "VICTORY_ASYNC_SUBMIT" && was && !will {
+            behind::leave();
+        }
+        if switch == "VICTORY_CCD_CORES" && was != will {
+            crate::cores::settle();
+        }
+    });
+}
+
 /// Diagnostics: the title's present is over.
 #[cfg(all(windows, feature = "diagnostics"))]
 fn frame_ends() {
@@ -1219,6 +1242,10 @@ fn frame_ends() {
     crate::ab::presented(|switch, was, will| {
         if switch == "VICTORY_ASYNC_SUBMIT" && was && !will {
             behind::leave();
+        }
+        // Where our threads run follows the switch as it changes.
+        if switch == "VICTORY_CCD_CORES" && was != will {
+            crate::cores::settle();
         }
     });
 }
@@ -1593,7 +1620,7 @@ mod tests {
 
     #[test]
     fn a_pair_of_timestamps_shows_the_load_it_is_given() {
-        let (start, end) = (0xd0419_6698, 0xd0419_6690);
+        let (start, end) = (0x000d_0419_6698, 0x000d_0419_6690);
         assert_eq!(as_loaded(5_000_000, end, 4_000_000) - as_loaded(5_000_000, start, 4_000_000), 4_000_000);
         assert_eq!(as_loaded(5_000_000, start, 0), 5_000_000);
         assert_eq!(as_loaded(5, start, 100), 1);

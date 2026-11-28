@@ -42,6 +42,8 @@ static EMULATED: AtomicU64 = AtomicU64::new(0);
 static QUERIES: AtomicU64 = AtomicU64::new(0);
 static ZEROED: AtomicU64 = AtomicU64::new(0);
 static PATCHED: AtomicU64 = AtomicU64::new(0);
+/// Lines zeroed by [`zero_through_fault`] since the start.
+static THROUGH_FAULT: AtomicU64 = AtomicU64::new(0);
 
 /// Our stub areas, as base and bytes used.
 static AREAS: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
@@ -139,6 +141,7 @@ unsafe fn handle(ctx: &mut CONTEXT, o: Options) -> bool {
                 queries = QUERIES.load(Relaxed),
                 zeroed = ZEROED.load(Relaxed),
                 patched = PATCHED.load(Relaxed),
+                through_fault = THROUGH_FAULT.load(Relaxed),
                 "AMD-only instructions handled"
             );
         }
@@ -282,6 +285,34 @@ unsafe fn zero(at: usize, len: usize, o: Options) -> bool {
     true
 }
 
+/// Zeroes the 64-byte line at `line` with ordinary stores, for a line [`writable`] refused that
+/// is committed or reserved all the same: write-protected on purpose, as the write-watch guards
+/// over the host copies of view memory make it (victory-gpu's `watch.rs`), whose vectored
+/// handler opens a guarded block for the title's own stores. The console's `clzero` faults into
+/// such a handler as any store does; here it is an illegal instruction the handler never sees,
+/// so refusing the line left that exception unhandled and ended the run. These stores fault
+/// inside this handler instead, the guard opens the block, and the stores complete (a fault
+/// nothing resolves ends the run, as the title's own store would). False, with nothing written,
+/// for free memory: the exception stays the title's.
+///
+/// # Safety
+/// The title owns the line, as it owns the line of the instruction being emulated.
+unsafe fn zero_through_fault(line: usize) -> bool {
+    QUERIES.fetch_add(1, Relaxed);
+    match info(line) {
+        Some(m) if m.State == MEM_COMMIT || m.State == MEM_RESERVE => {}
+        _ => return false,
+    }
+    let words = line as *mut u64;
+    for i in 0..8 {
+        // SAFETY: see the function's contract; a fault here is resolved by the runtime's
+        // handlers or ends the run, as the title's own store would
+        unsafe { words.add(i).write_volatile(0) };
+    }
+    THROUGH_FAULT.fetch_add(1, Relaxed);
+    true
+}
+
 unsafe fn clzero(ctx: &mut CONTEXT, code: &[u8; WINDOW], i: &Insn, o: Options) -> bool {
     if i.len == 3
         && let Some(l) = find_loop(code)
@@ -291,11 +322,17 @@ unsafe fn clzero(ctx: &mut CONTEXT, code: &[u8; WINDOW], i: &Insn, o: Options) -
             return true;
         }
         // SAFETY: as for clzero
-        return unsafe { run_loop(ctx, l, o) };
+        if unsafe { run_loop(ctx, l, o) } {
+            return true;
+        }
+        // run_loop wrote nothing: this one line below, then the loop's own add, cmp and jb
+        // run natively and fault here again on the next line
     }
     let rax = if i.addr32 { ctx.Rax & 0xffff_ffff } else { ctx.Rax };
-    // SAFETY: zero checks the line first
-    if !unsafe { zero(rax as usize & !63, 64, o) } {
+    let line = rax as usize & !63;
+    // SAFETY: zero checks the line first, zero_through_fault only stores to committed or
+    // reserved memory
+    if !unsafe { zero(line, 64, o) } && !unsafe { zero_through_fault(line) } {
         return false;
     }
     ctx.Rip += i.len as u64;
@@ -714,6 +751,96 @@ mod tests {
         ctx.Rax = 0;
         assert!(!run(&mut ctx, ON));
         assert_eq!(ctx.Rip, code as u64 + 16);
+    }
+
+    /// Memory kept from the title's stores until one faults, read-only as the write-watch guards
+    /// make it, or reserved and not committed, with a stand-in for such a handler at the front of
+    /// the chain: it opens a page of this reservation on a write. `clzero` on such a line, alone
+    /// or as the first line of a loop, zeroes it through that fault; free memory is still refused.
+    #[test]
+    fn clzero_on_guarded_or_uncommitted_lines_faults_into_the_runtime_s_handlers() {
+        use std::sync::atomic::AtomicUsize;
+        use windows_sys::Win32::Foundation::EXCEPTION_ACCESS_VIOLATION;
+        use windows_sys::Win32::System::Diagnostics::Debug::{
+            AddVectoredExceptionHandler, EXCEPTION_POINTERS, RemoveVectoredExceptionHandler,
+        };
+        use windows_sys::Win32::System::Memory::{MEM_RELEASE, VirtualFree};
+        const PAGES: usize = 3;
+        static BASE: AtomicUsize = AtomicUsize::new(0);
+        static OPENED: AtomicUsize = AtomicUsize::new(0);
+        unsafe extern "system" fn open(info: *mut EXCEPTION_POINTERS) -> i32 {
+            // SAFETY: the system passes the exception being dispatched
+            let r = unsafe { &*(*info).ExceptionRecord };
+            let base = BASE.load(Relaxed);
+            if r.ExceptionCode != EXCEPTION_ACCESS_VIOLATION
+                || r.NumberParameters < 2
+                || r.ExceptionInformation[0] != 1
+                || !(base..base + PAGES * PAGE).contains(&r.ExceptionInformation[1])
+            {
+                return 0;
+            }
+            let page = r.ExceptionInformation[1] & !(PAGE - 1);
+            let mut old = 0;
+            // SAFETY: a page of the test's own reservation
+            unsafe {
+                assert!(!VirtualAlloc(page as _, PAGE, MEM_COMMIT, PAGE_READWRITE).is_null());
+                VirtualProtect(page as _, PAGE, PAGE_READWRITE, &mut old);
+            }
+            OPENED.fetch_add(1, Relaxed);
+            -1
+        }
+        // page 0 committed, filled and made read-only; pages 1 and 2 only reserved
+        // SAFETY: the test's own memory, released at the end with the handler removed
+        let (base, handler) = unsafe {
+            let base = VirtualAlloc(std::ptr::null(), PAGES * PAGE, MEM_RESERVE, PAGE_NOACCESS) as usize;
+            assert_ne!(base, 0);
+            assert!(!VirtualAlloc(base as _, PAGE, MEM_COMMIT, PAGE_READWRITE).is_null());
+            std::ptr::write_bytes(base as *mut u8, 0xaa, PAGE);
+            let mut old = 0;
+            VirtualProtect(base as _, PAGE, PAGE_READONLY, &mut old);
+            BASE.store(base, Relaxed);
+            (base, AddVectoredExceptionHandler(1, Some(open)))
+        };
+        assert!(!handler.is_null());
+        let page = |p: usize| get((base + p * PAGE) as *const u8, PAGE);
+        // a lone clzero at 16, the loop `clzero; add rax, 40h; cmp rax, r10; jb` at 48
+        let code = rwx(PAGE);
+        put(code.wrapping_add(16), &[0x0f, 0x01, 0xfc, 0x90]);
+        put(code.wrapping_add(48), &[0x0f, 0x01, 0xfc, 0x48, 0x83, 0xc0, 0x40, 0x4c, 0x39, 0xd0, 0x72, 0xf4, 0x90]);
+        let go = |at: usize, rax: usize, r10: usize| {
+            let mut ctx = context(code.wrapping_add(at));
+            ctx.Rax = rax as u64;
+            ctx.R10 = r10 as u64;
+            let done = run(&mut ctx, OFF);
+            (done, ctx.Rip as usize - code as usize - at, ctx.Rax as usize)
+        };
+        // a guarded line: zeroed through the fault, the rest of the page left as it was
+        assert_eq!(go(16, base + 0x45, 0), (true, 3, base + 0x45));
+        assert_eq!(OPENED.load(Relaxed), 1);
+        let p0 = page(0);
+        assert!(p0[0x40..0x80].iter().all(|&b| b == 0));
+        assert!(p0[..0x40].iter().chain(&p0[0x80..]).all(|&b| b == 0xaa));
+        // a line never committed: the same
+        assert!(go(16, base + 0x1080, 0).0);
+        assert_eq!(OPENED.load(Relaxed), 2);
+        assert!(page(1)[0x80..0xc0].iter().all(|&b| b == 0));
+        // the loop starting on a line never committed: its first line through the fault, the
+        // loop's own add then runs natively, and its next fault zeroes the rest whole
+        let (start, end) = (base + 2 * PAGE, base + 2 * PAGE + 0x400);
+        assert_eq!(go(48, start, end), (true, 3, start), "one line, then the loop's own add");
+        assert_eq!(OPENED.load(Relaxed), 3);
+        put((start + 64) as *mut u8, &[0xaa; 0x400]);
+        assert_eq!(go(48, start + 64, end), (true, 12, end), "the rest, then past the loop");
+        let p2 = page(2);
+        assert!(p2[..0x400].iter().all(|&b| b == 0));
+        assert!(p2[0x400..0x440].iter().all(|&b| b == 0xaa));
+        // SAFETY: removes the handler and releases the reservation made above
+        unsafe {
+            RemoveVectoredExceptionHandler(handler);
+            VirtualFree(base as _, 0, MEM_RELEASE);
+        }
+        // free memory: refused, the exception stays the title's
+        assert!(!go(16, base + 0x40, 0).0);
     }
 
     #[test]

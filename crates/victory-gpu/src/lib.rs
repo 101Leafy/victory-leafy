@@ -24,6 +24,8 @@ mod compose;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
+#[cfg(windows)]
+mod dxc;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod sidetime;
 #[cfg(all(windows, feature = "diagnostics"))]
@@ -34,6 +36,8 @@ pub mod descriptor;
 pub mod device;
 #[cfg(windows)]
 mod draw;
+#[cfg(windows)]
+pub mod dxr;
 pub mod dxgi;
 pub mod fence;
 pub mod frame;
@@ -48,7 +52,11 @@ mod indirect;
 #[cfg(windows)]
 mod inplace;
 #[cfg(windows)]
+mod port;
+#[cfg(windows)]
 mod port_journal;
+#[cfg(windows)]
+mod port_cbv;
 #[cfg(windows)]
 mod land;
 mod launch;
@@ -85,7 +93,8 @@ mod shadow;
 mod tiles;
 pub mod signature;
 mod switch;
-#[cfg(all(windows, feature = "diagnostics"))]
+// Also in builds with the `ab` feature alone (A/B in a release build).
+#[cfg(all(windows, any(feature = "diagnostics", feature = "ab")))]
 mod ab;
 #[cfg(windows)]
 mod tdr;
@@ -103,10 +112,14 @@ mod texback;
 
 #[cfg(windows)]
 pub use host::{on_failure, start_host};
+/// Reserves the address space for memory shaders read by address; call it
+/// first thing, before the process's other allocations can fill [4 GiB, 2^37).
+#[cfg(windows)]
+pub use upload::reserve_space as reserve_upload_space;
 
 /// Whether `switch` is on now, if it is one of those `VICTORY_AB` turns on and
 /// off while the title runs (`ab`).
-#[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(all(windows, any(feature = "diagnostics", feature = "ab")))]
 pub fn switched(switch: &str) -> Option<bool> {
     ab::pick(switch)
 }
@@ -123,6 +136,8 @@ pub fn frames_begun() -> u64 {
 }
 #[cfg(windows)]
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_section_gone, title_memory_view};
+#[cfg(windows)]
+pub use shadow::title_memory_write_combined;
 #[cfg(windows)]
 pub use watch::{
     kernel_writing, mapping_costs, title_graphics_block, title_memory_allocated, title_memory_freed, title_memory_reading, title_memory_remapped,

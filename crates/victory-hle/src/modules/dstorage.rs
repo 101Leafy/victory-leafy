@@ -149,7 +149,7 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
     // SAFETY: a handle we just opened and nobody else owns.
     let file = unsafe { std::fs::File::from_raw_handle(handle) };
     let files = Files::new(file, Io::chosen());
-    let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { files });
+    let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { files, path: kept.clone() });
     if stream_log::on() {
         stream_log::line(format_args!("F\t{:x}\t{kept}", file as usize));
     }
@@ -228,11 +228,30 @@ extern "system" fn create_queue(
 
 /// The title asks for 32 MiB and stops if this fails.
 extern "system" fn set_staging_buffer_size(_: Factory, size: u32) -> HRESULT {
-    tracing::info!(size, "dstorage: staging buffer size");
+    let floor = staging_floor();
+    tracing::info!(size, floor, "dstorage: staging buffer size");
     if let Some(scheduler) = scheduler() {
-        scheduler.lock().staging = u64::from(size);
+        scheduler.lock().staging = u64::from(size).max(floor);
     }
     S_OK
+}
+
+/// The least staging the title is given (`VICTORY_DSTORAGE_FLOOR=1`; off by
+/// default): 256 MiB, or `VICTORY_DSTORAGE_STAGING_MB`, so that chunks of
+/// several MB on every worker are not held back by the 32 MiB the title
+/// asks for. After codec_d's 256 MiB DirectStorage floor.
+fn staging_floor() -> u64 {
+    static FLOOR: OnceLock<u64> = OnceLock::new();
+    *FLOOR.get_or_init(|| {
+        if !std::env::var("VICTORY_DSTORAGE_FLOOR").is_ok_and(|v| v.trim() == "1") {
+            return 0;
+        }
+        let mb = std::env::var("VICTORY_DSTORAGE_STAGING_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(256);
+        mb << 20
+    })
 }
 
 fn text(name: *const c_char) -> String {
@@ -268,6 +287,20 @@ static FACTORY_VTABLE: Methods<16> = Methods([
 
 struct File {
     files: Files,
+    /// The path the title opened it by, for what is said of a request of
+    /// it that fails ([`source_path`]).
+    path: String,
+}
+
+/// The path of the file `request` reads from; empty for a request whose
+/// source is memory. A request that fails says it (#812: every chunk of two
+/// entries failed, and only the order of the log said which archive).
+fn source_path(request: &Request) -> &str {
+    if request.options & MEMORY_SOURCE != 0 || request.source.is_null() {
+        return "";
+    }
+    // SAFETY: a file object we created; the title keeps it open.
+    &unsafe { &*request.source.cast::<Instance<File>>() }.state.path
 }
 
 /// How files are read (`VICTORY_DSTORAGE_IO`).
@@ -429,7 +462,7 @@ fn read_direct(file: &std::fs::File, out: &mut [u8], offset: u64) -> std::io::Re
     /// Read at a time.
     const MOST: usize = 1 << 20;
     let sector = SECTOR as u64;
-    if offset % sector == 0 && out.len() % SECTOR == 0 && out.as_ptr() as usize % SECTOR == 0 {
+    if offset.is_multiple_of(sector) && out.len().is_multiple_of(SECTOR) && (out.as_ptr() as usize).is_multiple_of(SECTOR) {
         return read_overlapped(file, out, offset);
     }
     thread_local! {
@@ -633,6 +666,14 @@ fn scheduler() -> Option<&'static Scheduler> {
         .as_ref()?;
     STARTED.call_once(|| {
         let workers = std::thread::available_parallelism().map_or(4, |n| n.get());
+        // `VICTORY_DSTORAGE_WORKERS=<n>`: fewer workers than the CPU's threads (at most that many;
+        // the file handles stay one a CPU thread). On a Ryzen 7 5700X the title stopped itself
+        // at the start after a batch of reads whenever all sixteen ran freely.
+        let workers = std::env::var("VICTORY_DSTORAGE_WORKERS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .map_or(workers, |n| n.min(workers));
         let started = (0..workers)
             .filter(|i| {
                 std::thread::Builder::new()
@@ -1723,6 +1764,7 @@ fn execute(request: &Request, scratch: &mut WorkerScratch) -> Result<(), HRESULT
             intermediate_size = request.intermediate_size,
             tag = request.tag,
             name = text(request.name),
+            path = source_path(request),
             hr = format_args!("{:#010x}", hr as u32),
             "dstorage: request failed: {why}"
         );
@@ -2377,6 +2419,21 @@ mod tests {
         void(queue, 0x40);
     }
 
+    /// A request names the file it reads, for its failure's warning; one
+    /// whose bytes are no zlib stream fails as bad data; a memory source
+    /// names no file.
+    #[test]
+    fn a_request_names_the_file_it_reads() {
+        let (dir, file) = file_with(b"these bytes are no zlib stream");
+        let mut out = vec![0u8; 64];
+        let r = request(ZLIB, out.as_mut_ptr().cast(), out.len(), file, 0, 30);
+        assert_eq!(source_path(&r), dir.path().join("data.bin").to_string_lossy());
+        assert_eq!(execute(&r, &mut WorkerScratch::new()), Err(INVALID_DATA));
+        let source = [0u8; 4];
+        let memory = request(ZLIB | MEMORY_SOURCE, out.as_mut_ptr().cast(), out.len(), source.as_ptr().cast(), 0, 4);
+        assert_eq!(source_path(&memory), "");
+    }
+
     #[test]
     fn memory_sources_inflate_too() {
         let plain = pattern(70_000);
@@ -2583,7 +2640,7 @@ mod tests {
         for round in 0..2 {
             for mode in [Io::One, Io::Handles, Io::Overlapped, Io::Direct] {
                 let file = Files::open_for_test(&path, mode);
-                let at: Vec<u64> = (0..READS).map(|_| random() % (len - SIZE as u64) & !15).collect();
+                let at: Vec<u64> = (0..READS).map(|_| (random() % (len - SIZE as u64)) & !15).collect();
                 for pass in ["cold", "again"] {
                     let next = std::sync::atomic::AtomicUsize::new(0);
                     let busy = AtomicU64::new(0);

@@ -48,12 +48,13 @@ pub const MEMORY: usize = usize::MAX - 1;
 
 /// The reasons an address traces to no root parameter for which the
 /// address is then taken as it stands ([`MEMORY`]).
-const RAW: [&str; 5] = [
+const RAW: [&str; 6] = [
     "an address not from a root parameter",
     "an address from a root parameter that is no address",
     "an address in an SGPR that is no root parameter",
     "an address loaded from memory",
     "an address from a phi",
+    "an address with an untracked high half",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -138,6 +139,9 @@ pub struct RootIndexedView {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Resources {
+    /// Scalar values saved to a constant VGPR lane and restored within one
+    /// block, even if that VGPR is also used in ordinary vector operations.
+    pub(crate) restored_lanes: std::collections::HashMap<Site, Moved>,
     /// Every scalar memory access by address (`s_load_*`, `s_store_*`), and
     /// every global memory access (`global_*`, the dynamic term per lane).
     pub scalar: Vec<(Site, Address)>,
@@ -228,9 +232,12 @@ pub fn track(
     let mut offset_at =
         std::collections::BTreeMap::<usize, (Vec<usize>, Vec<Value>, Vec<Site>)>::new();
     for (b, block) in p.blocks.iter().enumerate() {
-        t.at.set(Some(b));
         for (i, inst) in block.insts.iter().enumerate() {
             let site = (b, i);
+            t.at.set(Some(site));
+            if crate::emit::wave32_lowering() && let Some(value) = t.restored(inst, Some(b)) {
+                out.restored_lanes.insert(site, value);
+            }
             let fail = |what| ShaderError::Unsupported {
                 offset: inst.machine.offset,
                 what,
@@ -238,7 +245,7 @@ pub fn track(
             let mut first_lane = Vec::new();
             let mut offset = Vec::new();
             let mut descriptor = |op: &Operand, role| -> Result<Source, ShaderError> {
-                let source = t.descriptor(inst, op, b).map_err(fail)?;
+                let source = t.descriptor(inst, op, site).map_err(fail)?;
                 // A descriptor the code keeps per lane ([`Tracer::lane_copies`])
                 // is the same in every lane: its loop is lowered as it stands
                 // and needs no proof.
@@ -385,7 +392,13 @@ pub fn track(
     for (block, (accesses, mut reads, loads)) in offset_at {
         reads.sort_unstable();
         reads.dedup();
-        if let Ok(proof) = t.waterfall(block, &accesses, &reads) {
+        // Where the per-lane form cannot follow the loop, its exact shape
+        // still proves it ([`Tracer::waterfall_shape`]).
+        let proof = t
+            .waterfall(block, &accesses, &reads)
+            .ok()
+            .or_else(|| t.waterfall_shape(block, &accesses, &reads, &loads));
+        if let Some(proof) = proof {
             out.waterfall.compares.extend(proof.compares);
             out.waterfall.reads.extend(proof.reads);
             out.waterfall.loads.extend(loads);
@@ -439,8 +452,8 @@ struct Tracer<'a> {
     meets: std::cell::RefCell<Meets>,
     /// Reverse-postorder index per block.
     rpo: Vec<usize>,
-    /// The block of the access being traced ([`Self::live`]).
-    at: std::cell::Cell<Option<usize>>,
+    /// The instruction site of the access being traced ([`Self::live`]).
+    at: std::cell::Cell<Option<Site>>,
 }
 
 /// What lanes are known to satisfy: each [`Bool`] where its flag is set,
@@ -542,7 +555,7 @@ impl<'a> Tracer<'a> {
                 }
                 for inst in &block.insts {
                     for (k, &(_, v)) in inst.writes.iter().enumerate() {
-                        let new = match copy_source(inst, k).or_else(|| self.restored(inst)) {
+                        let new = match copy_source(inst, k).or_else(|| self.restored(inst, None)) {
                             Some(Moved::Const(c)) => Some(Term::Const(c)),
                             Some(Moved::Value(s)) => o[s.0 as usize],
                             None => Some(Term::Value(v)),
@@ -865,6 +878,7 @@ impl<'a> Tracer<'a> {
             })) != Some(v)
             || f.abs != 0
             || f.neg != 0
+            || f.clamp
             || f.sdwa.is_some()
             || f.dpp.is_some()
         {
@@ -1030,8 +1044,10 @@ impl<'a> Tracer<'a> {
             ))
     }
 
-    /// `hi` adds something (with carry) to `high`: `s_addc_u32` or
-    /// `v_add_co_ci_u32` with `high` as an operand.
+    /// `hi` adds only the low half's carry to `high`: `s_addc_u32` or
+    /// `v_add_co_ci_u32` with `high` as one operand and zero as the other.
+    /// Another nonzero addend is part of the address's high half, which an
+    /// [`Address`] cannot represent.
     fn carried(&self, hi: Term, high: Value) -> bool {
         let Term::Value(v) = hi else { return false };
         if v == high {
@@ -1071,7 +1087,8 @@ impl<'a> Tracer<'a> {
             return self.carried(self.vorigin(lane), high);
         }
         if let Some((_, [a, b])) = self.sop2(v, &["s_addc_u32"]) {
-            return self.carried(a, high) || self.carried(b, high);
+            return (a == Term::Const(0) || self.sign_high(a)) && self.carried(b, high)
+                || (b == Term::Const(0) || self.sign_high(b)) && self.carried(a, high);
         }
         let Some(inst) = self.def(v) else {
             return false;
@@ -1079,10 +1096,72 @@ impl<'a> Tracer<'a> {
         let Fields::Valu(f) = &inst.fields else {
             return false;
         };
-        inst.name() == "v_add_co_ci_u32"
-            && f.src[..2.min(f.src.len())]
-                .iter()
-                .any(|o| self.vterm(inst, o).is_some_and(|t| self.carried(t, high)))
+        if inst.name() != "v_add_co_ci_u32" || f.src.len() < 2 {
+            return false;
+        }
+        let (a, b) = (self.vterm(inst, &f.src[0]), self.vterm(inst, &f.src[1]));
+        match (a, b) {
+            (Some(a), Some(b)) => {
+                (a == Term::Const(0) || self.sign_high(a)) && self.carried(b, high)
+                    || (b == Term::Const(0) || self.sign_high(b)) && self.carried(a, high)
+            }
+            _ => false,
+        }
+    }
+
+    /// `t` is the high dword of a signed 32-bit index made 64-bit: its sign
+    /// (`v_ashrrev_i32` or `s_ashr_i32` by 31), or that pair shifted left by
+    /// a constant. The
+    /// address is then the base plus a signed offset below 2 GB, which the
+    /// low half's offset modulo 2^32 gives (a table in the code read at
+    /// base + (sext(i) << 2); refused, every draw of its pixel shader was
+    /// dropped and the 3D scene went black).
+    fn sign_high(&self, t: Term) -> bool {
+        let Term::Value(v) = t else { return false };
+        let Some(inst) = self.def(v) else {
+            return false;
+        };
+        if let Fields::Sop { src, .. } = &inst.fields {
+            let operand = |k: usize| src.get(k).and_then(|o| self.term(inst, o));
+            return match inst.name() {
+                "s_ashr_i32" => inst.writes.first().is_some_and(|w| w.1 == v) && operand(1) == Some(Term::Const(31)),
+                "s_lshl_b64" => {
+                    let Some(&Operand::Scalar { code, .. }) = src.first() else {
+                        return false;
+                    };
+                    let word = |k| inst.read(Reg::S(code + k)).map(|x| self.origin(x));
+                    inst.writes.get(1).is_some_and(|w| w.1 == v)
+                        && matches!(operand(1), Some(Term::Const(n)) if n < 32)
+                        && matches!((word(0), word(1)), (Some(lo), Some(Term::Value(hi)))
+                            if self.sop2(hi, &["s_ashr_i32"]).is_some_and(|(_, [x, _])| x == lo)
+                                && self.sign_high(Term::Value(hi)))
+                }
+                _ => false,
+            };
+        }
+        let Fields::Valu(f) = &inst.fields else {
+            return false;
+        };
+        let operand = |k: usize| f.src.get(k).and_then(|o| self.vterm(inst, o));
+        match inst.name() {
+            "v_ashrrev_i32" => inst.writes.first().is_some_and(|w| w.1 == v) && operand(0) == Some(Term::Const(31)),
+            "v_lshlrev_b64" => {
+                let Some(&Operand::Vector { reg, .. }) = f.src.get(1) else {
+                    return false;
+                };
+                let word = |k| inst.read(Reg::V(reg + k)).map(|x| self.vorigin(x));
+                inst.writes.get(1).is_some_and(|w| w.1 == v)
+                    && matches!(operand(0), Some(Term::Const(n)) if n < 32)
+                    && matches!((word(0), word(1)), (Some(lo), Some(Term::Value(hi)))
+                        if self.def(hi).is_some_and(|i| i.name() == "v_ashrrev_i32")
+                            && self.sign_high(Term::Value(hi))
+                            && self.def(hi).and_then(|i| match &i.fields {
+                                Fields::Valu(g) => g.src.get(1).and_then(|o| self.vterm(i, o)),
+                                _ => None,
+                            }) == Some(lo))
+            }
+            _ => false,
+        }
     }
 
     fn why_no_base(&self, dynamic: Option<Value>) -> &'static str {
@@ -1141,8 +1220,8 @@ impl<'a> Tracer<'a> {
         self.address(lo, hi, extra)
     }
 
-    /// The source of the descriptor operand `op` of `inst`, in block `at`.
-    fn descriptor(&self, inst: &Inst, op: &Operand, at: usize) -> Result<Source, &'static str> {
+    /// The source of the descriptor operand `op` of `inst`, at `at`.
+    fn descriptor(&self, inst: &Inst, op: &Operand, at: Site) -> Result<Source, &'static str> {
         let Operand::Scalar { code, dwords } = *op else {
             return Err("a descriptor not in SGPRs");
         };
@@ -1157,8 +1236,14 @@ impl<'a> Tracer<'a> {
         {
             words = raw.to_vec();
         }
-        // Only the lanes that reach the access read the descriptor.
-        let mut known = Vec::from_iter(self.lanes.map(|l| (l.reach[at], true)));
+        // Only the lanes that reach and run the access read the descriptor.
+        let mut known = Vec::new();
+        if let Some(l) = self.lanes {
+            known.push((l.reach[at.0], true));
+            if let Some(guard) = l.guards[at.0][at.1].filter(|_| crate::emit::guarded_descriptors()) {
+                known.push((guard, true));
+            }
+        }
         self.classify(&words, &mut Vec::new(), &mut known)
     }
 
@@ -1310,7 +1395,10 @@ impl<'a> Tracer<'a> {
         let (Some(at), Some(lanes)) = (self.at.get(), self.lanes) else {
             return t;
         };
-        let mut known = vec![(lanes.reach[at], true)];
+        let mut known = vec![(lanes.reach[at.0], true)];
+        if let Some(guard) = lanes.guards[at.0][at.1].filter(|_| crate::emit::guarded_descriptors()) {
+            known.push((guard, true));
+        }
         for _ in 0..MAX_JOINS {
             let Term::Value(v) = t else { break };
             let Some((block, i)) = self.phis[v.0 as usize] else {
@@ -2141,6 +2229,213 @@ impl<'a> Tracer<'a> {
         Ok(out)
     }
 
+    /// The console compiler's waterfall over a first-lane table offset, by
+    /// its exact shape, where [`Self::waterfall`] cannot follow the lanes
+    /// (its per-lane form loses the relation of the two lane masks around
+    /// the loop in larger programs). The loop is one block that branches to
+    /// itself with `s_cbranch_execnz`, and holds nothing but:
+    ///
+    /// - `v_readfirstlane_b32 sX, vY` of a value set before the loop, under
+    ///   EXEC as the loop found it;
+    /// - `v_cmpx_eq_u32`/`_i32 exec, sX, vY` of the same two values, without
+    ///   modifiers: EXEC becomes the lanes whose offset is the first lane's;
+    /// - the table loads at those offsets (`loads`), waits and `s_nop`;
+    /// - the accesses that use them, which only read (`buffer_load_*`,
+    ///   `image_load*`, `image_sample*`, `image_gather*`), under that EXEC;
+    /// - `s_andn2_wrexec` of a mask T with itself (EXEC and T become T and
+    ///   not EXEC), then the branch.
+    ///
+    /// And T is EXEC on every entry to the loop: from outside, T's value is
+    /// a move of the very EXEC value the loop starts with; around the back
+    /// edge both are what that one `s_andn2_wrexec` wrote. So each pass
+    /// serves the waiting lanes with the first one's offset, drops exactly
+    /// those, and the loop ends when none waits: every lane makes its own
+    /// access once, with its own entry, which is what the per-lane load
+    /// does.
+    fn waterfall_shape(
+        &self,
+        b: usize,
+        accesses: &[usize],
+        reads: &[Value],
+        loads: &[Site],
+    ) -> Option<Waterfall> {
+        let block = &self.p.blocks[b];
+        let wave64 = self.p.wave64;
+        let halves: &[u8] = if wave64 { &[0, 1] } else { &[0] };
+        if !matches!(block.exit, Exit::Branch { taken, not_taken } if taken == b && not_taken != b)
+            || block.preds.len() != 2
+        {
+            return None;
+        }
+        let back = block.preds.iter().position(|&p| p == b)?;
+        let entry = 1 - back;
+        let (exit, body) = block.insts.split_last()?;
+        if exit.name() != "s_cbranch_execnz" {
+            return None;
+        }
+        let (retry, body) = body.split_last()?;
+        let wrexec = if wave64 {
+            "s_andn2_wrexec_b64"
+        } else {
+            "s_andn2_wrexec_b32"
+        };
+        if retry.name() != wrexec {
+            return None;
+        }
+        // T: the mask the retry reads and writes besides EXEC.
+        let t = retry.writes.iter().find_map(|&(reg, _)| match reg {
+            Reg::S(code) if code != EXEC && code != EXEC + 1 => Some(code),
+            _ => None,
+        })?;
+        let t = t - t % 2 * u8::from(wave64);
+        let phi = |reg: u8| block.phis.iter().find(|p| p.reg == Reg::S(reg));
+        let mut head_exec = Vec::new();
+        for &k in halves {
+            let (pe, pt) = (phi(EXEC + k)?, phi(t + k)?);
+            // Around the back edge: both what the retry wrote, from T as the
+            // loop found it.
+            if pe.args[back] != retry.write(Reg::S(EXEC + k))?
+                || pt.args[back] != retry.write(Reg::S(t + k))?
+                || retry.read(Reg::S(t + k))? != pt.value
+            {
+                return None;
+            }
+            // From outside: T is a move of the EXEC the loop is entered with.
+            let (tb, ti) = self.defs[pt.args[entry].0 as usize]?;
+            let mov = self.inst((tb, ti));
+            let moves = if wave64 { "s_mov_b64" } else { "s_mov_b32" };
+            if mov.name() != moves || mov.read(Reg::S(EXEC + k))? != pe.args[entry] {
+                return None;
+            }
+            head_exec.push(pe.value);
+        }
+        let exec_is = |inst: &Inst, values: &[Value]| {
+            halves
+                .iter()
+                .zip(values)
+                .all(|(&k, &v)| inst.read(Reg::S(EXEC + k)) == Some(v))
+        };
+        let mut out = Waterfall::default();
+        let mut selected: Option<Vec<Value>> = None;
+        // The lane value each first-lane read took, by the read's result.
+        let mut read_from: Vec<(Value, Value)> = Vec::new();
+        for (i, inst) in body.iter().enumerate() {
+            let name = inst.name();
+            let site = (b, i);
+            if name == "s_nop" || name.starts_with("s_waitcnt") {
+                continue;
+            }
+            if name == "v_readfirstlane_b32" {
+                // Before the compares, under the loop's own EXEC.
+                if selected.is_some() || !exec_is(inst, &head_exec) {
+                    return None;
+                }
+                let Fields::Valu(f) = &inst.fields else {
+                    return None;
+                };
+                let Some(&Operand::Vector { reg, .. }) = f.src.first() else {
+                    return None;
+                };
+                let lane = inst.read(Reg::V(reg))?;
+                // Set before the loop: the same in every pass.
+                if self.phis[lane.0 as usize].is_some_and(|(pb, _)| pb == b)
+                    || self.defs[lane.0 as usize].is_some_and(|(db, _)| db == b)
+                {
+                    return None;
+                }
+                let &(_, got) = inst.writes.first()?;
+                read_from.push((got, lane));
+                continue;
+            }
+            if name == "v_cmpx_eq_u32" || name == "v_cmpx_eq_i32" {
+                let Fields::Valu(f) = &inst.fields else {
+                    return None;
+                };
+                if f.abs != 0
+                    || f.neg != 0
+                    || f.opsel != 0
+                    || f.clamp
+                    || f.sdwa.is_some()
+                    || f.dpp.is_some()
+                {
+                    return None;
+                }
+                // Compares narrow EXEC one after another.
+                let before = selected.clone().unwrap_or_else(|| head_exec.clone());
+                if !exec_is(inst, &before) {
+                    return None;
+                }
+                let (Some(a), Some(c)) = (f.src.first(), f.src.get(1)) else {
+                    return None;
+                };
+                let pair = |first: &Operand, own: &Operand| -> Option<Value> {
+                    let (&Operand::Scalar { code, .. }, &Operand::Vector { reg, .. }) =
+                        (first, own)
+                    else {
+                        return None;
+                    };
+                    let x = inst.read(Reg::S(code))?;
+                    let lane = inst.read(Reg::V(reg))?;
+                    read_from
+                        .iter()
+                        .any(|&(got, from)| got == x && from == lane)
+                        .then_some(x)
+                };
+                let x = pair(a, c).or_else(|| pair(c, a))?;
+                let narrowed = halves
+                    .iter()
+                    .map(|&k| inst.write(Reg::S(EXEC + k)))
+                    .collect::<Option<Vec<_>>>()?;
+                selected = Some(narrowed);
+                out.compares.push(site);
+                if !out.reads.contains(&x) {
+                    out.reads.push(x);
+                }
+                continue;
+            }
+            let sel = selected.as_deref()?;
+            if loads.contains(&site) {
+                continue;
+            }
+            let reads_only = name.starts_with("buffer_load")
+                || name.starts_with("image_load")
+                || name.starts_with("image_sample")
+                || name.starts_with("image_gather");
+            if accesses.contains(&i) && reads_only && exec_is(inst, sel) {
+                continue;
+            }
+            return None;
+        }
+        // The retry takes T and not the EXEC the compares left.
+        let sel = selected?;
+        if !exec_is(retry, &sel) {
+            return None;
+        }
+        // Every offset read is one a compare made the lane's own, and every
+        // access was seen.
+        if reads.iter().any(|v| !out.reads.contains(v)) || accesses.iter().any(|&i| i >= body.len())
+        {
+            return None;
+        }
+        // Read nowhere else: made the lane's own, a first-lane value must
+        // not reach code past the loop, which would see the last pass's.
+        for (ob, other) in self.p.blocks.iter().enumerate() {
+            let carried = other
+                .phis
+                .iter()
+                .any(|p| p.args.iter().any(|a| out.reads.contains(a)));
+            let read_there = ob != b
+                && other
+                    .insts
+                    .iter()
+                    .any(|inst| inst.reads.iter().any(|(_, v)| out.reads.contains(v)));
+            if carried || read_there {
+                return None;
+            }
+        }
+        Some(out)
+    }
+
     /// Consecutive dwords of one scalar load.
     fn loaded(&self, words: &[Term]) -> Option<Source> {
         let Term::Value(v0) = words[0] else {
@@ -2320,41 +2615,65 @@ impl<'a> Tracer<'a> {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Moved {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Moved {
     Const(u32),
     Value(Value),
+}
+
+fn plain_lane(v: &crate::gfx10::Valu) -> bool {
+    v.abs == 0
+        && v.neg == 0
+        && v.opsel == 0
+        && !v.clamp
+        && v.omod == 0
+        && v.sdwa.is_none()
+        && v.dpp.is_none()
 }
 
 impl Tracer<'_> {
     /// For `v_readlane_b32` of a constant lane: the SGPR spilled to that
     /// lane, found by following the VGPR's `v_writelane_b32` writes.
-    fn restored(&self, inst: &Inst) -> Option<Moved> {
+    fn restored(&self, inst: &Inst, block: Option<usize>) -> Option<Moved> {
         let Fields::Valu(v) = &inst.fields else {
             return None;
         };
-        if inst.name() != "v_readlane_b32" {
+        let strict = crate::emit::lane_spill_strict();
+        if inst.name() != "v_readlane_b32" || strict && !plain_lane(v) {
             return None;
         }
         let [Operand::Vector { reg, .. }, lane] = v.src[..] else {
             return None;
         };
-        self.spilled(inst.read(Reg::V(reg))?, lane_of(lane)?, &mut Vec::new())
+        let lane = lane_of(lane)?;
+        if strict && lane >= if self.p.wave64 { 64 } else { 32 } {
+            return None;
+        }
+        self.spilled(inst.read(Reg::V(reg))?, lane, block, &mut Vec::new())
             .ok()
             .flatten()
     }
 
     /// What lane `lane` of VGPR value `v` holds: `Ok(None)` for a phi in
     /// `seen` (already being resolved), `Err` if not a spilled SGPR.
-    fn spilled(&self, v: Value, lane: u32, seen: &mut Vec<Value>) -> Result<Option<Moved>, ()> {
+    fn spilled(
+        &self,
+        v: Value,
+        lane: u32,
+        block: Option<usize>,
+        seen: &mut Vec<Value>,
+    ) -> Result<Option<Moved>, ()> {
         if let Some((b, i)) = self.phis[v.0 as usize] {
+            if block.is_some() {
+                return Err(());
+            }
             if seen.contains(&v) {
                 return Ok(None);
             }
             seen.push(v);
             let mut found = None;
             for &a in &self.p.blocks[b].phis[i].args {
-                if let Some(m) = self.spilled(a, lane, seen)? {
+                if let Some(m) = self.spilled(a, lane, block, seen)? {
                     if found.is_some_and(|f| f != m) {
                         return Err(());
                     }
@@ -2363,18 +2682,27 @@ impl Tracer<'_> {
             }
             return Ok(found);
         }
-        let inst = self.def(v).ok_or(())?;
+        let site = self.defs[v.0 as usize].ok_or(())?;
+        if block.is_some_and(|b| site.0 != b) {
+            return Err(());
+        }
+        let inst = self.inst(site);
         let Fields::Valu(w) = &inst.fields else {
             return Err(());
         };
         let (Some(Operand::Vector { reg, .. }), [value, at]) = (w.dst, &w.src[..]) else {
             return Err(());
         };
-        if inst.name() != "v_writelane_b32" {
+        let strict = crate::emit::lane_spill_strict();
+        if inst.name() != "v_writelane_b32" || strict && !plain_lane(w) {
             return Err(());
         }
-        if lane_of(*at).ok_or(())? != lane {
-            return self.spilled(inst.read(Reg::V(reg)).ok_or(())?, lane, seen);
+        let written = lane_of(*at).ok_or(())?;
+        if strict && written >= if self.p.wave64 { 64 } else { 32 } {
+            return Err(());
+        }
+        if written != lane {
+            return self.spilled(inst.read(Reg::V(reg)).ok_or(())?, lane, block, seen);
         }
         match *value {
             Operand::Scalar { code, .. } if code != NULL => {
@@ -3364,6 +3692,138 @@ pub(crate) mod tests {
         assert_eq!(r.waterfall.loads, [load]);
     }
 
+    /// [`WATERFALL_INDEXED_WAVE32`] as a wave of 64 runs it: EXEC saved
+    /// and the lanes still waiting kept in SGPR pairs, the retry
+    /// `s_andn2_wrexec_b64`.
+    fn waterfall_indexed_wave64() -> Vec<u32> {
+        let mut w = WATERFALL_INDEXED_WAVE32.to_vec();
+        for (from, to) in [
+            (0xBE97_037E, 0xBE96_047E), // s_mov_b64 s[22:23], exec
+            (0xBE95_037E, 0xBE98_047E), // s_mov_b64 s[24:25], exec
+            (0xBE95_4715, 0xBE98_3A18), // s_andn2_wrexec_b64 s[24:25], s[24:25]
+            (0xBEFE_0317, 0xBEFE_0416), // s_mov_b64 exec, s[22:23]
+        ] {
+            let at = word_at(&w, from);
+            w[at] = to;
+        }
+        w
+    }
+
+    #[test]
+    fn the_console_waterfall_over_a_first_lane_offset_is_one_in_a_wave_of_64() {
+        let r = waterfall(&waterfall_indexed_wave64(), true).unwrap();
+        let image = r
+            .descriptors
+            .iter()
+            .find(|d| d.role == Role::Resource)
+            .unwrap();
+        let Source::Loaded { load, first: 0 } = image.source else {
+            panic!("{:?}", image.source)
+        };
+        assert_eq!(r.waterfall.compares.len(), 1);
+        assert_eq!(r.waterfall.reads.len(), 1);
+        assert_eq!(r.waterfall.loads, [load]);
+    }
+
+    /// [`Tracer::waterfall_shape`] on the one loop of `words`, with what
+    /// [`track`] would hand it: the loop's table loads, its first-lane reads
+    /// and its buffer and image accesses.
+    fn by_shape(words: &[u32], wave64: bool) -> Option<Waterfall> {
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = crate::ir::build(&code, wave64, 256).unwrap();
+        let layout = [param(Table, 0, 1), param(Table, 1, 1)];
+        let lanes = lanes(&p);
+        let t = Tracer::new(&p, &layout, HwStage::Cs, lanes.as_ref()).unwrap();
+        let b = (0..p.blocks.len())
+            .find(|&b| matches!(p.blocks[b].exit, Exit::Branch { taken, .. } if taken == b))
+            .unwrap();
+        let insts = &p.blocks[b].insts;
+        let loads: Vec<Site> = (0..insts.len())
+            .filter(|&i| insts[i].name().starts_with("s_load_"))
+            .map(|i| (b, i))
+            .collect();
+        let reads: Vec<Value> = insts
+            .iter()
+            .filter(|i| i.name() == "v_readfirstlane_b32")
+            .filter_map(|i| i.writes.first().map(|w| w.1))
+            .collect();
+        let accesses: Vec<usize> = (0..insts.len())
+            .filter(|&i| {
+                matches!(
+                    insts[i].fields,
+                    Fields::Buffer { .. } | Fields::Image { .. }
+                )
+            })
+            .collect();
+        t.waterfall_shape(b, &accesses, &reads, &loads)
+    }
+
+    /// [`WATERFALL_INDEXED_WAVE32`] or [`waterfall_indexed_wave64`] with
+    /// words replaced.
+    fn indexed_with(wave64: bool, changes: &[(u32, u32)]) -> Vec<u32> {
+        let mut w = if wave64 {
+            waterfall_indexed_wave64()
+        } else {
+            WATERFALL_INDEXED_WAVE32.to_vec()
+        };
+        for &(from, to) in changes {
+            let at = word_at(&w, from);
+            w[at] = to;
+        }
+        w
+    }
+
+    #[test]
+    fn the_console_waterfall_over_a_first_lane_offset_holds_by_its_shape() {
+        for wave64 in [false, true] {
+            let shape = by_shape(&indexed_with(wave64, &[]), wave64)
+                .unwrap_or_else(|| panic!("wave64 {wave64}"));
+            assert_eq!(shape.compares.len(), 1, "wave64 {wave64}");
+            assert_eq!(shape.reads.len(), 1, "wave64 {wave64}");
+        }
+    }
+
+    #[test]
+    fn a_waterfall_loop_with_other_work_in_it_is_none_by_shape() {
+        for wave64 in [false, true] {
+            // s_waitcnt vmcnt(0) in the loop becomes v_mov_b32 v20, v7.
+            let words = indexed_with(wave64, &[(0xBF8C_3F70, 0x7E28_0307)]);
+            assert!(by_shape(&words, wave64).is_none(), "wave64 {wave64}");
+        }
+    }
+
+    #[test]
+    fn a_waterfall_comparing_another_lane_value_is_none_by_shape() {
+        for wave64 in [false, true] {
+            // v_cmpx_eq_u32 exec, s20, v0: the lane's index, not the offset
+            // the first lane's was read from (v7).
+            let words = indexed_with(wave64, &[(0x7DA4_0E14, 0x7DA4_0014)]);
+            assert!(by_shape(&words, wave64).is_none(), "wave64 {wave64}");
+        }
+    }
+
+    #[test]
+    fn a_waterfall_whose_lanes_to_do_are_not_exec_is_none_by_shape() {
+        // The mask of lanes still to do starts as every lane, not EXEC.
+        let words = indexed_with(false, &[(0xBE95_037E, 0xBE95_03C1)]); // s_mov_b32 s21, -1
+        assert!(by_shape(&words, false).is_none());
+        let words = indexed_with(true, &[(0xBE98_047E, 0xBE98_04C1)]); // s_mov_b64 s[24:25], -1
+        assert!(by_shape(&words, true).is_none());
+    }
+
+    #[test]
+    fn a_first_lane_offset_read_after_its_loop_is_none_by_shape() {
+        for wave64 in [false, true] {
+            // The store after the loop becomes v_mov_b32 v20, s20 (the
+            // first lane's offset of the last pass) and s_nop.
+            let words = indexed_with(
+                wave64,
+                &[(0xE070_1000, 0x7E28_0214), (0x800A_0C10, 0xBF80_0000)],
+            );
+            assert!(by_shape(&words, wave64).is_none(), "wave64 {wave64}");
+        }
+    }
+
     /// [`WATERFALL_JOINED_WAVE32`] with other sources on each path: lanes
     /// below 16 load table entry (lane & 1) with two `global_load_dwordx4`,
     /// the others pick per lane with `v_cndmask_b32` (lanes below 24 the
@@ -4088,5 +4548,185 @@ pub(crate) mod tests {
         assert_eq!(table_offset(&r, other), 0x20);
         assert_eq!(r.waterfall.compares.len(), 2);
         assert_eq!(r.waterfall.reads.len(), 4);
+    }
+
+    #[test]
+    fn a_guarded_access_excludes_dead_lane_edges_at_a_join() {
+        // Lanes failing `v_cmp_gt_u32` clear EXEC and take `s_cbranch_execz`
+        // directly to the join block without initializing the immediate
+        // sampler `s[8:11]`. The join's `image_sample_lz` is guarded by EXEC,
+        // so only the arm where `s[8:11]` was built can execute it.
+        let code: Vec<u8> = [
+            0xBE84_0300u32, // s_mov_b32 s4, s0
+            0xBE85_0380,    // s_mov_b32 s5, 0
+            0xF40C_0302,
+            0xFA00_0000,    // s_load_dwordx8 s[12:19], s[4:5], 0x0
+            0x7E04_0D00,    // v_cvt_f32_u32 v2, v0
+            0x7E06_0302,    // v_mov_b32 v3, v2
+            0x7D88_0090,    // v_cmp_gt_u32 vcc_lo, 16, v0
+            0xBF8C_C07F,    // s_waitcnt lgkmcnt(0)
+            0x877E_6A7E,    // s_and_b32 exec_lo, exec_lo, vcc_lo
+            0xBF88_0004,    // s_cbranch_execz -> join (skips 4 dwords)
+            0xBE88_0380,    // s_mov_b32 s8, 0
+            0xBE89_0380,    // s_mov_b32 s9, 0
+            0xBE8A_0380,    // s_mov_b32 s10, 0
+            0xBE8B_0380,    // s_mov_b32 s11, 0
+            0xF09C_0F08,
+            0x0043_0C02,    // image_sample_lz v[12:15], v[2:3], s[12:19], s[8:11]
+            S_ENDPGM,
+        ]
+        .iter()
+        .flat_map(|w| w.to_le_bytes())
+        .collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let structured = lanes(&p).expect("structured form");
+        assert!(structured.guards[2][0].is_some(), "join access must carry an EXEC guard");
+        crate::emit::test_guarded_descriptors(Some(true));
+        let r = track(&p, &[param(Table, 0, 1)], HwStage::Cs, Some(&structured)).unwrap();
+        crate::emit::test_guarded_descriptors(None);
+        assert!(
+            r.descriptors
+                .iter()
+                .any(|d| d.role == Role::Sampler && d.source == Source::Constant(vec![0; 4])),
+            "guarded join should resolve the immediate sampler from the live arm: {:?}",
+            r.descriptors
+        );
+    }
+
+    #[test]
+    fn a_real_high_half_addend_is_not_treated_as_carry() {
+        // s[12:13] = s[6:7] + s[2:3], a full 64-bit sum. The high half's
+        // nonzero addend s3 is not the low half's carry, so this address
+        // cannot be rebuilt as the root descriptor plus only s2.
+        let r = track_words(
+            &[
+                0x800C_0206, // s_add_u32 s12, s6, s2
+                0x820D_0307, // s_addc_u32 s13, s7, s3
+                0x7E02_0280, // v_mov_b32 v1, 0
+                0xDC70_8000,
+                0x000C_0101, // global_store_dword v1, v1, s[12:13]
+                S_ENDPGM,
+            ],
+            &[param(Constants, 0, 4), param(Descriptor, 6, 2)],
+            HwStage::Cs,
+        );
+        assert_eq!(r.scalar[0].1.param, MEMORY);
+    }
+
+    #[test]
+    fn only_a_zero_vector_addend_leaves_room_for_carry() {
+        let run = |zero| {
+            track_words(
+                &[
+                    0xD70F_6A00,
+                    0x0202_0406, // v_add_co_u32 v0, vcc_lo, s6, v2
+                    if zero {
+                        0x7E08_0280
+                    } else {
+                        0x7E08_0281
+                    }, // v_mov_b32 v4, 0/1
+                    0x5002_0807, // v_add_co_ci_u32 v1, vcc_lo, s7, v4, vcc_lo
+                    0xDC70_8000,
+                    0x007D_0100, // global_store_dword v[0:1], v1, off
+                    S_ENDPGM,
+                ],
+                &[param(Constants, 0, 4), param(Descriptor, 6, 2)],
+                HwStage::Cs,
+            )
+        };
+        assert_eq!(run(true).scalar[0].1.param, 1);
+        assert_eq!(run(false).scalar[0].1.param, MEMORY);
+    }
+
+    /// A table in the code read at base + (sext(i) << 2), the high half the
+    /// index's sign (pixel 5e69b507ec27b789 at 0x1dc): translates. With the
+    /// sign of another value the high half is no carry and is refused.
+    #[test]
+    fn a_code_table_index_made_64_bit_carries_its_sign() {
+        let run = |sign_of_low: bool| {
+            let code: Vec<u8> = [
+                0x2C02_0899, // 0x00: v_lshrrev_b32 v1, 25, v4
+                0x4A14_02C1, // v_add_nc_u32 v10, -1, v1
+                if sign_of_low {
+                    0x3016_149F // v_ashrrev_i32 v11, 31, v10
+                } else {
+                    0x3016_089F // v_ashrrev_i32 v11, 31, v4
+                },
+                0xD6FF_000A,
+                0x0002_1482, // 0x0c: v_lshlrev_b64 v[10:11], 2, v[10:11]
+                0xBE8C_1F00, // 0x14: s_getpc_b64 s[12:13]
+                0x800C_FF0C,
+                0x0000_4CF8, // s_add_u32 s12, s12, 0x4cf8
+                0x820D_800D, // s_addc_u32 s13, s13, 0
+                0xD70F_0409,
+                0x0000_190A, // v_add_co_u32 v9, s[4:5], v10, s12
+                0xD528_040A,
+                0x0012_160D, // v_add_co_ci_u32 v10, s[4:5], s13, v11, s[4:5]
+                0xDC38_8000,
+                0x197D_0009, // 0x34: global_load_dwordx4 v[25:28], v[9:10], off
+                S_ENDPGM,
+            ]
+            .iter()
+            .flat_map(|w: &u32| w.to_le_bytes())
+            .collect();
+            let p = crate::ir::build(&code, true, 256).unwrap();
+            track(&p, &[], HwStage::Ps, lanes(&p).as_ref())
+        };
+        let r = run(true).unwrap();
+        assert_eq!(r.scalar.len(), 1);
+        let a = r.scalar[0].1;
+        assert_eq!((a.param, a.offset), (CODE, 0x18 + 0x4CF8));
+        assert!(a.dynamic.is_some());
+        assert_eq!(
+            run(false).unwrap_err(),
+            ShaderError::Unsupported {
+                offset: 0x34,
+                what: "an address with an untracked high half"
+            }
+        );
+    }
+
+    /// The same in SGPRs: base + (sext(s24) << 2) added with `s_addc_u32`
+    /// (pixel 98bd9f9ae5f9c7e3 at 0xcc). With the sign of another register
+    /// the high half is refused.
+    #[test]
+    fn a_code_table_index_made_64_bit_in_sgprs_carries_its_sign() {
+        let run = |sign_of_low: bool| {
+            let code: Vec<u8> = [
+                0xBE98_0306, // 0x00: s_mov_b32 s24, s6
+                if sign_of_low {
+                    0x9119_9F18 // s_ashr_i32 s25, s24, 31
+                } else {
+                    0x9119_9F07 // s_ashr_i32 s25, s7, 31
+                },
+                0x8F84_8218, // s_lshl_b64 s[4:5], s[24:25], 2
+                0xBE96_1F00, // 0x0c: s_getpc_b64 s[22:23]
+                0x8016_FF16,
+                0x0000_0338, // s_add_u32 s22, s22, 0x338
+                0x8217_8017, // s_addc_u32 s23, s23, 0
+                0x8008_1604, // s_add_u32 s8, s4, s22
+                0x8209_1705, // s_addc_u32 s9, s5, s23
+                0xF400_0204,
+                0xFA00_0000, // 0x24: s_load_dword s8, s[8:9], null
+                S_ENDPGM,
+            ]
+            .iter()
+            .flat_map(|w: &u32| w.to_le_bytes())
+            .collect();
+            let p = crate::ir::build(&code, true, 256).unwrap();
+            track(&p, &[], HwStage::Ps, lanes(&p).as_ref())
+        };
+        let r = run(true).unwrap();
+        assert_eq!(r.scalar.len(), 1);
+        let a = r.scalar[0].1;
+        assert_eq!((a.param, a.offset), (CODE, 0x10 + 0x338));
+        assert!(a.dynamic.is_some());
+        assert_eq!(
+            run(false).unwrap_err(),
+            ShaderError::Unsupported {
+                offset: 0x24,
+                what: "an address with an untracked high half"
+            }
+        );
     }
 }

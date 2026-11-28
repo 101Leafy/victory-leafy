@@ -801,6 +801,7 @@ impl HostPipeline {
                         slot == victory_shader::emit::SLOT_FAULTS
                     } else {
                         slot == victory_shader::emit::SLOT_STRIDES
+                            || slot == victory_shader::emit::SLOT_TABLE_STRIDES
                             || slot == victory_shader::emit::SLOT_MEMORY
                     };
                     if (uav || kind == D3D12_ROOT_PARAMETER_TYPE_SRV) && !ours && bounded_root_srvs() {
@@ -1539,6 +1540,9 @@ fn root_signature(
         let blob = blob.ok_or_else(windows::core::Error::empty)?;
         let bytes =
             std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize());
+        // The host first sees different static samplers in the same order
+        // in every launch (`super::samplers`).
+        super::samplers::before(device, samplers, super::library::library_dir().as_deref());
         Ok((device.CreateRootSignature(0, bytes)?, bytes.to_vec()))
     }
 }

@@ -2134,3 +2134,206 @@ fn a_select_on_a_mask_held_as_a_number_keeps_the_consoles_lanes() {
     // 64 threads in waves of 32: two console waves, and no LDS
     assert_eq!(flag_wave(&native_of(&words, false, 64)), Some(32));
 }
+
+fn fp32_reduce(op: u32, identity: u32) -> Vec<u32> {
+    let mut words = super::wave::WAVE_OR_V7_TO_S7.to_vec();
+    if identity != 0 {
+        words[2] = (words[2] & !0x1ff) | LIT;
+        words.insert(3, identity);
+    }
+    for w in &mut words {
+        if *w >> 25 == 28 {
+            *w = (*w & 0x01ff_ffff) | op << 25;
+        }
+    }
+    words
+}
+
+/// The water's whole-wave sums as the console compiler expands them (the transmission
+/// volumetrics programs 5dc3b25986622949 and 6f225b641c5b0708): two FP32 sums in a row, the
+/// first leaving its partial sums in v1 and v2, which the second clears in every lane
+/// (`v_cndmask_b32 v1, 0, v7, s[4:5]`, `v_permlanex16_b32 v2, v1, 0, 0`); then the 64-bit
+/// float count of the lanes (a sum of `term`, 1.0 in the water: `None` a uniform that is not
+/// a constant). `seen`: the second sum's partials are read afterwards.
+fn water_sums(seen: bool, term: Option<u32>) -> NativeProgram {
+    let mut body = vec![
+        vop1(1, 7, 1), // v_mov_b32 v7, s1
+        sop1(4, 12, EXEC),
+        vop2(0x1d, 5, k(45), 0), // sparse EXEC across either half
+        vopc(0xd4, 0, 5),
+    ];
+    body.extend(fp32_reduce(3, 0));
+    body.push(vop1(1, 8, 7)); // v_mov_b32 v8, s7: the first sum
+    body.extend(fp32_reduce(3, 0));
+    body.push(vop1(1, 10, k(0))); // v_mov_b32 v10, 0
+    match term {
+        Some(hi) => body.extend([vop1(1, 11, LIT), hi]),
+        None => body.push(vop1(1, 11, 2)), // v_mov_b32 v11, s2
+    }
+    body.extend([
+        0xBE92_25C1, // s_or_saveexec_b64 s[18:19], -1
+        0x7E04_0280, // v_mov_b32 v2, 0
+        0x7E06_0280, // v_mov_b32 v3, 0
+        0xD501_0002,
+        0x004A_1502, // v_cndmask_b32 v2, v2, v10, s[18:19]
+        0xD501_0003,
+        0x004A_1703, // v_cndmask_b32 v3, v3, v11, s[18:19]
+    ]);
+    for dpp in [0xDE54_C100, 0x9360_1200, 0x0009_2400] {
+        body.extend([
+            0x7E08_02E9,
+            dpp | 2, // v_mov_b32 v4, v2 dpp8:[...]
+            0x7E0A_02E9,
+            dpp | 3, // v_mov_b32 v5, v3 dpp8:[...]
+            0xD564_0002,
+            0x0002_0504, // v_add_f64 v[2:3], v[4:5], v[2:3]
+        ]);
+    }
+    body.extend([
+        0x7E08_02FA,
+        0xFF09_4002, // v_mov_b32 v4, v2 row_mirror bound_ctrl:1
+        0x7E0A_02FA,
+        0xFF09_4003, // v_mov_b32 v5, v3 row_mirror bound_ctrl:1
+        0xD564_0002,
+        0x0002_0504,
+        0xD778_0004,
+        0x0201_0102, // v_permlanex16_b32 v4, v2, 0, 0
+        0xD778_0005,
+        0x0201_0103, // v_permlanex16_b32 v5, v3, 0, 0
+        0xD564_0002,
+        0x0002_0504,
+        0xD760_0010,
+        0x0001_4102, // v_readlane_b32 s16, v2, 32
+        0xD760_0011,
+        0x0001_4103, // v_readlane_b32 s17, v3, 32
+        0xD564_0002,
+        0x0002_0410, // v_add_f64 v[2:3], s[16:17], v[2:3]
+        0xD760_0010,
+        0x0001_0102, // v_readlane_b32 s16, v2, 0
+        0xD760_0011,
+        0x0001_0103, // v_readlane_b32 s17, v3, 0
+        sop1(3, 14, 16),
+        sop1(3, 15, 17),
+        sop1(4, EXEC, 18), // s_mov_b64 exec, s[18:19]
+        sop1(4, EXEC, 12),
+        vop1(1, 9, 7),   // the second sum
+        vop1(1, 10, 14), // the count's low dword
+        vop1(1, 11, if seen { v(1) } else { 15 }),
+    ]);
+    body.extend(stores([8, 9, 10, 11]));
+    native(&body)
+}
+
+#[test]
+fn paired_fp32_takes_the_water_sums() {
+    const TEST: &str = "WAVE64_FP32_WATER_TEST";
+    if std::env::var_os(TEST).is_some() {
+        let translate = |native: NativeProgram| {
+            let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+            let st = structure::structure(&p).expect("structure");
+            let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+            let io = io::raise(&p, &native).expect("io::raise");
+            let bytes = crate::dxbc::build(&[]);
+            let c = super::Container::parse(&bytes).expect("container");
+            let was = lower::TEST_HOST_WAVE.replace(Some(32));
+            let r = super::paired(&c, &native, &p, &io, &res).map(|(_, wave)| wave);
+            lower::TEST_HOST_WAVE.set(was);
+            r
+        };
+        let one = Some(0x3FF0_0000);
+        assert!(matches!(translate(water_sums(false, one)), Ok(Some(32))));
+        // -1.0 and 0.0 count too
+        assert!(matches!(translate(water_sums(false, Some(0xBFF0_0000))), Ok(Some(32))));
+        assert!(matches!(translate(water_sums(false, Some(0))), Ok(Some(32))));
+        // a partial sum read afterwards is no full reduction
+        assert!(matches!(
+            translate(water_sums(true, one)),
+            Err(ShaderError::Unsupported {
+                what: "a paired FP32 section without a proven full reduction",
+                ..
+            })
+        ));
+        return;
+    }
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["paired_fp32_takes_the_water_sums", "--nocapture"])
+        .env(TEST, "1")
+        .env_remove("VICTORY_WAVE_PAIRS_FP32")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+}
+
+/// Tile compute shader LDS pattern: thread 0 alone stores the tile's starting maximum (0,
+/// dword 0) and minimum (-1, dword 1), then every thread `ds_max_u32`s and `ds_min_u32`s its
+/// key in and reads both back. `max_start` replaces the 0; `stray` adds a dynamic-address
+/// write; `atomics: false` omits the atomics.
+fn tile_min_max(max_start: u32, stray: bool, atomics: bool) -> NativeProgram {
+    let mut body = vec![
+        0xBE8C_047E,           // s_mov_b64 s[12:13], exec
+        0x7D92_0080,           // v_cmpx_eq_u32 exec, 0, v0
+        0x7E06_02FF,
+        max_start,             // v_mov_b32 v3, max_start
+        0x7E08_02C1,           // v_mov_b32 v4, -1
+        0x7E0A_0280,           // v_mov_b32 v5, 0
+        0xD838_0100,
+        0x0004_0305,           // ds_write2_b32 v5, v3, v4 offset1:1
+        0xBEFE_040C,           // s_mov_b64 exec, s[12:13]
+        0x7E0A_0280,           // v_mov_b32 v5, 0
+    ];
+    if stray {
+        body.extend([0xD834_0000, 0x0000_0000]); // ds_write_b32 v0, v0
+    }
+    if atomics {
+        body.extend([
+            0xD81C_0004,
+            0x0000_0005, // ds_min_u32 v5, v0 offset:4
+            0xD820_0000,
+            0x0000_0005, // ds_max_u32 v5, v0
+        ]);
+    }
+    body.extend([0xD8DC_0100, 0x0600_0005]); // ds_read2_b32 v[6:7], v5 offset1:1
+    body.extend([
+        0x38 << 26 | 0x1C << 18,
+        0x80 << 24 | 2 << 16 | 6 << 8, // buffer_store_dword v6, off, s[8:11], 0
+    ]);
+    // 64 threads, 512 bytes of LDS
+    native_with(&body, true, 64, 512)
+}
+
+#[test]
+fn accumulator_inits_are_hoisted_to_the_start() {
+    let hoists = |program: NativeProgram| {
+        let p = crate::spill::build(&program).unwrap();
+        lower::lds_init_hoists(&p, 128)
+    };
+    assert_eq!(hoists(tile_min_max(0, false, true)), [(0, 0), (1, u32::MAX)]);
+    // A start value that is not the maximum's identity stays unhoisted.
+    assert_eq!(hoists(tile_min_max(5, false, true)), [(1, u32::MAX)]);
+    // Plain stores without atomics are not accumulators.
+    assert_eq!(hoists(tile_min_max(0, false, false)), []);
+    // Any dynamic-address write prevents hoisting.
+    assert_eq!(hoists(tile_min_max(0, true, true)), []);
+    // The shader still lowers and passes DXIL validation.
+    let program = tile_min_max(0, false, true);
+    let p = crate::spill::build(&program).unwrap();
+    let st = structure::structure(&p).unwrap();
+    let res = resource::track(&p, &program.layout, program.stage, Some(&st)).unwrap();
+    let io = io::raise(&p, &program).unwrap();
+    let shader = lower::lower(&lower::Parts {
+        native: &program,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: vec![],
+        outputs: vec![],
+        prims: vec![],
+        mesh_stride: 0,
+    })
+    .unwrap();
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut dxil = shader.dxil.clone();
+        v.validate(&mut dxil).unwrap();
+    }
+}

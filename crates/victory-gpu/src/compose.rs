@@ -5,7 +5,6 @@
 
 use std::sync::OnceLock;
 
-use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -17,6 +16,16 @@ use crate::host::Host;
 pub(crate) fn on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| !std::env::var("VICTORY_TWO_PLANES").is_ok_and(|v| v.trim() == "0"))
+}
+
+/// Whether a present's second plane is handed to the host: shown, or saved
+/// on its own (`VICTORY_CAPTURE_PLANE=interface`).
+pub(crate) fn passed() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if crate::capture::plane() == Some(crate::capture::Plane::Interface) {
+        return true;
+    }
+    on()
 }
 
 const SOURCE: &str = r#"
@@ -56,7 +65,7 @@ fn compile(entry: PCSTR, target: PCSTR) -> windows::core::Result<ID3DBlob> {
     // SAFETY: the source and names live through the call; the out pointer is
     // ours.
     unsafe {
-        D3DCompile(
+        crate::dxc::d3d_compile(
             SOURCE.as_ptr().cast(),
             SOURCE.len(),
             s!("compose"),
@@ -169,6 +178,7 @@ impl Composer {
                         },
                     },
                 };
+                crate::host::settle();
                 host.device
                     .CreateShaderResourceView(Some(plane.0), Some(&desc), at);
             }

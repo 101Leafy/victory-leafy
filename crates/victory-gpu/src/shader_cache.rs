@@ -86,13 +86,17 @@ fn build(translator: &str) -> [u8; 32] {
         // executable had cached with the switch unset.
         for name in [
             "VICTORY_WAVE_WIDE",
+            "VICTORY_WAVE_WIDE_SCENE",
             "VICTORY_SCALAR_SPLITS",
             "VICTORY_WAVE_DEEP_SKIPS",
             "VICTORY_WAVE_OWN_BITS",
             "VICTORY_WAVE_LOCAL",
             "VICTORY_F16_NEAREST",
+            "VICTORY_FILTER_3D",
             "VICTORY_HELPER_OWN",
             "VICTORY_FIRSTLANE_OWN",
+            "VICTORY_UNIFORM_LOADS",
+            "VICTORY_GUARDED_UNIFORM",
             "VICTORY_FIRST_HALF",
             "VICTORY_STRICT_JOINS",
             "VICTORY_MESH_OUTPUT_STRICT",
@@ -103,11 +107,25 @@ fn build(translator: &str) -> [u8; 32] {
             "VICTORY_MESH_LAUNCH",
             "VICTORY_GUARD_FLOAT",
             "VICTORY_GUARD_RUNS",
+            "VICTORY_GUARDED_DESCRIPTORS",
+            "VICTORY_WAVE32_LOWERING",
+            "VICTORY_LANE_SPILL_STRICT",
+            "VICTORY_TABLE_STRIDES",
+            "VICTORY_LDS_INIT_HOIST",
+            "VICTORY_BVH_MISS",
+            "VICTORY_NAN_SCRUB",
+            "VICTORY_MEMORY_NEAR",
         ] {
             append_switch(&mut bytes, name, std::env::var_os(name).as_deref());
         }
         // And which clean-up passes ran over the translated code.
         bytes.extend_from_slice(&victory_shader::emit::shader_opt().to_le_bytes());
+        // Renderer port 5 (`VICTORY_PORT_CBV=1`): constant buffers read as raw
+        // bytes. Only when on, so the translations cached without it keep
+        // their key.
+        if victory_shader::emit::constants_raw() {
+            bytes.extend_from_slice(b"VICTORY_PORT_CBV=1");
+        }
         bytes
     });
     let mut hash = blake3::Hasher::new();

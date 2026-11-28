@@ -5,6 +5,8 @@
 //! the times (each in a file of its own, the second in its name): a Chrome trace (JSON, for
 //! `chrome://tracing` or Perfetto) and beside it a text summary (`.txt`)
 //! with the chain of work and waits each frame's present came out of.
+//! When no present comes for `VICTORY_TIMELINE_STALL` seconds (10; 0: never)
+//! while it records, what it has is written, `.stall` in the file's name.
 //!
 //! What is recorded while it runs, by every thread:
 //! - spans of ours ([`span`]): the title's calls, the submitting thread's

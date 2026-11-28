@@ -9,27 +9,75 @@
 //! the title checks it one block later and treats a late command as an
 //! overrun. Commands complete when submitted here.
 //!
-//! The transforms themselves are not computed: the hardware takes impulse
-//! responses already in its own partitioned frequency-domain layout, which
-//! is not known. Outputs are silence, so reverb returns are dry.
-// shortcut: no convolution or block transform; outputs are zeros. Needs the
-// coprocessor's impulse response and spectrum layouts to do better.
+//! Convolution runs on the host with the console's partitioned
+//! frequency-domain impulse responses (see [`super::dsp_convolve`]), so
+//! reverb returns are wet. `VICTORY_DSP_CONVOLVE=mono` computes only mono
+//! convolutions of 1024-frame blocks instead, with [`convolve`] (trustno1
+//! #77): reverb, and the speakers in the world (TVs, phone calls), whose
+//! sound goes through the DSP alone. `VICTORY_DSP_CONVOLVE=0` computes none.
+//! The FFT and IFFT stream transforms remain silent: their inputs and
+//! outputs are spectra, not audio a title can play.
 #![allow(non_snake_case)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::ffi::c_void;
 use std::sync::Mutex;
 
+use super::dsp_convolve::Convolver;
 use super::xasync::E_INVALIDARG;
 use super::xgameruntime::{HRESULT, S_OK};
 use crate::{HleModule, hle_export};
+
+mod convolve;
+
+/// Which convolutions are computed (`VICTORY_DSP_CONVOLVE`, see the top).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Every,
+    Mono,
+    Off,
+}
+
+#[cfg(test)]
+thread_local! {
+    static FORCED: std::cell::Cell<Option<Mode>> = const { std::cell::Cell::new(None) };
+}
+
+fn mode() -> Mode {
+    #[cfg(test)]
+    if let Some(m) = FORCED.with(std::cell::Cell::get) {
+        return m;
+    }
+    static MODE: std::sync::OnceLock<Mode> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("VICTORY_DSP_CONVOLVE").as_deref() {
+        Ok("0") => Mode::Off,
+        Ok("mono") => Mode::Mono,
+        _ => Mode::Every,
+    })
+}
+
+/// What the computed convolutions are scaled by: `VICTORY_DSP_GAIN`, else 2.
+/// The hardware's own scaling is not known. With the textbook 1/2048 of the
+/// inverse FFT, TVs and phone calls sounded quiet next to the rest of the
+/// mix; twice that sounded right by ear.
+const GAIN: f32 = 2.0;
+
+fn gain() -> f32 {
+    static GAIN_SET: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *GAIN_SET.get_or_init(|| {
+        std::env::var("VICTORY_DSP_GAIN").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(GAIN)
+    })
+}
 
 const E_POINTER: HRESULT = 0x8000_4003_u32 as i32;
 const E_OUTOFMEMORY: HRESULT = 0x8007_000E_u32 as i32;
 
 const CONVOLUTION: u32 = 1;
-/// Option bits that need a stereo stream, and one convolution refuses.
-const STEREO_OPTIONS: u32 = 2 | 8;
+/// XDspActivationOptions: a per-channel IR and deinterleaved blocks both
+/// need a stereo stream; polar format is for FFT/IFFT only.
+const DEINTERLEAVED: u32 = 2;
+const STEREO_IR: u32 = 8;
+const STEREO_OPTIONS: u32 = STEREO_IR | DEINTERLEAVED;
 const NOT_FOR_CONVOLUTION: u32 = 4;
 
 pub struct Dsp {
@@ -62,6 +110,12 @@ pub struct Stream {
     frames: u32,
     channels: u32,
     status: Box<Status>,
+    /// `None` for the FFT/IFFT transforms, which we do not compute.
+    convolver: Option<Convolver>,
+    deinterleaved: bool,
+    /// Set for a stream whose convolution [`convolve`] computes
+    /// (`VICTORY_DSP_CONVOLVE=mono`).
+    mono: Option<convolve::Convolver>,
 }
 
 /// One block of work.
@@ -124,6 +178,9 @@ fn valid(desc: &StreamDesc) -> bool {
         (1..=2).contains(&channels)
             && matches!(frames, 0x200 | 0x400)
             && options & NOT_FOR_CONVOLUTION == 0
+            // The console's IR is complex pairs, one filter block at least.
+            && !desc.ir.is_null()
+            && desc.ir_floats >= 2 * frames
     } else {
         channels == 1 && matches!(frames, 0x200 | 0x400 | 0x800)
     };
@@ -148,11 +205,20 @@ pub extern "system" fn XDspActivate(
         return E_INVALIDARG;
     }
     let (kind, options, frames, channels) = (desc.kind, desc.options, desc.frames, desc.channels);
+    let (ir, ir_floats) = (desc.ir, desc.ir_floats);
+    let mono = if mode() == Mode::Mono && kind == CONVOLUTION && channels == 1 && frames == 0x400 && !ir.is_null() {
+        // SAFETY: the title's description says the impulse response holds this many floats.
+        convolve::Convolver::new(unsafe { std::slice::from_raw_parts(ir, ir_floats as usize) })
+    } else {
+        None
+    };
     tracing::debug!(
         kind,
         options,
         frames,
         channels,
+        ir_floats,
+        mono = mono.is_some(),
         "audio DSP stream activated"
     );
     {
@@ -164,6 +230,23 @@ pub extern "system" fn XDspActivate(
         }
         *active += 1;
     }
+    // SAFETY: `valid` checked the pointer and length; the IR stays alive in
+    // title memory for the stream's lifetime (the console copies it here).
+    let convolver = if kind == CONVOLUTION && mode() == Mode::Every {
+        let ir = unsafe { std::slice::from_raw_parts(desc.ir, desc.ir_floats as usize) };
+        match Convolver::new(
+            ir,
+            desc.ir_floats as usize,
+            frames as usize,
+            channels as usize,
+            options & STEREO_IR != 0,
+        ) {
+            Some(convolver) => Some(convolver),
+            None => return E_INVALIDARG,
+        }
+    } else {
+        None
+    };
     let new = Box::new(Stream {
         dsp,
         frames: desc.frames,
@@ -174,6 +257,9 @@ pub extern "system" fn XDspActivate(
             reserved: 0,
             result: S_OK,
         }),
+        convolver,
+        deinterleaved: options & DEINTERLEAVED != 0,
+        mono,
     });
     // SAFETY: checked non-null.
     unsafe {
@@ -195,7 +281,8 @@ pub extern "system" fn XDspDeactivate(stream: *mut Stream) -> HRESULT {
     S_OK
 }
 
-/// Completes the command at once: its output block is silence.
+/// Completes the command at once. Convolution writes wet output; the FFT
+/// and IFFT transforms still return silence.
 pub extern "system" fn XDspSubmitCommand(
     stream: *mut Stream,
     command: *const Command,
@@ -208,8 +295,32 @@ pub extern "system" fn XDspSubmitCommand(
     let (stream, command) = unsafe { (&mut *stream, &*command) };
     if !command.output.is_null() {
         let samples = (stream.frames * stream.channels) as usize;
-        // SAFETY: the title's output buffer holds one block of the stream.
-        unsafe { std::ptr::write_bytes(command.output, 0, samples) };
+        let mut written = false;
+        if !command.input.is_null() {
+            // SAFETY: the title's input and output buffers hold one block.
+            let (input, output) = unsafe {
+                (
+                    std::slice::from_raw_parts(command.input, samples),
+                    std::slice::from_raw_parts_mut(command.output, samples),
+                )
+            };
+            if let Some(convolver) = &mut stream.convolver {
+                written = convolver.process(
+                    input,
+                    output,
+                    command.gains,
+                    stream.deinterleaved,
+                    stream.deinterleaved,
+                );
+            } else if let Some(convolver) = stream.mono.as_mut() {
+                convolver.process(input, output, command.gains[0] * gain());
+                written = true;
+            }
+        }
+        if !written {
+            // SAFETY: the title's output buffer holds one block.
+            unsafe { std::ptr::write_bytes(command.output, 0, samples) };
+        }
     }
     let status = &mut *stream.status;
     let next = status.submitted.wrapping_add(1);
@@ -308,6 +419,87 @@ mod tests {
             XDspActivate(dsp, &transform, &mut status, &mut stream),
             S_OK
         );
+        assert_eq!(XDspDeactivate(stream), S_OK);
+        assert_eq!(XDspDisconnect(dsp), S_OK);
+    }
+
+    #[test]
+    fn convolution_through_the_api_returns_wet_audio() {
+        const BLOCK: usize = 0x200;
+        let mut base = vec![0u8; 0x10_0000];
+        let mut dsp = std::ptr::null_mut();
+        assert_eq!(
+            XDspConnectWithMaximumStreamLimit(
+                base.as_mut_ptr().cast(),
+                0x10_0000,
+                24,
+                4,
+                2,
+                &mut dsp
+            ),
+            S_OK
+        );
+        // A unity impulse in the console's frequency-domain layout.
+        let mut time = vec![0f32; BLOCK];
+        time[0] = 1.0;
+        let ir = crate::modules::dsp_convolve::encode_ir(&time, BLOCK);
+        let desc = StreamDesc {
+            kind: CONVOLUTION,
+            options: 0,
+            frames: BLOCK as u32,
+            channels: 1,
+            ir_floats: ir.len() as u32,
+            ir: ir.as_ptr(),
+        };
+        let (mut status, mut stream) = (std::ptr::null(), std::ptr::null_mut());
+        assert_eq!(XDspActivate(dsp, &desc, &mut status, &mut stream), S_OK);
+        let input = vec![0.75f32; BLOCK];
+        let mut output = vec![0f32; BLOCK];
+        let command = Command {
+            gains: [1.0, 1.0],
+            input: input.as_ptr(),
+            output: output.as_mut_ptr(),
+            reserved: 0,
+        };
+        let mut ticket = 0;
+        assert_eq!(XDspSubmitCommand(stream, &command, &mut ticket), S_OK);
+        assert_eq!(ticket, 1);
+        // SAFETY: the stream's status block.
+        let (completed, result) = unsafe { ((*status).completed, (*status).result) };
+        assert_eq!((completed, result), (ticket, S_OK));
+        let energy: f32 = output.iter().map(|s| s * s).sum::<f32>() / BLOCK as f32;
+        assert!(energy > 0.5, "wet return, energy {energy}");
+        assert_eq!(XDspDeactivate(stream), S_OK);
+        assert_eq!(XDspDisconnect(dsp), S_OK);
+    }
+
+    #[test]
+    fn a_mono_convolution_is_computed() {
+        FORCED.with(|f| f.set(Some(Mode::Mono)));
+        let mut base = vec![0u8; 0x10_0000];
+        let mut dsp = std::ptr::null_mut();
+        assert_eq!(XDspConnectWithMaximumStreamLimit(base.as_mut_ptr().cast(), 0x10_0000, 24, 0x80, 1, &mut dsp), S_OK);
+        // a response of one sample, 0.5, two samples late
+        let ir = convolve::layout(&[0.0, 0.0, 0.5]);
+        let desc = StreamDesc {
+            kind: CONVOLUTION,
+            options: 0,
+            frames: 0x400,
+            channels: 1,
+            ir_floats: ir.len() as u32,
+            ir: ir.as_ptr(),
+        };
+        let (mut status, mut stream) = (std::ptr::null(), std::ptr::null_mut());
+        assert_eq!(XDspActivate(dsp, &desc, &mut status, &mut stream), S_OK);
+        let input: Vec<f32> = (0..0x400).map(|i| (i % 7) as f32 / 7.0).collect();
+        let mut output = vec![0f32; 0x400];
+        let command = Command { gains: [1.0, 1.0], input: input.as_ptr(), output: output.as_mut_ptr(), reserved: 0 };
+        let mut ticket = 0;
+        assert_eq!(XDspSubmitCommand(stream, &command, &mut ticket), S_OK);
+        for n in 2..0x400 {
+            let want = input[n - 2] * 0.5 * gain();
+            assert!((output[n] - want).abs() < 1e-4, "sample {n}: {} vs {want}", output[n]);
+        }
         assert_eq!(XDspDeactivate(stream), S_OK);
         assert_eq!(XDspDisconnect(dsp), S_OK);
     }

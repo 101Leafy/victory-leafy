@@ -110,7 +110,9 @@ enum Command {
     /// Make the host pipelines of every pipeline the title ever created
     /// (runs with `VICTORY_PIPELINE_BOOK=1` write them down), so that the
     /// driver's cache on disk has them before a run needs one: once per change
-    /// of the translator or the driver. Goes on where it was stopped.
+    /// of the translator or the driver. Goes on where it was stopped. One that
+    /// ended a process is left out (`warm-bad.txt`) until the translator or the
+    /// driver changes; `VICTORY_WARM_BAD=0` tries those again too.
     #[cfg(windows)]
     Warm {
         /// Processes at once (default: two thirds of the logical cores).
@@ -119,7 +121,7 @@ enum Command {
         /// At most this many pipelines.
         #[arg(long)]
         limit: Option<usize>,
-        /// Those made before too.
+        /// Those made before too, and those that ended a process.
         #[arg(long)]
         again: bool,
         /// Only the pipelines earlier runs drew with.
@@ -128,6 +130,10 @@ enum Command {
         /// (What the processes it starts are given.)
         #[arg(long, hide = true)]
         these: Option<String>,
+        #[arg(long, hide = true)]
+        part: Option<PathBuf>,
+        #[arg(long, hide = true)]
+        merge: bool,
     },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
@@ -170,6 +176,9 @@ enum Console {
 }
 
 fn main() -> Result<()> {
+    // Before anything else can take the address space it needs.
+    #[cfg(windows)]
+    victory_hle::reserve_upload_space();
     victory_core::logging::init("info");
     #[cfg(windows)]
     agility::load();
@@ -219,7 +228,7 @@ fn main() -> Result<()> {
         }
         Command::Shaders { paths, jobs } => translate::precompile(paths, jobs),
         #[cfg(windows)]
-        Command::Warm { jobs, limit, again, used, these } => warm::run(jobs, limit, again, used, these),
+        Command::Warm { jobs, limit, again, used, these, part, merge } => warm::run(jobs, limit, again, used, these, part, merge),
         Command::Run {
             exe,
             unimplemented,

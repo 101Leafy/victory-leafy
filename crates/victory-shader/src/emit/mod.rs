@@ -84,6 +84,8 @@
 //!   It binds nothing.
 
 mod bitcode;
+#[cfg(test)]
+mod census_tests;
 pub(crate) mod container;
 #[cfg(all(test, windows))]
 mod cube_lod_tests;
@@ -91,6 +93,8 @@ mod cube_lod_tests;
 mod descriptor_tests;
 #[cfg(all(test, windows))]
 mod diff_tests;
+#[cfg(all(test, windows))]
+mod filter3d_tests;
 #[cfg(all(test, windows))]
 mod intersect_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
@@ -100,6 +104,7 @@ mod idiom;
 mod lane_order_tests;
 mod link;
 pub(crate) mod lower;
+mod trips;
 mod own_bits;
 #[cfg(all(test, windows))]
 mod permlane_tests;
@@ -133,8 +138,8 @@ pub use rect::rect_list_gs;
 pub use shader::{
     mesh_payload_bytes,
     LAUNCH_SPACE, MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
-    SLOT_STRIDES_COUNT, USER_DATA_SPACE, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, USER_DISPATCH_THREADS_X, USER_GROUP_BASE_X, USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
-    raw_views, set_raw_views, set_view_heap_limit, view_heap_limit,
+    SLOT_STRIDES_COUNT, SLOT_TABLE_STRIDES, USER_DATA_SPACE, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, USER_DISPATCH_THREADS_X, USER_GROUP_BASE_X, USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
+    constants_raw, raw_views, set_raw_views, set_view_heap_limit, view_heap_limit,
 };
 
 /// The translator's number in the shader cache's key (`victory-gpu`'s
@@ -154,7 +159,7 @@ pub use shader::{
 /// The first run after a source change without a raise translates its first
 /// 64 cached shaders again and compares the entries byte for byte; if one
 /// differs, that build keys on the whole source instead, as before.
-pub const VERSION: u32 = 22;
+pub const VERSION: u32 = 37;
 
 static HELPER_LANE_WAVES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -274,8 +279,44 @@ pub fn guard_runs() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_GUARD_RUNS").is_none_or(|v| v != "0"))
 }
 
+/// Whether a d16 typed access through a view in the program's tables reads
+/// the view's word from the table of strides (root SRV `SLOT_TABLE_STRIDES`)
+/// and passes integer bits for an integer format (`VICTORY_TABLE_STRIDES=1`,
+/// codec_d's; off, such views are taken as floats, as before). The dynamic
+/// slots write their words only then. Part of the translation: the shader
+/// cache keys on it.
+pub fn table_strides() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_TABLE_STRIDES.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TABLE_STRIDES").is_some_and(|v| v == "1"))
+}
+
+/// Whether a descriptor read under an EXEC guard is traced only from the
+/// lanes the guard keeps, so lanes that branch over the arm building it do
+/// not make two values at the join (`VICTORY_GUARDED_DESCRIPTORS=1`, codec_d's
+/// tracer; off, every lane that reaches the block counts, as before). Part
+/// of the translation: the shader cache keys on it.
+pub fn guarded_descriptors() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_GUARDED_DESCRIPTORS.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_GUARDED_DESCRIPTORS").is_some_and(|v| v == "1"))
+}
+
+#[cfg(test)]
+pub(crate) fn test_guarded_descriptors(on: Option<bool>) {
+    TEST_GUARDED_DESCRIPTORS.set(on);
+}
+
 #[cfg(test)]
 thread_local! {
+    static TEST_GUARDED_DESCRIPTORS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    static TEST_TABLE_STRIDES: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
     static TEST_GUARD_FLOAT: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
     static TEST_GUARD_RUNS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
@@ -286,6 +327,17 @@ thread_local! {
 pub fn builder_fences() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_FENCES").is_none_or(|v| v != "0"))
+}
+
+/// Whether a load by address in a program that walks the title's structures
+/// takes the copy an earlier load of the same 64 KiB page found, without a
+/// look in the directory of its own (`lower.rs` `memory_near`;
+/// `VICTORY_MEMORY_NEAR=1`, off by default: every load looks). The same
+/// bytes are read either way. Part of the translation: the shader cache
+/// keys on it.
+pub fn memory_near() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MEMORY_NEAR").is_some_and(|v| v == "1"))
 }
 
 /// Whether the structure builder's accesses through its root views stay near
@@ -497,13 +549,15 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
     }
 }
 
+mod water_tile_append;
+
 fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
     let c = Container::parse(container)?;
     let dxil = c
         .part(FourCC::DXIL)
         .or(c.part(FourCC::ACCC))
         .ok_or(ShaderError::Malformed("no DXIL part"))?;
-    let native = crate::native_programs(dxil.data)?
+    let mut native = crate::native_programs(dxil.data)?
         .into_iter()
         .find(|p| {
             matches!(
@@ -515,6 +569,9 @@ fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
             offset: 0,
             what: "a container without a vertex, pixel, compute or mesh program",
         })?;
+    if lower::host_max_wave() == 32 && c.digest == water_tile_append::CONTAINER_ID {
+        water_tile_append::rewrite(&mut native)?;
+    }
     let p = crate::spill::build(&native)?;
     // Structurisation first: tracing per-lane descriptors needs it (its
     // failure is reported after the earlier stages').
@@ -523,6 +580,27 @@ fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
     let io = io::raise(&p, &native)?;
     let st = st?;
     emit(&c, &native, &p, &st, &io, &res)
+}
+
+/// codec_d's Wave32 lowering (`VICTORY_WAVE32_LOWERING=1`): a scalar spilled
+/// to a constant VGPR lane and read back in the same block taken from the
+/// scalar, a `ds_read_b32` at a uniform address uniform where group barriers
+/// order shared memory, the SCC of a mask operation read as "some lane", and
+/// an active-lane loop the driver compiles (`s_andn2_wrexec_b64` latch) taken
+/// by the whole wave. Part of the translation: the shader cache keys on it.
+pub fn wave32_lowering() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_WAVE32_LOWERING").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// Whether a `v_readlane_b32` or `v_writelane_b32` with an input or output
+/// modifier, or a constant lane past the wave's width, is left as it is
+/// instead of followed as a spilled scalar (`VICTORY_LANE_SPILL_STRICT=1`,
+/// codec_d's fix; off, every constant lane is followed, as before). Part of
+/// the translation: the shader cache keys on it.
+pub fn lane_spill_strict() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_LANE_SPILL_STRICT").is_ok_and(|v| v.trim() == "1"))
 }
 
 thread_local! {
@@ -552,13 +630,37 @@ pub fn wave_wide_only(hash: &str) -> bool {
     only.iter().any(|o| hash.starts_with(o.as_str()))
 }
 
+/// `VICTORY_WAVE_WIDE_SCENE=1`: the wave-wide form for four programs known by digest, in
+/// groups of one console wave: the two kernels the NVIDIA fork widens by default, and the
+/// volumetric light's two tiled programs (`CS_TransmissionVolumetrics_Tiled` and
+/// `_Tiled_LocalLights`, GTA VI 1.0.2.1). Those two have an LDS read and write in one
+/// lane-branch region, so no other form translates them on a 32-lane host and their
+/// dispatches are dropped: no volumetric light or fog. Off by default, as the form is.
+fn scene_wide(c: &Container, native: &NativeProgram) -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_WIDE_SCENE").is_some_and(|v| v == "1"))
+        && matches!(native.io, crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 64)
+        && matches!(
+            c.digest,
+            [0x58, 0x1d, 0xab, 0x2c, 0xd8, 0xbc, 0xf2, 0x2e, 0x5c, 0x96, 0x4b, 0x98, 0xe9, 0x03, 0x48, 0xd1]
+                | [0x24, 0x31, 0xbb, 0xe7, 0xdc, 0x15, 0x4a, 0xd7, 0x59, 0xd2, 0x0b, 0xc9, 0x54, 0x82, 0x9c, 0x1c]
+                | [0x24, 0x12, 0x6c, 0x14, 0xdc, 0x76, 0x19, 0xb0, 0x82, 0xef, 0x57, 0x12, 0x96, 0x03, 0x88, 0x90]
+                | [0x70, 0x99, 0xa5, 0x7f, 0xde, 0xd1, 0x42, 0x61, 0x3b, 0x44, 0xf4, 0x10, 0x46, 0x3d, 0x6b, 0xe6]
+        )
+}
+
 /// Runs `f` (a translation on this thread) with the wave-wide form on when `on`
 /// ([`wave_wide_only`]).
 pub fn with_wave_wide<T>(on: bool, f: impl FnOnce() -> T) -> T {
-    let before = WIDE_HERE.replace(on);
-    let r = f();
-    WIDE_HERE.set(before);
-    r
+    // restored on a panic too: a worker that catches it translates the next shader here
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            WIDE_HERE.set(self.0);
+        }
+    }
+    let _restore = Restore(WIDE_HERE.replace(on));
+    f()
 }
 
 
@@ -781,10 +883,10 @@ fn emit_forms(
     if native.stage == HwStage::Cs && std::env::var_os("VICTORY_SCALAR_SPLITS").is_none_or(|v| v != "0") {
         let splits = lower::scalar_splits(p, st).unwrap_or_default();
         let halves = native.wave64 && lower::host_max_wave() == 32;
-        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1") || WIDE_HERE.get();
+        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1") || WIDE_HERE.get() || scene_wide(c, native);
         if !splits.is_empty() && (!halves || wide_on) {
             let why = std::env::var_os("VICTORY_WAVE_WHY").is_some();
-            match widen(c, native, p, &splits, why) {
+            match widen(c, native, p, &splits, why, false) {
                 Ok((shader, wave)) if !(halves && wave == Some(64)) => {
                     if why {
                         eprintln!("SCALAR-SPLITS {} branches taken wave-wide", splits.len());
@@ -869,7 +971,16 @@ fn emit_forms(
         // lost the card in a submission of two programs that had just moved to it
         // (`ptfx_CS_lightAtlas_Sprite` and `_Trail`). The 32-lane programs' form below, which
         // has no barrier, stays on.
-        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1") || WIDE_HERE.get();
+        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1") || WIDE_HERE.get() || scene_wide(c, native);
+        // A single guest wave can iterate an active-lane loop until both host
+        // halves have finished. The precise latch and convergence conditions
+        // for the driver compute route are checked by widen().
+        let driver_loop = wave32_lowering()
+            && std::env::var_os("VICTORY_WAVE_WIDE").is_none()
+            && c.part(FourCC::DXIL).is_none()
+            && c.part(FourCC::ACCC).is_some()
+            && matches!(&original, Err(ShaderError::Unsupported { what, .. })
+                if *what == lower::DIVERGENT_MASK_EXCHANGE);
         // Where an approximate form below translates the program, the paired form
         // ([`paired`]) is tried first: it runs each console wave as one host wave and gives
         // what the console's 64 lanes compute, at no barrier but the entry's; the approximate
@@ -915,7 +1026,7 @@ fn emit_forms(
                 // Still stopped where not every lane runs: the per-lane branches around
                 // those places taken as the console takes them, by the whole wave at once
                 // ([`widen`]), at two group barriers per such branch.
-                if wide_on {
+                if wide_on || driver_loop {
                     let bases = [
                         deep.as_ref().map(|f| &f.0),
                         forms[1].1.as_ref().map(|f| &f.0),
@@ -923,7 +1034,7 @@ fn emit_forms(
                         Some(p),
                     ];
                     if let Some(base) = bases.into_iter().flatten().next() {
-                        let again = widen(c, native, base, &[], why);
+                        let again = widen(c, native, base, &[], why, driver_loop && !wide_on);
                         report("wave-wide branches", &again);
                         if done(&again) {
                             return again;
@@ -977,18 +1088,22 @@ fn emit_forms(
         }
     }
     // SCC of a mask operation joined with a scalar test behind a per-lane skip (the 32-lane
-    // trace programs): right once the wave takes that skip together ([`widen`]; the
-    // lowering has named the skipped blocks).
+    // trace programs), and a compare's mask joined with the old one behind a per-lane branch
+    // (`lower::CompareJoins::skipped`): right once the wave takes that branch together ([`widen`];
+    // the lowering has named the blocks). Where it cannot, the compare's joins per lane, as
+    // before.
     let original = match original {
         Err(ShaderError::Unsupported { what, .. })
             if native.stage == HwStage::Cs
                 && what == lower::LANE_MASK
                 && std::env::var_os("VICTORY_WAVE_WIDE").is_none_or(|v| v != "0") =>
         {
-            let again = widen(c, native, p, &[], std::env::var_os("VICTORY_WAVE_WHY").is_some());
+            let again = widen(c, native, p, &[], std::env::var_os("VICTORY_WAVE_WHY").is_some(), false);
             match again {
                 Ok(_) => again,
-                Err(_) => emit_program(c, native, p, st, io, res),
+                Err(_) => {
+                    lower::with_per_lane_compare_joins(|| emit_program(c, native, p, st, io, res))
+                }
             }
         }
         other => other,
@@ -1079,6 +1194,7 @@ fn widen(
     p: &ir::Program,
     seed: &[usize],
     why: bool,
+    active_loop_only: bool,
 ) -> Result<(HostShader, Option<u32>), ShaderError> {
     const NOT: ShaderError = ShaderError::Unsupported {
         offset: 0,
@@ -1145,6 +1261,30 @@ fn widen(
                 offset: 0,
                 what: "a barrier where not every lane runs, and no branch left to widen",
             });
+        }
+        if active_loop_only {
+            // Only a single backward branch on the SCC just set by
+            // s_andn2_wrexec_b64. This instruction restricts EXEC to the
+            // unfinished lanes. The guest repeats the loop if *either*
+            // half still has work, while individual vector writes retain
+            // their EXEC predicates.
+            let [latch] = more.as_slice() else {
+                return r;
+            };
+            let block = &p.blocks[*latch];
+            let [.., update, branch] = block.insts.as_slice() else {
+                return r;
+            };
+            if !wide.is_empty()
+                || update.name() != "s_andn2_wrexec_b64"
+                || branch.name() != "s_cbranch_scc1"
+                || !matches!(
+                    block.exit,
+                    ir::Exit::Branch { taken, not_taken } if taken <= *latch && not_taken > *latch
+                )
+            {
+                return r;
+            }
         }
         wide.extend(more);
     }
@@ -3188,6 +3328,135 @@ mod tests {
         }
     }
 
+    /// Renderer port 5 (`VICTORY_PORT_CBV=1`): a table's constant buffer is
+    /// read as raw bytes through the raw twin of its slot, at a constant and
+    /// at a computed offset, and gives the dwords the constant buffer read
+    /// gives without the switch; the slot itself (a constant buffer view, of
+    /// other bytes here) is not read.
+    #[test]
+    #[cfg(windows)]
+    fn table_constant_buffers_read_as_raw_bytes_through_their_twins() {
+        let mut words: Vec<u32> = vec![
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0 (the constant buffer)
+            0xF408_0302,
+            0xFA00_0020, // s_load_dwordx4 s[12:15], s[4:5], 0x20 (the UAV)
+            0xF428_0404,
+            0xFA00_0010, // s_buffer_load_dwordx4 s[16:19], s[8:11], 0x10
+            0xF420_0504,
+            0x0000_0000, // s_buffer_load_dword s20, s[8:11], s0
+        ];
+        for (out, s) in (16..21u32).enumerate() {
+            // v_mov_b32 v1, s<s>; buffer_store_dword v1, s[12:15], offset 4 * out
+            words.push(0x7E00_0000 | 1 << 17 | 0x001 << 9 | s);
+            words.push(0x38 << 26 | 0x1C << 18 | (4 * out as u32));
+            words.push(0x80 << 24 | (12 >> 2) << 16 | 1 << 8);
+        }
+        words.push(0xBF81_0000); // s_endpgm
+        let table = |kind, at| crate::UsedResource {
+            kind,
+            root: crate::RootType::Table,
+            table_offset_dwords: at,
+            lower_bound: 0,
+            stride: 4,
+            dwords: 4,
+            user_data: 4,
+            slot: 1,
+        };
+        let native = super::NativeProgram {
+            stage: super::HwStage::Cs,
+            wave64: false,
+            vgprs: 4,
+            layout: vec![
+                crate::RootParam { root: crate::RootType::Constants, table_offset_dwords: 0, sgprs: 4, base_register: 0, user_data: 0, slot: 0 },
+                crate::RootParam { root: crate::RootType::Table, table_offset_dwords: 0, sgprs: 1, base_register: 0, user_data: 4, slot: 1 },
+            ],
+            used: vec![table(crate::ResourceType::Cbv, 0), table(crate::ResourceType::Uav, 8)],
+            io: crate::native::StageIo::Cs(crate::native::ComputeIo { rsrc2: 5 << 1, threads: [1, 1, 1] }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        // The twins start at slot 2: the constant buffer's (slot 0) is 2, the UAV's (1) 3.
+        const TWINS: u32 = 2;
+        let lowered = |raw: bool| {
+            super::shader::CONSTANTS_RAW_HERE.set(Some(raw));
+            super::shader::RAW_VIEWS_HERE.set(Some(if raw { TWINS } else { 0 }));
+            let p = crate::ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+            let res = crate::resource::track(&p, &native.layout, native.stage, None).unwrap();
+            let io = crate::io::raise(&p, &native).unwrap();
+            let st = crate::structure::structure(&p).unwrap();
+            let l = super::lower::lower(&super::lower::Parts {
+                native: &native,
+                p: &p,
+                st: &st,
+                io: &io,
+                res: &res,
+                inputs: Vec::new(),
+                outputs: Vec::new(),
+                prims: Vec::new(),
+                mesh_stride: 0,
+            })
+            .unwrap();
+            super::shader::CONSTANTS_RAW_HERE.set(None);
+            super::shader::RAW_VIEWS_HERE.set(None);
+            l
+        };
+        let (before, after) = (lowered(false), lowered(true));
+        assert_ne!(before.dxil, after.dxil, "the switch changes the translation");
+        let data: Vec<u32> = (0..16u32).map(|i| 0x0101_0101u32.wrapping_mul(i + 3) ^ 0x4000_0000).collect();
+        let other: Vec<u32> = vec![0xdead_beef; 64];
+        let s0 = 8u32;
+        let want: Vec<u32> = vec![data[4], data[5], data[6], data[7], data[(s0 / 4) as usize]];
+        let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        for (raw, l) in [(false, before), (true, after)] {
+            let mut dxil = l.dxil;
+            if let Ok(mut v) = super::validator::Validator::load(super::validator::Validator::default_path().as_deref()) {
+                v.validate(&mut dxil).unwrap();
+            }
+            let Ok(host) = super::host::Host::new(true) else {
+                eprintln!("no software adapter; the dispatch is skipped");
+                return;
+            };
+            let cs = super::HostShader {
+                stage: super::HwStage::Cs,
+                dxil,
+                user_data: l.user_data,
+                samplers: Vec::new(),
+                static_samplers: Vec::new(),
+                root_cbvs: l.root_cbvs,
+                root_srvs: l.root_srvs,
+                root_uavs: l.root_uavs,
+                root_indexed_views: Vec::new(),
+            };
+            let (root, pso) = host.compute_pipeline(&cs).unwrap();
+            let views: Vec<super::host::View> = if raw {
+                vec![
+                    super::host::View::Cbv(&other),
+                    super::host::View::RawUav(8),
+                    super::host::View::Buffer { data: &data, stride: super::host::Stride::Raw },
+                    super::host::View::RawUav(8),
+                ]
+            } else {
+                vec![super::host::View::Cbv(&data), super::host::View::RawUav(8)]
+            };
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &super::host::Dispatch {
+                        roots: vec![(0, super::host::Root::Constants(vec![s0, 0, 0, 0, 0]))],
+                        views: &views,
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap();
+            // The UAV is written where the program reads it: its twin with the switch.
+            let got = out.iter().find(|o| o[..5].iter().any(|&w| w != 0)).map(|o| o[..5].to_vec());
+            assert_eq!(got.as_deref(), Some(&want[..]), "switch {raw}: {out:x?}");
+        }
+    }
+
     #[test]
     fn valu_div_f32_sequence_executes_on_gpu() {
         let words: &[u32] = &[
@@ -3368,6 +3637,33 @@ mod tests {
             assert_eq!(out[0][13], f32::INFINITY.to_bits(), "warp={warp} 1e38/1e-38");
             assert_eq!(out[0][14], f32::NEG_INFINITY.to_bits(), "warp={warp} -1e38/1e-38");
         }
+    }
+
+    /// A program's constant table starts after its instructions, unless a
+    /// load at a fixed offset reads below that.
+    #[test]
+    fn the_code_table_starts_after_the_instructions() {
+        use super::lower::code_table_start;
+        use crate::{ir, resource};
+        // s_nop 0, s_endpgm, then 1,000 dwords of constants.
+        let mut words = vec![0xBF80_0000, 0xBF81_0000];
+        words.extend(0..1000u32);
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = ir::build(&code, false, 256).unwrap();
+        let at = |offset: u32, dynamic: bool| resource::Address {
+            param: resource::CODE,
+            offset,
+            dynamic: dynamic.then_some(ir::Value(0)),
+        };
+        let (computed, fixed_after, fixed_inside) = (at(0, true), at(12, false), at(4, false));
+        // A load at a computed offset from the code's start: the table is
+        // the constants only, not the whole program.
+        assert_eq!(code_table_start(&p, &[&computed], 0), 8);
+        assert_eq!(code_table_start(&p, &[&computed, &fixed_after], 0), 8);
+        // A load at a fixed offset inside the instructions keeps the start.
+        assert_eq!(code_table_start(&p, &[&computed, &fixed_inside], 0), 0);
+        // Loads past the instructions only: from the lowest of them.
+        assert_eq!(code_table_start(&p, &[&fixed_after], 12), 12);
     }
 }
 

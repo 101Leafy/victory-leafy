@@ -1607,7 +1607,6 @@ mod host {
             // pad's buttons, by the stand-in pad's table: with a real pad
             // connected the stand-in is not there, and a title that listens
             // to the pad (the title's start screen) saw nothing.
-            #[cfg(feature = "diagnostics")]
             if slot == 0 {
                 for vk in scripted() {
                     if let Some(&(_, button)) = super::FALLBACK_BUTTONS.iter().find(|(key, _)| *key == vk) {
@@ -1648,14 +1647,9 @@ mod host {
         fn keys(&mut self) -> Vec<KeyState> {
             let focus = focused();
             self.cursor(focus);
+            let mut down = scripted();
             #[cfg(feature = "diagnostics")]
-            let mut down = {
-                let mut down = scripted();
-                down.extend(self.kbm.keys(&self.counts));
-                down
-            };
-            #[cfg(not(feature = "diagnostics"))]
-            let mut down = Vec::new();
+            down.extend(self.kbm.keys(&self.counts));
             if focus {
                 // Left/right modifier keys only, as devices report them; no
                 // mouse buttons (below 0x08).
@@ -1720,7 +1714,6 @@ mod host {
     /// time), with or without focus. A key is a
     /// letter, a digit, or `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`,
     /// `Left`, `Right` (the stand-in pad's table maps them to buttons).
-    #[cfg(feature = "diagnostics")]
     fn scripted() -> Vec<u8> {
         static SCRIPT: LazyLock<(Instant, Vec<(Duration, Duration, u8)>)> = LazyLock::new(|| {
             let list = std::env::var("VICTORY_KEYS").unwrap_or_default();

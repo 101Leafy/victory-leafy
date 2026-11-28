@@ -180,9 +180,19 @@ pub(crate) fn tables_done(lists: &[This]) {
     }
 }
 
-/// The host list behind a title list, if there is a host GPU.
+/// The host list behind a title list, if there is a host GPU, for a call
+/// that may record into it: counted as a title call
+/// ([`crate::host::HostList::title_call`]).
 #[cfg(windows)]
 pub(crate) fn host_list<'a>(this: This) -> Option<&'a crate::host::HostList> {
+    let list = host_list_quiet(this)?;
+    list.title_call();
+    Some(list)
+}
+
+/// As [`host_list`], not counted as a title call: for the title's reset.
+#[cfg(windows)]
+fn host_list_quiet<'a>(this: This) -> Option<&'a crate::host::HostList> {
     if this.is_null() {
         return None;
     }
@@ -201,10 +211,50 @@ pub(crate) struct Detached {
     _state: crate::draw::State,
 }
 
+/// Whether the descriptor tables of a flight's lists go back when it has
+/// landed, not with its host lists after [`crate::host`]'s bury lag
+/// (`VICTORY_EARLY_TABLES=1`).
+///
+/// Why: the lag (64 submissions, about four frames) is for memory and lists
+/// the card may still read; a landed flight's fence is done, so its slots
+/// are not read again. Held with the lists, about six frames of tables held
+/// the 2^18 dynamic slots of an NVIDIA host (239,000 taken, 38,000 a frame;
+/// run ds-4) and 2,200 tables a frame were refused.
+#[cfg(windows)]
+fn early_tables() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_EARLY_TABLES").is_some_and(|v| v == "1"))
+}
+
+/// A flight has landed: with [`early_tables`], its lists' descriptor table
+/// slots go back now.
+#[cfg(windows)]
+pub(crate) fn tables_early(lists: &mut [Detached]) {
+    if !early_tables() {
+        return;
+    }
+    for list in lists {
+        list._state.tables_done();
+    }
+}
+
 #[cfg(windows)]
 impl Detached {
     pub(crate) fn host(&self) -> &crate::host::HostList {
         &self.host
+    }
+
+    /// Its submission has run: the dynamic slots of its tables go back now,
+    /// not when it is reset after the bury lag
+    /// ([`crate::host::tables_at_landing`]).
+    pub(crate) fn release_tables(&mut self) {
+        self._state.tables_done();
+    }
+
+    /// Gives the list's scratch chunks to the next lists once its submission has landed
+    /// ([`crate::host::HostList::release_scratch`]).
+    pub(crate) fn release_scratch(&self) {
+        self.host.release_scratch();
     }
 }
 
@@ -446,8 +496,8 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
                 continue;
             };
             // A new host list is open; the title's next call on its list is a
-            // reset, which wants it closed.
-            fresh.close();
+            // reset, which finds it so (or wants it closed).
+            fresh.leave_open();
             Some(fresh)
         };
         // SAFETY: one of our lists, closed and submitted: nothing records
@@ -456,6 +506,8 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
         let Some(host) = std::mem::replace(&mut list.host, spare) else {
             continue;
         };
+        // (Submitted again without a reset: it runs closed, empty.)
+        host.close_if_left_open();
         let earlier = std::mem::take(&mut list.earlier);
         let gate = std::mem::take(&mut list.gate);
         let uploads = std::mem::take(&mut *list.uploads.lock().unwrap_or_else(|e| e.into_inner()));
@@ -523,8 +575,8 @@ pub(crate) fn detach(lists: &[This]) -> (Vec<Detached>, Vec<usize>) {
                 continue;
             };
             // A new host list is open; the title's next call on its list is a
-            // reset, which wants it closed.
-            fresh.close();
+            // reset, which finds it so (or wants it closed).
+            fresh.leave_open();
             Some(fresh)
         };
         let list = this.cast_mut().cast::<List>();
@@ -534,6 +586,8 @@ pub(crate) fn detach(lists: &[This]) -> (Vec<Detached>, Vec<usize>) {
             let Some(host) = std::mem::replace(&mut (*list).host, spare) else {
                 continue;
             };
+            // (Submitted again without a reset: it runs closed, empty.)
+            host.close_if_left_open();
             let uploads =
                 std::mem::take(&mut *(*list).uploads.lock().unwrap_or_else(|e| e.into_inner()));
             let state =
@@ -742,11 +796,19 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
             list.host = Some(fresh);
         }
     }
+    // Not counted as a title call: the reset finds a host list left open
+    // as it was (`crate::host::HostList::leave_open`).
     #[cfg(windows)]
-    with_state(this, |host, state| {
+    if let Some(host) = host_list_quiet(this) {
+        #[cfg(feature = "diagnostics")]
+        let started = std::time::Instant::now();
+        // SAFETY: the title passes one of our lists.
+        let state = unsafe { &(*this.cast::<List>()).state };
         host.reset();
-        state.reset(pipeline);
-    });
+        state.lock().unwrap_or_else(|e| e.into_inner()).reset(pipeline);
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::recorded(started);
+    }
     crate::pipeline::bound(pipeline);
     #[cfg(not(windows))]
     let _ = this;
@@ -800,13 +862,13 @@ fn host_barrier(list: &crate::host::HostList, b: &Barrier) -> Option<Barrier> {
             // shortcut: whole resources, from the state the list tracked
             // (`HostList::transition`); subresources are not told apart.
             let wanted = crate::host::texture_state(b.last as u32);
-            let (texture, before) = list.transition(b.first, wanted)?;
+            let (texture, before, state) = list.transition(b.first, wanted)?;
             Some(Barrier {
                 kind: 0,
                 flags: 0,
                 first: texture.as_raw().cast_const().cast(),
                 second: 0xffff_ffff | (u64::from(before) << 32),
-                last: u64::from(crate::host::legal_state(texture, wanted)),
+                last: u64::from(state),
             })
         }
         1 => Some(Barrier {
@@ -855,6 +917,44 @@ fn wait_needed(this: This) -> bool {
     needed
 }
 
+/// `VICTORY_WAIT_SHARE=1`: a full wait of the title is left out when the
+/// call recorded before it on the same host list was a full wait too, with
+/// only bindings since (pipeline, tables, views, constants, fixed function
+/// state): no shader ran that a second wait could order. Only in lists whose
+/// calls are written down ([`thin`]), where every call between the two is
+/// seen ([`thin::binds_only`]).
+fn wait_share() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_WAIT_SHARE").as_deref() == Ok("1"))
+}
+
+thread_local! {
+    /// While a written-down list is made ([`thin`]) with `wait_share`: the
+    /// host list whose last recorded call was a full wait, 0 if the last
+    /// was other work. `None` otherwise.
+    static QUIET: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// Whether a full wait on `list` can be left out (`wait_share`). If not,
+/// the one about to be recorded is noted.
+#[cfg(windows)]
+fn wait_shared(list: &crate::host::HostList) -> bool {
+    use windows::core::Interface;
+    let at = list.list.as_raw() as usize;
+    match QUIET.get() {
+        Some(q) if q == at => {
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::WaitsLeftOut, 1);
+            true
+        }
+        Some(_) => {
+            QUIET.set(Some(at));
+            false
+        }
+        None => false,
+    }
+}
+
 /// Returns the console's barrier "actions" (none).
 extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> u32 {
     #[cfg(windows)]
@@ -866,33 +966,61 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
         }
         // SAFETY: the title passes `count` barriers.
         let barriers = unsafe { std::slice::from_raw_parts(barriers, count as usize) };
-        let mut host: Vec<Barrier> = barriers
-            .iter()
-            .filter_map(|b| host_barrier(list, b))
-            .collect();
         // Buffers have host copies, not resources the barrier can name:
         // a barrier on one waits for every shader write before it.
-        if barriers.iter().any(|b| {
+        let on_buffers = barriers.iter().any(|b| {
             b.kind != 1 && !b.first.is_null() && crate::resource::buffer_bytes(b.first).is_some()
-        }) && wait_needed(this)
-        {
-            host.push(UAV_BARRIER);
-            #[cfg(feature = "diagnostics")]
-            crate::copystat::add(crate::copystat::C::WaitsForBuffers, 1);
-        }
-        if !host.is_empty() {
+        });
+        let submit = |slice: &[Barrier]| {
+            if slice.is_empty() {
+                return;
+            }
             use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
             const _: () = assert!(size_of::<Barrier>() == size_of::<D3D12_RESOURCE_BARRIER>());
             // SAFETY: the same layout; borrowed resource pointers, never
             // released through this slice.
             let host = unsafe {
                 std::slice::from_raw_parts(
-                    host.as_ptr().cast::<D3D12_RESOURCE_BARRIER>(),
-                    host.len(),
+                    slice.as_ptr().cast::<D3D12_RESOURCE_BARRIER>(),
+                    slice.len(),
                 )
             };
             // SAFETY: an open list and live resources.
             unsafe { list.list.ResourceBarrier(host) };
+        };
+        if barriers.len() < 16 {
+            let mut stack = [const { std::mem::MaybeUninit::<Barrier>::uninit() }; 16];
+            let mut n = 0usize;
+            for b in barriers {
+                if let Some(hb) = host_barrier(list, b) {
+                    stack[n].write(hb);
+                    n += 1;
+                }
+            }
+            if on_buffers && wait_needed(this) && (n > 0 || !wait_shared(list)) {
+                stack[n].write(UAV_BARRIER);
+                n += 1;
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::WaitsForBuffers, 1);
+            }
+            // SAFETY: `stack[..n]` are all initialized.
+            let slice = unsafe { std::slice::from_raw_parts(stack.as_ptr().cast::<Barrier>(), n) };
+            submit(slice);
+            for item in &mut stack[..n] {
+                // SAFETY: initialized above and no longer borrowed by `slice`.
+                unsafe { item.assume_init_drop() };
+            }
+        } else {
+            let mut host: Vec<Barrier> = barriers
+                .iter()
+                .filter_map(|b| host_barrier(list, b))
+                .collect();
+            if on_buffers && wait_needed(this) && (!host.is_empty() || !wait_shared(list)) {
+                host.push(UAV_BARRIER);
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::WaitsForBuffers, 1);
+            }
+            submit(&host);
         }
     }
     0
@@ -902,8 +1030,7 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
 #[cfg(windows)]
 pub(crate) fn ensure_state(list: &crate::host::HostList, resource: This, state: u32) {
     use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATES as State;
-    if let Some((texture, before)) = list.transition(resource, state) {
-        let state = crate::host::legal_state(texture, state);
+    if let Some((texture, before, state)) = list.transition(resource, state) {
         let barrier = crate::host::transition(texture, State(before as i32), State(state as i32));
         // SAFETY: an open list and a live texture.
         unsafe { list.list.ResourceBarrier(&[barrier]) };
@@ -1205,6 +1332,8 @@ extern "system" fn copy_texture_region(
             return;
         }
         let mut from = src;
+        // SAFETY: the title passes a box or null.
+        let mut copy_box = unsafe { source_box.as_ref() }.copied();
         // Both sides are the same subresource of one host texture (set below).
         let mut same = false;
         let _upload; // keeps the source alive while this call records it
@@ -1217,17 +1346,29 @@ extern "system" fn copy_texture_region(
             let Some(data) = buffer_range(src.resource, src.footprint.offset, bytes) else {
                 return;
             };
+            let mut staged = bytes;
             let buffer = match list.place_source(data as usize, bytes as usize) {
                 // What shaders wrote to it, at this place of the list.
                 Some(buffer) => buffer,
                 None => {
-                    let Some((buffer, staging)) = list.upload(host, bytes) else {
+                    // A boxed copy stages only the box's rows, the box moved
+                    // to match (AnyXboxX#332).
+                    let (footprint, start, len) = copy_box
+                        .as_mut()
+                        .and_then(|b| src.footprint.crop_upload_rows(b, bytes))
+                        .unwrap_or((src.footprint, 0, bytes));
+                    let (Ok(start), Ok(len)) = (usize::try_from(start), usize::try_from(len)) else {
+                        return;
+                    };
+                    let Some((buffer, staging)) = list.upload(host, len as u64) else {
                         return;
                     };
                     // The list owns this mapped D3D12 upload buffer. Wine can
                     // report its address as MEM_FREE, so use the host-upload
                     // path.
-                    list.defer_fill_buffer(&buffer, staging, data, bytes as usize);
+                    list.defer_fill_buffer(&buffer, staging, data.wrapping_add(start), len);
+                    from.footprint = footprint;
+                    staged = len as u64;
                     buffer
                 }
             };
@@ -1236,8 +1377,10 @@ extern "system" fn copy_texture_region(
             #[cfg(feature = "diagnostics")]
             {
                 // SAFETY: a live buffer.
-                read = Some((unsafe { buffer.GetGPUVirtualAddress() }, bytes));
+                read = Some((unsafe { buffer.GetGPUVirtualAddress() }, staged));
             }
+            #[cfg(not(feature = "diagnostics"))]
+            let _ = staged;
             _upload = buffer;
         } else {
             let Some(texture) = crate::resource::host_resource(src.resource) else {
@@ -1313,12 +1456,12 @@ extern "system" fn copy_texture_region(
         ensure_state(list, dst.resource, COPY_DEST);
         let mut to_location = dst;
         to_location.resource = to.as_raw().cast_const().cast();
-        let host_box = (!source_box.is_null()).then(|| source_box.cast::<D3D12_BOX>());
+        let host_box = copy_box.as_ref().map(|b| std::ptr::from_ref(b).cast::<D3D12_BOX>());
         #[cfg(feature = "diagnostics")]
         {
             let text = || {
                 // SAFETY: a live texture; the box is the title's or null.
-                let (d, b) = unsafe { (to.GetDesc(), host_box.map(|b| *b)) };
+                let (d, b) = unsafe { (to.GetDesc(), source_box.cast::<D3D12_BOX>().as_ref().copied()) };
                 format!(
                     "copy to {:?} {}x{} f{} sub/kind {} at {x},{y},{z} from {:?} kind {} footprint {:?} box {b:?}",
                     dst.resource,
@@ -1339,7 +1482,7 @@ extern "system" fn copy_texture_region(
         const _: () =
             assert!(size_of::<CopyLocation>() == size_of::<D3D12_TEXTURE_COPY_LOCATION>());
         // SAFETY: an open list; both locations in the host's layout, naming
-        // live resources; the box is the title's (same layout).
+        // live resources; the box is a copy of the title's (same layout).
         unsafe {
             list.list.CopyTextureRegion(
                 (&raw const to_location).cast(),
@@ -1675,6 +1818,7 @@ extern "system" fn begin_query(this: This, heap: This, kind: u32, index: u32) {
     let Some(recording) = list.host.as_ref() else {
         return;
     };
+    recording.title_call();
     recording.keep(&host);
     // SAFETY: an open list and our query heap.
     unsafe { recording.list.BeginQuery(&host, r#type, index) };
@@ -1700,6 +1844,7 @@ extern "system" fn end_query(this: This, heap: This, kind: u32, index: u32) {
     let Some(recording) = list.host.as_ref() else {
         return;
     };
+    recording.title_call();
     if r#type != D3D12_QUERY_TYPE_TIMESTAMP {
         let Some(at) = list.open_queries.iter().position(|&(h, _, i)| h == heap as usize && i == index) else {
             return;
@@ -1856,7 +2001,7 @@ extern "system" fn sync(this: This, flags: u32, control: u32, address: u64, size
                 }
                 crate::copystat::add(crate::copystat::C::WaitsForGroups, 1);
             }
-            if wait_needed(this) {
+            if wait_needed(this) && !wait_shared(list) {
                 // SAFETY: the same layout; no resource named.
                 let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
                 // SAFETY: an open list.
@@ -2041,16 +2186,27 @@ mod state {
         one_range: i32,
         depth: *const u64,
     ) {
-        let handles: Vec<u64> = if one_range != 0 && !handles.is_null() {
+        let mut range_buf = [0u64; 8];
+        let handles_vec: Vec<u64>;
+        let handles: &[u64] = if one_range != 0 && !handles.is_null() {
             // SAFETY: the title passes the first handle.
             let first = unsafe { *handles };
-            (0..u64::from(count)).map(|i| first + 128 * i).collect()
+            let n = count as usize;
+            if n <= range_buf.len() {
+                for (i, slot) in range_buf[..n].iter_mut().enumerate() {
+                    *slot = first + 128 * i as u64;
+                }
+                &range_buf[..n]
+            } else {
+                handles_vec = (0..u64::from(count)).map(|i| first + 128 * i).collect();
+                &handles_vec
+            }
         } else {
-            items(handles, count).to_vec()
+            items(handles, count)
         };
         // SAFETY: the title passes a handle or null.
         let depth = unsafe { depth.as_ref() }.copied().unwrap_or(0);
-        with_state(this, |list, s| s.set_targets(list, &handles, depth));
+        with_state(this, |list, s| s.set_targets(list, handles, depth));
     }
     pub(super) extern "system" fn draw(
         this: This,
@@ -2411,35 +2567,360 @@ extern "system" fn wait_value64(this: This, address: u64, comparison: u32, refer
     wait_for(this, address, comparison, reference, true);
 }
 
+/// The title's barrier groups read as the PC's structures: a
+/// group of 16 bytes (kind, count, pointer); a global barrier of 16 bytes
+/// (kind 0), a texture's of 64 (kind 1), a buffer's of 40 (kind 2), each
+/// beginning with the work before and after and the accesses before and
+/// after, a texture's with its layouts before and after next. `each` gets a
+/// barrier's kind and those six words (the layouts 0 but for a texture).
+/// False if a group does not look like one of these (the rest is not read).
+#[cfg(windows)]
+fn each_barrier(count: u32, groups: *const u8, mut each: impl FnMut(u32, [u32; 6])) -> bool {
+    if groups.is_null() {
+        return false;
+    }
+    for g in 0..count as usize {
+        // SAFETY: the title passes `count` groups.
+        let (kind, barriers, first) = unsafe {
+            let at = groups.add(16 * g);
+            (at.cast::<u32>().read_unaligned(), at.add(4).cast::<u32>().read_unaligned(), at.add(8).cast::<usize>().read_unaligned())
+        };
+        let stride = match kind {
+            0 => 16,
+            1 => 64,
+            2 => 40,
+            _ => return false,
+        };
+        if barriers > 4096 || (barriers > 0 && first < 0x10000) {
+            return false;
+        }
+        for b in 0..barriers as usize {
+            // SAFETY: that many barriers of the kind's size, as the group says.
+            let w = unsafe {
+                let at = (first as *const u8).add(stride * b);
+                let w: [u32; 4] = at.cast::<[u32; 4]>().read_unaligned();
+                let layouts: [u32; 2] = if kind == 1 { at.add(16).cast::<[u32; 2]>().read_unaligned() } else { [0, 0] };
+                [w[0], w[1], w[2], w[3], layouts[0], layouts[1]]
+            };
+            each(kind, w);
+        }
+    }
+    true
+}
+
+/// One of the title's barrier groups, laid out as the PC's
+/// `D3D12_BARRIER_GROUP`: the kind of its barriers (0 global, 1 texture,
+/// 2 buffer), how many, and where they are.
+#[repr(C)]
+struct Group {
+    kind: u32,
+    count: u32,
+    barriers: *const u8,
+}
+
+/// What the barriers of a call say of unordered access (what shaders write).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum GroupWrites {
+    /// A barrier ends an unordered access: what shaders wrote is used next.
+    /// Also what is not understood (a kind unknown, no groups given).
+    Ended,
+    /// Unordered access only begins.
+    Begun,
+    /// Other accesses and layouts alone.
+    Other,
+}
+
+/// Each barrier of the groups as `(kind, [sync before, sync after, access
+/// before, access after])`: barriers of all kinds begin with those four
+/// (16, 64 and 40 bytes a global, texture and buffer barrier). `false` if
+/// a group is not one of those kinds, and nothing more is read.
+///
+/// # Safety
+/// `groups` holds `count` groups of the title, live for the call.
+unsafe fn group_barriers(groups: *const u8, count: u32, mut each: impl FnMut(u32, [u32; 4])) -> bool {
+    const SIZES: [usize; 3] = [16, 64, 40];
+    if groups.is_null() {
+        return false;
+    }
+    // SAFETY: the caller's.
+    let groups = unsafe { std::slice::from_raw_parts(groups.cast::<Group>(), count as usize) };
+    for g in groups {
+        let Some(&size) = SIZES.get(g.kind as usize) else { return false };
+        if g.count > 0 && g.barriers.is_null() {
+            return false;
+        }
+        for i in 0..g.count as usize {
+            // SAFETY: `count` barriers of that size, each beginning with four 32-bit values.
+            each(g.kind, unsafe { g.barriers.add(i * size).cast::<[u32; 4]>().read_unaligned() });
+        }
+    }
+    true
+}
+
+/// Diagnostics (`VICTORY_BARRIER_GROUPS_LOG=1`, read here): what the title's
+/// barrier groups ask for ([`each_barrier`]). Every 100,000 barriers the
+/// commonest are logged, with how many calls named a barrier that waits for
+/// a shader write (what stood before it was unordered access, or the common
+/// access, which says nothing: the only ones the wait the host records for a
+/// group is for) and of those the calls whose such barriers wait for compute
+/// alone. Nothing changes in what is recorded.
+///
+/// In the title's first scene (run 50 of docs/linux-wine.md): 800 calls a
+/// frame of four barriers each; a fifth of the calls name no such barrier,
+/// one in twenty-five waits for compute by name, and the rest name every
+/// shader stage on both sides, as the title does throughout.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn count_groups(count: u32, groups: *const u8) {
+    use std::collections::HashMap;
+    use windows::Win32::Graphics::Direct3D12::{
+        D3D12_BARRIER_ACCESS_NO_ACCESS, D3D12_BARRIER_ACCESS_UNORDERED_ACCESS, D3D12_BARRIER_SYNC_COMPUTE_SHADING, D3D12_BARRIER_SYNC_NONE,
+    };
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_BARRIER_GROUPS_LOG").is_some_and(|v| v == "1")) || groups.is_null() {
+        return;
+    }
+    /// Barriers by what they ask; then barriers, calls, calls with a barrier
+    /// that waits for a shader write, those of them that wait for compute
+    /// alone, and calls not all read.
+    type Seen = (HashMap<[u32; 7], u64>, [u64; 5]);
+    static SEEN: std::sync::Mutex<Option<Seen>> = std::sync::Mutex::new(None);
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    let (by, n) = seen.get_or_insert_with(Default::default);
+    let (mut barriers, mut work) = (0u64, 0u32);
+    let read = each_barrier(count, groups, |kind, w| {
+        *by.entry([kind, w[0], w[1], w[2], w[3], w[4], w[5]]).or_default() += 1;
+        barriers += 1;
+        let (before, access) = (w[0], w[2]);
+        if before != D3D12_BARRIER_SYNC_NONE.0 as u32
+            && access != D3D12_BARRIER_ACCESS_NO_ACCESS.0 as u32
+            && (access == 0 || access & D3D12_BARRIER_ACCESS_UNORDERED_ACCESS.0 as u32 != 0)
+        {
+            work |= before;
+        }
+    });
+    n[0] += barriers;
+    n[1] += 1;
+    n[2] += u64::from(work != 0);
+    n[3] += u64::from(work == D3D12_BARRIER_SYNC_COMPUTE_SHADING.0 as u32);
+    n[4] += u64::from(!read);
+    if n[0] >= 100_000 {
+        let mut all: Vec<_> = by.drain().collect();
+        all.sort_by_key(|&(_, count)| std::cmp::Reverse(count));
+        tracing::info!(
+            "the title's barrier groups (VICTORY_BARRIER_GROUPS_LOG): {} barriers in {} calls; {} calls with a barrier that waits for a shader write, {} of them for compute alone; {} calls not all read; {} kinds of barriers, the commonest follow",
+            n[0], n[1], n[2], n[3], n[4], all.len()
+        );
+        for (k, count) in all.into_iter().take(24) {
+            tracing::info!(
+                "  {count} barriers: kind {} (0 global, 1 texture, 2 buffer), work before {:#x} after {:#x}, access before {:#x} after {:#x}, layout before {:#x} after {:#x}",
+                k[0], k[1], k[2], k[3], k[4], k[5], k[6]
+            );
+        }
+        *n = [0; 5];
+    }
+}
+
+/// What a call of the title's barrier groups needs the host's full wait for
+/// ([`each_barrier`]): 2 for nothing, every barrier waiting on reads alone
+/// before reads after, or on no work, or on no access; 1 only for textures
+/// that the host moves between states anyway (`ensure_state`: a target, copy
+/// or unordered access write read after, or a read before a write), so the
+/// state move orders them; 0 for a write nothing else orders (unordered
+/// access, or the common access, which says nothing, on both sides of a
+/// texture; any write before or after on a buffer or a global barrier), or
+/// groups that cannot be read.
+#[cfg(windows)]
+pub(crate) fn groups_wait(count: u32, groups: *const u8) -> u8 {
+    use windows::Win32::Graphics::Direct3D12::*;
+    let reads = [
+        D3D12_BARRIER_ACCESS_VERTEX_BUFFER,
+        D3D12_BARRIER_ACCESS_CONSTANT_BUFFER,
+        D3D12_BARRIER_ACCESS_INDEX_BUFFER,
+        D3D12_BARRIER_ACCESS_DEPTH_STENCIL_READ,
+        D3D12_BARRIER_ACCESS_SHADER_RESOURCE,
+        D3D12_BARRIER_ACCESS_INDIRECT_ARGUMENT,
+        D3D12_BARRIER_ACCESS_COPY_SOURCE,
+        D3D12_BARRIER_ACCESS_RESOLVE_SOURCE,
+        D3D12_BARRIER_ACCESS_RAYTRACING_ACCELERATION_STRUCTURE_READ,
+        D3D12_BARRIER_ACCESS_SHADING_RATE_SOURCE,
+    ]
+    .iter()
+    .fold(0u32, |m, a| m | a.0 as u32);
+    let none = D3D12_BARRIER_ACCESS_NO_ACCESS.0 as u32;
+    let unordered = |a: u32| a == 0 || a & D3D12_BARRIER_ACCESS_UNORDERED_ACCESS.0 as u32 != 0;
+    let read_only = |a: u32| a != 0 && a & !reads == 0;
+    let mut least = 2u8;
+    let read = each_barrier(count, groups, |kind, w| {
+        let (work, before, after) = (w[0], w[2], w[3]);
+        if work == D3D12_BARRIER_SYNC_NONE.0 as u32 || before == none {
+            return;
+        }
+        let need = if read_only(before) && (read_only(after) || after == none) {
+            2
+        } else if kind == 1 && !(unordered(before) && unordered(after)) {
+            1
+        } else {
+            0
+        };
+        least = least.min(need);
+    });
+    if read { least } else { 0 }
+}
+
+/// What the groups say of unordered access ([`GroupWrites`]).
+///
+/// # Safety
+/// As [`group_barriers`].
+unsafe fn group_writes(groups: *const u8, count: u32) -> GroupWrites {
+    const UNORDERED: u32 = 0x10;
+    let mut found = GroupWrites::Other;
+    // SAFETY: the caller's.
+    let known = unsafe {
+        group_barriers(groups, count, |_, [_, _, before, after]| {
+            if before & UNORDERED != 0 {
+                found = GroupWrites::Ended;
+            } else if after & UNORDERED != 0 && found == GroupWrites::Other {
+                found = GroupWrites::Begun;
+            }
+        })
+    };
+    if known { found } else { GroupWrites::Ended }
+}
+
+/// Which of the title's barrier groups record a wait for every earlier
+/// shader write (`VICTORY_GROUP_WAITS`): `all` of them (unset, `reads` or `textures`: as it was),
+/// `named` (the groups that name unordered access, before or after), or
+/// `ended` (only the groups that end one). With `VICTORY_AB` naming the
+/// switch (diagnostics builds): `all` in its phases on, `ended` in the others.
+#[cfg(windows)]
+fn group_waits(writes: GroupWrites) -> bool {
+    #[cfg(feature = "diagnostics")]
+    {
+        static BIT: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+        if let Some(bit) = *BIT.get_or_init(|| crate::ab::bit("VICTORY_GROUP_WAITS")) {
+            return crate::ab::on(bit) || writes == GroupWrites::Ended;
+        }
+    }
+    match group_waits_set() {
+        1 => writes != GroupWrites::Other,
+        2 => writes == GroupWrites::Ended,
+        _ => true,
+    }
+}
+
+/// The least [`groups_wait`] of a call whose full wait is left out: 2 under
+/// `VICTORY_GROUP_WAITS=reads`, 1 under `textures`; else 3 (none left out).
+#[cfg(windows)]
+fn group_waits_left() -> u8 {
+    match group_waits_set() {
+        3 => 2,
+        4 => 1,
+        _ => 3,
+    }
+}
+
+/// `VICTORY_GROUP_WAITS`: 0 unset (`all`), 1 `named`, 2 `ended` ([`group_waits`]);
+/// 3 `reads`, 4 `textures` ([`group_waits_left`]).
+#[cfg(windows)]
+fn group_waits_set() -> u8 {
+    static SET: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *SET.get_or_init(|| match std::env::var("VICTORY_GROUP_WAITS").as_deref() {
+        Ok("named") => 1,
+        Ok("ended") => 2,
+        Ok("reads") => 3,
+        Ok("textures") => 4,
+        _ => 0,
+    })
+}
+
 /// The enhanced barriers `(group count, groups)`: buffer, texture and
 /// global barriers with layouts instead of states. Every host use of a
 /// title texture (clears, copies) moves its host copy to the state it needs
 /// first, so only their ordering matters: one barrier on every shader
 /// write (the title's buffer barriers order compute passes).
+///
+/// Under Wine that wait was tried lighter: none where a call names no
+/// barrier after unordered access, and one for compute passes alone where
+/// the groups name those alone or no draw of the list since its last full
+/// wait has a shader that can store. Four calls in five were recorded so,
+/// and the frame was the same in both trees (runs 53 and 55 of
+/// docs/linux-wine.md, by turns in one run: 30.1 ms against 30.2, 33.5
+/// against 32.5): unlike the waits around our clamps (`crate::indirect`'s
+/// `narrow`), these are not what the card stands still for. Taken out again.
 extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
-    // Diagnostics: counted, and left out under `VICTORY_BARRIER_TEST=groups`.
     #[cfg(all(windows, feature = "diagnostics"))]
     if count > 0 {
-        crate::copystat::add(crate::copystat::C::WaitsForGroups, 1);
+        count_groups(count, _groups);
+        // SAFETY: the title's groups, for this call.
+        unsafe { group_barriers(_groups, count, crate::copystat::group_barrier) };
+    }
+    #[cfg(windows)]
+    barrier_groups_waiting(
+        this,
+        count,
+        if _groups.is_null() { 0 } else { groups_wait(count, _groups) },
+        // SAFETY: as above.
+        unsafe { groups_writes(_groups, count) },
+    );
+    #[cfg(not(windows))]
+    let _ = (this, count);
+}
+
+/// What [`group_waits`] goes by: the groups read only where what they say is
+/// used, in diagnostics builds or with `VICTORY_GROUP_WAITS=named` or `ended`.
+/// Else [`GroupWrites::Ended`], and every call waits as before.
+///
+/// # Safety
+/// As [`group_barriers`].
+#[cfg(windows)]
+pub(crate) unsafe fn groups_writes(groups: *const u8, count: u32) -> GroupWrites {
+    if cfg!(feature = "diagnostics") || matches!(group_waits_set(), 1 | 2) {
+        // SAFETY: the caller's.
+        unsafe { group_writes(groups, count) }
+    } else {
+        GroupWrites::Ended
+    }
+}
+
+/// [`barrier_groups`] with what the groups need a wait for, [`groups_wait`]
+/// and [`groups_writes`] (worked out where the title's structures still stand).
+#[cfg(windows)]
+pub(crate) fn barrier_groups_waiting(this: This, count: u32, need: u8, writes: GroupWrites) {
+    // Diagnostics: counted, and left out under `VICTORY_BARRIER_TEST=groups`.
+    #[cfg(feature = "diagnostics")]
+    if count > 0 {
+        use crate::copystat::{C, add};
+        add(C::WaitsForGroups, 1);
+        match need {
+            2.. => add(C::WaitsGroupsRead, 1),
+            1 => add(C::WaitsGroupsTexture, 1),
+            0 => {}
+        }
+        add(
+            match writes {
+                GroupWrites::Ended => C::GroupsEndWrites,
+                GroupWrites::Begun => C::GroupsBeginWrites,
+                GroupWrites::Other => C::GroupsOther,
+            },
+            1,
+        );
         if crate::copystat::barrier_test() & 1 != 0 {
             return;
         }
     }
-    #[cfg(windows)]
     if count > 0
         && let Some(list) = host_list(this)
     {
         use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
         with_state(this, |_, state| state.synced());
-        if wait_needed(this) {
+        // A wait left out is not one the quiet waits count as made.
+        if need < group_waits_left() && group_waits(writes) && wait_needed(this) && !wait_shared(list) {
             // SAFETY: the same layout; no resource named.
             let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
             // SAFETY: an open list.
             unsafe { list.list.ResourceBarrier(&[barrier]) };
         }
     }
-    #[cfg(not(windows))]
-    let _ = (this, count);
 }
 
 /// The bottom-of-pipe value writes `(address, value, flush, flags)`, 32 and
@@ -2717,6 +3198,27 @@ mod tests {
         assert_eq!(readback, [101, 23, 23, 23, 23, 106, 107, 108]);
     }
 
+    /// What barrier groups say of unordered access, from the access before
+    /// and after of each barrier; groups not understood count as ending one.
+    #[test]
+    fn barrier_groups_are_read_for_unordered_access() {
+        const UNORDERED: u32 = 0x10;
+        // Global barriers: sync before, sync after, access before, access after.
+        let global = |access: [[u32; 2]; 2]| access.map(|[before, after]| [0u32, 0, before, after]);
+        let writes = |kind: u32, barriers: &[[u32; 4]]| {
+            let group = Group { kind, count: barriers.len() as u32, barriers: barriers.as_ptr().cast() };
+            // SAFETY: one group of that many barriers, alive for the call.
+            unsafe { group_writes(std::ptr::from_ref(&group).cast(), 1) }
+        };
+        assert_eq!(writes(0, &global([[1, 2], [UNORDERED, 2]])), GroupWrites::Ended);
+        assert_eq!(writes(0, &global([[1, UNORDERED], [2, 4]])), GroupWrites::Begun);
+        assert_eq!(writes(0, &global([[1, 2], [4, 8]])), GroupWrites::Other);
+        // A kind unknown, and no groups given.
+        assert_eq!(writes(3, &global([[1, 2], [4, 8]])), GroupWrites::Ended);
+        // SAFETY: nothing is read.
+        assert_eq!(unsafe { group_writes(std::ptr::null(), 2) }, GroupWrites::Ended);
+    }
+
     #[test]
     fn every_inline_command_falls_back_to_the_table() {
         let null = std::ptr::null();
@@ -2845,5 +3347,68 @@ mod tests {
             list.list.ResourceBarrier(&barriers);
             list.list.Close().expect("the list closes");
         }
+    }
+
+    /// A back-copied texture written, whose memory the title then reuses
+    /// (its ticket goes stale), and written again in the same list: the
+    /// second write re-registers the read-back. The old dedup stopped at the
+    /// stale entry and dropped it, a missed read-back (the title's ocean
+    /// height map read back nothing).
+    #[cfg(windows)]
+    #[test]
+    fn a_rewritten_back_texture_after_reuse_is_read_back() {
+        use crate::object::guid;
+        use crate::resource::{create_committed, readback_test_descriptions};
+        let Some(_) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        // Make 256x256 R32_FLOAT a back-copied kind, deterministically,
+        // independent of the environment.
+        let _test_kinds = ResetTestKinds(crate::texback::TEST_KINDS.replace(Some(&[(256, 256, 41)])));
+        struct ResetTestKinds(Option<&'static [(u64, u32, u32)]>);
+        impl Drop for ResetTestKinds {
+            fn drop(&mut self) {
+                crate::texback::TEST_KINDS.set(self.0);
+            }
+        }
+        let null = std::ptr::null();
+        let (heap, desc) = readback_test_descriptions();
+        let resource = guid(
+            0x696442be,
+            0xa72e,
+            0x4059,
+            [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
+        );
+        let mut tex = null;
+        assert_eq!(
+            create_committed(null, &heap, 0, &desc, 0, null.cast(), &resource, &mut tex),
+            S_OK
+        );
+        let (_, at, _) = crate::resource::title_texture(tex).expect("synthetic title texture");
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        let new_list = || {
+            let mut allocator = null;
+            assert_eq!(create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator), S_OK);
+            let mut list = null;
+            assert_eq!(create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list), S_OK);
+            (list, allocator)
+        };
+        let (list, allocator) = new_list();
+        let host = host_list(list).expect("a host list");
+        host.texture_written(tex);
+        assert!(host.back_wanted_fresh(tex), "the write registered a read-back");
+        // The title reuses the texture's memory: the ticket goes stale.
+        crate::texback::replaced(at);
+        assert!(!host.back_wanted_fresh(tex), "the reuse invalidated the read-back");
+        // Written again in the same list: the read-back is re-registered, not
+        // dropped (the old dedup saw an entry for this texture and stopped).
+        host.texture_written(tex);
+        assert!(host.back_wanted_fresh(tex), "the second write re-registered the read-back");
+        host.close();
+        assert_eq!(host.texture_back_count(), 1, "the rewritten texture was read back");
+        eprintln!("texture ticket regression exercised on host device");
+        assert_eq!(release(list), 0);
+        assert_eq!(release(allocator), 0);
+        assert_eq!(release(tex), 0);
     }
 }

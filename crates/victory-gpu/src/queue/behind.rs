@@ -276,14 +276,27 @@ impl<W: Work> Lane<W> {
             let (asked, limit) = {
                 let mut state = self.lock();
                 while state.asked == state.served {
+                    // What it stands idle for ([`STOOD`]): nothing in the
+                    // line, lists in it not translated yet, or waits.
+                    let began = Instant::now();
+                    let untranslated = |e: &Entry<W>| e.what.folded() && e.what.ask().is_some_and(|ask| !W::met(&ask));
+                    let why = if state.items.is_empty() {
+                        0
+                    } else if state.items.iter().any(untranslated) {
+                        1
+                    } else {
+                        2
+                    };
                     if state.items.is_empty() {
                         state = self.work.wait(state).unwrap_or_else(|e| e.into_inner());
+                        STOOD[why].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
                     } else {
                         // It stands at something the CPU may write without
                         // a call of ours.
                         let (back, out) =
                             self.work.wait_timeout(state, Duration::from_millis(1)).unwrap_or_else(|e| e.into_inner());
                         state = back;
+                        STOOD[why].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
                         if out.timed_out() {
                             break;
                         }
@@ -725,6 +738,12 @@ static QUEUED: AtomicU64 = AtomicU64::new(0);
 /// present, and for a drain, and the drains; what our thread worked; waits
 /// not met at a present.
 static STATS: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
+/// Since the last frame-rate line, microseconds our thread stood with
+/// nothing free to run: with nothing in the line (the title had not
+/// submitted), with a submission in it whose lists were not all translated
+/// (`crate::list::thin`), and at waits alone. In every build: two clock reads
+/// a wait. Not in `BUSY`: the frame's time less `BUSY` is these three.
+static STOOD: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 const RUNS: usize = 0;
 const PRESENTS: usize = 1;
 const DEPTH: usize = 2;
@@ -767,7 +786,7 @@ thread_local! {
 /// the relay has them, and lists cut at their waits).
 pub(super) fn on() -> bool {
     // Diagnostics: on and off while the title runs (`crate::ab`).
-    #[cfg(feature = "diagnostics")]
+    #[cfg(any(feature = "diagnostics", feature = "ab"))]
     if let Some(on) = crate::ab::pick("VICTORY_ASYNC_SUBMIT") {
         return on && started();
     }
@@ -779,7 +798,7 @@ pub(super) fn on() -> bool {
 
 /// The line is about to be left for the way without it: everything in it is
 /// done first. (At a present, by the title's thread that submits.)
-#[cfg(feature = "diagnostics")]
+#[cfg(any(feature = "diagnostics", feature = "ab"))]
 pub(super) fn leave() {
     LANE.wait_presents(0);
     LANE.drain();
@@ -976,6 +995,15 @@ pub(super) fn line(frames: f64) {
         s[FORCED] / frames,
         s[JOINED] / frames
     );
+    let stood = STOOD.each_ref().map(|s| s.swap(0, Relaxed) as f64 / 1000.0 / frames);
+    tracing::info!(
+        "the thread that prepares submissions stood with nothing free to run, per frame: {:.1} ms with nothing in the line \
+         (the title had not submitted), {:.1} ms with lists in the line that were not translated yet (VICTORY_THIN), \
+         {:.1} ms at waits alone",
+        stood[0],
+        stood[1],
+        stood[2]
+    );
 }
 
 #[cfg(test)]
@@ -1140,6 +1168,49 @@ mod tests {
     fn look(lane: &Lane<T>) {
         let limit = lane.lock().next;
         lane.look(limit);
+    }
+
+    #[test]
+    fn slot_pressure_preserves_commands_and_fence_order() {
+        fn run(by_landing: bool, needed: u64) -> Vec<String> {
+            let lane = Lane::new();
+            let log: Log = Default::default();
+            let f = fence();
+            for (i, command) in ["copy", "dispatch", "draw"].into_iter().enumerate() {
+                lane.push(1, [T::Run(command, log.clone()), T::Signal(f, i as u64 + 1, log.clone())]);
+            }
+            // Each completed command releases one slot. The next table needs
+            // two contiguous slots, or four in the permanently exhausted case.
+            let table = crate::host::slot_wait::retry(
+                || (value(f) >= needed).then_some(7),
+                by_landing,
+                || look(&lane),
+                || {
+                    let before = value(f);
+                    lane.look(2 * (before + 1));
+                    value(f) > before
+                },
+            );
+            assert_eq!(value(f), if by_landing { needed.min(3) } else { 3 });
+            if table.is_some() {
+                lane.push(1, [T::Run("draw with table", log.clone())]);
+            }
+            lane.push(1, [T::Signal(f, 4, log.clone())]);
+            look(&lane);
+            assert_eq!(value(f), 4);
+            crate::object::slot::<extern "system" fn(This) -> u32>(f as This, 0x10)(f as This);
+            Arc::try_unwrap(log).unwrap().into_inner().unwrap()
+        }
+        for needed in [2, 4] {
+            let settled = run(false, needed);
+            let mut expected = vec!["copy", "signal 1", "dispatch", "signal 2", "draw", "signal 3"];
+            if needed == 2 {
+                expected.push("draw with table");
+            }
+            expected.push("signal 4");
+            assert_eq!(settled, expected);
+            assert_eq!(run(true, needed), settled);
+        }
     }
 
     /// A queue's order is kept, a wait for another queue's signal holds only

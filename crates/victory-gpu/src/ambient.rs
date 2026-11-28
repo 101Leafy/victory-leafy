@@ -29,6 +29,9 @@
 //! - `constant:<level>`: the constant, as beloooo's fork has it.
 //!
 //! `VICTORY_AMBIENT_SHADE=<strength>,<radius in metres>` sets the creases.
+//! `VICTORY_AMBIENT_ONCE=1`: one bounce of the title's own light, without the
+//! stand-in's light coming back to it ([`once`]).
+//! `VICTORY_AMBIENT_LEAST=<level>`: the least light the estimate gives ([`least`]).
 //!
 //! The air of a room is lit by the same probes: without rays they hold the
 //! sky's light indoors too, a brown veil at sunset. `VICTORY_AMBIENT_AIR`
@@ -116,6 +119,22 @@ fn parse(set: &str) -> Set {
     }
 }
 
+/// `VICTORY_AMBIENT_LEAST=<level>`: with the estimate (`VICTORY_AMBIENT=<share>`),
+/// the least indirect light a point gets, as the constant of `constant:<level>`
+/// gives it (0, the default: no floor). The estimate is made from what is on
+/// screen, so at night outdoors and in unlit rooms it is about nothing and
+/// what no lamp reaches is black; VI-BR-PORT keeps such a floor
+/// (`estimate:<share>:<least>`, 0.16 outdoors since the opening was too dark at
+/// 0.08; edsuuu/VI-BR-PORT 849a20b3, GPL-3.0-or-later).
+fn least() -> f32 {
+    static LEAST: OnceLock<f32> = OnceLock::new();
+    *LEAST.get_or_init(|| parse_least(&std::env::var("VICTORY_AMBIENT_LEAST").unwrap_or_default()))
+}
+
+fn parse_least(set: &str) -> f32 {
+    set.trim().parse::<f32>().ok().filter(|v| v.is_finite() && *v > 0.0).map_or(0.0, |v| v.min(4.0))
+}
+
 fn set() -> Set {
     static SET: OnceLock<Set> = OnceLock::new();
     *SET.get_or_init(|| parse(&std::env::var("VICTORY_AMBIENT").unwrap_or_default()))
@@ -124,6 +143,26 @@ fn set() -> Set {
 /// Whether the stand-in is on: set, and the title's rays find nothing.
 pub(crate) fn on() -> bool {
     set() != Set::Off && !crate::pipeline::builder_runs()
+}
+
+/// `VICTORY_AMBIENT_ONCE=1`: the estimate is one bounce of the light the
+/// title's own lighting put there, not of the stand-in's too.
+///
+/// The light the visible surfaces send out (the estimate's source) is that of
+/// the frame before, which the stand-in had raised: its own light comes back
+/// to it, reflected. With a share `level` of what surfaces send out, and
+/// surfaces sending out a share `a` of the light they get (`e` their own),
+/// the light settles at `level * e / (1 - level * a)` instead of
+/// `level * (a * l + e)`: at 0.8 and walls that send out 0.6, 1.9 times
+/// one bounce, more near pale surfaces and lamps (the overexposed rooms).
+/// With this switch the raise notes, at the 25 places of each cell that the
+/// next keep reads, which share of the light there is the title's own; the
+/// keep counts each place's light by that share. Light that is the
+/// surface's own (lamps) is counted down as well where the stand-in raised
+/// it: shortcut, no albedo to tell the two apart.
+fn once() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_AMBIENT_ONCE").is_some_and(|v| v == "1"))
 }
 
 /// The most the air scatters, as a multiple of the light around
@@ -153,7 +192,7 @@ fn reflect() -> f32 {
         }
         held
     });
-    #[cfg(feature = "diagnostics")]
+    #[cfg(any(feature = "diagnostics", feature = "ab"))]
     if let Some(on) = crate::ab::pick("VICTORY_AMBIENT_REFLECT") {
         return if !on { 0.0 } else if held > 0.0 { held } else { REFLECT };
     }
@@ -259,7 +298,7 @@ fn shade() -> [f32; 2] {
 }
 
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=15, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2)"
+#define RS "RootConstants(num32BitConstants=16, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2)"
 #define CX 64
 #define CY 36
 #define CELLS (CX * CY)
@@ -268,12 +307,14 @@ const SOURCE: &str = r#"
 cbuffer Set : register(b0) {
     float level; float constant; float strength; float radius;
     float near; float tan_y; uint width; uint height;
-    float follow; float most; float air; float unused;
-    float jump; float fresh; float dt;
+    float follow; float most; float air; float once;
+    float jump; float fresh; float dt; float least;
 };
 Texture2D<float> depth : register(t0);
 // Cells: the light they send out (then, at CELLS, the slow mean), from
-// CELLS + 1 on where they are.
+// CELLS + 1 on where they are, from SHARES on the share of the title's own
+// light at each of the 25 places of a cell the keep reads (x; y: written).
+#define SHARES (2 * CELLS + 1)
 RWStructuredBuffer<float4> cells : register(u1);
 // Three a point: red, green and blue, each a mean and a direction.
 RWStructuredBuffer<float4> points : register(u2);
@@ -300,7 +341,10 @@ void keep(uint3 at : SV_DispatchThreadID) {
         float3 c = max(radiance[p], 0.0);
         c = any(isnan(c)) || any(isinf(c)) ? 0.0 : c;
         // Lamps and glints count, but not for everything.
-        sum += c / max(1.0, dot(c, LUMA) / 20.0);
+        c /= max(1.0, dot(c, LUMA) / 20.0);
+        // Not the stand-in's own light, reflected (`once`).
+        float4 share = cells[SHARES + (at.y * CX + at.x) * 25 + y * 5 + x];
+        sum += once > 0.0 && share.y > 0.0 ? c * saturate(share.x) : c;
     }
     cells[at.y * CX + at.x] = float4(sum / 25.0, 1.0);
 }
@@ -493,7 +537,18 @@ void raise(uint3 at : SV_DispatchThreadID) {
     found = all + 1.2 * float3(dot(sr.xyz, n), dot(sg.xyz, n), dot(sb.xyz, n)) / sum;
     found = clamp(found, 0.2 * all, 2.5 * all);
     found = lerp(found, cells[CELLS].rgb, 0.2) * level * open;
+    if (any(isnan(found)) || any(isinf(found)) || any(found < 0.0)) found = 0.0;
     float3 was = unpack(light[p]);
+    if (any(isnan(was)) || any(isinf(was)) || any(was < 0.0)) was = 0.0;
+    // Magenta/violet garbage the probes' memory held (green far under red and
+    // blue): dropped, as VIctory-Belobug-AMD does (ambient.rs, "Filter magenta
+    // garbage probes"). Seen on an RTX 5080 as a purple-blue glow on a lit
+    // sheet of paper in the prison cell; not an AMD-only fault.
+    if (was.g < 0.5 * min(was.r, was.b) && max(was.r, was.b) > 0.02) was = 0.0;
+    // And the bluer kind of it (blue over 2.5x green and over red): left as
+    // a faint violet by the line above. The sky's light keeps green above
+    // 0.4x blue, sunsets keep blue low, so neither is touched.
+    if (was.b > 2.5 * was.g && was.b > was.r && was.b > 0.02) was = 0.0;
     // What the program left counts as far as it can be true: the sky's light
     // outdoors, not the blocks of other memory.
     // For `fresh` seconds after the light around jumped (a new room) the
@@ -503,14 +558,34 @@ void raise(uint3 at : SV_DispatchThreadID) {
     float top = max(dot(found, LUMA) * bound, 1e-6);
     float has = dot(was, LUMA);
     was *= min(1.0, top / max(has, 1e-6));
-    light[p] = pack(max(was, found));
+    // Never under the least light asked for (`VICTORY_AMBIENT_LEAST`): at
+    // night what is on screen is dark, the estimate made from it too. After
+    // the bound above, which stays the estimate's: raised by the floor it let
+    // the probes' violet memory through outdoors (sky and trees in violet
+    // tones).
+    float3 floor_light = float3(1.0, 0.98, 0.94) * least * open;
+    if (least > 0.0 && dot(found, LUMA) < dot(floor_light, LUMA)) found = floor_light;
+    float3 now = max(was, found);
+    light[p] = pack(now);
+    if (once > 0.0) {
+        // At the places the next keep reads, the share of the light that is
+        // the title's own.
+        float2 gc = (float2(p) + 0.5) / size * float2(CX, CY);
+        uint2 cell = min(uint2(gc), uint2(CX - 1, CY - 1));
+        uint2 k = min(uint2((gc - float2(cell)) * 5.0), uint2(4, 4));
+        uint2 q = uint2((float2(cell) + (float2(k) + 0.5) / 5.0) * size / float2(CX, CY));
+        if (q.x == uint(p.x) && q.y == uint(p.y)) {
+            float share = dot(was, LUMA) / max(dot(now, LUMA), 1e-6);
+            cells[SHARES + (cell.y * CX + cell.x) * 25 + k.y * 5 + k.x] = float4(share, 1.0, 0.0, 0.0);
+        }
+    }
 }
 #endif
 "#;
 
 /// Bytes of the cells' buffer and of the points'.
 const CELLS: u64 = 64 * 36;
-const CELL_BYTES: u64 = (2 * CELLS + 1) * 16;
+const CELL_BYTES: u64 = (2 * CELLS + 1 + 25 * CELLS) * 16;
 const POINT_BYTES: u64 = 160 * 90 * 48;
 
 struct Pass {
@@ -569,15 +644,44 @@ fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -
     })
 }
 
+static PASS: OnceLock<Option<Pass>> = OnceLock::new();
+
+fn build() -> Option<Pass> {
+    let host = host()?;
+    make(&host.device, |bytes| host.uav_buffer(bytes))
+        .inspect_err(|e| tracing::warn!(error = %e, "no stand-in for the indirect light"))
+        .ok()
+}
+
+/// Whether the passes are made by a thread of ours and left out until they
+/// are (`VICTORY_AMBIENT_ASIDE=1`). Made by the list thread that first wants
+/// them, the seven creations took the driver as long as the title's own
+/// pipelines in a run with an empty cache, tens of seconds; the list threads
+/// behind it waited too, the submission they were translating stood at the
+/// head of the line, and the present behind it with the title's thread in it
+/// past the title's 30 s watchdog.
+fn aside() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_AMBIENT_ASIDE").is_some_and(|v| v == "1"))
+}
+
 fn pass() -> Option<&'static Pass> {
-    static PASS: OnceLock<Option<Pass>> = OnceLock::new();
-    PASS.get_or_init(|| {
-        let host = host()?;
-        make(&host.device, |bytes| host.uav_buffer(bytes))
-            .inspect_err(|e| tracing::warn!(error = %e, "no stand-in for the indirect light"))
-            .ok()
-    })
-    .as_ref()
+    if !aside() {
+        return PASS.get_or_init(build).as_ref();
+    }
+    static ASKED: std::sync::Once = std::sync::Once::new();
+    ASKED.call_once(|| {
+        let made = std::thread::Builder::new().name("victory-ambient".into()).spawn(|| {
+            let began = std::time::Instant::now();
+            PASS.get_or_init(build);
+            tracing::info!(ms = began.elapsed().as_millis() as u64, "the passes of the stand-in for the indirect light are made");
+        });
+        if let Err(e) = made {
+            tracing::warn!(error = %e, "no thread to make the stand-in for the indirect light");
+            let _ = PASS.set(None);
+        }
+    });
+    PASS.get()?.as_ref()
 }
 
 /// For the replay (`--reflect`): the root signature and the pass that holds
@@ -602,7 +706,7 @@ pub(crate) fn hold_pass(
         let pso = device.CreateComputePipelineState(&desc)?;
         (root, pso)
     };
-    let mut words = vec![0u32; 15];
+    let mut words = vec![0u32; 16];
     words[9] = most.to_bits();
     Ok((root, pso, words))
 }
@@ -622,7 +726,7 @@ pub(crate) struct Views {
     /// The image the title's program just wrote.
     pub(crate) image: D3D12_GPU_DESCRIPTOR_HANDLE,
     /// The scene's depth, for [`Role::Resolve`].
-    pub(crate) depth: D3D12_GPU_DESCRIPTOR_HANDLE,
+    pub(crate) depth: Option<D3D12_GPU_DESCRIPTOR_HANDLE>,
     /// The size of the image, and how many slices it has.
     pub(crate) size: [u32; 2],
     pub(crate) slices: u32,
@@ -662,7 +766,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     list.keep(&pass.points);
     let [strength, radius] = shade();
     let floats = [level, constant, strength, radius, 0.1, 0.45];
-    let mut words = [0u32; 15];
+    let mut words = [0u32; 16];
     for (to, v) in words.iter_mut().zip(floats) {
         *to = v.to_bits();
     }
@@ -676,9 +780,11 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     };
     words[9] = most.to_bits();
     words[10] = air().to_bits();
+    words[11] = if once() { 1.0f32 } else { 0.0 }.to_bits();
     words[12] = settle().map_or(0.0, |s| s.jump).to_bits();
     words[13] = settle().map_or(0.0, |s| s.fresh).to_bits();
     words[14] = (frame_ms(role) / 1000.0).to_bits();
+    words[15] = least().to_bits();
     let l = &list.list;
     // SAFETY: an open list with the heap of the views set; the title's
     // program has just used both views, so their textures are in the states
@@ -686,8 +792,10 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     unsafe {
         uav_barrier(l);
         l.SetComputeRootSignature(&pass.root);
-        l.SetComputeRoot32BitConstants(0, 15, words.as_ptr().cast(), 0);
-        l.SetComputeRootDescriptorTable(1, views.depth);
+        l.SetComputeRoot32BitConstants(0, 16, words.as_ptr().cast(), 0);
+        if let Some(depth) = views.depth {
+            l.SetComputeRootDescriptorTable(1, depth);
+        }
         l.SetComputeRootDescriptorTable(2, views.image);
         l.SetComputeRootUnorderedAccessView(3, pass.cells.GetGPUVirtualAddress());
         l.SetComputeRootUnorderedAccessView(4, pass.points.GetGPUVirtualAddress());
@@ -738,6 +846,16 @@ mod tests {
     }
 
     #[test]
+    fn least_settings() {
+        assert_eq!(parse_least(""), 0.0);
+        assert_eq!(parse_least("0"), 0.0);
+        assert_eq!(parse_least("x"), 0.0);
+        assert_eq!(parse_least("-1"), 0.0);
+        assert_eq!(parse_least(" 0.16 "), 0.16);
+        assert_eq!(parse_least("99"), 4.0);
+    }
+
+    #[test]
     fn roles_by_name() {
         assert_eq!(role(b"..CS_ScreenProbes_TemporalResolve_a911b49c_Wrapped.."), Some(Role::Resolve));
         assert_eq!(role(b"..CS_CacheScreenSpaceRadiance_eed2fc35.."), Some(Role::Radiance));
@@ -746,6 +864,52 @@ mod tests {
         assert_eq!(role(opaque), Some(Role::Reflect));
         assert_eq!(role(b"CS_TemporalResolve1_Alpha_68979fba"), Some(Role::Reflect));
         assert_eq!(role(b"CS_TemporalResolve"), None);
+    }
+
+    /// The keep and raise as they act on the light, frame after frame, for
+    /// surfaces that send out `a` of the light they get and the title's own
+    /// light `title` on each (`VICTORY_AMBIENT_ONCE`'s model): the light it
+    /// settles at on each surface.
+    fn settle(level: f32, a: f32, title: &[f32], once: bool) -> Vec<f32> {
+        let mut light = title.to_vec();
+        let mut share = vec![1.0f32; title.len()];
+        for _ in 0..500 {
+            // Keep: what the surfaces sent out (the frame before), counted by
+            // the share of the title's own light there with `once`.
+            let sent: f32 = light
+                .iter()
+                .zip(&share)
+                .map(|(l, s)| a * l * if once { *s } else { 1.0 })
+                .sum::<f32>()
+                / title.len() as f32;
+            // Raise: never below the title's own light.
+            for (i, t) in title.iter().enumerate() {
+                light[i] = t.max(level * sent);
+                share[i] = t / light[i].max(1e-6);
+            }
+        }
+        light
+    }
+
+    /// Without it the stand-in's own light comes back to it: a lit wall and a
+    /// dark one settle at `level a t / 2 / (1 - level a / 2)` on the dark one,
+    /// a third more than one bounce at walls that send out 0.6, three
+    /// quarters more at 0.9. With it, one bounce of the title's light.
+    #[test]
+    fn once_is_one_bounce_of_the_titles_light() {
+        for a in [0.6f32, 0.9] {
+            let one_bounce = 0.8 * a * 1.0 / 2.0;
+            let fed = settle(0.8, a, &[1.0, 0.0], false)[1];
+            let once = settle(0.8, a, &[1.0, 0.0], true)[1];
+            assert!(
+                (fed - one_bounce / (1.0 - 0.8 * a / 2.0)).abs() < 1e-4,
+                "a={a}: fed back {fed}"
+            );
+            assert!((once - one_bounce).abs() < 1e-4, "a={a}: once {once}");
+            assert!(fed > 1.3 * once);
+        }
+        // Where the title's light is above the estimate nothing changes.
+        assert_eq!(settle(0.8, 0.6, &[1.0, 1.0], true), vec![1.0, 1.0]);
     }
 
     /// The passes compile with the system's compiler and the host takes them.

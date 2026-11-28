@@ -27,12 +27,32 @@ pub(super) fn own() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_SEND_OWN").is_none_or(|v| v != "0"))
 }
 
+/// Whether the long runs are copied on several threads from more than
+/// [`PIECE`] bytes on (`VICTORY_SEND_WIDE=1`; off by default), not only
+/// past 4 MB ([`crate::shadow::copy_all`]).
+///
+/// Why: in Leafy's run leafy-0314 the taking was 6.7 ms a frame of the
+/// submitting thread in play, for 36 MB in some 300 runs over 18
+/// submissions: about 2 MB a submission, mostly under the 4 MB that goes
+/// wide, so copied on that thread alone into the upload memory.
+fn wide() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_SEND_WIDE") {
+        return on;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_SEND_WIDE"))
+}
+
+/// With [`wide`]: about this many bytes to a thread's piece.
+const PIECE: usize = 256 << 10;
+
 /// Runs up to this many bytes go as pairs.
 const SHORT: usize = 256;
 
 /// Whether a run of `len` bytes at offset `at` of a copy goes as pairs.
 fn short(at: usize, len: usize) -> bool {
-    len <= SHORT && at % 4 == 0 && len % 4 == 0
+    len <= SHORT && at.is_multiple_of(4) && len.is_multiple_of(4)
 }
 
 /// Whether a run of `len` bytes at offset `at` of a copy in the card's memory
@@ -79,30 +99,67 @@ struct Pass {
     pso: ID3D12PipelineState,
 }
 
+/// Whether the submitting thread leaves the pass to a thread of its own
+/// (`VICTORY_SEND_PASS_AWAY=1`; off by default): until it is made, the
+/// changed words go up as copies, as with `VICTORY_SEND_OWN=0`.
+///
+/// Why: in ff-se r126 the submitting thread made the pass at its first use,
+/// 56 s in, while 26 pipeline workers compiled. The driver's create waited
+/// on its shader cache lock (NvMemMapStoragex) for over 30 s, the title's
+/// present waited on the submitting thread (`Lane::wait_presents`), and the
+/// title's watchdog ended the run.
+fn away() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SEND_PASS_AWAY").is_some_and(|v| v == "1"))
+}
+
 fn pass(host: &Host) -> Option<&'static Pass> {
     static PASS: OnceLock<Option<Pass>> = OnceLock::new();
-    PASS.get_or_init(|| {
-        let code = compile(SCATTER, windows::core::s!("main"), windows::core::s!("cs_5_1")).ok()?;
-        // SAFETY: the code lives through the calls; the root signature is
-        // inside it.
-        unsafe {
-            let root: ID3D12RootSignature = host.device.CreateRootSignature(0, &code).ok()?;
-            let pso: ID3D12PipelineState = host
-                .device
-                .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
-                    pRootSignature: std::mem::transmute_copy(&root),
-                    CS: D3D12_SHADER_BYTECODE {
-                        pShaderBytecode: code.as_ptr().cast(),
-                        BytecodeLength: code.len(),
-                    },
-                    ..Default::default()
-                })
-                .ok()?;
-            name(&pso, || "victory: changed words sent to the card".into());
-            Some(Pass { root, pso })
+    if !away() {
+        return PASS.get_or_init(|| make_pass(&host.device)).as_ref();
+    }
+    if let Some(made) = PASS.get() {
+        return made.as_ref();
+    }
+    static ASKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !ASKED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        let device = host.device.clone();
+        let began = std::time::Instant::now();
+        let spawned = std::thread::Builder::new()
+            .name("victory-send-pass".into())
+            .spawn(move || {
+                PASS.get_or_init(|| make_pass(&device));
+                tracing::info!(
+                    ms = began.elapsed().as_millis() as u64,
+                    "the pass for changed words is made (VICTORY_SEND_PASS_AWAY)"
+                );
+            });
+        if spawned.is_err() {
+            return PASS.get_or_init(|| make_pass(&host.device)).as_ref();
         }
-    })
-    .as_ref()
+    }
+    None
+}
+
+fn make_pass(device: &ID3D12Device) -> Option<Pass> {
+    let code = compile(SCATTER, windows::core::s!("main"), windows::core::s!("cs_5_1")).ok()?;
+    // SAFETY: the code lives through the calls; the root signature is
+    // inside it.
+    unsafe {
+        let root: ID3D12RootSignature = device.CreateRootSignature(0, &code).ok()?;
+        let pso: ID3D12PipelineState = device
+            .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::transmute_copy(&root),
+                CS: D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: code.as_ptr().cast(),
+                    BytecodeLength: code.len(),
+                },
+                ..Default::default()
+            })
+            .ok()?;
+        name(&pso, || "victory: changed words sent to the card".into());
+        Some(Pass { root, pso })
+    }
 }
 
 /// Memory a submission's sends come from, mapped.
@@ -170,8 +227,9 @@ pub(super) fn give_back(memory: Memory) {
 }
 
 /// Since the last frame-rate line: bytes copied, runs copied, words stored,
-/// microseconds of taking them out of the CPU sides.
-pub(super) static STATS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+/// microseconds of taking them out of the CPU sides, of copying the runs
+/// among them.
+pub(super) static STATS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 
 /// One copy's sends: ranges copied (offset in the copy, in the memory,
 /// bytes), and its pairs (where in the memory, how many).
@@ -184,6 +242,22 @@ struct Copy {
 pub(super) struct Own {
     memory: Memory,
     copies: Vec<Copy>,
+    used: u64,
+    /// The long runs, still being copied on the kept threads
+    /// ([`beside`]); [`Own::copied`] waits for them.
+    copying: std::sync::Mutex<Option<crate::shadow::Beside>>,
+}
+
+/// Whether a submission's long runs are copied into its memory on the kept
+/// threads while the submitting thread records the list that sends them,
+/// and waited for before that list is handed to the card
+/// (`VICTORY_SEND_BESIDE=1`; off by default). In Leafy's play run of
+/// 2026-11-27 they were 29 MB a frame in about 230 runs, under a MiB a
+/// submission, so `copy_all` did them on this thread: 6.4-8.4 ms a frame
+/// with the card idle.
+fn beside() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_SEND_BESIDE"))
 }
 
 /// Runs whose pairs are one piece of work.
@@ -270,12 +344,26 @@ pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, us
     STATS[0].fetch_add(moves.iter().map(|m| m.2 as u64).sum(), Ordering::Relaxed);
     STATS[1].fetch_add(moves.len() as u64, Ordering::Relaxed);
     STATS[2].fetch_add(copies.iter().map(|c| u64::from(c.pairs.1)).sum(), Ordering::Relaxed);
-    crate::shadow::copy_all(moves);
+    let copy_began = std::time::Instant::now();
+    let mut copying = None;
+    if beside() {
+        copying = Some(crate::shadow::copy_beside(moves));
+    } else if wide() {
+        crate::shadow::copy_in_pieces(moves, PIECE);
+    } else {
+        crate::shadow::copy_all(moves);
+    }
+    STATS[4].fetch_add(copy_began.elapsed().as_micros() as u64, Ordering::Relaxed);
     STATS[3].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
-    Some(Own { memory, copies })
+    Some(Own { memory, copies, copying: std::sync::Mutex::new(copying), used: at })
 }
 
 impl Own {
+    /// Used extent, including the packed scatter pairs, for the copy queue.
+    pub(super) fn source(&self) -> (&ID3D12Resource, u64) {
+        (&self.memory.buffer, self.used)
+    }
+
     /// Records the sends into `list`; the copies that `looked` says are in
     /// `COPY_DEST`, the others in the common state. Those with a "before" are
     /// left readable by compute shaders.
@@ -288,7 +376,9 @@ impl Own {
         list: &ID3D12GraphicsCommandList,
         dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, usize)>)],
         looked: impl Fn(&Shadow) -> bool,
+        from: Option<&ID3D12Resource>,
     ) {
+        let source = from.unwrap_or(&self.memory.buffer);
         let read = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
         let write = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
         let dest = D3D12_RESOURCE_STATE_COPY_DEST;
@@ -296,7 +386,7 @@ impl Own {
         for ((shadow, _), copy) in dirty.iter().zip(&self.copies) {
             for &(a, from, n) in &copy.runs {
                 // SAFETY: the caller's; live buffers, ranges inside them.
-                unsafe { list.CopyBufferRegion(&shadow.buffer, a as u64, &self.memory.buffer, from, n as u64) };
+                unsafe { list.CopyBufferRegion(&shadow.buffer, a as u64, source, from, n as u64) };
             }
             let mut state = (looked(shadow) || !copy.runs.is_empty()).then_some(dest);
             if copy.pairs.1 > 0 {
@@ -323,7 +413,7 @@ impl Own {
             {
                 list.SetComputeRootSignature(&pass.root);
                 list.SetPipelineState(&pass.pso);
-                list.SetComputeRootShaderResourceView(1, self.memory.buffer.GetGPUVirtualAddress());
+                list.SetComputeRootShaderResourceView(1, source.GetGPUVirtualAddress());
                 for ((shadow, _), copy) in dirty.iter().zip(&self.copies).filter(|(_, c)| c.pairs.1 > 0) {
                     list.SetComputeRootUnorderedAccessView(2, shadow.buffer.GetGPUVirtualAddress());
                     const MOST: u32 = 64 * D3D12_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION;
@@ -344,8 +434,20 @@ impl Own {
         }
     }
 
+    /// Waits for the long runs still being copied into the memory; its time
+    /// is counted with taking them.
+    pub(super) fn copied(&self) {
+        let copying = self.copying.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(copying) = copying {
+            let began = std::time::Instant::now();
+            copying.join();
+            STATS[3].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
+        }
+    }
+
     /// The memory, to be kept until the submission has run.
     pub(super) fn memory(self) -> Memory {
+        self.copied();
         self.memory
     }
 }
