@@ -926,7 +926,7 @@ mod tests {
             ..Default::default()
         };
         assert!(neutral_image(Role::Resolve, &image));
-        for role in [Role::Radiance, Role::Air, Role::Miss] {
+        for role in [Role::Radiance, Role::Air, Role::Reflect] {
             assert!(!neutral_image(role, &image));
         }
         for bad in [
