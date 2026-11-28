@@ -4358,6 +4358,7 @@ pub(crate) fn joinable<'a>(ahead: impl Iterator<Item = &'a HostList>, next: &[&H
         let deferred = list.deferred();
         written.extend(deferred.writes.iter().map(|&(at, _, bytes)| (at, at + bytes)));
         written.extend(deferred.backs.iter().map(|&(_, _, at, [row, rows, pitch])| (at, at + rows.saturating_sub(1) * pitch + row)));
+        written.extend(deferred.texture_backs.iter().map(crate::texback::Back::range));
     }
     let mut joined = Vec::new();
     join_ranges(&mut joined, written);
