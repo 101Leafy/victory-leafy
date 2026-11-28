@@ -3533,7 +3533,10 @@ pub(crate) fn texture_kind(this: This) -> Option<(u64, u32, u32)> {
 
 /// Texture `this`'s console layout (one plane), where it lies in title
 /// memory and the bytes that layout takes, for `crate::texback`; `None` for
-/// buffers, multi-plane textures, and layouts we cannot address.
+/// a buffer or a texture with planes. An `R32_FLOAT` texture at a 64 KiB
+/// boundary in `SW_64KB_R_X` (the ocean's height map) is addressed with the
+/// console's pipes and packers
+/// ([`victory_formats::texture::Layout::configure_render_xor`]).
 #[cfg(windows)]
 pub(crate) fn title_texture(this: This) -> Option<(victory_formats::texture::Layout, usize, usize)> {
     if this.is_null() {
@@ -3554,15 +3557,6 @@ pub(crate) fn title_texture(this: This) -> Option<(victory_formats::texture::Lay
             crate::console::Console::SeriesX => RenderPipeConfig::Pipes32Packers8,
         };
         plane.layout.configure_render_xor(pipes);
-    }
-    if !plane.layout.addressable() {
-        // Recording and waiting for a GPU copy cannot produce a CPU-visible
-        // plane if the console's address equation is unavailable.
-        static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| tracing::warn!(width = r.desc.width, height = r.desc.height,
-            format = r.desc.format, swizzle = plane.layout.desc.swizzle.0,
-            "a texture of a kind copied back (VICTORY_TEXTURE_BACK) is left alone: its console layout is not addressed here"));
-        return None;
     }
     Some((plane.layout, at, t.size as usize))
 }
@@ -4006,8 +4000,10 @@ mod tests {
 
     #[test]
     #[cfg(windows)]
-    fn water_readback_requires_an_addressable_console_plane() {
-        for (swizzle, bias, supported) in [(0x105, 0, true), (0x11b, 0, true),
+    fn the_ocean_height_map_layout_is_addressed_at_a_64_kib_boundary() {
+        // SW_4KB_S always; SW_64KB_R_X only at a 64 KiB boundary; SW_64KB_S_X
+        // not (no XOR mode but that one has addresses yet).
+        for (swizzle, bias, addressable) in [(0x105, 0, true), (0x11b, 0, true),
             (0x11b, 256, false), (0x119, 0, false)] {
             let desc = ResourceDesc { layout: swizzle, flags: 4, ..texture(256, 256, 41, 1) };
             let bytes = footprint(&desc).unwrap().size as usize;
@@ -4016,8 +4012,8 @@ mod tests {
             let mut r = std::ptr::null();
             assert_eq!(create_at_address(std::ptr::null(), at as u64, &desc, 0,
                 std::ptr::null(), &PAGEABLE_IIDS[0], &mut r), object::S_OK);
-            let destination = title_texture(r).map(|(_, base, extent)| (base, extent));
-            assert_eq!(destination, supported.then_some((at, bytes)));
+            let destination = title_texture(r).map(|(layout, base, extent)| (layout.addressable(), base, extent));
+            assert_eq!(destination, Some((addressable, at, bytes)), "layout {swizzle:#x}, {bias} bytes off");
             assert_eq!(resource_release(r), 0);
         }
     }
