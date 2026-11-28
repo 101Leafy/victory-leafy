@@ -207,7 +207,7 @@ impl<'a> Lower<'a> {
             }
         };
         let src = Source::Loaded { load: site, first };
-        let h = self.handle(site, &src, false, props)?;
+        let h = self.size_view_handle(site, first, &src, props, image.is_none())?; // amd.rs (DexNom PR 62)
         let c = self.cur;
         let i32t = self.s.t.i32;
         let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
