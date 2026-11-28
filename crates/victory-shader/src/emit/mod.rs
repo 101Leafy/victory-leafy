@@ -92,6 +92,8 @@ mod filter3d_tests;
 mod intersect_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
+#[cfg(test)]
+mod lds_loop_tests;
 mod lower;
 mod own_bits;
 #[cfg(all(test, windows))]
