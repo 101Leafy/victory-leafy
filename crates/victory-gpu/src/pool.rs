@@ -45,7 +45,7 @@ static SPARES: AtomicUsize = AtomicUsize::new(SPARE);
 /// up to 4 GiB of them stayed on a card short of room until then.
 pub(crate) fn room(memory: Option<[u64; 4]>) {
     let limit = spares(memory, crate::host::keep_freed());
-    SPARES.store(limit, Ordering::Relaxed);
+    SPARES.store(texture_spares(memory, limit, spare_scale().then(ahead)), Ordering::Relaxed);
     if stats_on() {
         static ASKED: AtomicU64 = AtomicU64::new(0);
         if ASKED.fetch_add(1, Ordering::Relaxed).is_multiple_of(5) {
@@ -99,6 +99,26 @@ fn by_headroom() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_SPARES_BY_HEADROOM").is_some_and(|v| v == "1"))
 }
 
+/// `VICTORY_SPARE_SCALE=1` caps empty texture blocks by the DXGI budget.
+fn spare_scale() -> bool {
+    static SCALE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SCALE.get_or_init(|| std::env::var_os("VICTORY_SPARE_SCALE").is_some_and(|v| v == "1"))
+}
+
+fn texture_spares(memory: Option<[u64; 4]>, limit: usize, ripe_ahead: Option<usize>) -> usize {
+    match (memory, ripe_ahead) {
+        (Some([budget, ..]), Some(ripe_ahead)) => {
+            // Both Ripe::now and the staging pool's rested() read SPARES.
+            let scaled = (budget / 32 / BLOCK)
+                .max(ripe_ahead as u64)
+                .max(STAGING_KEPT as u64)
+                .min(SPARE_KEPT as u64);
+            limit.min(scaled as usize)
+        }
+        _ => limit,
+    }
+}
+
 fn spares(memory: Option<[u64; 4]>, keep: bool) -> usize {
     spares_of(memory, keep, by_headroom())
 }
@@ -135,6 +155,8 @@ pub(crate) fn on() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_POOL").is_none_or(|v| v != "0"))
 }
 
+const DEFAULT_RIPE_BLOCKS: usize = 12;
+
 /// How many blocks of textures are made ahead, so that one has been there
 /// for a while when its first piece is taken (`VICTORY_RIPE_BLOCKS`, 12;
 /// 0: none, and new blocks are used at once, as before).
@@ -149,7 +171,12 @@ pub(crate) fn on() -> bool {
 /// no such lists: pieces are cut from those first.
 fn ahead() -> usize {
     static AHEAD: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *AHEAD.get_or_init(|| std::env::var("VICTORY_RIPE_BLOCKS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(12))
+    *AHEAD.get_or_init(|| {
+        std::env::var("VICTORY_RIPE_BLOCKS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(DEFAULT_RIPE_BLOCKS)
+    })
 }
 
 /// Submissions begun and finished ([`crate::host::submissions`]), and how
@@ -1193,6 +1220,48 @@ mod tests {
         assert_eq!(spares(Some([100, 85, 0, 0]), true), SPARE);
         assert_eq!(spares(Some([100, 10, 0, 0]), false), SPARE);
         assert_eq!(spares(None, true), SPARE);
+
+        let budgets = [
+            (1u64, 8, 12),
+            (8, 8, 12),
+            (12, 8, 12),
+            (16, 8, 12),
+            (24, 12, 12),
+            (256, SPARE_KEPT, SPARE_KEPT),
+        ];
+        for (gib, without_ripe, with_ripe) in budgets {
+            let budget = gib << 30;
+            for (percent, legacy) in [(84, SPARE_KEPT), (85, SPARE), (86, SPARE)] {
+                let memory = Some([budget, (budget * percent).div_ceil(100), 0, 0]);
+                let limit = spares(memory, true);
+                for (ripe_ahead, expected) in [
+                    (None, legacy),
+                    (Some(0), legacy.min(without_ripe)),
+                    (Some(DEFAULT_RIPE_BLOCKS), legacy.min(with_ripe)),
+                    (Some(16), legacy.min(without_ripe.max(16))),
+                ] {
+                    assert_eq!(
+                        texture_spares(memory, limit, ripe_ahead),
+                        expected,
+                        "{gib} GiB at {percent}%, scaled ripe floor={ripe_ahead:?}"
+                    );
+                }
+            }
+        }
+
+        let memory = Some([8 << 30, 1 << 30, 0, 0]);
+        assert_eq!(
+            texture_spares(memory, spares(memory, false), Some(DEFAULT_RIPE_BLOCKS)),
+            SPARE
+        );
+        assert_eq!(
+            texture_spares(None, spares(None, true), Some(DEFAULT_RIPE_BLOCKS)),
+            SPARE
+        );
+        assert_eq!(
+            texture_spares(memory, SPARE_KEPT, Some(SPARE_KEPT + 1)),
+            SPARE_KEPT
+        );
     }
 
     /// `VICTORY_SPARES_BY_HEADROOM=1`: at most half of what is left below
