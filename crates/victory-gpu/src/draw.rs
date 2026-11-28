@@ -2498,6 +2498,7 @@ impl State {
         HEAP_SPLIT[2].fetch_add(refreshed.elapsed().as_nanos() as u64, Ordering::Relaxed);
         HEAP_BUFFER_PASSES.fetch_add(1, Ordering::Relaxed);
         HEAP_BUFFER_MICROS.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        crate::cores::log::note(crate::cores::log::HEAP, started.elapsed().as_micros() as u64);
         Some(gpu)
     }
 

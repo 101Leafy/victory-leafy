@@ -8606,6 +8606,7 @@ impl std::hash::Hasher for AddressHash {
 /// of the steps: the refreshes, and the copies and fills (those with the
 /// refreshes a copy of title memory flushes). Of the asking, which ranges it
 /// is of. Of the refreshes, those before ranges are given to shaders, one
+        crate::cores::log::note(crate::cores::log::COPIES, us.as_micros() as u64);
 /// copy at a time: nanoseconds, and how many. Ahead of all that: the wait for
 /// the submission lock, the steps done on the card planned ([`card_steps`]),
 /// the flights waited for, the heaps' records and what is swept; and, at the
@@ -9397,6 +9398,7 @@ impl Batch {
         self.front = true;
         for (shadow, from, to) in &spans {
             self.ahead.insert(std::sync::Arc::as_ptr(shadow) as usize, (*from, *to));
+        crate::cores::log::note(crate::cores::log::COPIES, us);
         }
         #[cfg(feature = "diagnostics")]
         {
@@ -9589,9 +9591,13 @@ impl Batch {
         let light = crate::watch::light();
         if light && self.refreshes.len() <= FEW {
             let started = std::time::Instant::now();
+                let started = crate::cores::log::on().then(std::time::Instant::now);
             #[cfg(feature = "diagnostics")]
             let all = self.refreshes.len();
             self.refreshes.retain_mut(keep_new);
+                if let Some(started) = started {
+                    crate::cores::log::note(crate::cores::log::COPIES, started.elapsed().as_micros() as u64);
+                }
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             FLUSHES[2].fetch_add((all - self.refreshes.len()) as u64, Ordering::Relaxed);
