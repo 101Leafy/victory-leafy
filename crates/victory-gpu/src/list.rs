@@ -955,6 +955,84 @@ fn wait_shared(list: &crate::host::HostList) -> bool {
     }
 }
 
+/// `VICTORY_UAV_FOLD=1`: the unordered access barriers of one title call
+/// fold into one on every resource when it has one (or names a buffer,
+/// [`barrier`]), and none is kept when nothing that writes was recorded in
+/// the list since our last full wait (as `VICTORY_QUIET_WAITS` for the
+/// title's own). Off by default; the census is counted either way.
+pub(crate) fn uav_fold() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_UAV_FOLD").as_deref() == Ok("1"))
+}
+
+/// Leaves out the unordered access barriers of `host` that `wrote` (a
+/// shader, copy or clear since the last full wait) and `all` (a wait for
+/// every resource asked for besides) make needless, keeping the rest in
+/// order at the front. How many stay, and whether one on every resource
+/// goes after them.
+fn fold_uavs(host: &mut [Barrier], wrote: bool, all: bool) -> (usize, bool) {
+    let all = wrote && (all || host.iter().any(|b| b.kind == 2 && b.first.is_null()));
+    let mut n = 0;
+    for i in 0..host.len() {
+        if host[i].kind == 2 && (all || !wrote) {
+            continue;
+        }
+        host[n] = host[i];
+        n += 1;
+    }
+    (n, all)
+}
+
+/// The census of [`uav_fold`] for a call's host barriers, with a wait for
+/// buffers asked for or not.
+#[cfg(feature = "diagnostics")]
+fn uav_census(host: &[Barrier], buffers: bool, wrote: bool) {
+    use crate::copystat::{C, add};
+    let globals = host.iter().filter(|b| b.kind == 2 && b.first.is_null()).count() as u64;
+    let named = host.iter().filter(|b| b.kind == 2 && !b.first.is_null()).count() as u64;
+    add(C::UavGlobals, globals);
+    add(C::UavOnResources, named);
+    let waits = globals + named + u64::from(buffers);
+    if !wrote {
+        add(C::UavQuiet, waits);
+    } else if globals > 0 || buffers {
+        add(C::UavFolded, waits - 1);
+    }
+}
+
+/// How many of a call's host barriers stay, and whether a wait for every
+/// resource goes after them: for buffers as before, or as [`uav_fold`] says.
+#[cfg(windows)]
+fn uav_waits(this: This, list: &crate::host::HostList, host: &mut [Barrier], on_buffers: bool) -> (usize, bool) {
+    let named = on_buffers || host.iter().any(|b| b.kind == 2);
+    let mut wrote = true;
+    if named && (uav_fold() || cfg!(feature = "diagnostics")) {
+        with_state(this, |list, state| wrote = state.wrote_since_wait(list));
+    }
+    #[cfg(feature = "diagnostics")]
+    if named {
+        uav_census(host, on_buffers, wrote);
+    }
+    if !uav_fold() {
+        let all = on_buffers && wait_needed(this) && (!host.is_empty() || !wait_shared(list));
+        #[cfg(feature = "diagnostics")]
+        if all {
+            crate::copystat::add(crate::copystat::C::WaitsForBuffers, 1);
+        }
+        return (host.len(), all);
+    }
+    let (n, all) = fold_uavs(host, wrote, on_buffers);
+    let all = all && (n > 0 || !wait_shared(list));
+    if all {
+        with_state(this, |_, state| state.waited());
+        #[cfg(feature = "diagnostics")]
+        if on_buffers {
+            crate::copystat::add(crate::copystat::C::WaitsForBuffers, 1);
+        }
+    }
+    (n, all)
+}
+
 /// Returns the console's barrier "actions" (none).
 extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> u32 {
     #[cfg(windows)]
@@ -997,11 +1075,13 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
                     n += 1;
                 }
             }
-            if on_buffers && wait_needed(this) && (n > 0 || !wait_shared(list)) {
+            // SAFETY: `stack[..n]` are initialized, and a barrier is plain data.
+            let host = unsafe { std::slice::from_raw_parts_mut(stack.as_mut_ptr().cast::<Barrier>(), n) };
+            let (kept, all) = uav_waits(this, list, host, on_buffers);
+            n = kept;
+            if all {
                 stack[n].write(UAV_BARRIER);
                 n += 1;
-                #[cfg(feature = "diagnostics")]
-                crate::copystat::add(crate::copystat::C::WaitsForBuffers, 1);
             }
             // SAFETY: `stack[..n]` are all initialized.
             let slice = unsafe { std::slice::from_raw_parts(stack.as_ptr().cast::<Barrier>(), n) };
@@ -1015,10 +1095,10 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
                 .iter()
                 .filter_map(|b| host_barrier(list, b))
                 .collect();
-            if on_buffers && wait_needed(this) && (!host.is_empty() || !wait_shared(list)) {
+            let (kept, all) = uav_waits(this, list, &mut host, on_buffers);
+            host.truncate(kept);
+            if all {
                 host.push(UAV_BARRIER);
-                #[cfg(feature = "diagnostics")]
-                crate::copystat::add(crate::copystat::C::WaitsForBuffers, 1);
             }
             submit(&host);
         }
@@ -3155,6 +3235,30 @@ static NEWER_THIN_FUNCTIONS: Table<160> = Table(thin::table(true));
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One call's unordered access barriers fold into one on every
+    /// resource after a write, and go when nothing wrote; others stay in
+    /// order.
+    #[test]
+    fn uav_barriers_fold() {
+        let on = |r: usize| Barrier { first: r as This, ..UAV_BARRIER };
+        let moved = |r: usize| Barrier { kind: 0, first: r as This, ..UAV_BARRIER };
+        let kinds = |host: &[Barrier]| host.iter().map(|b| (b.kind, b.first as usize)).collect::<Vec<_>>();
+
+        let mut host = [moved(1), on(2), UAV_BARRIER, moved(3), UAV_BARRIER];
+        let (n, all) = fold_uavs(&mut host, true, false);
+        assert_eq!((kinds(&host[..n]), all), (vec![(0, 1), (0, 3)], true));
+
+        let mut host = [on(2), moved(1), on(4)];
+        let (n, all) = fold_uavs(&mut host, true, false);
+        assert_eq!((kinds(&host[..n]), all), (vec![(2, 2), (0, 1), (2, 4)], false));
+        let (n, all) = fold_uavs(&mut host, true, true);
+        assert_eq!((kinds(&host[..n]), all), (vec![(0, 1)], true));
+
+        let mut host = [on(2), UAV_BARRIER, moved(1)];
+        let (n, all) = fold_uavs(&mut host, false, true);
+        assert_eq!((kinds(&host[..n]), all), (vec![(0, 1)], false));
+    }
     use crate::object::slot;
 
     #[cfg(windows)]

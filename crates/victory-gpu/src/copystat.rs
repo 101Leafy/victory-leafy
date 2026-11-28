@@ -478,11 +478,20 @@ pub(crate) enum C {
     GroupsEndWrites,
     GroupsBeginWrites,
     GroupsOther,
+    /// The title's own unordered access barriers (in `list::barrier`), on
+    /// every resource and on one; of them, and of the waits for buffers
+    /// with them, those a wait for every resource in the same call covers,
+    /// and those after nothing that writes since our last full wait
+    /// (`VICTORY_UAV_FOLD`).
+    UavGlobals,
+    UavOnResources,
+    UavFolded,
+    UavQuiet,
 }
 const COUNTERS: usize = 256;
 
 /// The counters' names, in the order of [`C`], for the frame recorder's columns.
-pub(crate) const NAMES: [&str; 252] = [
+pub(crate) const NAMES: [&str; 256] = [
     "Submissions", "Copies", "CopyBytes", "Refreshes", "RefreshBytes", "Skipped", "SkippedBytes", "Runs",
     "RunUs", "Queries", "QueryUs", "MoveUs", "Unmapped", "Watches", "WatchUs", "Checked", "Unchanged",
     "Fallbacks", "GuardFaults", "TexWatched", "TexHashed", "TexChanged", "TexHot", "Frames", "RecordCalls",
@@ -540,6 +549,7 @@ pub(crate) const NAMES: [&str; 252] = [
     "BatchArgsWritten", "WaitsLeftOut",
     "TakenWholeBytes", "TakenPartBytes",
     "GroupsEndWrites", "GroupsBeginWrites", "GroupsOther",
+    "UavGlobals", "UavOnResources", "UavFolded", "UavQuiet",
 ];
 /// One of some sets of counters, each in lines of the processor's memory of
 /// its own: a set for all threads had them wait for each other's lines at
@@ -928,7 +938,7 @@ mod command_tests {
     #[test]
     fn every_counter_is_named() {
         use super::{C, COUNTERS, NAMES};
-        assert_eq!(C::GroupsOther as usize + 1, NAMES.len());
+        assert_eq!(C::UavQuiet as usize + 1, NAMES.len());
         assert_eq!(NAMES[C::Frames as usize], "Frames");
         assert!(NAMES.len() <= COUNTERS);
     }
@@ -2057,6 +2067,15 @@ pub(crate) fn log(frames: f64) {
         c[C::GroupsEndWrites as usize],
         c[C::GroupsBeginWrites as usize],
         c[C::GroupsOther as usize]
+    );
+    tracing::info!(
+        "  the title's own unordered access barriers, per frame: {:.0} on every resource, {:.0} on one; \
+         {:.0} covered by another in the same call, {:.0} after nothing that writes (VICTORY_UAV_FOLD {})",
+        c[C::UavGlobals as usize],
+        c[C::UavOnResources as usize],
+        c[C::UavFolded as usize],
+        c[C::UavQuiet as usize],
+        if crate::list::uav_fold() { "on" } else { "off" }
     );
     let barriers = GROUP_BARRIERS.lock().unwrap_or_else(|e| e.into_inner()).take();
     let mut barriers: Vec<_> = barriers.into_iter().flatten().collect();
