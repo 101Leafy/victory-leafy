@@ -55,6 +55,8 @@ pub(crate) struct Pending {
     scene_input: bool,
     /// Why it is never made ([`left_out`]).
     left_out: Option<&'static str>,
+    /// A compute program known to take seconds to make ([`long_compute`]).
+    long: bool,
     /// Whether draws already waited [`GIVE_UP`] for it in vain: later
     /// draws do not wait for it (see [`wait`]).
     given_up: AtomicBool,
@@ -63,6 +65,9 @@ pub(crate) struct Pending {
     /// The title frame in which draws first waited for it (`u64::MAX`: none
     /// yet). Draws of later frames do not wait for it ([`claim_wait`]).
     waited_frame: AtomicU64,
+    /// The last title frame a draw asked for it and found it not made
+    /// ([`newest`]).
+    asked_frame: AtomicU64,
     /// The formats its state declares for what a draw draws into (zeros
     /// without a graphics state).
     pub(crate) formats: TargetFormats,
@@ -98,6 +103,14 @@ fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
         return Some("ray activation shader without BVH, left out");
     }
     None
+}
+
+/// The compute programs that take 7 to 30 s each to make on a cold cache:
+/// run 164 still had CS_DepthCopy (3 ms) asked for 81 s while they held
+/// every compute place, the one past the cap too, before the slow list knew
+/// any of them.
+fn long_compute(shaders: &[Arc<Shader>]) -> bool {
+    named(shaders, b"CS_RaytracingResolve") || named(shaders, b"CS_GatherRaymarchedLocalLights")
 }
 
 /// Whether the opening scene's producers are made first
@@ -168,11 +181,13 @@ impl Pending {
             && !(scene_inputs() && shaders.iter().any(|s| s.stage == "mesh")))
             || scene_input;
         let left_out = left_out(&shaders);
+        let long = long_compute(&shaders);
         let made = if leave_out_hash(&shaders) { OnceLock::from(None) } else { OnceLock::new() };
         Pending {
             screen,
             scene_input,
             left_out,
+            long,
             formats: graphics.as_ref().map_or([0; 9], |g| g.formats()),
             variant: OnceLock::new(),
             shaders,
@@ -188,6 +203,7 @@ impl Pending {
             given_up: AtomicBool::new(false),
             waited_us: AtomicU64::new(0),
             waited_frame: AtomicU64::new(u64::MAX),
+            asked_frame: AtomicU64::new(0),
         }
     }
 
@@ -387,8 +403,9 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
         super::library::note_used(&p.key);
     }
     if p.made.get().is_none() {
-        start(p, REQUESTED);
         let frame = crate::frame::current();
+        p.asked_frame.store(frame, Ordering::Relaxed);
+        start(p, REQUESTED);
         if p.graphics.is_none() && compute_waits() && compute_wait_left(frame) {
             // Made here, or waited for while a worker makes it.
             let began = Instant::now();
@@ -948,6 +965,50 @@ fn graphics_first() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_GRAPHICS_FIRST").is_none_or(|v| v != "0"))
 }
 
+/// `VICTORY_COMPUTE_FIRST=1`: compute pipelines draws have asked for go
+/// ahead of every graphics request, and one the slow list does not name
+/// goes past the compute cap. Run 139: `CS_DepthCopy` (a full-screen depth
+/// copy, 1 ms to make) waited 245 s behind 7 to 25 s ray-tracing creates
+/// that held every compute place, and the world was black until it was made.
+fn compute_first() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_COMPUTE_FIRST").is_some_and(|v| v == "1"))
+}
+
+/// For [`compute_first`]: the quickest asked-for compute pipeline while
+/// compute has places, else, in one place past them, the one asked for last
+/// that neither the slow list names nor [`long_compute`] is. A cold run has no slow list, and taking
+/// the oldest went to the 15-30 s CS_RaytracingResolve variants asked for
+/// first (run 139: about 120 of them ahead of CS_DepthCopy).
+fn compute_ahead(list: &mut VecDeque<Arc<Pending>>, compute_free: bool, one_past: bool) -> Option<Arc<Pending>> {
+    if compute_free {
+        // Under COMPUTE_AHEAD the places are few, and a cold run has no
+        // slow list to put the long resolves last: they wait for the
+        // places graphics leave.
+        if compute_ahead_places().is_some() {
+            let at = (0..list.len()).filter(|&i| !list[i].long).min_by_key(|&i| super::library::slow_ms(&list[i].key))?;
+            return list.remove(at);
+        }
+        return quickest(list);
+    }
+    if !one_past {
+        return None;
+    }
+    let at = list.iter().rposition(|p| !p.long && !super::library::slow(&p.key))?;
+    list.remove(at)
+}
+
+/// `VICTORY_COMPUTE_AHEAD=N`: [`compute_first`] takes compute ahead of the
+/// graphics requests only while fewer than N compute pipelines are being
+/// made; past that the graphics requests go first and compute takes the
+/// places they leave. Cold ff-fixc r164: from game 44 on the workers made
+/// 377 compute pipelines and 26 graphics ones, 600 to 770 graphics requests
+/// waited, and scene A drew 280 of its 1700 draws for 14 s. Off by default.
+fn compute_ahead_places() -> Option<usize> {
+    static N: OnceLock<Option<usize>> = OnceLock::new();
+    *N.get_or_init(|| std::env::var("VICTORY_COMPUTE_AHEAD").ok().and_then(|v| v.parse().ok()).filter(|&n| n > 0))
+}
+
 /// Of the compute pipelines draws have asked for, the one the slow list says
 /// is made soonest (one not on it first; in the order asked among equals).
 /// In the 980073cbe run draws asked for 323: 107 of them took the driver
@@ -955,6 +1016,17 @@ fn graphics_first() -> bool {
 /// the order asked they waited behind the long ones, half of them 160 s or
 /// more, their dispatches dropped all the while.
 /// `VICTORY_PIPELINE_QUICK_FIRST=0`: in the order asked, as before.
+/// Compute workers that early and slow ones leave for compute pipelines a
+/// draw waits on. In ff-held r139 the world stayed black for 245 s: early
+/// compute creates of 7 to 25 s held every compute worker while
+/// CS_DepthCopy, a 1 ms create its draws asked for, waited behind them
+/// until game 65. `VICTORY_COMPUTE_KEEP=N` keeps N (at least one compute
+/// worker stays open to early ones); off (0) by default.
+fn compute_kept() -> usize {
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| std::env::var("VICTORY_COMPUTE_KEEP").ok().and_then(|v| v.parse().ok()).unwrap_or(0))
+}
+
 fn quickest(list: &mut VecDeque<Arc<Pending>>) -> Option<Arc<Pending>> {
     static ON: OnceLock<bool> = OnceLock::new();
     if !*ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_QUICK_FIRST").is_none_or(|v| v != "0")) {
@@ -962,6 +1034,28 @@ fn quickest(list: &mut VecDeque<Arc<Pending>>) -> Option<Arc<Pending>> {
     }
     let at = (0..list.len()).min_by_key(|&i| super::library::slow_ms(&list[i].key))?;
     list.remove(at)
+}
+
+/// `VICTORY_PIPELINE_NOW_FIRST=1`: of the requested graphics pipelines, the
+/// first one a draw of this frame or the one before asked for, else the
+/// oldest. In the order asked alone, r107 and r111 (cold library) had the
+/// world's requests waiting 10 to 175 s, longer the older the run, behind
+/// requests of scenes the title had left; the frame on screen got none of
+/// its own until they were made. Off: in the order asked, as before.
+fn now_first() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_NOW_FIRST").is_some_and(|v| v == "1"))
+}
+
+fn newest(list: &mut VecDeque<Arc<Pending>>) -> Option<Arc<Pending>> {
+    if !now_first() {
+        return list.pop_front();
+    }
+    let since = crate::frame::current().saturating_sub(1);
+    match list.iter().position(|p| p.asked_frame.load(Ordering::Relaxed) >= since) {
+        Some(at) => list.remove(at),
+        None => list.pop_front(),
+    }
 }
 
 struct Queue {
@@ -982,6 +1076,8 @@ struct Queue {
     /// one, so one is always free for graphics.
     compute_now: usize,
     compute_cap: usize,
+    /// Of those, how many only requested ones may take ([`compute_kept`]).
+    compute_kept: usize,
     /// When a pipeline last went into a list other than the slow one.
     others_at: Option<Instant>,
 }
@@ -998,6 +1094,7 @@ impl Queue {
             early_compute: VecDeque::new(),
             compute_now: 0,
             compute_cap: usize::MAX,
+            compute_kept: 0,
             others_at: None,
         }
     }
@@ -1051,10 +1148,16 @@ impl Queue {
             std::iter::from_fn(|| list.pop_front()).find(|p| p.queue_state.load(Ordering::Relaxed) == EARLY)
         };
         let compute_free = self.compute_now < self.compute_cap;
+        let early_compute_free = self.compute_now + self.compute_kept < self.compute_cap;
         let mut p = self.screen.pop_front();
         let mut from = TAKEN_SCREEN;
         if p.is_none() && !screens_only {
-            p = self.requested.pop_front();
+            if compute_first() && compute_ahead_places().is_none_or(|n| self.compute_now < n) {
+                p = compute_ahead(&mut self.requested_compute, compute_free, self.compute_now <= self.compute_cap);
+            }
+            if p.is_none() {
+                p = newest(&mut self.requested);
+            }
             from = TAKEN_REQUESTED;
             if p.is_none() && compute_free {
                 p = quickest(&mut self.requested_compute);
@@ -1063,7 +1166,7 @@ impl Queue {
                 p = unclaimed(&mut self.early);
                 from = TAKEN_EARLY;
             }
-            if p.is_none() && compute_free {
+            if p.is_none() && early_compute_free {
                 p = unclaimed(&mut self.early_compute);
             }
             if p.is_none() && self.slow_now < slow_limit {
@@ -1075,7 +1178,7 @@ impl Queue {
                     unclaimed(&mut self.slow)
                 };
                 // A compute one waits its turn while compute holds all it may.
-                if let Some(q) = p.take_if(|q| q.graphics.is_none() && !compute_free) {
+                if let Some(q) = p.take_if(|q| q.graphics.is_none() && !early_compute_free) {
                     self.slow.push_front(q);
                 }
                 from = TAKEN_SLOW;
@@ -1176,7 +1279,9 @@ fn workers() -> bool {
         tracing::info!(workers, "pipeline workers");
         if graphics_first() {
             // With one worker only, compute has to take it, else none is made.
-            QUEUE.lock().unwrap_or_else(|e| e.into_inner()).compute_cap = workers.max(2) - 1;
+            let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+            queue.compute_cap = workers.max(2) - 1;
+            queue.compute_kept = compute_kept().min(queue.compute_cap - 1);
         }
         let screens = if screens_first() { SCREEN_WORKERS } else { 0 };
         for i in 0..workers + screens {
@@ -1635,6 +1740,25 @@ mod tests {
         assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &early_c));
         queue.compute_now -= 1;
         assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &long_c));
+    }
+
+    /// Kept compute workers go to requested compute ones only.
+    #[test]
+    fn kept_compute_workers_wait_for_requested_ones() {
+        let compute = || Arc::new(Pending::new(Vec::new(), None));
+        let (early_a, early_b, long_c, asked) = (compute(), compute(), compute(), compute());
+        let mut queue = Queue::new();
+        queue.compute_cap = 2;
+        queue.compute_kept = 1;
+        queue.push_as(&early_a, EARLY, false);
+        queue.push_as(&early_b, EARLY, false);
+        queue.push_as(&long_c, EARLY, true);
+        assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &early_a));
+        assert!(queue.pop(false, 1).is_none(), "the kept worker is not for early or slow ones");
+        queue.push_as(&asked, REQUESTED, false);
+        assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &asked));
+        queue.compute_now -= 2;
+        assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &early_b));
     }
 
     /// Passes over the screen go before all others, and workers of their own
