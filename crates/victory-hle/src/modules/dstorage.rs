@@ -596,6 +596,8 @@ struct Lanes {
     /// BCPack bytes written and time spent on them.
     bcpack: (u64, std::time::Duration),
     since: Option<std::time::Instant>,
+    /// For [`stuck`]: when each running read started.
+    running_since: HashMap<(u64, u64), stuck::Started>,
 }
 
 /// A queue's requests in the scheduler.
@@ -658,6 +660,7 @@ fn scheduler() -> Option<&'static Scheduler> {
                     refused: 0,
                     bcpack: Default::default(),
                     since: None,
+                    running_since: HashMap::new(),
                 }),
                 work: Condvar::new(),
                 finished: Condvar::new(),
@@ -694,6 +697,7 @@ fn scheduler() -> Option<&'static Scheduler> {
             })
             .count();
         tracing::info!(workers = started, "dstorage: workers");
+        stuck::watch(scheduler);
     });
     Some(scheduler)
 }
@@ -748,6 +752,172 @@ fn walls_request(request: &Request, result: &Result<(), HRESULT>, started: std::
         hr = format_args!("{hr:#010x}"),
         "walls trace: a read request is done"
     );
+}
+
+/// The stuck watch (`VICTORY_DSTORAGE_STUCK_MS=<n>`, off by default): once a
+/// second, every command older than n ms is named once, with the stage it
+/// sits in, and again with its whole age when it moves on. Stages: enqueued
+/// and not submitted by the title, submitted and not started (with what
+/// holds the start back), running, and a status entry held behind earlier
+/// reads of its queue (entries are written in submit order).
+mod stuck {
+    use super::*;
+    use std::collections::HashSet;
+
+    pub(super) fn limit() -> u64 {
+        static MS: OnceLock<u64> = OnceLock::new();
+        *MS.get_or_init(|| {
+            std::env::var("VICTORY_DSTORAGE_STUCK_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0)
+        })
+    }
+
+    pub(super) fn on() -> bool {
+        limit() > 0
+    }
+
+    /// A running read, as the watch names it.
+    pub(super) struct Started {
+        since: std::time::Instant,
+        /// The file's name, without its folders.
+        file: String,
+        offset: u64,
+        source: u32,
+        destination: u32,
+        options: u64,
+    }
+
+    impl Started {
+        pub(super) fn new(request: &Request) -> Started {
+            let path = source_path(request);
+            Started {
+                since: std::time::Instant::now(),
+                file: path.rsplit(['\\', '/']).next().unwrap_or(path).to_owned(),
+                offset: request.offset,
+                source: request.source_size,
+                destination: request.destination_size,
+                options: request.options,
+            }
+        }
+    }
+
+    fn ms(t: Option<std::time::Instant>) -> u64 {
+        t.map_or(0, |t| t.elapsed().as_millis() as u64)
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+    enum Stage {
+        Unsubmitted,
+        Unstarted,
+        Running,
+        Unwritten,
+    }
+
+    pub(super) fn watch(scheduler: &'static Scheduler) {
+        if !on() {
+            return;
+        }
+        let limit = limit();
+        tracing::info!(ms = limit, "dstorage: stuck watch (VICTORY_DSTORAGE_STUCK_MS)");
+        let _ = std::thread::Builder::new().name("dstorage stuck".into()).spawn(move || {
+            // Queue, sequence number (0 for the unsubmitted list), stage:
+            // when it got there.
+            let mut named: HashMap<(u64, u64, Stage), std::time::Instant> = HashMap::new();
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                let mut seen = HashSet::new();
+                let lanes = scheduler.lock();
+                let mut name = |key: (u64, u64, Stage), age: u64, say: &dyn Fn(u64)| {
+                    seen.insert(key);
+                    if age >= limit && !named.contains_key(&key) {
+                        let now = std::time::Instant::now();
+                        named.insert(key, now.checked_sub(std::time::Duration::from_millis(age)).unwrap_or(now));
+                        say(age);
+                    }
+                };
+                for (&id, lane) in &lanes.lanes {
+                    if let Some(first) = lane.unsubmitted.first() {
+                        let age = match first {
+                            Command::Read(read) => ms(read.note.enqueued),
+                            Command::Status(status) => stream_log::now().saturating_sub(status.enqueued),
+                        };
+                        let statuses = lane.unsubmitted.iter().filter(|c| matches!(c, Command::Status(_))).count();
+                        name((id, 0, Stage::Unsubmitted), age, &|age| {
+                            tracing::warn!(
+                                queue = id,
+                                ms = age,
+                                commands = lane.unsubmitted.len(),
+                                statuses,
+                                capacity = lane.capacity,
+                                "dstorage stuck: commands enqueued and not submitted"
+                            )
+                        });
+                    }
+                    if let Some(&(seq, Read { request, note })) = lane.reads.front() {
+                        name((id, seq, Stage::Unstarted), ms(note.submitted), &|age| {
+                            tracing::warn!(
+                                queue = id,
+                                seq,
+                                ms = age,
+                                waiting = lane.reads.len(),
+                                class = lane.class,
+                                staged = lanes.staged,
+                                staging = lanes.staging,
+                                need = staging_bytes(&request),
+                                in_flight = lanes.in_flight,
+                                in_flight_cap = lanes.in_flight_cap,
+                                running = lanes.running_since.len(),
+                                "dstorage stuck: a read submitted and not started"
+                            )
+                        });
+                    }
+                    if let Some(&(seq, ref status)) = lane.statuses.front() {
+                        let before = lane.reads.front().map(|r| r.0).into_iter().chain(lane.running.first().copied()).min();
+                        name((id, seq, Stage::Unwritten), stream_log::now().saturating_sub(status.enqueued), &|age| {
+                            tracing::warn!(
+                                queue = id,
+                                seq,
+                                ms = age,
+                                index = status.index,
+                                held_by = before,
+                                unstarted = lane.reads.len(),
+                                running = lane.running.len(),
+                                "dstorage stuck: a status entry not written, earlier reads not done"
+                            )
+                        });
+                    }
+                }
+                for (&(id, seq), read) in &lanes.running_since {
+                    name((id, seq, Stage::Running), ms(Some(read.since)), &|age| {
+                        tracing::warn!(
+                            queue = id,
+                            seq,
+                            ms = age,
+                            file = read.file.as_str(),
+                            offset = read.offset,
+                            source = read.source,
+                            destination = read.destination,
+                            options = format_args!("{:x}", read.options),
+                            "dstorage stuck: a read running"
+                        )
+                    });
+                }
+                drop(lanes);
+                named.retain(|key, since| {
+                    let still = seen.contains(key);
+                    if !still {
+                        let stage = match key.2 {
+                            Stage::Unsubmitted => "not submitted",
+                            Stage::Unstarted => "not started",
+                            Stage::Running => "running",
+                            Stage::Unwritten => "status not written",
+                        };
+                        tracing::warn!(queue = key.0, seq = key.1, ms = since.elapsed().as_millis() as u64, stage, "dstorage stuck: moved on");
+                    }
+                    still
+                });
+            }
+        });
+    }
 }
 
 /// The streaming log (`VICTORY_DSTORAGE_LOG=<file>`): a line for every
@@ -1114,6 +1284,9 @@ impl Lanes {
         }
         lane.reads.pop_front();
         lane.running.insert(seq);
+        if stuck::on() {
+            self.running_since.insert((id, seq), stuck::Started::new(&request));
+        }
         self.staged += staging;
         self.in_flight += host;
         stats::in_flight(self.in_flight);
@@ -1133,6 +1306,7 @@ impl Lanes {
     }
 
     fn finish(&mut self, job: &Job, result: Result<(), HRESULT>) {
+        self.running_since.remove(&(job.lane, job.seq));
         self.staged -= job.staging;
         self.in_flight -= job.host;
         stats::in_flight(self.in_flight);
@@ -1370,7 +1544,7 @@ struct Note {
 impl Note {
     fn enqueued(request: &Request) -> Note {
         match trace() {
-            0 if stream_log::on() => Note { enqueued: Some(std::time::Instant::now()), ..Note::default() },
+            0 if stream_log::on() || stuck::on() => Note { enqueued: Some(std::time::Instant::now()), ..Note::default() },
             0 => Note::default(),
             _ => Note {
                 enqueued: Some(std::time::Instant::now()),
@@ -1382,7 +1556,7 @@ impl Note {
 
     fn submitted(&mut self, request: &Request, early: bool) {
         self.early = early;
-        if trace() > 0 || stream_log::on() || stats::on() {
+        if trace() > 0 || stream_log::on() || stats::on() || stuck::on() {
             self.submitted = Some(std::time::Instant::now());
         }
         if trace() > 0 {
@@ -1611,6 +1785,7 @@ fn queue(this: QueueRef, command: Command) {
         return;
     };
     let mut lanes = scheduler.lock();
+    let full = stuck::on().then(std::time::Instant::now);
     loop {
         let Some(lane) = lanes.lanes.get(&id).filter(|l| !l.closed) else {
             return; // closed: dropped (a status releases its array)
@@ -1633,6 +1808,9 @@ fn queue(this: QueueRef, command: Command) {
             .finished
             .wait(lanes)
             .unwrap_or_else(|e| e.into_inner());
+    }
+    if let Some(ms) = full.map(|t| t.elapsed().as_millis() as u64).filter(|&ms| ms >= stuck::limit()) {
+        tracing::warn!(queue = id, ms, "dstorage stuck: an enqueue waited for room in a full queue");
     }
     let Some(lane) = lanes.lanes.get_mut(&id) else {
         return;
