@@ -36,6 +36,9 @@ mod dot;
 /// it shares the emitter's state.
 #[path = "intersect.rs"]
 pub(super) mod intersect;
+/// DexNom PR 62's size handle (AMD compiler crash on RDNA 4).
+#[path = "lower/amd.rs"]
+pub(super) mod amd;
 
 /// Descriptors whose dwords the code reads as numbers (`descriptor_data`), a child module so it
 /// shares the emitter's state.
