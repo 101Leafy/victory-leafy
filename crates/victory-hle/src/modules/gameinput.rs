@@ -399,6 +399,11 @@ struct State {
     /// The title sees one pad ([`one_pad`]): every host pad merged into the
     /// stand-in pad.
     one_pad: bool,
+    /// Host pads that have shown input. Some wireless receivers answer for a
+    /// pad that is switched off with a success and an all-zero state: that is
+    /// not a device the title can use, and counting it as one would take the
+    /// keyboard's stand-in pad away.
+    shown_input: [bool; PADS],
 }
 
 pub struct Hub {
@@ -459,6 +464,7 @@ impl Hub {
                 host_pads: [None; PADS],
                 keys: Vec::new(),
                 one_pad,
+                shown_input: [false; PADS],
             }),
             returned: Condvar::new(),
         }));
@@ -572,6 +578,28 @@ impl State {
                 .chain(mouse_buttons.iter().copied())
                 .collect();
             c.feed(&held, counts);
+        }
+        // Counted over the pads actually shown: an all-zero pad is no
+        // device, and must not keep the keyboard's stand-in pad away.
+        let mut pads = pads;
+        if !self.one_pad {
+            for (slot, pad) in pads.iter_mut().enumerate() {
+                // A pad that has never shown input is not a device: it neither
+                // takes the keyboard's stand-in pad away nor shows up as a
+                // connected device the title could wait on.
+                *pad = match *pad {
+                    Some(p) => {
+                        if p != PadState::default() {
+                            self.shown_input[slot] = true;
+                        }
+                        self.shown_input[slot].then_some(p)
+                    }
+                    None => {
+                        self.shown_input[slot] = false;
+                        None
+                    }
+                };
+            }
         }
         self.host_pads = pads;
         self.keys.clone_from(&keys);
@@ -2160,6 +2188,47 @@ mod tests {
         release(rest);
     }
 
+    /// A pad a receiver answers for while it is switched off comes back as a
+    /// success and an all-zero state. It is not a device the title can use:
+    /// counting it as one takes the keyboard's stand-in pad away, and the
+    /// title then waits for input from a pad nobody can press.
+    #[test]
+    fn an_all_zero_pad_is_not_a_device_the_title_can_use() {
+        let (hub, host) = fake();
+        let log = Log::default();
+        register(hub, GAMEPAD_KIND, 2, &log);
+        assert_eq!(*log.lock().unwrap(), [(FALLBACK, STATUS_CONNECTED, 0)]);
+
+        // The receiver answers, the pad is off: still only the stand-in.
+        host.lock().unwrap().pads[0] = Some(PadState::default());
+        hub.poll();
+        assert_eq!(*log.lock().unwrap(), [(FALLBACK, STATUS_CONNECTED, 0)]);
+
+        // Its first input makes it a device.
+        host.lock().unwrap().pads[0] = Some(PadState {
+            buttons: A,
+            ..Default::default()
+        });
+        hub.poll();
+        assert_eq!(
+            log.lock().unwrap()[1..],
+            [(0, STATUS_CONNECTED, 0), (FALLBACK, 0, STATUS_CONNECTED)]
+        );
+
+        // At rest it stays connected: it has shown it is there.
+        host.lock().unwrap().pads[0] = Some(PadState::default());
+        hub.poll();
+        assert_eq!(log.lock().unwrap().len(), 3);
+
+        // The receiver stops answering: it goes, the stand-in returns.
+        host.lock().unwrap().pads[0] = None;
+        hub.poll();
+        assert_eq!(
+            log.lock().unwrap()[3..],
+            [(0, 0, STATUS_CONNECTED), (FALLBACK, STATUS_CONNECTED, 0)]
+        );
+    }
+
     #[test]
     fn keys_feed_the_keyboard_and_the_stand_in_pad() {
         let (hub, host) = fake();
@@ -2400,7 +2469,12 @@ mod tests {
             register(&hub.object, std::ptr::null(), GAMEPAD_KIND, 1, 0, context, Some(slow), &mut token),
             S_OK
         );
-        host.lock().unwrap().pads[1] = Some(PadState::default());
+        // A pad with input is a device: the registration's callback runs
+        // when it connects.
+        host.lock().unwrap().pads[1] = Some(PadState {
+            buttons: A,
+            ..Default::default()
+        });
         let poller = std::thread::spawn(|| hub.poll());
         while !INSIDE.load(Ordering::SeqCst) {
             std::thread::sleep(Duration::from_millis(1));
