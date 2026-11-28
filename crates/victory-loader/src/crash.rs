@@ -508,6 +508,7 @@ unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
 /// A write to address 0: how the title kills itself on purpose. Its GPU
 /// watchdog (thread at image+0x2215a60, b99f876b74d4a77f) writes there 30 s
 /// after the frame loop stops (bp9 r45, bp3, big-play-1).
+#[cfg(feature = "diagnostics")]
 fn writes_zero(record: &windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_RECORD) -> bool {
     record.ExceptionCode == EXCEPTION_ACCESS_VIOLATION
         && record.NumberParameters >= 2
@@ -517,6 +518,7 @@ fn writes_zero(record: &windows_sys::Win32::System::Diagnostics::Debug::EXCEPTIO
 
 /// `VICTORY_STACKS_AT_KILL=1`: on the first such write, every other
 /// thread's stack, to name what the frame loop was stuck in.
+#[cfg(feature = "diagnostics")]
 fn stacks_at_kill() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
