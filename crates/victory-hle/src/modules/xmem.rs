@@ -1454,11 +1454,6 @@ fn map_pages(address: *mut c_void, n: usize, pages: *const usize, lazy: bool) ->
     if let Some(costed) = &mut costed {
         costed.waited = costed.started.elapsed().as_nanos() as u64;
     }
-    // Until the pages are mapped again: `unmap` takes whole views away and
-    // maps what stays of them again, and a mapped view is a reservation
-    // until it is committed. A read of title memory in place must not fall
-    // into that gap (`victory_gpu::title_memory_remapping`).
-    let _changing = victory_gpu::title_memory_remapping();
     let Some(pages) = pages else {
         unmap(&mut physical, base, len);
         return address;
