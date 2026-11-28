@@ -1435,7 +1435,8 @@ impl State {
             return;
         };
         self.targets.clear();
-        let mut views = Vec::with_capacity(self.target_views.len());
+        let mut views = [const { (None, None) }; 8];
+    let mut view_count = 0usize;
         let mut keys = Vec::with_capacity(self.target_views.len());
         // The formats of the host views, for the draws' pipelines.
         let mut formats = [0; 9];
@@ -1450,10 +1451,7 @@ impl State {
                 // null view to stand for it and is left out, as before.
                 let null = t.desc.filter(|d| d.Format.0 != 0 && d.ViewDimension.0 != 0);
                 if let Some(desc) = null {
-                    if views.len() < 8 {
-                        formats[views.len()] = desc.Format.0 as u32;
-                    }
-                    views.push((None, Some(desc)));
+                    if view_count < 8 { formats[view_count] = desc.Format.0 as u32; views[view_count] = (None, Some(desc)); view_count += 1; }
                     keys.push((0, t.key));
                 }
                 continue;
@@ -1461,10 +1459,7 @@ impl State {
             self.targets.push(t.key.0);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(resource);
-            if views.len() < 8 {
-                formats[views.len()] = bound_format(texture, t.desc.map(|d| d.Format));
-            }
-            views.push((Some(texture), t.desc));
+            if view_count < 8 { formats[view_count] = bound_format(texture, t.desc.map(|d| d.Format)); views[view_count] = (Some(texture), t.desc); view_count += 1; }
             keys.push((texture.as_raw() as usize, t.key));
         }
         self.depth = 0;
@@ -1492,13 +1487,13 @@ impl State {
         }
         self.host_targets = Some(now);
         self.ensured = None;
-        let rtvs: Vec<_> = views.iter().map(|(texture, desc)| host.rtv(*texture, desc.as_ref())).collect();
+        let mut rtvs = [D3D12_CPU_DESCRIPTOR_HANDLE::default(); 8];
+    for (dst, (texture, desc)) in rtvs.iter_mut().zip(&views[..view_count]) { *dst = host.rtv(*texture, desc.as_ref()); }
         let dsv = dsv.map(|(texture, t)| host.dsv(texture, t.desc.as_ref()));
         // SAFETY: an open list; the views were just made.
         unsafe {
             list.list.OMSetRenderTargets(
-                rtvs.len() as u32,
-                (!rtvs.is_empty()).then_some(rtvs.as_ptr()),
+                view_count as u32, (view_count != 0).then_some(rtvs.as_ptr()),
                 false,
                 dsv.as_ref().map(std::ptr::from_ref),
             )
