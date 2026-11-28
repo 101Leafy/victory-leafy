@@ -2293,7 +2293,8 @@ impl Module {
                 let name = name.strip_prefix("dx.op.").unwrap_or(name);
                 Self::is_speculatable_pure_call(name)
             }
-            Op::Store(..) | Op::AtomicRmw(..) | Op::CmpXchg(..) | Op::Phi(_) => false,
+            // A volatile load reads memory other lanes or groups write: never moved.
+            Op::Store(..) | Op::AtomicRmw(..) | Op::CmpXchg(..) | Op::Phi(_) | Op::VolatileLoad(_) => false,
         }
     }
 
