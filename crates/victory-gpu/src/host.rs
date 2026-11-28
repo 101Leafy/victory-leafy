@@ -5968,11 +5968,15 @@ mod beside {
         if card_steps::copied_read(&card_steps::copies(&line), runs) || blocked_with(&line.written, runs, false, false).is_some() {
             return None;
         }
+        // A fill that takes a placed copy's bytes does not wait: it is left
+        // to the submission, as [`blocked_with`] leaves it.
+        let forwards = place::forwards(&line.written, runs);
         let mut steps = Vec::new();
-        for list in runs {
+        for (n, list) in runs.iter().enumerate() {
             for (i, step) in list.deferred().copies.iter().enumerate() {
                 if let &Step::Fill(_, src, len, _) = step
                     && read_blocked(&line.written, src, len)
+                    && !place::forwarded(&forwards, n, i)
                 {
                     steps.push((std::ptr::from_ref::<HostList>(list) as usize, i));
                 }
@@ -9019,7 +9023,6 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         ahead.part(12);
         stage.next("submit: waiting for flights it reads from");
-        let mut waited_for_flights = false;
         // Fills left to [`beside`].
         let mut put_beside: Vec<(usize, usize)> = Vec::new();
         if !late {
