@@ -4463,6 +4463,23 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// With `VICTORY_NAN_SCRUB=1`, `f` or 0 where it is NaN or an infinity. Used on the
+    /// colours pixel shaders write and on float image stores: one such value reaching the
+    /// title's bloom, blur or the upscaler spreads into black patches that stay in its
+    /// history (black blobs on NVIDIA). Not what the console does, so it is a switch.
+    fn scrub_nan(&mut self, f: V) -> V {
+        if !nan_scrub() {
+            return f;
+        }
+        // |f| >= inf, unordered: true for NaN too (an infinity alone whitened the picture).
+        let c = self.cur;
+        let a = self.unary(6, f);
+        let inf = self.s.m.f32(0x7f80_0000);
+        let bad = self.s.m.cmp(c, pred::UGE, a, inf);
+        let zero = self.s.m.f32(0);
+        self.s.m.select(c, bad, zero, f)
+    }
+
     fn unary(&mut self, op: u32, f: V) -> V {
         self.s.op(
             self.cur,
