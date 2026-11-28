@@ -254,9 +254,33 @@ fn wait_resident() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_WAIT_RESIDENT").is_none_or(|v| v != "0"))
 }
 
+/// Whether plain buffers are waited for as well ([`wait_resident`]).
+/// `VICTORY_WAIT_RESIDENT=textures` waits for texture blocks and textures
+/// only: the device losses above lay in texture blocks, and the waits for
+/// buffers are most of them (an RTX 4090 run: 59,000 waits, 18.1 s, the
+/// longest 1.2 s; on an RTX 3080, 212,000 waits, 60.8 s, Belobug issue #346).
+fn wait_resident_buffers() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WAIT_RESIDENT").is_none_or(|v| v != "0" && v != "textures"))
+}
+
 /// The flag memory is made with that [`resident`] waits for.
 pub(crate) fn not_resident() -> D3D12_HEAP_FLAGS {
     if wait_resident() { D3D12_HEAP_FLAG_CREATE_NOT_RESIDENT } else { D3D12_HEAP_FLAG_NONE }
+}
+
+/// [`not_resident`], [`resident`] and [`mapped`] for a plain buffer
+/// ([`wait_resident_buffers`]).
+fn buffer_not_resident() -> D3D12_HEAP_FLAGS {
+    if wait_resident_buffers() { not_resident() } else { D3D12_HEAP_FLAG_NONE }
+}
+
+fn buffer_resident(device: &ID3D12Device, object: &impl Interface) -> windows::core::Result<()> {
+    if wait_resident_buffers() { resident(device, object) } else { Ok(()) }
+}
+
+fn buffer_mapped(device: &ID3D12Device) -> windows::core::Result<()> {
+    if wait_resident_buffers() { mapped(device) } else { Ok(()) }
 }
 
 /// A queue of its own that new memory is waited for with ([`mapped`]).
@@ -10816,7 +10840,7 @@ impl Host {
             self.device
                 .CreateCommittedResource(
                     &heap,
-                    not_resident(),
+                    buffer_not_resident(),
                     &desc,
                     D3D12_RESOURCE_STATE_GENERIC_READ,
                     None,
@@ -10824,7 +10848,7 @@ impl Host {
                 )
                 .and_then(|()| {
                     let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
-                    resident(&self.device, b)?;
+                    buffer_resident(&self.device, b)?;
                     b.Map(0, None, Some(&mut data))
                 })
         };
@@ -11883,7 +11907,7 @@ impl Host {
             self.device
                 .CreateCommittedResource(
                     &heap,
-                    not_resident(),
+                    buffer_not_resident(),
                     &desc,
                     D3D12_RESOURCE_STATE_COMMON,
                     None,
@@ -11891,8 +11915,8 @@ impl Host {
                 )
                 .and_then(|()| {
                     let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
-                    resident(&self.device, b)?;
-                    mapped(&self.device)?;
+                    buffer_resident(&self.device, b)?;
+                    buffer_mapped(&self.device)?;
                     b.Map(0, None, Some(&mut data))
                 })
         };
@@ -11972,7 +11996,7 @@ impl Host {
             self.device
                 .CreateCommittedResource(
                     &heap,
-                    not_resident(),
+                    buffer_not_resident(),
                     &desc,
                     D3D12_RESOURCE_STATE_COMMON,
                     None,
@@ -11980,9 +12004,9 @@ impl Host {
                 )
                 .and_then(|()| {
                     let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
-                    resident(&self.device, b)?;
+                    buffer_resident(&self.device, b)?;
                     hot(&self.device, b);
-                    mapped(&self.device)?;
+                    buffer_mapped(&self.device)?;
                     b.Map(0, None, Some(&mut data))
                 })
         };
@@ -12023,7 +12047,7 @@ impl Host {
         let made = unsafe {
             self.device.CreateCommittedResource(
                 &heap,
-                not_resident(),
+                buffer_not_resident(),
                 &desc,
                 D3D12_RESOURCE_STATE_COMMON,
                 None,
@@ -12034,7 +12058,7 @@ impl Host {
         if let Some(b) = &buffer {
             crate::book::made(b, || "an unordered access buffer".into());
         }
-        let made = made.and_then(|()| buffer.as_ref().map_or(Ok(()), |b| resident(&self.device, b))).and_then(|()| mapped(&self.device));
+        let made = made.and_then(|()| buffer.as_ref().map_or(Ok(()), |b| buffer_resident(&self.device, b))).and_then(|()| buffer_mapped(&self.device));
         if made.is_ok()
             && let Some(b) = &buffer
         {
