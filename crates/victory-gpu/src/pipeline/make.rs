@@ -960,6 +960,17 @@ fn graphics_first() -> bool {
 /// the order asked they waited behind the long ones, half of them 160 s or
 /// more, their dispatches dropped all the while.
 /// `VICTORY_PIPELINE_QUICK_FIRST=0`: in the order asked, as before.
+/// Compute workers that early and slow ones leave for compute pipelines a
+/// draw waits on. In ff-held r139 the world stayed black for 245 s: early
+/// compute creates of 7 to 25 s held every compute worker while
+/// CS_DepthCopy, a 1 ms create its draws asked for, waited behind them
+/// until game 65. `VICTORY_COMPUTE_KEEP=N` keeps N (at least one compute
+/// worker stays open to early ones); off (0) by default.
+fn compute_kept() -> usize {
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| std::env::var("VICTORY_COMPUTE_KEEP").ok().and_then(|v| v.parse().ok()).unwrap_or(0))
+}
+
 fn quickest(list: &mut VecDeque<Arc<Pending>>) -> Option<Arc<Pending>> {
     static ON: OnceLock<bool> = OnceLock::new();
     if !*ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_QUICK_FIRST").is_none_or(|v| v != "0")) {
@@ -1009,6 +1020,8 @@ struct Queue {
     /// one, so one is always free for graphics.
     compute_now: usize,
     compute_cap: usize,
+    /// Of those, how many only requested ones may take ([`compute_kept`]).
+    compute_kept: usize,
     /// When a pipeline last went into a list other than the slow one.
     others_at: Option<Instant>,
 }
@@ -1025,6 +1038,7 @@ impl Queue {
             early_compute: VecDeque::new(),
             compute_now: 0,
             compute_cap: usize::MAX,
+            compute_kept: 0,
             others_at: None,
         }
     }
@@ -1078,6 +1092,7 @@ impl Queue {
             std::iter::from_fn(|| list.pop_front()).find(|p| p.queue_state.load(Ordering::Relaxed) == EARLY)
         };
         let compute_free = self.compute_now < self.compute_cap;
+        let early_compute_free = self.compute_now + self.compute_kept < self.compute_cap;
         let mut p = self.screen.pop_front();
         let mut from = TAKEN_SCREEN;
         if p.is_none() && !screens_only {
@@ -1090,7 +1105,7 @@ impl Queue {
                 p = unclaimed(&mut self.early);
                 from = TAKEN_EARLY;
             }
-            if p.is_none() && compute_free {
+            if p.is_none() && early_compute_free {
                 p = unclaimed(&mut self.early_compute);
             }
             if p.is_none() && self.slow_now < slow_limit {
@@ -1102,7 +1117,7 @@ impl Queue {
                     unclaimed(&mut self.slow)
                 };
                 // A compute one waits its turn while compute holds all it may.
-                if let Some(q) = p.take_if(|q| q.graphics.is_none() && !compute_free) {
+                if let Some(q) = p.take_if(|q| q.graphics.is_none() && !early_compute_free) {
                     self.slow.push_front(q);
                 }
                 from = TAKEN_SLOW;
@@ -1203,7 +1218,9 @@ fn workers() -> bool {
         tracing::info!(workers, "pipeline workers");
         if graphics_first() {
             // With one worker only, compute has to take it, else none is made.
-            QUEUE.lock().unwrap_or_else(|e| e.into_inner()).compute_cap = workers.max(2) - 1;
+            let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+            queue.compute_cap = workers.max(2) - 1;
+            queue.compute_kept = compute_kept().min(queue.compute_cap - 1);
         }
         let screens = if screens_first() { SCREEN_WORKERS } else { 0 };
         for i in 0..workers + screens {
@@ -1662,6 +1679,25 @@ mod tests {
         assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &early_c));
         queue.compute_now -= 1;
         assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &long_c));
+    }
+
+    /// Kept compute workers go to requested compute ones only.
+    #[test]
+    fn kept_compute_workers_wait_for_requested_ones() {
+        let compute = || Arc::new(Pending::new(Vec::new(), None));
+        let (early_a, early_b, long_c, asked) = (compute(), compute(), compute(), compute());
+        let mut queue = Queue::new();
+        queue.compute_cap = 2;
+        queue.compute_kept = 1;
+        queue.push_as(&early_a, EARLY, false);
+        queue.push_as(&early_b, EARLY, false);
+        queue.push_as(&long_c, EARLY, true);
+        assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &early_a));
+        assert!(queue.pop(false, 1).is_none(), "the kept worker is not for early or slow ones");
+        queue.push_as(&asked, REQUESTED, false);
+        assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &asked));
+        queue.compute_now -= 2;
+        assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &early_b));
     }
 
     /// Passes over the screen go before all others, and workers of their own
