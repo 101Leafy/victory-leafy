@@ -969,6 +969,8 @@ impl Written {
             }
         }
         crate::watch::told(&[(at as usize, bytes)]);
+        // A fence's value: the events waiting for it are set.
+        crate::fence::written(at as usize, bytes);
     }
 }
 
