@@ -24,6 +24,8 @@ mod compose;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
+#[cfg(windows)]
+mod dxc;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod sidetime;
 #[cfg(all(windows, feature = "diagnostics"))]
