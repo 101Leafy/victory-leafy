@@ -718,6 +718,8 @@ struct Call {
     /// Provider operations under way, and whether the call was released:
     /// its cleanup then waits for the last of them to return.
     busy: Mutex<(usize, bool)>,
+    /// Its number in the async log ([`log`]), 0 with the log off.
+    logged: u64,
 }
 
 impl Call {
@@ -829,7 +831,7 @@ pub fn XAsyncBegin(
     block: *mut AsyncBlock,
     context: *mut c_void,
     identity: *const c_void,
-    _identity_name: *const u8,
+    identity_name: *const u8,
     provider: Option<Provider>,
 ) -> HRESULT {
     let Some(provider) = provider else {
@@ -863,6 +865,7 @@ pub fn XAsyncBegin(
         done: Mutex::new(false),
         finished: Condvar::new(),
         busy: Mutex::default(),
+        logged: log::begun(block, identity, identity_name, provider),
     });
     lock(&CALLS).insert(block as usize, call.clone());
     // A failed begin fails the call, so the completion routine still runs.
@@ -933,10 +936,12 @@ pub fn XAsyncComplete(block: *mut AsyncBlock, result: HRESULT, required_size: us
 fn complete_call(call: &Call, block: *mut AsyncBlock, result: HRESULT, required_size: usize) {
     extern "system" fn complete(block: *mut c_void, _canceled: bool) {
         let block = block.cast::<AsyncBlock>();
+        let logged = log::routine_runs(block);
         // SAFETY: read before the status was published; see below.
         if let Some(routine) = unsafe { (*block).callback } {
             routine(block);
         }
+        log::routine_ran(logged);
     }
     if result == E_PENDING {
         return;
@@ -969,6 +974,7 @@ fn complete_call(call: &Call, block: *mut AsyncBlock, result: HRESULT, required_
     *done = true;
     drop(done);
     call.finished.notify_all();
+    log::completed(call.logged, block, handle, result, routine.is_some());
     if routine.is_some() {
         let task = Task::new(block.cast(), complete);
         match queue(handle) {
@@ -1232,6 +1238,184 @@ pub fn XAsyncRun(block: *mut AsyncBlock, work: Option<Work>) -> HRESULT {
         std::ptr::null(),
         Some(provider),
     )
+}
+
+/// `VICTORY_ASYNC_LOG=1`: a line for each async call when it begins, when it
+/// completes and when its completion routine runs, with the queue it uses (the
+/// block's own, or the process queue for none) and that queue's port modes. A
+/// completion on a manual port runs only when the title dispatches that port.
+/// A call still pending, or a routine still waiting to run, gets a line once
+/// it has waited `VICTORY_ASYNC_LOG_MS` (default 5000).
+mod log {
+    use std::collections::HashMap;
+    use std::ffi::{CStr, c_void};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, LazyLock, Mutex, Once};
+    use std::time::{Duration, Instant};
+
+    use super::{AsyncBlock, HRESULT, Provider, Queue, lock, queue};
+
+    static ON: LazyLock<bool> =
+        LazyLock::new(|| std::env::var_os("VICTORY_ASYNC_LOG").is_some_and(|v| v == "1"));
+    static LATE_MS: LazyLock<u64> = LazyLock::new(|| {
+        std::env::var("VICTORY_ASYNC_LOG_MS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(5000)
+    });
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+
+    struct Watched {
+        what: String,
+        queue: String,
+        begun: Instant,
+        /// When it completed, with its routine still to run.
+        completed: Option<Instant>,
+        late: bool,
+    }
+
+    /// Calls not over yet: pending, or with a routine still to run.
+    static WATCHED: LazyLock<Mutex<HashMap<u64, Watched>>> = LazyLock::new(Default::default);
+    /// The call whose routine is queued, by block.
+    static ROUTINES: LazyLock<Mutex<HashMap<usize, u64>>> = LazyLock::new(Default::default);
+
+    fn title(address: usize) -> String {
+        match crate::runtime::main_image() {
+            Some(base) if address >= base => format!("{address:#x} (title+{:#x})", address - base),
+            _ => format!("{address:#x}"),
+        }
+    }
+
+    fn describe(handle: *const Queue) -> String {
+        let whose = if handle.is_null() { "process" } else { "own" };
+        match queue(handle) {
+            Some(q) => format!(
+                "{whose} queue {:#x}, work {:?} {:#x}, completion {:?} {:#x}",
+                Arc::as_ptr(&q) as usize,
+                q.ports[0].mode,
+                Arc::as_ptr(&q.ports[0]) as usize,
+                q.ports[1].mode,
+                Arc::as_ptr(&q.ports[1]) as usize,
+            ),
+            None => format!("{whose} queue none"),
+        }
+    }
+
+    pub(super) fn begun(
+        block: *mut AsyncBlock,
+        identity: *const c_void,
+        name: *const u8,
+        provider: Provider,
+    ) -> u64 {
+        if !*ON {
+            return 0;
+        }
+        static WATCHER: Once = Once::new();
+        WATCHER.call_once(|| {
+            std::thread::spawn(watch);
+        });
+        let id = NEXT.fetch_add(1, Ordering::Relaxed);
+        let mut what = format!(
+            "block {:#x} identity {} provider {}",
+            block as usize,
+            title(identity as usize),
+            title(provider as usize)
+        );
+        if !name.is_null() {
+            // SAFETY: the title's name for the call, a C string.
+            let name = unsafe { CStr::from_ptr(name.cast()) };
+            what += &format!(" {}", name.to_string_lossy());
+        }
+        // SAFETY: the block being begun is valid.
+        let queue = describe(unsafe { (*block).queue });
+        tracing::info!("async {id} begins: {what} on {queue}");
+        lock(&WATCHED).insert(
+            id,
+            Watched {
+                what,
+                queue,
+                begun: Instant::now(),
+                completed: None,
+                late: false,
+            },
+        );
+        id
+    }
+
+    pub(super) fn completed(
+        id: u64,
+        block: *mut AsyncBlock,
+        handle: *const Queue,
+        result: HRESULT,
+        routine: bool,
+    ) {
+        if id == 0 {
+            return;
+        }
+        let mut watched = lock(&WATCHED);
+        let Some(w) = watched.get_mut(&id) else {
+            return;
+        };
+        let ms = w.begun.elapsed().as_millis();
+        if routine {
+            w.completed = Some(Instant::now());
+            w.late = false;
+            lock(&ROUTINES).insert(block as usize, id);
+            tracing::info!(
+                "async {id} completes {:#010x} after {ms} ms, routine to {}",
+                result as u32,
+                describe(handle)
+            );
+        } else {
+            watched.remove(&id);
+            tracing::info!("async {id} completes {:#010x} after {ms} ms, no routine", result as u32);
+        }
+    }
+
+    pub(super) fn routine_runs(block: *mut AsyncBlock) -> u64 {
+        if !*ON {
+            return 0;
+        }
+        lock(&ROUTINES).remove(&(block as usize)).unwrap_or(0)
+    }
+
+    pub(super) fn routine_ran(id: u64) {
+        if id == 0 {
+            return;
+        }
+        let Some(w) = lock(&WATCHED).remove(&id) else {
+            return;
+        };
+        let waited = w.completed.map_or(0, |c| c.elapsed().as_millis());
+        tracing::info!(
+            "async {id} routine done {waited} ms after completing, {} ms after begin",
+            w.begun.elapsed().as_millis()
+        );
+    }
+
+    fn watch() {
+        let late = Duration::from_millis(*LATE_MS);
+        loop {
+            std::thread::sleep(Duration::from_secs(1));
+            let mut watched = lock(&WATCHED);
+            let waiting = watched.values().filter(|w| w.completed.is_some()).count();
+            let pending = watched.len() - waiting;
+            for (id, w) in watched.iter_mut().filter(|(_, w)| !w.late) {
+                let since = w.completed.unwrap_or(w.begun).elapsed();
+                if since < late {
+                    continue;
+                }
+                w.late = true;
+                let state = if w.completed.is_some() { "routine not run" } else { "still pending" };
+                tracing::warn!(
+                    "async {id} {state} after {} ms: {} on {} ({pending} pending, {waiting} routines waiting)",
+                    since.as_millis(),
+                    w.what,
+                    w.queue
+                );
+            }
+        }
+    }
 }
 
 // The object `QueryApiImpl` returns. Each method takes the object first,
