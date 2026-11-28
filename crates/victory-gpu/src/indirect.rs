@@ -673,7 +673,7 @@ void main() {
     }
 
     impl WarpHarness {
-        fn new() -> Option<Self> {
+        pub(crate) fn new() -> Option<Self> {
             Self::on(true)
         }
 
@@ -728,7 +728,7 @@ void main() {
         }
 
         /// CPU-mapped L0 write-back buffer matching `Shadow`'s heap type.
-        fn shared_buffer(&self, size: u64) -> (ID3D12Resource, *mut u8, u64) {
+        pub(crate) fn shared_buffer(&self, size: u64) -> (ID3D12Resource, *mut u8, u64) {
             let heap = D3D12_HEAP_PROPERTIES {
                 Type: D3D12_HEAP_TYPE_CUSTOM,
                 CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
