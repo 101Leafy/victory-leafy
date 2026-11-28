@@ -658,6 +658,21 @@ mod tests {
         slot::<extern "system" fn(This) -> u32>(c, 1)(c);
     }
 
+    /// An XOR mode gets element offsets once the console is known: the
+    /// first rows of a 256x256 R32 `SW_64KB_R_X` texture on Series X.
+    #[test]
+    fn xor_modes_have_element_offsets() {
+        type Offset = extern "system" fn(This, u32, u32, u64, u32, u32, u32, *mut u32) -> u64;
+        let c = create(&desc(256, 256, 1, 41, 0x11b));
+        let offset: Offset = slot(c, 6);
+        let at = |x, y| offset(c, 0, 0, x, y, 0, 0, std::ptr::null_mut());
+        // x bits 0 and 1 land on address bits 2 and 3, y bit 0 on bit 4.
+        assert_eq!([at(0, 0), at(1, 0), at(2, 0), at(0, 1)], [0, 4, 8, 16]);
+        // x bit 7 also flips a pipe bit inside the block.
+        assert_eq!(at(128, 0), 65536 + 0x8100);
+        slot::<extern "system" fn(This) -> u32>(c, 1)(c);
+    }
+
     #[test]
     fn suggestions_follow_the_use() {
         let mut out = 0;

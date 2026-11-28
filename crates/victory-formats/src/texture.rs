@@ -202,8 +202,8 @@ type XorPattern = [XorBit; 16];
 /// The XOR mode patterns, by console, mode ([`xor_family`]) and log2 of the
 /// element size: addrlib's RB+ single-sample `ADDR_SW_PATINFO` rows for
 /// the console's pipes and packers, expanded from `GFX10_SW_PATTERN_NIBBLE01`
-/// to `NIBBLE4` (`GetSwizzlePatternFromPatternInfo`), all from
-/// `gfx10SwizzlePattern.h`. Each mode's table is named in its comment.
+/// to `NIBBLE3` (`GetSwizzlePatternFromPatternInfo`; `NIBBLE4` holds bits
+/// above 64 KiB, empty for these modes), all from `gfx10SwizzlePattern.h`. Each mode's table is named in its comment.
 #[rustfmt::skip]
 static XOR_PATTERNS: [[[XorPattern; 5]; 12]; 2] = [
     // Series S: addrlib's "8 pipes (4 PKRs)" rows.
@@ -814,6 +814,8 @@ impl Layout {
     /// linear, the modes without pipe or bank XOR, and the XOR modes once
     /// [`Layout::configure_xor`] has named the console; single-sampled.
     ///
+    /// `SW_4KB_R_X` stays unaddressed: GFX10 has no pattern for it.
+    ///
     /// shortcut: no addressing for MSAA; titles use it for render targets
     /// and depth, which the host renders.
     pub fn addressable(&self) -> bool {
@@ -1293,7 +1295,7 @@ mod tests {
 
     /// Every XOR mode, on both consoles: elements tiled by `tile` sit where
     /// `offset` says, and `detile` gives the rows back, for arrays, thick
-    /// and thin 3D textures, mip tails, and 2- to 16-byte elements.
+    /// and thin 3D textures, mip tails, and 1- to 16-byte elements.
     #[test]
     fn xor_modes_tile_where_offset_points() {
         let cases = [
@@ -1308,7 +1310,8 @@ mod tests {
             (Dimension::Tex3d, 64, 32, 16, 0, 8, Swizzle::SW_64KB_S_X),
             (Dimension::Tex3d, 20, 20, 20, 0, 4, Swizzle::SW_4KB_S_X),
             (Dimension::Tex3d, 32, 32, 8, 0, 4, Swizzle::SW_64KB_D_X),
-            (Dimension::Tex3d, 50, 30, 6, 1, 4, Swizzle::SW_64KB_R_X),
+            (Dimension::Tex3d, 50, 30, 6, 0, 4, Swizzle::SW_64KB_R_X),
+            (Dimension::Tex3d, 40, 24, 12, 0, 2, Swizzle::SW_64KB_S_T),
         ];
         for config in [PipeConfig::Pipes8Packers4, PipeConfig::Pipes32Packers8] {
             for (dimension, width, height, depth, mips, bytes, swizzle) in cases {
