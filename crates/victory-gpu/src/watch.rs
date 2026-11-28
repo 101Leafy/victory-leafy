@@ -890,6 +890,7 @@ fn ask_split() -> bool {
 }
 
 /// The reservation `page` lies in: its allocation base, in pages.
+#[cfg(test)]
 fn reservation(page: usize) -> usize {
     use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
     // SAFETY: plain data filled in by the query.
@@ -897,6 +898,41 @@ fn reservation(page: usize) -> usize {
     // SAFETY: a valid out pointer of the right size.
     let n = unsafe { VirtualQuery((page * PAGE) as *const _, &mut info, size_of_val(&info)) };
     if n == 0 { usize::MAX } else { info.AllocationBase as usize / PAGE }
+}
+
+/// [`reservation`] of each piece's first page, `pieces` in order: one query
+/// for all the pieces that start in the region it answered for. A query
+/// stood 1.4 ms (run lp-ask-ph: 3,800 pieces a frame, 5.4 s under the whole
+/// submission's hold, while every refresh waited).
+fn reservations(pieces: &[(usize, usize)]) -> Vec<usize> {
+    use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
+    let mut homes = Vec::with_capacity(pieces.len());
+    // The last region answered: its bytes and allocation base, in pages.
+    let mut known: Option<(usize, usize, usize)> = None;
+    for &(first, _) in pieces {
+        let at = first * PAGE;
+        if let Some((start, end, base)) = known
+            && start <= at
+            && at < end
+        {
+            homes.push(base);
+            continue;
+        }
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+        if n == 0 {
+            known = None;
+            homes.push(usize::MAX);
+            continue;
+        }
+        let start = info.BaseAddress as usize;
+        let base = info.AllocationBase as usize / PAGE;
+        known = Some((start, start.saturating_add(info.RegionSize), base));
+        homes.push(base);
+    }
+    homes
 }
 
 /// Asks the kernel about many ranges `(start, end)` at once, before the
@@ -929,7 +965,7 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
     let bases = if spans { ask_spans::bases(&mut pieces) } else { Vec::new() };
     phase(0, &mut t);
     let split = ask_split();
-    let homes: Vec<usize> = if split { pieces.iter().map(|p| reservation(p.0)).collect() } else { Vec::new() };
+    let homes: Vec<usize> = if split { reservations(&pieces) } else { Vec::new() };
     phase(1, &mut t);
     let (mut asked, mut written) = (Vec::new(), Vec::new());
     let mut i = 0;
@@ -5493,6 +5529,10 @@ mod tests {
         assert_eq!(reservation(a / PAGE + 2), a / PAGE);
         assert_eq!(reservation(a / PAGE + 7), a / PAGE);
         assert_eq!(reservation(b / PAGE), b / PAGE);
+        let mut pieces = [(a / PAGE, a / PAGE + 1), (a / PAGE + 2, a / PAGE + 3), (a / PAGE + 7, a / PAGE + 8), (b / PAGE, b / PAGE + 1)];
+        pieces.sort_unstable();
+        let one: Vec<usize> = pieces.iter().map(|p| reservation(p.0)).collect();
+        assert_eq!(reservations(&pieces), one);
         // SAFETY: our reservations.
         unsafe {
             VirtualFree(a as *mut _, 0, MEM_RELEASE);
