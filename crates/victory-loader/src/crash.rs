@@ -497,6 +497,7 @@ unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
         // SAFETY: as above.
         unsafe { report("first-chance exception", info, false) };
         // SAFETY: as above.
+        #[cfg(feature = "diagnostics")]
         if unsafe { writes_zero(&*(*info).ExceptionRecord) } && stacks_at_kill() {
             crate::stacks::dump_stacks();
         }
