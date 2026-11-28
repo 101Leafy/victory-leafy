@@ -346,7 +346,10 @@ impl<B: Clone> Pool<B> {
     ) -> Option<(Piece, B, bool)> {
         let (i, start) = match self.cut(len, align, now, ripe, fullest, best_fit)? {
             Some(found) => found,
-            None => self.add_and_cut(self.grow(now, &mut make)?, ripe.started, len, align)?,
+            None => {
+                let memory = self.grow(now, &mut make)?;
+                self.add_and_cut(memory, ripe.started, len, align)?
+            }
         };
         if self.short_ahead(ripe)
             && let Some(memory) = self.grow(now, &mut make)

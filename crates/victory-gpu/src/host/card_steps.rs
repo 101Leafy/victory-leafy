@@ -1832,6 +1832,7 @@ mod tests {
             back: vec![(shadow.clone(), vec![(start, start + 4096)])],
             own: None,
             texture_back_ranges: vec![(start + 256, start + 512)],
+            pc_sends: None,
         })];
         let active = writers(&items);
         assert!(
