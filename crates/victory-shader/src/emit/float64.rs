@@ -69,8 +69,9 @@ impl Lower<'_> {
             }
             let (rl, rh) = self.split_double(r);
             let c = self.cur;
-            let (lower_lo, upper_lo) = self.exchange_halves(c, rl);
-            let (lower_hi, upper_hi) = self.exchange_halves(c, rh);
+            let (lower_lo, upper_lo) = self.exchange_halves(c, rl)?;
+            let c = self.cur;
+            let (lower_hi, upper_hi) = self.exchange_halves(c, rh)?;
             let lower = self.make_double(lower_lo, lower_hi);
             let upper = self.make_double(upper_lo, upper_hi);
             self.s.m.bin(self.cur, Bin::Add, lower, upper)
