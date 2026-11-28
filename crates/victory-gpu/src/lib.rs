@@ -57,13 +57,15 @@ pub enum SettingsPadMode {
     StickShortcut,
 }
 
+/// `VICTORY_MENU_PAD`: unset, the pad in slot 0 works in the open menu;
+/// `1`, both stick buttons also open it; `0`, the pad never reaches it.
 #[cfg(windows)]
 pub fn settings_pad_mode() -> SettingsPadMode {
     static MODE: std::sync::OnceLock<SettingsPadMode> = std::sync::OnceLock::new();
     *MODE.get_or_init(|| match std::env::var("VICTORY_MENU_PAD").as_deref() {
-        Ok("menu") => SettingsPadMode::MenuOnly,
+        Ok("0") => SettingsPadMode::Off,
         Ok("1") => SettingsPadMode::StickShortcut,
-        _ => SettingsPadMode::Off,
+        _ => SettingsPadMode::MenuOnly,
     })
 }
 /// The F1 settings menu is shown (`host/menu.rs`): the title gets no keyboard meanwhile

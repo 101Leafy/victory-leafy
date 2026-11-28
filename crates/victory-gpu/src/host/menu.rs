@@ -1,13 +1,15 @@
 //! The F1 settings menu. F1 shows and hides it while our window has the
 //! focus; Up/Down pick a setting, Left/Right change it, Enter runs the line
 //! picked (save, reset, close), Esc closes. While it is shown the title sees
-//! no keyboard (`crate::SETTINGS_MENU_OPEN`, read by the input module). By
-//! default a pad still works. With `VICTORY_MENU_PAD=1`, press both stick
-//! buttons on the physical pad in slot 0 to toggle F1. Use the D-pad to
-//! navigate, A to select, and B to go back.
+//! no keyboard (`crate::SETTINGS_MENU_OPEN`, read by the input module). The
+//! pad in slot 0 works in it too: the D-pad picks and changes, A selects, B
+//! closes. With `VICTORY_MENU_PAD=1` both stick buttons also open it, and
+//! `VICTORY_MENU_PAD=0` keeps the pad out of it.
 //!
-//! The settings are read once at start, so a change is saved to the file
-//! `VICTORY_MENU_FILE` names and takes effect at the next start.
+//! Most settings are read once at start, so a change to one of those is
+//! marked to restart. Saved, the changes go to the `[settings]` table of the
+//! config file (`VICTORY_CONFIG`, else `victory.toml`), which the next start
+//! reads (victory-core `Config::apply_settings`).
 //!
 //! In every build (the stats panel is in diagnostics builds only). Drawn as
 //! that panel is: white text on a black box, copied onto the swap chain's
@@ -32,13 +34,14 @@ const CELL: (u32, u32) = (6, 9);
 const COLUMNS: u32 = 60;
 /// Lines of the box: a title, a help line, a blank, the settings shown, a
 /// blank and a note.
-const ROWS: usize = 20;
+const ROWS: usize = 24;
 const LINES: u32 = ROWS as u32 + 5;
 const RIM: u32 = 4;
 const UPLOADS: usize = 4;
 
 /// A setting: the variable, its name in the menu, the values it takes
-/// (`""`: not set, the build's own default), and whether a change applies at once.
+/// (`""`: not set, the build's own default), and whether a change applies at
+/// once. With no variable, the name of the group the next ones are in.
 struct Item {
     var: &'static str,
     label: &'static str,
@@ -50,26 +53,46 @@ const ON_UNSET: &[(&str, &str)] = &[("1", "ON"), ("", "OFF")];
 const UNSET_ON: &[(&str, &str)] = &[("", "OFF"), ("1", "ON")];
 const STAGES: &[(&str, &str)] = &[("2", "2"), ("1", "1"), ("0", "0 OFF")];
 
+/// Said under the menu while a row that makes frames up or renders fewer
+/// pixels is picked (render scale now, frame generation if it comes).
+const NOT_ENDORSED: &str = "NOT ENDORSED BY 101LEAFY, NEVER USED BY THE DEVELOPER";
+
+const fn group(label: &'static str) -> Item {
+    Item { var: "", label, values: &[], live: false }
+}
+
 /// The first value of each is what scripts\play.ps1 starts with.
 #[rustfmt::skip]
 const ITEMS: &[Item] = &[
-    Item { var: "VICTORY_FPS_LINE", label: "FPS AT THE TOP", values: &[("1", "ON"), ("0", "OFF")], live: true },
+    group("DISPLAY"),
+    Item { var: "VICTORY_OUTPUT", label: "OUTPUT SIZE", values: &[("1280x720", "1280X720"), ("1664x936", "1664X936"), ("1920x1080", "1920X1080"), ("2560x1440", "2560X1440"), ("3840x2160", "3840X2160")], live: false },
+    Item { var: "VICTORY_BORDERLESS", label: "BORDERLESS WINDOW", values: UNSET_ON, live: false },
+    group("GRAPHICS"),
     Item { var: "VICTORY_AMBIENT", label: "LIGHT ESTIMATE", values: &[("0.8", "0.8"), ("1", "1"), ("0.5", "0.5"), ("", "OFF")], live: false },
     Item { var: "VICTORY_AMBIENT_AIR", label: "FOG CAP", values: &[("", "NONE"), ("1.5", "1.5"), ("1", "1"), ("2", "2")], live: false },
     Item { var: "VICTORY_BVH_BUILDER", label: "RAY TRACING (SLOW)", values: UNSET_ON, live: false },
-    Item { var: "VICTORY_WC_NO_BACK", label: "SKIP BIG COPY-BACKS", values: UNSET_ON, live: false },
+    // Under 1.0 the title's own upscaler fills the output (victory-loader resolution.rs).
+    Item { var: "VICTORY_RENDER_SCALE", label: "RENDER SCALE (UPSCALING)", values: &[("", "1.0 NATIVE"), ("0.83", "0.83"), ("0.67", "0.67"), ("0.5", "0.5")], live: false },
+    group("PERFORMANCE"),
     Item { var: "VICTORY_TEXTURE_NO_WAIT", label: "TEXTURE NO WAIT", values: ON_UNSET, live: false },
     Item { var: "VICTORY_RELAY", label: "RELAY (SPEED, TRIANGLES)", values: STAGES, live: false },
     Item { var: "VICTORY_CARD_STEPS", label: "CARD STEPS", values: STAGES, live: false },
     Item { var: "VICTORY_INDIRECT_BATCH", label: "INDIRECT BATCH", values: STAGES, live: false },
+    Item { var: "VICTORY_WC_NO_BACK", label: "SKIP BIG COPY-BACKS", values: UNSET_ON, live: false },
     Item { var: "VICTORY_PORT_CONSTANTS", label: "CONSTANTS HEAP IN PLACE", values: UNSET_ON, live: false },
+    group("AUDIO"),
+    Item { var: "VICTORY_DSP_CONVOLVE", label: "REVERB, WORLD SPEAKERS", values: &[("", "FULL"), ("mono", "MONO"), ("0", "OFF")], live: false },
+    group("INPUT"),
     // The mouse on the stand-in pad's right stick (controls.rs): the same
     // `VICTORY_MOUSE_SENS` a player would set before the start, changeable
     // at once so the feel can be matched to the title's own slider.
     Item { var: "VICTORY_MOUSE_SENS", label: "MOUSE LOOK SENSITIVITY", values: &[("", "THE TITLE'S OWN"), ("0.5", "0.5 (SLOW)"), ("1", "1"), ("1.5", "1.5"), ("2", "2"), ("3", "3 (FAST)")], live: true },
+    Item { var: "VICTORY_MENU_PAD", label: "PAD IN THIS MENU", values: &[("", "YES"), ("1", "L3+R3 OPENS"), ("0", "NO")], live: false },
+    group("DEBUG"),
+    Item { var: "VICTORY_FPS_LINE", label: "FPS AT THE TOP", values: &[("1", "ON"), ("0", "OFF")], live: true },
 ];
 /// The lines after the settings.
-const ACTIONS: [&str; 3] = ["SAVE FOR NEXT START", "RESET ALL TO PLAY DEFAULTS", "CLOSE"];
+const ACTIONS: [&str; 3] = ["SAVE TO VICTORY.TOML", "RESET ALL TO PLAY DEFAULTS", "CLOSE"];
 
 fn get(var: &str) -> String {
     std::env::var(var).unwrap_or_default()
@@ -77,6 +100,60 @@ fn get(var: &str) -> String {
 
 fn live(item: &Item) -> bool {
     item.live
+}
+
+fn is_group(row: usize) -> bool {
+    ITEMS.get(row).is_some_and(|i| i.var.is_empty())
+}
+
+/// The config file the settings are saved in, found as victory-core finds it.
+fn config_path() -> std::path::PathBuf {
+    std::env::var_os("VICTORY_CONFIG").filter(|v| !v.is_empty()).map_or_else(|| "victory.toml".into(), Into::into)
+}
+
+/// `text` (a config file) with its `[settings]` table holding `changes`
+/// (variable, value) over what it had, or with no such table when `changes`
+/// is `None`. The other lines are kept as they were.
+fn with_settings(text: &str, changes: Option<&[(&str, &str)]>) -> String {
+    let newline = if text.contains("\r\n") { "\r\n" } else { "\n" };
+    let mut kept = Vec::new();
+    let mut table: Vec<(String, String)> = Vec::new();
+    let mut inside = false;
+    for line in text.lines() {
+        let head = line.trim();
+        if head.starts_with('[') {
+            inside = head == "[settings]";
+            if inside {
+                continue;
+            }
+        }
+        if !inside {
+            kept.push(line);
+        } else if let Some((k, v)) = head.split_once('=').filter(|_| !head.starts_with('#')) {
+            table.push((k.trim().to_owned(), v.trim().to_owned()));
+        }
+    }
+    while kept.last().is_some_and(|l| l.trim().is_empty()) {
+        kept.pop();
+    }
+    let mut out: String = kept.iter().flat_map(|l| [*l, newline]).collect();
+    let Some(changes) = changes else { return out };
+    for (var, value) in changes {
+        let key = var.trim_start_matches("VICTORY_").to_ascii_lowercase();
+        table.retain(|(k, _)| *k != key);
+        table.push((key, format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))));
+    }
+    if !out.is_empty() {
+        out.push_str(newline);
+    }
+    out.push_str("[settings]");
+    out.push_str(newline);
+    out.push_str("# Saved by the F1 menu. \"\" unsets one; a variable set before the start wins.");
+    out.push_str(newline);
+    for (k, v) in &table {
+        out.push_str(&format!("{k} = {v}{newline}"));
+    }
+    out
 }
 
 /// Whether the frame-rate line is shown at the top while the menu is closed
@@ -300,7 +377,7 @@ impl Menu {
             crate::SETTINGS_MENU_OPEN.store(true, Ordering::Relaxed);
         }
         let values: Vec<String> = ITEMS.iter().map(|i| get(i.var)).collect();
-        Menu { started: values.clone(), values, at: 0, note: String::new(), changed: true, painted: None, buffers: None, failed: false }
+        Menu { started: values.clone(), values, at: 1, note: String::new(), changed: true, painted: None, buffers: None, failed: false }
     }
 
     fn open() -> bool {
@@ -319,10 +396,16 @@ impl Menu {
         let mut out = vec![title.to_owned(), help.to_owned(), String::new()];
         for row in first..(first + ROWS).min(total) {
             let cursor = if row == self.at { '>' } else { ' ' };
-            let line = if let Some(item) = ITEMS.get(row) {
+            let line = if let Some(item) = ITEMS.get(row).filter(|i| i.var.is_empty()) {
+                format!("  -- {} --", item.label)
+            } else if let Some(item) = ITEMS.get(row) {
                 let value = &self.values[row];
                 let shown = index_of(item, value).map_or(value.to_ascii_uppercase(), |i| item.values[i].1.to_owned());
-                let mark = if *value != self.started[row] { if live(item) { " *LIVE" } else { " *" } } else if live(item) { " LIVE" } else { "" };
+                let mark = match (*value != self.started[row], live(item)) {
+                    (false, _) => "",
+                    (true, true) => " *",
+                    (true, false) => " *RESTART",
+                };
                 format!("{cursor} {:<27} < {shown} >{mark}", item.label)
             } else {
                 format!("{cursor} {}", ACTIONS[row - ITEMS.len()])
@@ -333,7 +416,11 @@ impl Menu {
             out.push(String::new());
         }
         out.push(String::new());
-        out.push(if self.note.is_empty() { "* = CHANGED: APPLIES AT THE NEXT START UNLESS LIVE".to_owned() } else { self.note.clone() });
+        out.push(match ITEMS.get(self.at) {
+            _ if !self.note.is_empty() => self.note.clone(),
+            Some(item) if item.var == "VICTORY_RENDER_SCALE" => NOT_ENDORSED.to_owned(),
+            _ => "* CHANGED     *RESTART: AT THE NEXT START".to_owned(),
+        });
         out
     }
 
@@ -371,48 +458,40 @@ impl Menu {
         }
     }
 
-    /// Writes the changed values over those in the settings file.
+    /// Writes the changed values into the config file's `[settings]`.
     fn save(&mut self) -> bool {
-        let Some(path) = std::env::var_os("VICTORY_MENU_FILE") else {
-            self.note = "NO SETTINGS FILE (VICTORY_MENU_FILE)".to_owned();
-            return false;
-        };
-        let mut kept: Vec<(String, String)> = std::fs::read_to_string(&path)
-            .unwrap_or_default()
-            .lines()
-            .filter_map(|l| l.split_once('=').map(|(k, v)| (k.trim().to_owned(), v.trim().to_owned())))
-            .filter(|(k, _)| k.starts_with("VICTORY_"))
+        let changes: Vec<(&str, &str)> = ITEMS
+            .iter()
+            .zip(self.values.iter().zip(&self.started))
+            .filter(|(item, (now, then))| !item.var.is_empty() && now != then)
+            .map(|(item, (now, _))| (item.var, now.as_str()))
             .collect();
-        for (i, item) in ITEMS.iter().enumerate() {
-            if self.values[i] == self.started[i] {
-                continue;
-            }
-            kept.retain(|(k, _)| k != item.var);
-            kept.push((item.var.to_owned(), self.values[i].clone()));
-        }
-        let mut text = String::from("# Saved by the F1 menu (an empty value: unset).\r\n");
-        for (k, v) in &kept {
-            text.push_str(&format!("{k}={v}\r\n"));
-        }
-        match std::fs::write(&path, text) {
+        let path = config_path();
+        let text = std::fs::read_to_string(&path).unwrap_or_default();
+        match std::fs::write(&path, with_settings(&text, Some(&changes))) {
             Ok(()) => {
-                tracing::info!(path = %std::path::Path::new(&path).display(), "settings menu: saved");
+                tracing::info!(path = %path.display(), changed = changes.len(), "settings menu: saved");
                 self.started = self.values.clone();
-                self.note = "SAVED. APPLIES AT THE NEXT START".to_owned();
+                self.note = "SAVED TO VICTORY.TOML [SETTINGS]".to_owned();
                 true
             }
             Err(e) => {
-                tracing::warn!(error = %e, "settings menu: not saved");
-                self.note = "COULD NOT SAVE THE SETTINGS FILE".to_owned();
+                tracing::warn!(path = %path.display(), error = %e, "settings menu: not saved");
+                self.note = "COULD NOT WRITE VICTORY.TOML".to_owned();
                 false
             }
         }
     }
 
-    /// Removes the settings file: the launcher's own settings at the next start.
+    /// Takes `[settings]` out of the config file: the launcher's own settings at the next start.
     fn reset(&mut self) {
-        if let Some(path) = std::env::var_os("VICTORY_MENU_FILE") {
-            let _ = std::fs::remove_file(path);
+        let path = config_path();
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            let rest = with_settings(&text, None);
+            if rest != text && std::fs::write(&path, rest).is_err() {
+                self.note = "COULD NOT WRITE VICTORY.TOML".to_owned();
+                return;
+            }
         }
         self.note = "RESET. PLAY DEFAULTS AT THE NEXT START".to_owned();
     }
@@ -445,8 +524,13 @@ impl Menu {
                 continue;
             }
             match vk {
-                VK_UP => self.at = (self.at + total - 1) % total,
-                VK_DOWN => self.at = (self.at + 1) % total,
+                VK_UP | VK_DOWN => {
+                    let step = if vk == VK_UP { total - 1 } else { 1 };
+                    self.at = (self.at + step) % total;
+                    while is_group(self.at) {
+                        self.at = (self.at + step) % total;
+                    }
+                }
                 VK_LEFT if self.at < ITEMS.len() => self.change(self.at, -1),
                 VK_RIGHT if self.at < ITEMS.len() => self.change(self.at, 1),
                 VK_RETURN if self.at < ITEMS.len() => self.change(self.at, 1),
@@ -556,14 +640,35 @@ mod tests {
 
     #[test]
     fn values_cycle_both_ways() {
-        let mut menu = Menu { values: ITEMS.iter().map(|i| i.values[0].0.to_owned()).collect(), started: Vec::new(), at: 0, note: String::new(), changed: false, painted: None, buffers: None, failed: false };
+        let mut menu = Menu { values: ITEMS.iter().map(|i| i.values.first().map_or("", |v| v.0).to_owned()).collect(), started: Vec::new(), at: 1, note: String::new(), changed: false, painted: None, buffers: None, failed: false };
         menu.started = menu.values.clone();
-        let n = ITEMS[0].values.len();
+        let n = ITEMS[1].values.len();
         for _ in 0..n {
-            menu.change(0, 1);
+            menu.change(1, 1);
         }
-        assert_eq!(menu.values[0], ITEMS[0].values[0].0);
-        menu.change(0, -1);
-        assert_eq!(menu.values[0], ITEMS[0].values[n - 1].0);
+        assert_eq!(menu.values[1], ITEMS[1].values[0].0);
+        menu.change(1, -1);
+        assert_eq!(menu.values[1], ITEMS[1].values[n - 1].0);
+    }
+
+    #[test]
+    fn groups_are_stepped_over() {
+        assert!(is_group(0) && !is_group(1));
+        let total = ITEMS.len() + ACTIONS.len();
+        for at in 0..total {
+            assert!(!(is_group(at) && is_group((at + 1) % total)), "two groups in a row at {at}");
+        }
+    }
+
+    #[test]
+    fn saves_go_into_the_settings_table_and_keep_the_rest() {
+        let text = "title = \"a\"\r\n\r\n[settings]\r\nambient = \"1\"\r\ncard_steps = \"2\"\r\n\r\n[graphics]\r\nx = 1\r\n";
+        let saved = with_settings(text, Some(&[("VICTORY_AMBIENT", "0.5"), ("VICTORY_MOUSE_SENS", "")]));
+        assert_eq!(
+            saved,
+            "title = \"a\"\r\n\r\n[graphics]\r\nx = 1\r\n\r\n[settings]\r\n# Saved by the F1 menu. \"\" unsets one; a variable set before the start wins.\r\ncard_steps = \"2\"\r\nambient = \"0.5\"\r\nmouse_sens = \"\"\r\n"
+        );
+        assert_eq!(with_settings(&saved, None), "title = \"a\"\r\n\r\n[graphics]\r\nx = 1\r\n");
+        assert_eq!(with_settings("", Some(&[("VICTORY_RELAY", "1")])), "[settings]\n# Saved by the F1 menu. \"\" unsets one; a variable set before the start wins.\nrelay = \"1\"\n");
     }
 }

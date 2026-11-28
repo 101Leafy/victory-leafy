@@ -271,8 +271,9 @@ or publisher.
 ## Master build (2026-11-27)
 
 This branch now holds the master build, the one the stream runs. It runs the
-title as the Series S does, at 1280x720. There is no ray tracing, no DLSS, no
-FSR, no upscaling of any kind, and no frame generation.
+title as the Series S does, at 1280x720. As shipped it has no ray tracing, no
+DLSS, no FSR, no upscaling of any kind, and no frame generation, and every test
+here runs that way. The F1 menu can turn some of these on (see "Options").
 
 Known issues:
 
@@ -313,6 +314,35 @@ the picture is stretched to it and the render size stays.
 
 It runs the title as the Series S (`--console series-s`) at 1280x720. Before
 2026-11-28 it passed no console, so the title ran as the Series X at 4K.
+
+### Options (F1)
+
+F1 in the game opens a settings menu: display, graphics, performance, audio,
+input, and debug. The arrow keys pick and change, Enter selects, F1 or Esc
+closes. A pad in the first slot works in it too (D-pad, A, B); with
+`VICTORY_MENU_PAD=1` pressing both sticks in also opens it, and
+`VICTORY_MENU_PAD=0` keeps the pad out of it. While the menu is open the game
+gets no keyboard input.
+
+Mouse look sensitivity and the FPS line change at once. Everything else is
+read when the game starts, so a changed row is marked `*RESTART`. "Save"
+writes the changed rows to a `[settings]` table in `victory.toml` (or the file
+`VICTORY_CONFIG` names), and the next start uses them. A variable you set
+yourself before starting still wins over the file, and so do the
+`play.ps1` switches. "Reset" takes the table out again. A build from before
+2026-11-28 will not start with a `[settings]` table in its config, so take it
+out before going back to one.
+
+Please read this before changing anything. I may not use all of these options
+myself, they may not be tested much, and most of them are not recommended. The
+defaults are what I play and test with.
+
+Upscaling (render scale under 1.0, where the game's own upscaler fills the
+window) is in the menu, off by default. Frame generation is not in this build;
+if it ever comes it will be off by default too. These are not endorsed by
+101Leafy and are never used by the developer. They make a game look
+faster than it runs. I would rather make the game itself run properly than
+lean on crutches like these, but they are there for anyone who wants them.
 
 Before the first run, ahead of time (both can be stopped and go on later):
 

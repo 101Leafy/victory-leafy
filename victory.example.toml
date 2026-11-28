@@ -43,3 +43,10 @@ test_titles = []
 # MouseLeft = "RT"
 # [controls.vehicle]
 # W = "RT"
+
+# What the F1 menu saves (README "Options"). A key is a VICTORY_ variable
+# without the prefix, in lower case; "" unsets one. A variable set before the
+# start wins over this.
+[settings]
+# fps_line = "0"
+# mouse_sens = "1.5"
