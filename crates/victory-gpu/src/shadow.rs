@@ -4834,6 +4834,8 @@ impl Shadow {
         let Some(first) = first_difference(now, held) else {
             return 0;
         };
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::BackDiffer, 1);
         let last = last_difference(now, held).unwrap_or(first);
         let (at, n) = (at + first, last + 1 - first);
         let (now, held) = (&now[first..=last], &mut held[first..=last]);
@@ -6003,6 +6005,8 @@ impl Shadow {
             }
             return 0;
         };
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::BackDiffer, 1);
         let last = last_difference(gpu, old).unwrap_or(first);
         let (at, n) = (at + first, last + 1 - first);
         let (gpu, old) = (&gpu[first..=last], &mut old[first..=last]);
@@ -6115,6 +6119,8 @@ impl Shadow {
         let Some(first) = first_difference(gpu, held) else {
             return 0;
         };
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::BackDiffer, 1);
         let last = last_difference(gpu, held).unwrap_or(first);
         let (at, n) = (at + first, last + 1 - first);
         let (gpu, held) = (&gpu[first..=last], &mut held[first..=last]);

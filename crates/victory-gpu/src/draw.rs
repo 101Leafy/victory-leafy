@@ -3947,7 +3947,9 @@ impl State {
         #[cfg(feature = "diagnostics")]
         crate::copystat::lap(crate::copystat::C::DrawAfterNs, began);
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
-        self.after_dispatch(list, p);
+        if ![x, y, z].contains(&0) {
+            self.after_dispatch(list, p);
+        }
     }
 
     /// What follows a dispatch of `p`, direct or indirect: the stand-in for
@@ -4004,6 +4006,22 @@ impl State {
                 })
             }),
         };
+        // The optional neutral probe pass has no depth dependency. It has
+        // its own root signature and must also work when real depth exists.
+        let neutral_view = || {
+            let Some(Root::Table(table)) = self.roots_ref(true).get(usize::from(LIGHT.0)) else { return false };
+            let Some(view) = crate::descriptor::view(table + u64::from(LIGHT.1) * 4) else { return false };
+            match crate::descriptor::host::placed_texture(&view).map_or(view, |placed| placed.view) {
+                View::Unordered(_, _, words) => crate::ambient::neutral_uav(words.as_ref()),
+                _ => false,
+            }
+        };
+        if role == Role::Resolve && crate::ambient::neutral_level().is_some() && neutral_view()
+            && let Some((desc, handle)) = image.as_ref()
+            && crate::ambient::neutral_after(list, role, desc, *handle)
+        {
+            return true;
+        }
         let Some((of, image)) = image else {
             once!(?role, "no stand-in for the indirect light: missing image UAV");
             return false;
