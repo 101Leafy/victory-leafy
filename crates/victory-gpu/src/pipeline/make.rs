@@ -49,6 +49,9 @@ pub(crate) struct Pending {
     scene_input: bool,
     /// Why this pipeline is intentionally skipped (e.g. RT resolve without BVH).
     left_out: Option<&'static str>,
+    /// The last title frame a draw asked for it and found it not made
+    /// ([`newest`]).
+    asked_frame: AtomicU64,
 }
 
 fn named(shaders: &[Arc<Shader>], name: &[u8]) -> bool {
@@ -173,6 +176,7 @@ impl Pending {
             graphics,
             queue_state: AtomicU8::new(NOT_QUEUED),
             was_slow: AtomicBool::new(false),
+            asked_frame: AtomicU64::new(0),
             made: OnceLock::new(),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
@@ -306,8 +310,10 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
         super::library::note_used(&p.key);
     }
     if p.made.get().is_none() {
+        let frame = crate::frame::current();
+        p.asked_frame.store(frame, Ordering::Relaxed);
         start(p, REQUESTED);
-        wait(p, crate::frame::current());
+        wait(p, frame);
     }
     p.made.get()?.as_ref()
 }
@@ -490,7 +496,7 @@ impl Queue {
         };
         let mut p = self.screen.pop_front();
         if p.is_none() && !screens_only {
-            p = self.requested.pop_front().or_else(|| unclaimed(&mut self.early));
+            p = newest(&mut self.requested).or_else(|| unclaimed(&mut self.early));
             if p.is_none() && self.slow_now < slow_limit {
                 p = unclaimed(&mut self.slow);
                 if let Some(p) = &p {
@@ -502,6 +508,29 @@ impl Queue {
         let p = p?;
         p.queue_state.store(MAKING, Ordering::Relaxed);
         Some(p)
+    }
+}
+
+/// `VICTORY_PIPELINE_NOW_FIRST=1`: of the requested pipelines, the first
+/// one a draw of this frame or the one before asked for, else the oldest.
+/// In the order asked alone, a cold library had the world's requests waiting
+/// 10 to 175 s behind requests of scenes the title had already left, and the
+/// frame on screen got none of its own until those were made. Off: in the
+/// order asked, as before.
+fn now_first() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_NOW_FIRST").is_some_and(|v| v == "1"))
+}
+
+fn newest(list: &mut VecDeque<Arc<Pending>>) -> Option<Arc<Pending>> {
+    if !now_first() {
+        return list.pop_front();
+    }
+    let since = crate::frame::current().saturating_sub(1);
+    let at = list.iter().position(|p| p.asked_frame.load(Ordering::Relaxed) >= since);
+    match at {
+        Some(at) => list.remove(at),
+        None => list.pop_front(),
     }
 }
 
