@@ -310,6 +310,9 @@ something is wrong. `-RayTracing` turns the title's ray-traced indirect light on
 (`VICTORY_BORDERLESS=1`) covers the primary display with no border or title bar;
 the picture is stretched to it and the render size stays.
 
+It runs the title as the Series S (`--console series-s`) at 1280x720. Before
+2026-11-28 it passed no console, so the title ran as the Series X at 4K.
+
 Before the first run, ahead of time (both can be stopped and go on later):
 
 ```powershell
