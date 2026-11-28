@@ -2505,37 +2505,40 @@ fn guard_parts(start: usize, end: usize) -> Option<Vec<(usize, u16)>> {
     // runtime's. Windows is asked with the lock not held (the range is, no
     // other thread asks about it: `ASKING`); what the runtime tells meanwhile
     // takes the block out of the set, and it is looked at as any other.
-    let unsure: Vec<usize> = {
-        let g = guards_timed();
-        let clean = (first / 64..last.div_ceil(64)).all(|word| {
-            let these = in_word(word * 64, first, last);
-            g.clean.word(word) & these == these
-        });
-        if clean && !BESIDE.any(first, last) && !LOOSE.any(first, last) && !PENDING.any(first, last) {
-            // Nothing written, mapped or new since the range was last taken.
-            #[cfg(feature = "diagnostics")]
-            tally(3, 1);
-            return Some(Vec::new());
-        }
-        g.absent.range(first..last).filter(|block| !g.held.contains(*block)).collect()
-    };
+    let mut g = guards_timed();
+    let clean = (first / 64..last.div_ceil(64)).all(|word| {
+        let these = in_word(word * 64, first, last);
+        g.clean.word(word) & these == these
+    });
+    if clean && !BESIDE.any(first, last) && !LOOSE.any(first, last) && !PENDING.any(first, last) {
+        // Nothing written, mapped or new since the range was last taken.
+        #[cfg(feature = "diagnostics")]
+        tally(3, 1);
+        return Some(Vec::new());
+    }
+    let unsure: Vec<usize> = g.absent.range(first..last).filter(|block| !g.held.contains(*block)).collect();
     let mut came: Vec<(usize, bool)> = Vec::new();
-    let mut uncommitted_until = first;
-    for block in unsure {
-        // One question for the blocks of a region.
-        if block >= uncommitted_until {
-            uncommitted_until = uncommitted_end(block);
-            #[cfg(feature = "diagnostics")]
-            tally(9, 1);
+    // VICTORY_KEEP_GUARD_LOCK=1: with no block to ask Windows about, the lock
+    // is kept rather than let go and taken again.
+    if !unsure.is_empty() || !crate::titlewrite::asked_for!("VICTORY_KEEP_GUARD_LOCK") {
+        drop(g);
+        let mut uncommitted_until = first;
+        for block in unsure {
+            // One question for the blocks of a region.
+            if block >= uncommitted_until {
+                uncommitted_until = uncommitted_end(block);
+                #[cfg(feature = "diagnostics")]
+                tally(9, 1);
+            }
+            if block >= uncommitted_until {
+                // The hole may have been given up, and its address be the
+                // title's heap's, or code's, now: not ours to guard.
+                came.push((block, is_view(block * BLOCK, (block + 1) * BLOCK)));
+            }
         }
-        if block >= uncommitted_until {
-            // The hole may have been given up, and its address be the
-            // title's heap's, or code's, now: not ours to guard.
-            came.push((block, is_view(block * BLOCK, (block + 1) * BLOCK)));
-        }
+        g = guards_timed();
     }
     let rest = rest();
-    let mut g = guards_timed();
     #[cfg(feature = "diagnostics")]
     tally(4, 1);
     for &(block, view) in &came {
