@@ -3225,6 +3225,46 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
     drop(freed);
 }
 
+/// Drops the spare scratch chunks kept idle when an upload buffer is
+/// refused for want of memory ([`Host::upload_buffer`]). The bytes freed.
+fn trim_spare_chunks() -> u64 {
+    let freed: Vec<(Chunk, u64)> = {
+        let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+        if spare.kept.is_empty() {
+            return 0;
+        }
+        spare.bytes = 0;
+        std::mem::take(&mut spare.kept)
+    };
+    let count = freed.len() as u64;
+    let bytes: u64 = freed.iter().map(|(_, s)| *s).sum();
+    ALIVE[1].fetch_sub(count, Ordering::Relaxed);
+    ALIVE[2].fetch_sub(bytes, Ordering::Relaxed);
+    ALIVE[3].fetch_sub(count, Ordering::Relaxed);
+    ALIVE[4].fetch_sub(bytes, Ordering::Relaxed);
+    drop(freed);
+    bytes
+}
+
+/// What `make` gives, and when it failed for want of memory (`E_OUTOFMEMORY`)
+/// what it gives once more after `free` gave memory back; with the bytes
+/// `free` gave back (0: not asked again).
+fn make_or_free_and_retry<T>(
+    make: impl Fn() -> windows::core::Result<T>,
+    free: impl FnOnce() -> u64,
+) -> (windows::core::Result<T>, u64) {
+    match make() {
+        Err(e) if e.code() == windows::Win32::Foundation::E_OUTOFMEMORY => match free() {
+            0 => (Err(e), 0),
+            freed => (make(), freed),
+        },
+        made => (made, 0),
+    }
+}
+
+/// Upload buffers made on the second try ([`make_or_free_and_retry`]).
+static UPLOAD_RETRIED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Copy sources of [`HostList::upload`] no list holds: upload buffers,
 /// then shared buffers, by size class.
 static UPLOAD_SPARE: [Mutex<Spare<Chunk>>; 2] = [const { Mutex::new(Spare::new()) }; 2];
@@ -4655,6 +4695,10 @@ struct Sent {
     texture_back_ranges: Vec<(usize, usize)>,
     /// Its bottom-of-pipe writes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
+    /// Submission-owned bytes restored into one-sided host copies before the
+    /// lists ([`Host::pc_before`]), and the prelude list that copied them,
+    /// kept until the flight has run.
+    pc_sends: Option<(Option<Prelude>, send::Memory)>,
 }
 
 /// A submission on the card that has not been waited for ([`late`]): its
@@ -4671,6 +4715,7 @@ struct Flight {
     /// The list of ours that ran ahead of them ([`card_steps`]).
     own: Option<card_steps::Taken>,
     texture_back_ranges: Vec<(usize, usize)>,
+    pc_sends: Option<(Option<Prelude>, send::Memory)>,
 }
 
 /// One thing in the line of what waits for the card, in order.
@@ -7344,6 +7389,47 @@ impl Host {
             .is_some_and(|work| u64::from(work.taken) * 8 > work.differs.2)
     }
 
+    /// One-sided host copies this submission's CPU buffer copies wrote: take
+    /// their bytes into submission-owned upload memory and copy them onto the
+    /// GPU-visible mapping before the lists run. Later prepares may overwrite
+    /// that mapping; the owned buffer keeps this submission's value.
+    fn pc_before(&self) -> Option<(Option<Prelude>, send::Memory)> {
+        let dirty = crate::shadow::pc_copied();
+        if dirty.is_empty() || !send::own() {
+            return None;
+        }
+        let own = send::take_copies(self, &dirty)?;
+        let Some(sync) = self.make_prelude() else {
+            // Keep the snapshot anyway: without a list the mapping already
+            // holds these bytes for a submission that runs alone.
+            return Some((None, own.memory()));
+        };
+        let (allocator, list) = &sync;
+        // SAFETY: a fresh prelude list; live buffers and ranges inside them.
+        // The list and owned memory are kept until the flight lands.
+        let recorded = unsafe {
+            (|| -> windows::core::Result<()> {
+                allocator.Reset()?;
+                list.Reset(allocator, None)?;
+                own.record(self, list, &dirty, |_| false, None);
+                list.Close()?;
+                self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
+                Ok(())
+            })()
+        };
+        if let Err(e) = recorded {
+            fail(format_args!("one-sided host copies could not be restored for this submission ({e})"));
+        }
+        Some((Some(sync), own.memory()))
+    }
+
+    /// Gives back what [`Host::pc_before`] held for a finished submission.
+    fn pc_done(&self, pc: (Option<Prelude>, send::Memory)) {
+        let (prelude, memory) = pc;
+        send::give_back(memory);
+        drop(prelude);
+    }
+
     /// The plan's submission has run and its results were read
     /// ([`Host::card_back`]): its lists are free for the next plan. Called
     /// when nothing of ours is on the card, so the compare's results start
@@ -8059,6 +8145,9 @@ impl Host {
                     if let Some(card) = flight.card {
                         self.card_done(card);
                     }
+                    if let Some(pc) = flight.pc_sends {
+                        self.pc_done(pc);
+                    }
                     if let Some(own) = flight.own {
                         own.landed();
                     }
@@ -8399,6 +8488,7 @@ impl Host {
                 back: sent.back,
                 own: sent.own,
                 texture_back_ranges: sent.texture_back_ranges,
+                pc_sends: sent.pc_sends,
             }));
             items.extend(sent.writes.into_iter().map(|(at, what, bytes)| Late::Write(at, what, bytes)));
             *flying >= limit
@@ -8456,6 +8546,7 @@ impl Host {
                 back: sent.back,
                 own: sent.own,
                 texture_back_ranges: sent.texture_back_ranges,
+                pc_sends: sent.pc_sends,
             }));
             items.extend(sent.writes.into_iter().map(|(at, what, bytes)| Late::Write(at, what, bytes)));
         }
@@ -8597,6 +8688,9 @@ impl Host {
                         }
                         if let Some(card) = flight.card {
                             self.card_done(card);
+                        }
+                        if let Some(pc) = flight.pc_sends {
+                            self.pc_done(pc);
                         }
                         let mut lists = flight.lists;
                         for detached in &lists {
@@ -8970,6 +9064,10 @@ impl Host {
         let card = self.card_before(&declared, &picked, flown);
         // (Before anything writes the copies again.)
         snapped(&mut snapping);
+        // One-sided host copies written by this submission's CPU buffer
+        // copies: restore their bytes from a submission-owned snapshot so a
+        // later prepare cannot overwrite what this one's GPU reads still use.
+        let pc_sends = self.pc_before();
         // The sends are taken: from here on the references hold what the
         // copies in the lists put.
         for (shadow, at, bytes) in batch.placed.drain(..) {
@@ -9076,6 +9174,7 @@ impl Host {
                 own,
                 texture_back_ranges,
                 writes,
+                pc_sends,
             };
             batch.give_back();
             working(was_working);
@@ -9210,6 +9309,9 @@ impl Host {
         hand_back(&back);
         if let Some(card) = card {
             self.card_done(card);
+        }
+        if let Some(pc) = pc_sends {
+            self.pc_done(pc);
         }
         #[cfg(feature = "diagnostics")]
         if !back.is_empty() {
@@ -13009,9 +13111,40 @@ impl Host {
         Ok(buffer)
     }
 
+    /// A committed upload buffer of `size` bytes, mapped.
+    ///
+    /// Refused for want of memory (`0x8007000E`), it is asked again once
+    /// after the spare scratch chunks no list holds are freed: they are upload
+    /// buffers too, in the same budget, the PC's memory the card may use. That
+    /// budget can run out while the PC itself still has memory free, and then
+    /// nothing else frees them. With 15.7 GB of RAM, 368 buffers of 256 KiB
+    /// were refused in 4 s at world load and the run ended there (#944).
     pub(crate) fn upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         MADE[0].fetch_add(1, Ordering::Relaxed);
         MADE[1].fetch_add(size, Ordering::Relaxed);
+        let (made, freed) = make_or_free_and_retry(|| self.make_upload_buffer(size), trim_spare_chunks);
+        if freed > 0 && made.is_ok() {
+            let times = UPLOAD_RETRIED.fetch_add(1, Ordering::Relaxed) + 1;
+            if times.is_power_of_two() {
+                tracing::warn!(
+                    size,
+                    freed_mb = freed >> 20,
+                    times,
+                    "an upload buffer refused for want of memory (0x8007000E) was made once the spare scratch chunks were freed"
+                );
+            }
+        }
+        match made {
+            Ok(made) => Some(made),
+            Err(e) => {
+                tracing::warn!(error = %e, size, "no upload buffer");
+                None
+            }
+        }
+    }
+
+    /// [`Host::upload_buffer`]'s one try.
+    fn make_upload_buffer(&self, size: u64) -> windows::core::Result<(ID3D12Resource, *mut u8)> {
         let heap = D3D12_HEAP_PROPERTIES {
             Type: D3D12_HEAP_TYPE_UPLOAD,
             ..Default::default()
@@ -13054,13 +13187,8 @@ impl Host {
         {
             crate::book::made(b, || "an upload buffer".into());
         }
-        match made {
-            Ok(()) => Some((buffer?, data.cast())),
-            Err(e) => {
-                tracing::warn!(error = %e, size, "no upload buffer");
-                None
-            }
-        }
+        made?;
+        Ok((buffer.ok_or_else(windows::core::Error::empty)?, data.cast()))
     }
 }
 
@@ -14803,7 +14931,47 @@ mod trail {
 
 #[cfg(test)]
 mod spare {
-    use super::Spare;
+    use super::{Spare, make_or_free_and_retry};
+
+    /// Refused for want of memory, a buffer is asked again once memory was
+    /// given back; not when none was, nor after another refusal (#944).
+    #[test]
+    fn an_out_of_memory_refusal_is_tried_again_once_memory_is_given_back() {
+        use std::cell::Cell;
+        use windows::Win32::Foundation::{E_INVALIDARG, E_OUTOFMEMORY};
+        use windows::core::{Error, HRESULT};
+        let tries = Cell::new(0);
+        // Refused, then made once 4 MiB went.
+        let refused_once = || {
+            tries.set(tries.get() + 1);
+            if tries.get() == 1 { Err(Error::from_hresult(E_OUTOFMEMORY)) } else { Ok(7) }
+        };
+        let (made, freed) = make_or_free_and_retry(refused_once, || 4 << 20);
+        assert_eq!((made.ok(), freed, tries.get()), (Some(7), 4 << 20, 2));
+        // Refused, with nothing to give back: tried once.
+        let refused = |code: HRESULT| {
+            tries.set(tries.get() + 1);
+            Err::<u32, _>(Error::from_hresult(code))
+        };
+        tries.set(0);
+        let (made, freed) = make_or_free_and_retry(|| refused(E_OUTOFMEMORY), || 0);
+        assert_eq!((made.map_err(|e| e.code()), freed, tries.get()), (Err(E_OUTOFMEMORY), 0, 1));
+        // Another refusal: nothing is freed for it, and it is tried once.
+        let asked_to_free = Cell::new(false);
+        tries.set(0);
+        let (made, freed) = make_or_free_and_retry(
+            || refused(E_INVALIDARG),
+            || {
+                asked_to_free.set(true);
+                1
+            },
+        );
+        assert_eq!((made.map_err(|e| e.code()), freed, tries.get()), (Err(E_INVALIDARG), 0, 1));
+        assert!(!asked_to_free.get());
+        // Made at once: nothing freed.
+        let (made, freed) = make_or_free_and_retry(|| Ok(3), || unreachable!("nothing to free for"));
+        assert_eq!((made.ok(), freed), (Some(3), 0));
+    }
 
     /// Kept things come back by size, the last given first, and nothing is
     /// kept past the limit.
