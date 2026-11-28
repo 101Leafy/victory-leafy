@@ -982,6 +982,13 @@ fn compute_first() -> bool {
 /// first (run 139: about 120 of them ahead of CS_DepthCopy).
 fn compute_ahead(list: &mut VecDeque<Arc<Pending>>, compute_free: bool, one_past: bool) -> Option<Arc<Pending>> {
     if compute_free {
+        // Under COMPUTE_AHEAD the places are few, and a cold run has no
+        // slow list to put the long resolves last: they wait for the
+        // places graphics leave.
+        if compute_ahead_places().is_some() {
+            let at = (0..list.len()).filter(|&i| !list[i].long).min_by_key(|&i| super::library::slow_ms(&list[i].key))?;
+            return list.remove(at);
+        }
         return quickest(list);
     }
     if !one_past {
