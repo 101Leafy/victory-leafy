@@ -1539,6 +1539,7 @@ fn drained() {
             "host pipelines all made"
         );
     }
+    super::refused::summary(false);
     super::library::save(false);
 }
 
