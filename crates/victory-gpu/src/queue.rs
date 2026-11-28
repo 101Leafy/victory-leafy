@@ -1125,7 +1125,7 @@ extern "system" fn present(
             None
         };
         let resource = texture.as_ref().map_or(0, |t| t.0);
-        let overlay = (crate::compose::on() && planes > 1 && !plane_parameters.is_null())
+        let overlay = (crate::compose::passed() && planes > 1 && !plane_parameters.is_null())
             .then(|| second_plane(plane_parameters))
             .flatten()
             .filter(|&over| over as usize != resource)
@@ -1157,7 +1157,7 @@ extern "system" fn present(
         const COPY_SOURCE: u32 = 0x800;
         let state = crate::resource::host_transition(resource, COPY_SOURCE)
             .map_or(COPY_SOURCE, |(_, before)| before);
-        let overlay = (crate::compose::on() && planes > 1)
+        let overlay = (crate::compose::passed() && planes > 1)
             .then(|| second_plane(plane_parameters))
             .flatten()
             .filter(|&over| over != resource)

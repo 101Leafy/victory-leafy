@@ -13237,7 +13237,8 @@ impl Host {
         static NO_COMPOSER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };
-        let planes = overlay.filter(|_| !NO_COMPOSER.load(Ordering::Relaxed)).and_then(|(over, over_state)| {
+        // (Handed over only to be saved, with `VICTORY_TWO_PLANES=0`: not shown.)
+        let planes = overlay.filter(|_| crate::compose::on() && !NO_COMPOSER.load(Ordering::Relaxed)).and_then(|(over, over_state)| {
             // SAFETY: a live resource.
             let over_desc = unsafe { over.GetDesc() };
             Some((
@@ -13392,16 +13393,29 @@ impl Host {
             // (A frame put together is read from the back buffer.)
             let shape = (width, height, format);
             p.overlay.record(self, list, &back, shape, p.hwnd, D3D12_RESOURCE_STATE_COPY_DEST, overlay_shown);
+            // The picture shown is read from the back buffer, put together
+            // or copied; `VICTORY_CAPTURE_PLANE` reads one plane instead.
             #[cfg(feature = "diagnostics")]
             let capture = crate::capture::wanted(frame)
                 .then(|| {
-                    if !composed {
-                        return crate::capture::read_back(&self.device, list, texture);
+                    let at = if composed { state } else { D3D12_RESOURCE_STATE_COPY_SOURCE };
+                    let (read, at): (&ID3D12Resource, _) = match crate::capture::plane() {
+                        Some(crate::capture::Plane::Scene) => (texture, at),
+                        Some(crate::capture::Plane::Interface) => {
+                            let (over, over_state) = overlay?;
+                            (over, D3D12_RESOURCE_STATES(over_state as i32))
+                        }
+                        None => (&back, D3D12_RESOURCE_STATE_COPY_DEST),
+                    };
+                    let moved = at != D3D12_RESOURCE_STATE_COPY_SOURCE;
+                    if moved {
+                        list.ResourceBarrier(&[transition(read, at, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
                     }
-                    list.ResourceBarrier(&[transition(&back, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
-                    let read = crate::capture::read_back(&self.device, list, &back);
-                    list.ResourceBarrier(&[transition(&back, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST)]);
-                    read
+                    let taken = crate::capture::read_back(&self.device, list, read);
+                    if moved {
+                        list.ResourceBarrier(&[transition(read, D3D12_RESOURCE_STATE_COPY_SOURCE, at)]);
+                    }
+                    taken
                 })
                 .flatten();
             #[cfg(feature = "diagnostics")]

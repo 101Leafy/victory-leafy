@@ -172,6 +172,26 @@ pub(crate) fn frame_drew(frame: u64, drawn: u64) {
     }
 }
 
+/// A plane saved instead of the picture shown (`VICTORY_CAPTURE_PLANE`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Plane {
+    /// The title's first plane, the scene (`scene`).
+    Scene,
+    /// Its second plane, the interface (`interface`), at its own size.
+    Interface,
+}
+
+/// The plane `VICTORY_CAPTURE_PLANE` names; unset: the picture shown, the
+/// planes put together or the first alone.
+pub(crate) fn plane() -> Option<Plane> {
+    static PLANE: std::sync::OnceLock<Option<Plane>> = std::sync::OnceLock::new();
+    *PLANE.get_or_init(|| match std::env::var("VICTORY_CAPTURE_PLANE").as_deref().map(str::trim) {
+        Ok("scene") => Some(Plane::Scene),
+        Ok("interface") => Some(Plane::Interface),
+        _ => None,
+    })
+}
+
 /// Whether frame `n` is saved.
 pub(crate) fn wanted(n: u64) -> bool {
     // Before the world, with `VICTORY_CAPTURE_WORLD`: every 16th frame too

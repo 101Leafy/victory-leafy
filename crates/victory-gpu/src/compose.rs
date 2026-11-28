@@ -19,6 +19,16 @@ pub(crate) fn on() -> bool {
     *ON.get_or_init(|| !std::env::var("VICTORY_TWO_PLANES").is_ok_and(|v| v.trim() == "0"))
 }
 
+/// Whether a present's second plane is handed to the host: shown, or saved
+/// on its own (`VICTORY_CAPTURE_PLANE=interface`).
+pub(crate) fn passed() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if crate::capture::plane() == Some(crate::capture::Plane::Interface) {
+        return true;
+    }
+    on()
+}
+
 const SOURCE: &str = r#"
 #define RS "DescriptorTable(SRV(t0, numDescriptors=2), visibility=SHADER_VISIBILITY_PIXEL), StaticSampler(s0, filter=FILTER_MIN_MAG_MIP_LINEAR, addressU=TEXTURE_ADDRESS_CLAMP, addressV=TEXTURE_ADDRESS_CLAMP)"
 Texture2D<float4> scene : register(t0);
