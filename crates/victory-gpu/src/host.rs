@@ -10698,7 +10698,7 @@ impl HostList {
     #[cfg(test)]
     pub(crate) fn run_steps(&self) {
         let mut batch = Batch::default();
-        self.run_deferred(&mut batch, &[], |_| false);
+        self.run_deferred(&mut batch, &[], 0, |_| false);
         batch.fill();
         batch.flush();
     }
