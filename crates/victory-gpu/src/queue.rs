@@ -468,6 +468,15 @@ pub(crate) fn release_held(all: bool) {
     }
 }
 
+/// What a present does with what queues still hold ([`forces`]), for a
+/// thread of the title's that blocks on a fence and so cannot present.
+#[cfg(windows)]
+pub(crate) fn release_forced() {
+    if !behind::on() {
+        release_held(forces());
+    }
+}
+
 /// Before a submission of ours that is waited for, or a wait for flights by
 /// a thread of the title's: what the title gave its queues before goes to the
 /// card first ([`behind`]).
@@ -969,6 +978,8 @@ impl Written {
             }
         }
         crate::watch::told(&[(at as usize, bytes)]);
+        // A fence's value: the events waiting for it are set.
+        crate::fence::written(at as usize, bytes);
     }
 }
 
