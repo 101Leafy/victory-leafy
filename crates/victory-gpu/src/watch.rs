@@ -819,8 +819,14 @@ fn kernel_written(first: usize, last: usize) -> Option<Vec<(usize, u16)>> {
 /// as long as the memory stays as it is mapped, and the title maps and
 /// unmaps its views between frames, not in the middle of one; a range the
 /// title made write-watched in the frame is then guarded, or copied whole,
-/// until the next frame asks again.
+/// until the next frame asks again. Not in the tests: their frame never
+/// ends, and one test's freed memory is another's write-watched memory at
+/// the same address (`written_pages_are_reported_to_every_asker` refused in
+/// about one run in four).
 fn refused_once() -> bool {
+    if cfg!(test) {
+        return false;
+    }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_REFUSED_ONCE").is_none_or(|v| v != "0"))
 }

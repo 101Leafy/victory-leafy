@@ -1934,6 +1934,9 @@ impl State {
             return false;
         }
         let Some(p) = crate::pipeline::host_pipeline_for(self.pipeline as This, &self.target_formats) else {
+            if self.pipeline == 0 {
+                once!("a draw with no pipeline set is dropped");
+            }
             return false;
         };
         if p.compute || p.mesh != mesh {
@@ -1980,6 +1983,10 @@ impl State {
         if indexed {
             let v = self.index;
             let Some(shadow) = crate::shadow::find_any(v.address, u64::from(v.size)) else {
+                once!(
+                    address = format_args!("{:#x}", v.address),
+                    "an indexed draw whose index buffer has no host copy is dropped"
+                );
                 return refuse(Refused::NoIndex);
             };
             shadow.refresh(list, v.address, u64::from(v.size));
@@ -2441,6 +2448,7 @@ impl State {
             None => {
                 let shadow = address.and_then(|a| find(a).map(|s| (a, s)));
                 let Some(index) = dynamic_slots(key.0, host, 1) else {
+                    once!("a root UAV found no free dynamic view slot: the draw is dropped");
                     return false;
                 };
                 self.dynamic.push((key.0, host.id(), index, 1));
@@ -2512,6 +2520,7 @@ impl State {
             None => {
                 let shadow = address.and_then(|a| crate::shadow::find(a, 1).map(|s| (a, s)));
                 let Some(index) = dynamic_slots(key.0, host, 1) else {
+                    once!("a root SRV found no free dynamic view slot: the draw is dropped");
                     return false;
                 };
                 self.dynamic.push((key.0, host.id(), index, 1));
@@ -3871,6 +3880,8 @@ impl State {
         }
         if !self.bind(list, p, true) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            crate::pipeline::note_drop(self.pipeline as This);
             // A stage of the structure builder that cannot be bound is a
             // dropped stage: the others stop too.
             if crate::pipeline::is_builder(self.pipeline as This) {
