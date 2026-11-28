@@ -3432,16 +3432,18 @@ mod tests {
         void(queue, 0x40);
     }
 
-    /// A file released with reads enqueued is closed once they are dropped:
-    /// by the queue's `Close`, by its last `Release`, or at once on a queue
-    /// already closed.
+    /// A file released with reads enqueued is closed once they are done:
+    /// the queue's `Close` and its last `Release` both finish what was
+    /// enqueued, and a queue already closed drops a new read at once.
     #[test]
     fn a_file_whose_enqueued_reads_are_dropped_is_closed() {
-        let (dir, file) = file_with(&pattern(64));
+        let data = pattern(64);
+        let (dir, file) = file_with(&data);
         let path = dir.path().join("data.bin");
         let mut out = [0u8; 16];
         let mut file = file;
         for end in [0x40, 0x10] {
+            out = [0; 16];
             let (queue, array) = (new_queue(0), status_array(1));
             enqueue(queue, &request(0, out.as_mut_ptr().cast(), 16, file, 0, 16));
             enqueue_status(queue, array, 0);
@@ -3452,10 +3454,12 @@ mod tests {
             } else {
                 assert_eq!(release_object(queue), 0);
             }
-            assert!(!held_open(&path), "still open after its read was dropped ({end:#x})");
-            assert_eq!(result(array, 0), E_PENDING);
+            assert_eq!(result(array, 0), S_OK);
+            assert_eq!(out, data[..16]);
+            assert!(!held_open(&path), "still open after its read was done ({end:#x})");
             file = open(&path);
         }
+        out = [0; 16];
         let queue = new_queue(0);
         void(queue, 0x40);
         enqueue(queue, &request(0, out.as_mut_ptr().cast(), 16, file, 0, 16));
