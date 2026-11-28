@@ -915,6 +915,21 @@ fn in_block(resource: &ID3D12Resource) -> bool {
     unsafe { resource.GetPrivateData(&KEY, &mut size, None) }.is_ok() && size > 0
 }
 
+/// Whether `texture` was placed inside a pool block (so D3D12 aliasing
+/// barriers are legal on it; committed fallback textures > `TEXTURE_BLOCK`
+/// must not receive aliasing barriers or `Close()` fails with `E_INVALIDARG`).
+pub(crate) fn is_pooled(texture: &ID3D12Resource) -> bool {
+    if !on() {
+        return false;
+    }
+    let mut size = 0u32;
+    // SAFETY: querying presence with `None` writes only `size` and does not AddRef.
+    unsafe { texture.GetPrivateData(&KEY, &mut size, None).is_ok() }
+}
+
+/// Makes `texture` give `piece` back when the last reference to it goes.
+fn give_back_with(texture: &ID3D12Resource, piece: Piece, small: u64) {
+    let made = Box::into_raw(Box::new(Reclaim { methods: &RECLAIM.0, references: AtomicU32::new(1), piece, small }));
 /// Makes `texture` give `piece` back to [`TEXTURES`] when the last
 /// reference to it goes.
 fn give_back_with(texture: &ID3D12Resource, piece: Piece, small: u64) {
@@ -929,7 +944,7 @@ fn give_back_to(texture: &ID3D12Resource, piece: Piece, small: u64, to: &'static
     // drops at the end; the texture takes its own.
     unsafe {
         let object = IUnknown::from_raw(made.cast());
-        if texture.SetPrivateDataInterface(&KEY, &object).is_err() {
+        if texture.SetPrivateDataInterface(&RECLAIM_KEY, &object).is_err() {
             // Never given back: the piece stays taken, nothing is reused
             // under a texture that may be alive.
             std::mem::forget(object);
