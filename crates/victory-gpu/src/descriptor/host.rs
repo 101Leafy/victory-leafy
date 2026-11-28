@@ -1183,20 +1183,35 @@ fn stale_rule() -> Rule {
 /// locks held: this locks one mutex of its own and calls nothing but
 /// [`record_range`].
 pub(crate) fn remapped(at: usize, len: usize) {
+    remapped_ranges([(at, len)]);
+}
+
+/// Notes ranges in order while holding the texture invalidation queue once.
+pub(crate) fn remapped_ranges(spans: impl IntoIterator<Item = (usize, usize)>) {
     use std::sync::atomic::Ordering::Relaxed;
     /// Ranges kept until a pass takes them. (A world's first minutes note
     /// tens of thousands between two passes: 131,072 were dropped in one run
     /// at the 32,768 there were.)
     const MOST: usize = 1 << 18;
-    let (start, end) = (at as u64, at.saturating_add(len) as u64);
-    if end <= SPANNED[0].load(Relaxed) || start >= SPANNED[1].load(Relaxed) {
+    let mut live = spans
+        .into_iter()
+        .filter(|&(at, len)| {
+            let (start, end) = (at as u64, at.saturating_add(len) as u64);
+            end > SPANNED[0].load(Relaxed) && start < SPANNED[1].load(Relaxed)
+        })
+        .peekable();
+    if live.peek().is_none() {
         return;
     }
-    #[cfg(feature = "diagnostics")]
-    crate::texture::audit::told(at, len, 1);
     let mut ranges = REMAPPED.lock().unwrap_or_else(|e| e.into_inner());
-    STALE[1].fetch_add(1, Relaxed);
-    let joined = record_range(&mut ranges, start, end, MOST);
+    let (mut noted, mut joined) = (0, 0);
+    for (at, len) in live {
+        #[cfg(feature = "diagnostics")]
+        crate::texture::audit::told(at, len, 1);
+        noted += 1;
+        joined += record_range(&mut ranges, at as u64, at.saturating_add(len) as u64, MOST);
+    }
+    STALE[1].fetch_add(noted, Relaxed);
     if joined > 0 {
         STALE[2].fetch_add(joined, Relaxed);
     }
@@ -7210,8 +7225,7 @@ mod tests {
         heap.texture_slot_done(1, write, None);
         assert_eq!(slots(u64::MAX), []);
         // Memory elsewhere: nothing. Under the texture: due from the next frame.
-        remapped((at + 2 * len) as usize, 0x1000);
-        remapped(at as usize, 0x1000);
+        remapped_ranges([((at + 2 * len) as usize, 0x1000), (at as usize, 0x1000)]);
         assert_eq!(heap.texture_slots_remapped(50), 1);
         assert_eq!(slots(50), []);
         assert_eq!(slots(51), [1]);
