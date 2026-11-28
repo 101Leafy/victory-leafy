@@ -1711,6 +1711,15 @@ fn lds_bounds_exempt() -> bool {
     })
 }
 
+/// Mesh programs take every LDS dword as inside, as before the bounds; `VICTORY_LDS_MESH_FREE=0`
+/// holds them to their header's size too. The console gives the group more than that size (the
+/// vertex and primitive rings come after it), so the outputs they pass through there read 0 and
+/// peds stood in their bind pose.
+fn lds_mesh_free() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LDS_MESH_FREE").is_none_or(|v| v != "0"))
+}
+
 /// Whether accumulator initialisations are also stored at the start of the program
 /// ([`lds_init_hoists`]); `VICTORY_LDS_INIT_HOIST=0` turns it off.
 fn lds_init_hoist_on() -> bool {
@@ -2000,9 +2009,12 @@ fn own_bits_on() -> bool {
 /// wave, the view heap's limit, where the raw twins of its views start, and
 /// what it writes for the console's own hardware.
 pub fn host_settings() -> [u32; 4] {
-    // (bit 31 of the last: `VICTORY_COLOR_FINITE`, bit 30: helper lane waves, so the key is
-    // the same while they are off)
-    let rdna = host_rdna() | u32::from(color_finite_on()) << 31 | u32::from(super::helper_lane_waves()) << 30;
+    // (bit 31 of the last: `VICTORY_COLOR_FINITE`, bit 30: helper lane waves, bit 29:
+    // `VICTORY_LDS_MESH_FREE=0`, so the key is the same while they are off)
+    let rdna = host_rdna()
+        | u32::from(color_finite_on()) << 31
+        | u32::from(super::helper_lane_waves()) << 30
+        | u32::from(!lds_mesh_free()) << 29;
     [host_max_wave(), super::shader::view_heap_limit(), super::shader::raw_views(), rdna]
 }
 
@@ -7313,9 +7325,10 @@ impl<'a> Lower<'a> {
         // with whether it lies inside the program's LDS (not the dwords added
         // after it here): out-of-bounds console accesses read 0 and drop
         // writes, and the host index is clamped so it never leaves the
-        // group-shared array. The face programs ([`lds_bounds_exempt`]) take every
+        // group-shared array. The face programs ([`lds_bounds_exempt`]) and mesh
+        // programs ([`lds_mesh_free`]) take every
         // dword as inside.
-        let limit = if lds_bounds_exempt() {
+        let limit = if lds_bounds_exempt() || self.s.mesh.is_some() && lds_mesh_free() {
             u32::MAX
         } else {
             CLAMPED.set(CLAMPED.get() + 1);
