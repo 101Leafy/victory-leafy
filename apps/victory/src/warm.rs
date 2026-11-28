@@ -29,6 +29,29 @@ fn folder() -> Result<PathBuf> {
     Ok(cfg.cache_subdir("shaders")?.with_file_name("pipelines"))
 }
 
+/// The keys `warm-bad.txt` (`text`) holds against `fingerprint`: a pipeline
+/// that ended a process stays out until the translator or the driver
+/// changes, then it is tried again. Lines are `<key> fp=<fingerprint> <why>`
+/// (the key first, as the older readers of the journal take it),
+/// `<fingerprint> <key>` from builds that put it first, or `<key> <why>`
+/// without one from builds before: those stay out whatever the fingerprint.
+/// From TaynanGT's Vice-Tay#316, adapting BlueCatsz's Belobug#294.
+fn bad_keys<'a>(text: &'a str, fingerprint: &str) -> HashSet<&'a str> {
+    let hex = |word: &str, len| word.len() == len && word.bytes().all(|b| b.is_ascii_hexdigit());
+    text.lines()
+        .filter_map(|line| {
+            let mut words = line.split_whitespace();
+            let first = words.next()?;
+            let second = words.next();
+            let (key, recorded) = match second {
+                Some(key) if hex(first, 16) && hex(key, 32) => (key, Some(first)),
+                _ => (first, second.and_then(|word| word.strip_prefix("fp=")).filter(|fp| hex(fp, 16))),
+            };
+            (hex(key, 32) && recorded.is_none_or(|fp| fp.eq_ignore_ascii_case(fingerprint))).then_some(key)
+        })
+        .collect()
+}
+
 pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, these: Option<String>) -> Result<()> {
     let dir = folder()?;
     if let Some(these) = these {
@@ -52,8 +75,13 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
             done.insert(key);
         }
     }
-    let bad = std::fs::read_to_string(&bad_file).unwrap_or_default();
-    let bad: HashSet<&str> = bad.lines().filter_map(|l| l.split(' ').next()).collect();
+    // `--again` and `VICTORY_WARM_BAD=0`: those that ended a process are tried again too.
+    let listed_bad = if again || std::env::var_os("VICTORY_WARM_BAD").is_some_and(|v| v == "0") {
+        String::new()
+    } else {
+        std::fs::read_to_string(&bad_file).unwrap_or_default()
+    };
+    let bad = bad_keys(&listed_bad, &fingerprint);
     let early = std::fs::read_to_string(dir.join("early-pipelines.txt")).unwrap_or_default();
     let early: HashSet<&str> = early.lines().collect();
     // Those earlier runs drew with first, the others in no order (by key).
@@ -125,7 +153,7 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
                                     }
                                     WorkerStop::Failed(why) => {
                                         println!("pipeline {n} {}: {why}", keys[n]);
-                                        let _ = writeln!(lock(&bad_out), "{} {why}", keys[n]);
+                                        let _ = writeln!(lock(&bad_out), "{} fp={fingerprint} {why}", keys[n]);
                                         lock(&state).2 += 1;
                                     }
                                 }
@@ -286,4 +314,27 @@ fn make(dir: &Path, these: &str) -> Result<()> {
         std::process::exit(if published { BOOK_ERROR } else { 1 });
     }
     std::process::exit(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A pipeline that ended a process stays out under the fingerprint it did
+    /// so under, and is tried again under another; lines without one stay out
+    /// whatever the fingerprint, and those with the fingerprint first are read.
+    #[test]
+    fn the_quarantine_follows_the_fingerprint_and_keeps_older_lines() {
+        let [current, stale, legacy, first] = ['1', '2', '3', '4'].map(|c| c.to_string().repeat(32));
+        let fp = "1234567890abcdef";
+        let other = "ffffffffffffffff";
+        let listed = format!(
+            "# not a key\n\n{current} fp={fp} timed out\n{stale} fp={other} ended the process\n{legacy} timed out\n{fp} {first}\n"
+        );
+        assert_eq!(bad_keys(&listed, fp), HashSet::from([current.as_str(), legacy.as_str(), first.as_str()]));
+        assert_eq!(bad_keys(&listed, other), HashSet::from([stale.as_str(), legacy.as_str()]));
+        // A fingerprint is compared without case; a word that is not one is a reason.
+        assert!(bad_keys(&format!("{current} fp=1234567890ABCDEF x"), fp).contains(current.as_str()));
+        assert!(bad_keys(&format!("{current} fp=nothex x"), other).contains(current.as_str()));
+    }
 }
