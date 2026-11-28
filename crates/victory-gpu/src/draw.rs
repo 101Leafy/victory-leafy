@@ -1689,6 +1689,34 @@ impl State {
         crate::draw::depth_bounds(list, min, max);
     }
 
+    /// A pass of ours was recorded into the title's list
+    /// (`HostList::planes_now`): it set a heap, a graphics root signature, a
+    /// pipeline, a depth target, a viewport, a scissor and the topology.
+    /// The title's targets, viewports, scissors and topology are set again
+    /// here; heaps, root signatures and pipeline by the next `bind`. The
+    /// tables stay (they are in this host list), and the pass leaves the
+    /// blend factor, stencil reference and depth bounds alone.
+    fn after_our_pass(&mut self, list: &HostList) {
+        self.host_pipeline = 0;
+        self.host_roots = [0; 2];
+        self.host_heaps = [0; 2];
+        self.host_heaps_set = false;
+        if self.topology_set {
+            self.set_topology(list, self.topology);
+        }
+        self.host_targets = None;
+        if self.targets_set {
+            self.bind_targets(list);
+        }
+        if !self.viewports.is_empty() {
+            crate::draw::viewports(list, &self.viewports);
+        }
+        if !self.scissors.is_empty() {
+            let rects = std::mem::take(&mut self.scissors);
+            self.set_scissors(list, &rects);
+        }
+    }
+
     /// `list` is a new host list that continues the title's list (it was
     /// cut at a wait for a memory value, `crate::list::cut`): a new host
     /// list has nothing set, so what the title set so far is set again.
@@ -2017,6 +2045,11 @@ impl State {
     /// False if the draw or dispatch must not run: a root SRV it reads
     /// could not be given a view.
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+        // Depth planes this list's shaders wrote (the material classes),
+        // drawn into their planes before anything of the title's is set.
+        if list.planes_now() {
+            self.after_our_pass(list);
+        }
         let l = &list.list;
         #[cfg(feature = "diagnostics")]
         let began = std::time::Instant::now();
