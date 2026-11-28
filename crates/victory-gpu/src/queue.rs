@@ -701,6 +701,7 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
     if let Some(host) = crate::host::host() {
         // SAFETY: the title passes `count` lists.
         let lists = unsafe { std::slice::from_raw_parts(lists, count as usize) };
+        crate::list::check_put(lists, "ExecuteCommandLists");
         if behind::on() && !this.is_null() {
             behind::submit(this, lists);
             return;
