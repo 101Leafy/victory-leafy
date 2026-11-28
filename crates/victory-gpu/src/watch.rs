@@ -532,9 +532,11 @@ pub(crate) fn lock_waits(frames: f64) -> String {
     let per = |v: u64| v as f64 / frames;
     let each = |v: u64| if h[0] > 0 { v as f64 / h[0] as f64 } else { 0.0 };
     let w: [u64; 3] = std::array::from_fn(|i| REFRESH_HOLDS[i].swap(0, std::sync::atomic::Ordering::Relaxed));
+    let p: [u64; 15] = std::array::from_fn(|i| PHASES[i].swap(0, std::sync::atomic::Ordering::Relaxed));
+    let ms = |i: usize| p[i] as f64 / 1e6 / frames;
     let (long_ns, long_first, long_last) = std::mem::take(&mut *LONGEST.lock().unwrap_or_else(|e| e.into_inner()));
     format!(
-        "ranges held {}, journal read {}, journal noted in {}, guards {};          whole submissions waiting {:.1} for {:.2} ms (longest {:.2} ms), {:.1} ranges held as each began, {:.1} taken while each waited;          held longest: whole {:.2} ms, a range {:.2} ms ({} KiB at {:#x}); ranges held 10 ms or more {:.1}, all held {:.2} ms (VICTORY_ASK_ALL_FIRST={});          refreshes held {:.1} ranges, {:.1} of them sent to the guards, held there {:.2} ms",
+        "ranges held {}, journal read {}, journal noted in {}, guards {};          whole submissions waiting {:.1} for {:.2} ms (longest {:.2} ms), {:.1} ranges held as each began, {:.1} taken while each waited;          held longest: whole {:.2} ms, a range {:.2} ms ({} KiB at {:#x}); ranges held 10 ms or more {:.1}, all held {:.2} ms (VICTORY_ASK_ALL_FIRST={});          refreshes held {:.1} ranges, {:.1} of them sent to the guards, held there {:.2} ms;          inside whole holds: ahead spans {:.2} ms, split {:.2} ms, runs {:.2} ms, hot {:.2} ms, journal {:.2} ms ({:.0} pieces); rest take {:.2} ms, loop {:.2} ms (longest {:.2} ms), hot {:.2} ms, journal {:.2} ms; rest calls {:.1}, {:.0} ranges, {:.0} kept, {:.0} askings",
         of(0),
         of(1),
         of(2),
@@ -554,6 +556,21 @@ pub(crate) fn lock_waits(frames: f64) -> String {
         per(w[0]),
         per(w[1]),
         w[2] as f64 / 1e6 / frames,
+        ms(0),
+        ms(1),
+        ms(2),
+        ms(3),
+        ms(4),
+        per(p[13]),
+        ms(5),
+        ms(6),
+        p[14] as f64 / 1e6,
+        ms(7),
+        ms(8),
+        per(p[12]),
+        per(p[9]),
+        per(p[10]),
+        per(p[11]),
     )
 }
 
@@ -572,6 +589,38 @@ static LONGEST: Mutex<(u64, usize, usize)> = Mutex::new((0, 0, 0));
 /// at the guards with the range held.
 #[cfg(feature = "diagnostics")]
 static REFRESH_HOLDS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+/// Inside the whole-submission holds, per part, nanoseconds: [`ask_ahead`]'s
+/// reservations by spans (0), by split (1), its runs (2), `note_hot` (3), the
+/// journal (4); [`ask_rest`]'s taking the journal (5), its loop over the
+/// ranges (6), `note_hot` (7), the journal (8). Then counts: ranges
+/// `ask_rest` was given (9), ranges it held in the journal at the end (10),
+/// kernel askings it made (11), its calls (12), pieces `ask_ahead` had (13),
+/// and the longest loop of `ask_rest` in nanoseconds (14).
+#[cfg(feature = "diagnostics")]
+static PHASES: [std::sync::atomic::AtomicU64; 15] = [const { std::sync::atomic::AtomicU64::new(0) }; 15];
+
+#[cfg(feature = "diagnostics")]
+fn phase(i: usize, since: &mut std::time::Instant) {
+    let now = std::time::Instant::now();
+    let ns = (now - *since).as_nanos() as u64;
+    PHASES[i].fetch_add(ns, std::sync::atomic::Ordering::Relaxed);
+    if i == 6 {
+        PHASES[14].fetch_max(ns, std::sync::atomic::Ordering::Relaxed);
+    }
+    *since = now;
+}
+
+#[cfg(not(feature = "diagnostics"))]
+fn phase(_: usize, _: &mut std::time::Instant) {}
+
+#[cfg(feature = "diagnostics")]
+fn phase_count(i: usize, n: usize) {
+    PHASES[i].fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(not(feature = "diagnostics"))]
+fn phase_count(_: usize, _: usize) {}
+
 /// Ranges held so far, for "taken while each waited".
 #[cfg(feature = "diagnostics")]
 static TAKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -874,10 +923,14 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
         return;
     }
     let _all = Asking::hold_all();
+    let mut t = std::time::Instant::now();
+    phase_count(13, pieces.len());
     let spans = ask_spans::on();
     let bases = if spans { ask_spans::bases(&mut pieces) } else { Vec::new() };
+    phase(0, &mut t);
     let split = ask_split();
     let homes: Vec<usize> = if split { pieces.iter().map(|p| reservation(p.0)).collect() } else { Vec::new() };
+    phase(1, &mut t);
     let (mut asked, mut written) = (Vec::new(), Vec::new());
     let mut i = 0;
     while i < pieces.len() {
@@ -908,7 +961,9 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
         }
         i = k;
     }
+    phase(2, &mut t);
     note_hot(&written);
+    phase(3, &mut t);
     if port_journal() {
         // Renderer port #7: the pages noted shared, under their parts; then
         // the number and the ranges, alone (no shared holder with a lower
@@ -917,6 +972,7 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
         let mut j = journal_mut();
         j.ahead_asked = now;
         j.ahead = asked;
+        phase(4, &mut t);
         return;
     }
     let mut j = journal_mut();
@@ -926,6 +982,7 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
     for (page, parts) in written {
         j.notes.note(page, parts, now);
     }
+    phase(4, &mut t);
 }
 
 /// Renderer port #7: notes `written` (pages and their parts) as found by an
@@ -1239,10 +1296,14 @@ pub(crate) fn ask_more(ranges: &[(usize, usize)]) -> bool {
 /// asking stands.
 fn ask_rest(ranges: &[(usize, usize)]) {
     let _all = Asking::hold_all();
+    let mut t = std::time::Instant::now();
     let mut ahead = {
         let mut j = journal_mut();
         std::mem::take(&mut j.ahead)
     };
+    phase(5, &mut t);
+    phase_count(12, 1);
+    phase_count(9, ranges.len());
     // `ask_ahead` leaves a range that lies alone to `writes`, which asks
     // once per flush: with one asking for the submission that was every
     // such range asked again at each of its 70 flushes (run 76: 2,300
@@ -1254,14 +1315,18 @@ fn ask_rest(ranges: &[(usize, usize)]) {
             continue;
         }
         let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-        if !ahead.iter().any(|&(a, b)| a <= first && last <= b)
-            && let Some(pages) = kernel_written(first, last)
-        {
-            written.extend(pages);
-            ahead.push((first, last));
+        if !ahead.iter().any(|&(a, b)| a <= first && last <= b) {
+            phase_count(11, 1);
+            if let Some(pages) = kernel_written(first, last) {
+                written.extend(pages);
+                ahead.push((first, last));
+            }
         }
     }
+    phase(6, &mut t);
+    phase_count(10, ahead.len());
     note_hot(&written);
+    phase(7, &mut t);
     // A number of its own, and the one this asking stands under: between
     // the two parts another thread may have asked about a range of the
     // second, copied it, and the title written it since. Under the first
@@ -1273,6 +1338,8 @@ fn ask_rest(ranges: &[(usize, usize)]) {
         j.ahead_asked = now;
         j.kept = !ahead.is_empty();
         j.ahead = ahead;
+        drop(j);
+        phase(8, &mut t);
         return;
     }
     let mut j = journal_mut();
@@ -1283,6 +1350,8 @@ fn ask_rest(ranges: &[(usize, usize)]) {
     }
     j.kept = !ahead.is_empty();
     j.ahead = ahead;
+    drop(j);
+    phase(8, &mut t);
 }
 
 /// The submission's one asking stands no longer: its refreshes are done,
