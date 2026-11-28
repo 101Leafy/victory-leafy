@@ -1331,8 +1331,37 @@ mod host {
             }
             let mut state = XINPUT_STATE::default();
             // SAFETY: room for the state.
-            self.shim_slots[slot] = gameinput_shim()
+            let through_shim = gameinput_shim()
                 .is_some_and(|(get, _)| unsafe { get(slot as u32, &mut state) } == 0);
+            self.shim_slots[slot] = through_shim;
+            // `VICTORY_GAMEPAD_LOG=1`: say which path answered each slot, once per slot, so a pad
+            // that does not work can be told apart from a pad that is not there. GameInput's own
+            // XInput says 1167 for every slot when the system one does not see the pad at all.
+            if std::env::var_os("VICTORY_GAMEPAD_LOG").is_some_and(|v| v == "1") {
+                use std::sync::atomic::{AtomicU8, Ordering};
+                static SAID: AtomicU8 = AtomicU8::new(0);
+                if SAID.load(Ordering::Relaxed) & (1 << slot) == 0 {
+                    let system = unsafe { XInputGetState(slot as u32, &mut state) };
+                    SAID.fetch_or(1 << slot, Ordering::Relaxed);
+                    if through_shim || system == 0 {
+                        tracing::info!(
+                            slot,
+                            through = if through_shim { "Microsoft GameInput's XInput" } else { "the system XInput" },
+                            buttons = format_args!("{:#x}", state.Gamepad.wButtons),
+                            left_x = state.Gamepad.sThumbLX,
+                            right_x = state.Gamepad.sThumbRX,
+                            "VICTORY_GAMEPAD_LOG: a pad answered this slot"
+                        );
+                    } else {
+                        tracing::info!(
+                            slot,
+                            system = system,
+                            gameinput = "no pad in this slot either",
+                            "VICTORY_GAMEPAD_LOG: no pad answered this slot"
+                        );
+                    }
+                }
+            }
             if !self.shim_slots[slot] && unsafe { XInputGetState(slot as u32, &mut state) } != 0 {
                 self.empty_until[slot] = Some(Instant::now() + EMPTY_SLOT_RECHECK);
                 return None;
