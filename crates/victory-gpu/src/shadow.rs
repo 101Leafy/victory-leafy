@@ -5605,6 +5605,21 @@ fn unsized_window(address: u64, reach: u64) -> (u64, u64) {
     (address & !(WINDOW - 1), WINDOW + reach)
 }
 
+/// The window an ask names. An ask without a length names its cell's long
+/// window ([`unsized_window`]); so does an ask with a length whose window on
+/// `grid` is that very cell, so that a cell's memory is held once whoever
+/// asks (two windows of one cell are two copies of its memory). Other asks
+/// with a length (cut finer than a cell, or over more than one) name the
+/// window they did.
+fn named_window(address: u64, end: u64, unsized_ask: bool, grid: u64, reach: u64) -> (u64, u64) {
+    let long = unsized_window(address, reach);
+    if unsized_ask {
+        return long;
+    }
+    let sized = window_of(address, end, grid);
+    if sized == (long.0, WINDOW) { long } else { sized }
+}
+
 /// The window (start, bytes) of title memory for an ask of `[address,
 /// end)` on a grid of `grid` bytes.
 fn window_of(address: u64, end: u64, grid: u64) -> (u64, u64) {
@@ -5778,7 +5793,7 @@ static LOOSE: std::sync::RwLock<BTreeMap<(u64, u64), Arc<Shadow>>> = std::sync::
 
 fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Shadow>> {
     let (cell, _) = window_of(address, end, WINDOW);
-    let named = if unsized_ask { unsized_window(address, reach()) } else { window_of(address, end, window()) };
+    let named = named_window(address, end, unsized_ask, window(), reach());
     // Under the lock, with the handing out: see `let_go_idle`.
     let note = |shadow: &Shadow| {
         // (Read first: the lines are shared by all recording threads.)
@@ -6003,7 +6018,7 @@ mod write_combined_tests {
 mod window_tests {
     use super::{
         WINDOW, cover, default_card_limits_mb, grid, holder, longest_tail, resolve_card_limits,
-        reach_of, tail_of, unsized_window, window_of,
+        named_window, reach_of, tail_of, unsized_window, window_of,
     };
 
     #[test]
@@ -6141,6 +6156,15 @@ mod window_tests {
         assert!(start == cell && start + bytes >= last + reach);
         // Every ask of a cell names the same window.
         assert_eq!(unsized_window(cell, reach), unsized_window(last, reach));
+        // An ask with a length inside the cell names the same window, on
+        // the 4 MiB grid: the cell's memory is held once. One cut finer, or
+        // over two cells, names the window it did.
+        let long = unsized_window(ask, reach);
+        assert_eq!(named_window(ask, ask + 1, true, WINDOW, reach), long);
+        assert_eq!(named_window(cell + 0x1000, cell + 0x9000, false, WINDOW, reach), long);
+        assert_eq!(named_window(cell + 0x1000, cell + 0x9000, false, 64 << 10, reach), (cell, 0x1_0000));
+        assert_eq!(named_window(last, last + 0x1000, false, WINDOW, reach), (cell, 2 * WINDOW));
+        assert_eq!(named_window(cell + 0x1000, cell + 0x9000, false, WINDOW, 0), (cell, WINDOW));
         // A tail reaches as far.
         assert_eq!(tail_of(ask, ask + 1, reach), (cell + 0x3c_0000, 0x4_0000 + reach));
         let tail = tail_of(ask, ask + 1, reach);
