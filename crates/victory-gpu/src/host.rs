@@ -11205,7 +11205,6 @@ impl HostList {
         }
         PREPARING[0].fetch_add(us.as_micros() as u64, Ordering::Relaxed);
         PREPARING[1].fetch_add(bytes, Ordering::Relaxed);
-        crate::cores::log::note(crate::cores::log::COPIES, us.as_micros() as u64);
         #[cfg(feature = "diagnostics")]
         {
             add(C::Copies, copies);
@@ -12110,7 +12109,6 @@ impl Batch {
         }
         PREPARING[0].fetch_add(us, Ordering::Relaxed);
         PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
-        crate::cores::log::note(crate::cores::log::COPIES, us);
     }
 
     /// Whether `staging` is still to be refreshed in this submission (and
@@ -12312,12 +12310,8 @@ impl Batch {
         } else {
             let fills = std::mem::take(&mut self.fills);
             crate::shadow::wide_each(fills.len().div_ceil(PART), move |i| {
-                let started = crate::cores::log::on().then(std::time::Instant::now);
                 for &(dst, src, len) in fills.iter().skip(i * PART).take(PART) {
                     copy_mapped(dst as *mut u8, src as *const u8, len, false);
-                }
-                if let Some(started) = started {
-                    crate::cores::log::note(crate::cores::log::COPIES, started.elapsed().as_micros() as u64);
                 }
             });
         }
