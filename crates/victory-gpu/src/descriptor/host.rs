@@ -669,6 +669,9 @@ pub(crate) enum Rule {
     /// bytes (or the older within its own). No two textures share the
     /// block of their smallest levels. A view that only reaches into the
     /// address range of an older texture's larger levels says nothing.
+    /// A texture shorter than [`HEAD`] has no head past its end
+    /// ([`heads_meet`]): the next one may start right after it. A view
+    /// at address 0 describes no memory and is not looked at.
     #[default]
     Start,
     /// Whenever their spans at full size overlap (the rule until run
@@ -686,6 +689,16 @@ pub(crate) enum Rule {
 /// pairs of overlapping neighbours in the listings of runs 188 and 189,
 /// none starts closer than 0x2000 to the one before it.)
 const HEAD: u64 = 4096;
+
+/// Whether one of two spans starts inside the other's head: its first
+/// [`HEAD`] bytes, or all of it where it is shorter than that. The title
+/// packs its smallest textures back to back (colour tables of 256 bytes,
+/// sixteen to a 4 KiB block): they start well within [`HEAD`] of one
+/// another and share no byte.
+fn heads_meet(a: u64, a_end: u64, b: u64, b_end: u64) -> bool {
+    let (low, low_end, high) = if a <= b { (a, a_end, b) } else { (b, b_end, a) };
+    high < low.saturating_add(HEAD.min(low_end.saturating_sub(low)))
+}
 
 impl Spans {
     /// The bytes of title memory a placed texture with the resource
@@ -724,7 +737,10 @@ impl Spans {
             return Vec::new();
         }
         self.forget(index);
-        if end <= start {
+        // A view at address 0 describes no memory (the title writes views of
+        // nothing, each with its own size): nothing can be there with it,
+        // and it takes no other view's place.
+        if end <= start || start == 0 {
             return Vec::new();
         }
         let rule = self.rule;
@@ -733,6 +749,7 @@ impl Spans {
             Rule::Start => self
                 .by_start
                 .range(start.saturating_sub(HEAD - 1)..start.saturating_add(HEAD))
+                .filter(|&(&at, span)| heads_meet(at, span.0, start, end))
                 .map(|(at, _)| *at)
                 .collect(),
             Rule::Overlap | Rule::Never => self.overlapping(start, end),
@@ -6335,6 +6352,53 @@ mod tests {
         assert_eq!(q.room(5), 1);
         assert!(q.due(5, 100).iter().any(|d| d.0 == 20));
         assert_eq!(q.room(6), 0);
+    }
+
+    /// Textures smaller than the 4 KiB head, back to back: the colour tables
+    /// far buildings take their walls' tint from are 256 bytes each (three of
+    /// a run's log, where writing one made its neighbours null and the walls
+    /// black). Writing any of them leaves the others; one written where
+    /// another lies still takes its place.
+    #[test]
+    fn small_neighbours_stay() {
+        let mut spans = Spans::default();
+        assert_eq!(spans.rule, Rule::Start);
+        let at = 0xc_042b_e000u64;
+        let table = |from: u64| (at + from, at + from + 0x100);
+        let (a, b, c) = (table(0), table(0x100), table(0xa00));
+        assert!(spans.note(76_523, a.0, a.1, true).is_empty());
+        assert!(spans.note(97_420, b.0, b.1, true).is_empty());
+        assert!(spans.note(127_320, c.0, c.1, true).is_empty());
+        assert!(spans.note(76_523, a.0, a.1, true).is_empty());
+        assert_eq!(spans.slots_at(a.0), vec![76_523]);
+        assert_eq!(spans.slots_at(b.0), vec![97_420]);
+        // Inside another's bytes: that one is stale, its neighbour is not.
+        assert_eq!(spans.note(5, a.0 + 0x80, a.0 + 0x180, true), vec![76_523, 97_420]);
+        assert_eq!(spans.slots_at(c.0), vec![127_320]);
+        // At the same start with another length, as before.
+        assert_eq!(spans.note(6, c.0, c.0 + 0x400, true), vec![127_320]);
+        // A larger texture's head is its first 4 KiB, as before.
+        let big = 0xb_86bf_8000u64;
+        assert!(spans.note(7, big, big + 0x2c000, true).is_empty());
+        assert_eq!(spans.note(8, big + 0x800, big + 0x800 + 0x2c000, true), vec![7]);
+        assert!(spans.note(9, big + 0x2800, big + 0x2800 + 0x2c000, true).is_empty());
+    }
+
+    /// Views at address 0 describe no memory: the title writes them one
+    /// after the other, each of its own size, and none makes another stale
+    /// (108,157 of a run's 139,485 stale views were these).
+    #[test]
+    fn views_of_no_memory_take_no_place() {
+        let mut spans = Spans::default();
+        assert!(spans.note(11_680, 0, 0x1000, true).is_empty());
+        assert!(spans.note(11_681, 0, 0x4000, true).is_empty());
+        assert!(spans.note(11_682, 0, 0xc0_0000, true).is_empty());
+        assert!(spans.slots_at(0).is_empty());
+        // One that had memory and is written with none is forgotten there.
+        let at = 0xc_042b_e000u64;
+        assert!(spans.note(3, at, at + 0x100, true).is_empty());
+        assert!(spans.note(3, 0, 0x100, true).is_empty());
+        assert!(spans.slots_at(at).is_empty());
     }
 
     /// Textures of which only the smallest levels are held, packed into
