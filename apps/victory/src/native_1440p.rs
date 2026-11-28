@@ -101,6 +101,22 @@ const STOCK_SCALED_LOAD: &str = "e218882c95d2e16163a409d55b3451519414eb87c4d6220
 /// The scale the scaled branch loads (shared with other code: not written).
 const UPSCALER_SCALE: u32 = 0x0615_d95c;
 
+/// `VICTORY_RENDERER_TEMPORAL=1`: the title's own temporal pass (renderer 6)
+/// every time, also where it takes its FidelityFX path without DLSS (Series
+/// S): the scene stays at the title's own size (720p for 1080p) and its
+/// temporal pass scales it up, in place of the shipping FSR4 network, which
+/// took about 3.4 ms of an RTX 3060's frame at 720p to 1080p (the title's
+/// temporal resolve, 1.6 ms).
+pub(super) fn prepare_temporal(image: &mut PreparedImage) -> Result<()> {
+    ensure!(
+        image.original_hash.to_hex().as_str() == RETAIL_BUILD,
+        "the renderer selection is only known for the retail build {RETAIL_BUILD}"
+    );
+    ensure!(same(&field::<8>(image, RENDERER_SELECTION)?[..], STOCK_RENDERER_SELECTION), "unexpected renderer selection");
+    *field::<8>(image, RENDERER_SELECTION)? = [0xb8, 6, 0, 0, 0, 0x90, 0x90, 0x90];
+    Ok(())
+}
+
 /// Makes the title render through its FidelityFX upscaler path (renderer 7,
 /// as Series S does) with the scene at `mode`'s scale of the output, so that
 /// DLSS can take its upscale dispatches over (`victory_hle::modules::fidelityfx`).
@@ -182,6 +198,20 @@ mod tests {
             // Patched once, the image is no longer the stock one: refused.
             assert!(prepare(&mut image, render_1080p).is_err());
         }
+    }
+
+    /// With the retail executable (as above): renderer 6 every time, and a
+    /// second patch refused (the bytes are no longer the stock ones).
+    #[test]
+    fn patches_the_renderer_to_its_temporal_pass() {
+        let Some(path) = std::env::var_os("VICTORY_DISPLAY_PROFILE_TEST_IMAGE") else {
+            return;
+        };
+        let bytes = std::fs::read(path).unwrap();
+        let mut image = victory_loader::prepare(&bytes).unwrap();
+        prepare_temporal(&mut image).unwrap();
+        assert_eq!(*field::<8>(&mut image, RENDERER_SELECTION).unwrap(), [0xb8, 6, 0, 0, 0, 0x90, 0x90, 0x90]);
+        assert!(prepare_temporal(&mut image).is_err());
     }
 
     /// With the retail executable (as above): the upscaler path at each
