@@ -540,6 +540,12 @@ pub(crate) fn making() -> u64 {
     make::waiting()
 }
 
+/// A frame reached our window (`VICTORY_HELD_FRAME_MS`).
+#[cfg(windows)]
+pub(crate) fn presented() {
+    make::presented();
+}
+
 /// Draws and dispatches dropped since the last [`take_drops`], by reason
 /// (diagnostics).
 #[cfg(all(windows, feature = "diagnostics"))]

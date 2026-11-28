@@ -674,6 +674,57 @@ fn claim_wait(p: &Pending, frame: u64) -> bool {
     }
 }
 
+/// When a frame last reached our window, in microseconds from [`EPOCH`]
+/// plus one (0: none yet), for [`held_room`].
+static PRESENTED_US: AtomicU64 = AtomicU64::new(0);
+static EPOCH: OnceLock<Instant> = OnceLock::new();
+/// The present whose held frame was told of (one line per held frame).
+static HELD_TOLD: AtomicU64 = AtomicU64::new(0);
+
+fn since_epoch_us() -> u64 {
+    EPOCH.get_or_init(Instant::now).elapsed().as_micros() as u64
+}
+
+/// A frame reached our window.
+pub(crate) fn presented() {
+    PRESENTED_US.store(since_epoch_us() + 1, Ordering::Relaxed);
+}
+
+/// How long the title may go without a present before pipeline waits stop
+/// (`VICTORY_HELD_FRAME_MS`, off by default). Its GPU watchdog (thread at
+/// image+0x2215a60, b99f876b74d4a77f) counts 30 one-second looks at the
+/// frame tick and then writes to 0 (+0x23cf683). Budgets are per title
+/// frame, so on a cold library one held frame can still add a pass over
+/// the screen's 10 s to other waits: ff-4386 r91 waited 7.1, 6.5 and 3.5 s
+/// for three passes while frame 1288 was held for 32 s, and was killed.
+fn held_limit() -> Option<Duration> {
+    static LIMIT: OnceLock<Option<Duration>> = OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        let millis = std::env::var("VICTORY_HELD_FRAME_MS").ok()?.trim().parse::<u64>().ok()?;
+        (millis > 0).then(|| Duration::from_millis(millis))
+    })
+}
+
+/// What is left of [`held_limit`] since the last present (`None`: no limit,
+/// or nothing presented yet). Past it, says so once for that present.
+fn held_room() -> Option<Duration> {
+    let limit = held_limit()?;
+    let at = PRESENTED_US.load(Ordering::Relaxed);
+    if at == 0 {
+        return None;
+    }
+    let held = Duration::from_micros(since_epoch_us().saturating_sub(at - 1));
+    let room = limit.saturating_sub(held);
+    if room.is_zero() && HELD_TOLD.swap(at, Ordering::Relaxed) != at {
+        tracing::warn!(
+            held_ms = held.as_millis() as u64,
+            still_being_made = waiting(),
+            "a frame held past VICTORY_HELD_FRAME_MS: its draws and passes do not wait for pipelines until the next present"
+        );
+    }
+    Some(room)
+}
+
 /// Waits for `p` while frame `frame` has budget left, unless an earlier
 /// wait for it gave up or an earlier frame waited for it.
 fn wait(p: &Pending, frame: u64) {
@@ -682,7 +733,8 @@ fn wait(p: &Pending, frame: u64) {
         return;
     }
     let budget = if screen { screen_budget() } else { wait_budget() };
-    if budget.is_zero() {
+    let room = held_room();
+    if budget.is_zero() || room.is_some_and(|r| r.is_zero()) {
         return;
     }
     // The frame the budget belongs to, and what was waited of it (or is
@@ -695,7 +747,7 @@ fn wait(p: &Pending, frame: u64) {
         if spent.0 != frame {
             *spent = (frame, Duration::ZERO);
         }
-        let left = budget.saturating_sub(spent.1);
+        let left = budget.saturating_sub(spent.1).min(room.unwrap_or(Duration::MAX));
         // Claimed only with time left, so a pipeline first drawn with once
         // the frame's budget is spent keeps its one wait for a later frame.
         if left.is_zero() || (!screen && !claim_wait(p, frame)) {
