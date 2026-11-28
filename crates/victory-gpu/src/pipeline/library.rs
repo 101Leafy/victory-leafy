@@ -1062,6 +1062,23 @@ pub(crate) fn save_while_busy() {
         let secs = std::env::var("VICTORY_LIBRARY_SAVE_BUSY_S").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(180);
         std::time::Duration::from_secs(secs)
     });
+    // A cold run is one burst from start to end, so it saved nothing until
+    // its first 180 s: bs-bp3 r53 made 708 pipelines, died at game 43 and
+    // left the library as it was at launch (8,262 bytes), and the next run
+    // was cold again. With VICTORY_LIBRARY_SAVE_MADE=N a library that was
+    // under 64 MB at launch is saved in a burst too, once N pipelines were
+    // added (at most every 20 s).
+    static MADE_EVERY: OnceLock<u64> = OnceLock::new();
+    let made_every = *MADE_EVERY.get_or_init(|| {
+        let n = std::env::var("VICTORY_LIBRARY_SAVE_MADE").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0);
+        let dir = library_dir().or_else(|| DIR.get().cloned());
+        let at_launch = dir.and_then(|d| std::fs::metadata(d.join(LIBRARY_FILE)).ok()).map_or(0, |m| m.len());
+        if at_launch < 64 << 20 { n } else { 0 }
+    });
+    if made_every > 0 && library().is_some_and(|l| l.added.load(Ordering::Relaxed) >= made_every) {
+        save(false);
+        return;
+    }
     {
         let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
         match *last {
