@@ -730,23 +730,13 @@ impl<T> Default for HeapRanges<T> {
 }
 
 /// Descriptor-derived references belong to the heap that produced them.
+#[derive(Default)]
 pub(crate) struct BufferSweep {
     passes: u64,
     ranges: HeapRanges<std::sync::Arc<crate::shadow::Shadow>>,
     // Last refresh frame and covered interval for throttled, unwatched copies.
     unwatched: std::collections::HashMap<u64, (u64, u64, u64)>,
     last_spans: usize,
-}
-
-impl Default for BufferSweep {
-    fn default() -> Self {
-        Self {
-            passes: 0,
-            ranges: HeapRanges::default(),
-            unwatched: Default::default(),
-            last_spans: 0,
-        }
-    }
 }
 
 impl<T> HeapRanges<T> {
