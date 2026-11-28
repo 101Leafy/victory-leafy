@@ -3048,6 +3048,10 @@ fn under_wide() -> bool {
 /// shortcut: a piece with very many runs has them joined over small gaps,
 /// where the old race is left.
 fn put_changed(at: usize, title: &[u8], merged: &[u8]) -> usize {
+    // A size answered at the builder's call stays: the builder's own store
+    // lands frames later (`crate::dxr`).
+    let kept = crate::dxr::keep_answers(at, title, merged);
+    let merged = kept.as_deref().unwrap_or(merged);
     let put = put_bytes(at, title, merged);
     crate::watch::told(&changed_spans(at, title, merged));
     put
