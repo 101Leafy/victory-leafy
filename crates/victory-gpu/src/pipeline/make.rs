@@ -991,6 +991,17 @@ fn compute_ahead(list: &mut VecDeque<Arc<Pending>>, compute_free: bool, one_past
     list.remove(at)
 }
 
+/// `VICTORY_COMPUTE_AHEAD=N`: [`compute_first`] takes compute ahead of the
+/// graphics requests only while fewer than N compute pipelines are being
+/// made; past that the graphics requests go first and compute takes the
+/// places they leave. Cold ff-fixc r164: from game 44 on the workers made
+/// 377 compute pipelines and 26 graphics ones, 600 to 770 graphics requests
+/// waited, and scene A drew 280 of its 1700 draws for 14 s. Off by default.
+fn compute_ahead_places() -> Option<usize> {
+    static N: OnceLock<Option<usize>> = OnceLock::new();
+    *N.get_or_init(|| std::env::var("VICTORY_COMPUTE_AHEAD").ok().and_then(|v| v.parse().ok()).filter(|&n| n > 0))
+}
+
 /// Of the compute pipelines draws have asked for, the one the slow list says
 /// is made soonest (one not on it first; in the order asked among equals).
 /// In the 980073cbe run draws asked for 323: 107 of them took the driver
@@ -1134,7 +1145,7 @@ impl Queue {
         let mut p = self.screen.pop_front();
         let mut from = TAKEN_SCREEN;
         if p.is_none() && !screens_only {
-            if compute_first() {
+            if compute_first() && compute_ahead_places().is_none_or(|n| self.compute_now < n) {
                 p = compute_ahead(&mut self.requested_compute, compute_free, self.compute_now <= self.compute_cap);
             }
             if p.is_none() {
