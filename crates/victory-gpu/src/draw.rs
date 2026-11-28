@@ -4009,7 +4009,16 @@ impl State {
             let Some(Root::Table(table)) = self.roots_ref(true).get(usize::from(slot)) else {
                 return None;
             };
-            let resource = match (kind, crate::descriptor::view(table + u64::from(offset) * 4)?) {
+            // A view of a texture the title placed in its memory is a placed
+            // record; its host texture is the one placed_texture names (run
+            // final-3: the miss program's depth and most of its textures).
+            let view = crate::descriptor::view(table + u64::from(offset) * 4)?;
+            let placed = crate::descriptor::host::placed_texture(&view);
+            let view = match &placed {
+                Some(p) => p.view.clone(),
+                None => view,
+            };
+            let resource = match (kind, view) {
                 (ResourceType::Srv, View::Shader(r, _)) | (ResourceType::Uav, View::Unordered(r, ..)) => r,
                 _ => return None,
             };
@@ -4022,11 +4031,110 @@ impl State {
             let desc = unsafe { host.GetDesc() };
             Some((desc, heap.gpu_handle((start + offset * 4) / 32)))
         };
+        // Variants of the miss program bind the rays' image and the depth at
+        // other places of their tables than the one found first (run
+        // final-1: 416 of 472 dispatches had "other tables"): where the
+        // usual place has none, the first table entry of that kind that
+        // fits (a 2D R11G11B10 image; a 2D 32-bit depth at least its size).
+        // A depth-stencil texture's view of its stencil plane (formats
+        // X32_TYPELESS_G8X24_UINT, X24_TYPELESS_G8_UINT, or a 2D view of plane
+        // 1) is no depth: the estimate made of it puts every point far away
+        // with its normal to the camera (flat floors). Seen in the capture
+        // haze2: after the _ReflectiveCaustics variant 34fb51b8a0312e82 the
+        // place (0,464) named #6481's stencil plane.
+        // (The description's words are D3D12_SHADER_RESOURCE_VIEW_DESC's: its
+        // union starts at word 4, so a 2D view's plane is word 6; word 5 is
+        // its levels, which run final-3 mistook for the plane.)
+        fn stencil_view(view: Option<View>) -> bool {
+            let view = view.map(|v| crate::descriptor::host::placed_texture(&v).map_or(v, |p| p.view.clone()));
+            match view {
+                Some(View::Shader(_, Some(d))) => {
+                    matches!(crate::resource::pc_format(d[0]), 22 | 47) || (d[1] == 4 && d[6] == 1)
+                }
+                _ => false,
+            }
+        }
+        let stencil_at = |(slot, offset): (u8, u32)| {
+            let Some(Root::Table(table)) = self.roots_ref(true).get(usize::from(slot)) else {
+                return false;
+            };
+            stencil_view(crate::descriptor::view(table + u64::from(offset) * 4))
+        };
+        let depth_like = |d: &D3D12_RESOURCE_DESC| {
+            use windows::Win32::Graphics::Dxgi::Common::{
+                DXGI_FORMAT_D24_UNORM_S8_UINT, DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_D32_FLOAT_S8X24_UINT,
+                DXGI_FORMAT_R24G8_TYPELESS, DXGI_FORMAT_R32_TYPELESS, DXGI_FORMAT_R32G8X24_TYPELESS,
+            };
+            d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
+                && matches!(
+                    d.Format,
+                    DXGI_FORMAT_R32_TYPELESS
+                        | DXGI_FORMAT_D32_FLOAT
+                        | DXGI_FORMAT_R32G8X24_TYPELESS
+                        | DXGI_FORMAT_D32_FLOAT_S8X24_UINT
+                        | DXGI_FORMAT_R24G8_TYPELESS
+                        | DXGI_FORMAT_D24_UNORM_S8_UINT
+                )
+        };
+        let scan = |kind: ResourceType, fits: &dyn Fn(&D3D12_RESOURCE_DESC) -> bool| {
+            t.used
+                .iter()
+                .filter(|u| u.kind == kind && u.root == RootType::Table)
+                .filter(|u| kind != ResourceType::Srv || !stencil_at((u.slot, u.table_offset_dwords)))
+                .filter_map(|u| entry(kind, (u.slot, u.table_offset_dwords)))
+                .find(|(desc, _)| fits(desc))
+        };
+        let usual_depth = |at: (u8, u32)| {
+            if stencil_at(at) {
+                static STENCIL: AtomicU64 = AtomicU64::new(0);
+                if STENCIL.fetch_add(1, Ordering::Relaxed) == 0 {
+                    tracing::info!(?role, ?at, "stand-in: the depth place names a stencil plane; another depth view of the tables is taken (counted once)");
+                }
+                None
+            } else {
+                entry(ResourceType::Srv, at)
+            }
+        };
+        // Once per miss program whose rays' image or depth is not found:
+        // what its tables hold, so one run names the place of each.
+        let name_tables = || {
+            static SEEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+            let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+            if seen.len() < 16 && !seen.contains(&p.name) {
+                seen.push(p.name.clone());
+                let held: Vec<String> = t
+                    .used
+                    .iter()
+                    .filter(|u| u.root == RootType::Table && matches!(u.kind, ResourceType::Uav | ResourceType::Srv))
+                    .map(|u| {
+                        let at = (u.slot, u.table_offset_dwords);
+                        match entry(u.kind, at) {
+                            Some((d, _)) => format!(
+                                "{:?}{:?} {}x{} f{} dim{}{}",
+                                u.kind,
+                                at,
+                                d.Width,
+                                d.Height,
+                                d.Format.0,
+                                d.Dimension.0,
+                                if stencil_at(at) { " stencil" } else { "" }
+                            ),
+                            None => format!("{:?}{:?} -", u.kind, at),
+                        }
+                    })
+                    .collect();
+                tracing::info!(program = %p.name, tables = %held.join("; "), "reflections stand-in: a miss program whose rays' image or depth was not found");
+            }
+        };
         let image = match role {
             Role::Resolve => entry(ResourceType::Uav, LIGHT),
             Role::Radiance => entry(ResourceType::Uav, RADIANCE),
             Role::Air => entry(ResourceType::Uav, AIR),
-            Role::Miss => entry(ResourceType::Uav, MISS_LIGHT),
+            Role::Miss => entry(ResourceType::Uav, MISS_LIGHT).or_else(|| {
+                scan(ResourceType::Uav, &|d| {
+                    d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && d.Format.0 == 26
+                })
+            }),
             // The first of the places that holds a 2D image of the format.
             Role::Reflect => REFLECTIONS.iter().find_map(|&at| {
                 entry(ResourceType::Uav, at).filter(|(d, _)| {
@@ -4054,12 +4162,16 @@ impl State {
             once!(?role, "no stand-in for the indirect light: missing image UAV");
             if role == Role::Miss {
                 crate::ambient::note_miss(MissNote::NotReady);
+                name_tables();
             }
             return false;
         };
         let (depth, depth_size) = match role {
             Role::Resolve => {
-                let Some((seen, depth)) = entry(ResourceType::Srv, DEPTH) else {
+                let found = usual_depth(DEPTH).or_else(|| {
+                    scan(ResourceType::Srv, &|d| depth_like(d) && (d.Width, d.Height) == (of.Width, of.Height))
+                });
+                let Some((seen, depth)) = found else {
                     once!(?role, "no stand-in for the indirect light: missing depth SRV");
                     return false;
                 };
@@ -4076,7 +4188,7 @@ impl State {
                     DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_D32_FLOAT_S8X24_UINT, DXGI_FORMAT_R32_FLOAT,
                     DXGI_FORMAT_R32_TYPELESS, DXGI_FORMAT_R32G8X24_TYPELESS,
                 };
-                let found = entry(ResourceType::Srv, MISS_DEPTH).filter(|(seen, _)| {
+                let fits = |seen: &D3D12_RESOURCE_DESC| {
                     matches!(
                         seen.Format,
                         DXGI_FORMAT_R32_TYPELESS
@@ -4084,13 +4196,19 @@ impl State {
                             | DXGI_FORMAT_D32_FLOAT
                             | DXGI_FORMAT_R32G8X24_TYPELESS
                             | DXGI_FORMAT_D32_FLOAT_S8X24_UINT
-                    ) && seen.Width >= of.Width
-                        && seen.Height >= of.Height
-                        && seen.Width <= of.Width * 4
+                    ) && seen.Width.abs_diff(of.Width * 2) <= 1
+                        && u64::from(seen.Height).abs_diff(u64::from(of.Height) * 2) <= 1
+                };
+                // The picture's depth: twice the rays' image each way (run
+                // final-4: a looser match took another depth texture, which the
+                // size check then refused, "another image").
+                let found = usual_depth(MISS_DEPTH).filter(|(seen, _)| fits(seen)).or_else(|| {
+                    scan(ResourceType::Srv, &|d| depth_like(d) && fits(d))
                 });
                 let Some((seen, depth)) = found else {
                     once!(?role, "no stand-in for the indirect light: missing depth SRV");
                     crate::ambient::note_miss(MissNote::NotReady);
+                    name_tables();
                     return false;
                 };
                 (Some(depth), [seen.Width as u32, seen.Height])
