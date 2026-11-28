@@ -8024,7 +8024,11 @@ impl HostList {
                 None => {
                     let (buffer, data) = if shared { host.shared_buffer(class)? } else { host.upload_buffer(class)? };
                     name(&buffer, || format!("list upload, pooled {class:#x}"));
-                    Chunk { buffer, data: data as usize }
+                    {
+                        // SAFETY: a live buffer.
+                        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+                        Chunk { buffer, data: data as usize, gpu }
+                    }
                 }
             };
             let out = (chunk.buffer.clone(), chunk.data as *mut u8);
