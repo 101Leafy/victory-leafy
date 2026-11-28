@@ -402,14 +402,14 @@ fn windows() -> bool {
 /// opens a new one. After a shader that stores by address (it may write
 /// anywhere) the batch ends as with 2.
 ///
-/// `VICTORY_BATCH_KEEP=0`: 2 stays 2. On, 2 runs as 3: r201 opened 301
+/// Unless `VICTORY_BATCH_KEEP=1`, 2 stays 2. On, 2 runs as 3: r201 opened 301
 /// batches a frame, and their clamps and rebinds were 116 of the 372 ms
 /// the thin threads spent recording.
 pub(crate) fn batches() -> u8 {
     static ON: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *ON.get_or_init(|| match std::env::var("VICTORY_INDIRECT_BATCH").as_deref() {
         Ok("0") => 0,
-        Ok("2") if crate::toggled!("VICTORY_BATCH_KEEP") => 3,
+        Ok("2") if crate::asked_for!("VICTORY_BATCH_KEEP") => 3,
         Ok("2") => 2,
         Ok("3") => 3,
         _ => 1,

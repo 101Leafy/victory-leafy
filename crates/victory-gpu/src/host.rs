@@ -4186,7 +4186,7 @@ struct Deferred {
     /// fills behind them ([`HostList::place_constants`]).
     placed: Vec<(usize, usize)>,
     /// Scratch memory of constant views since the list last wrote title
-    /// memory, unless `VICTORY_CBV_ONCE=0` (source, bytes): the buffer, its
+    /// memory, with `VICTORY_CBV_ONCE=1` (source, bytes): the buffer, its
     /// GPU address, the CPU address of its fill, and whether more than one
     /// slot shows it ([`HostList::constants_held`]).
     constants: std::collections::HashMap<(usize, usize), (ID3D12Resource, u64, usize, bool), std::hash::BuildHasherDefault<AddressHash>>,
@@ -5849,7 +5849,7 @@ fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) {
 }
 
 /// Fills of upload memory that wait only for flights, made beside the
-/// submission (`VICTORY_FILL_BESIDE=0` turns it off; only with
+/// submission (off unless `VICTORY_FILL_BESIDE=1`; only with
 /// [`relay_exact`] and [`relay_copy`]).
 ///
 /// A submission whose only reads of memory flights may write are fills
@@ -5892,7 +5892,7 @@ mod beside {
 
     fn on() -> bool {
         static ON: OnceLock<bool> = OnceLock::new();
-        *ON.get_or_init(|| relay_exact() && relay_copy() && std::env::var_os("VICTORY_FILL_BESIDE").is_none_or(|v| v != "0"))
+        *ON.get_or_init(|| relay_exact() && relay_copy() && std::env::var_os("VICTORY_FILL_BESIDE").is_some_and(|v| v == "1"))
     }
 
     fn get(device: &ID3D12Device) -> Option<&'static Beside> {
@@ -5919,7 +5919,7 @@ mod beside {
                     tracing::warn!(error = %e, "no thread for fills beside submissions: they wait as before");
                     return None;
                 }
-                tracing::info!("fills of upload memory that wait for flights are made beside the submission (VICTORY_FILL_BESIDE=0 turns it off)");
+                tracing::info!("fills of upload memory that wait for flights are made beside the submission (VICTORY_FILL_BESIDE=1)");
                 Some(Beside {
                     fence,
                     jobs: Mutex::new(jobs),
@@ -6522,9 +6522,9 @@ fn declare_once() -> bool {
 }
 
 /// Whether constant views of the same bytes share a copy
-/// ([`HostList::constants_held`]; `VICTORY_CBV_ONCE=0`: each its own).
+/// ([`HostList::constants_held`]; off unless `VICTORY_CBV_ONCE=1`: each its own).
 fn cbv_once() -> bool {
-    crate::toggled!("VICTORY_CBV_ONCE")
+    crate::asked_for!("VICTORY_CBV_ONCE")
 }
 
 /// The ranges the shaders of `runs` may write, per host copy, as declared.
@@ -10836,7 +10836,7 @@ impl HostList {
     /// Scratch memory that holds the `len` bytes of title memory at `src` as
     /// of the list's submission, for the constant view in `slot` (a title
     /// heap's address, and the slot): the buffer and the GPU address.
-    /// Unless `VICTORY_CBV_ONCE=0`, the constant views of the same bytes share one
+    /// With `VICTORY_CBV_ONCE=1`, the constant views of the same bytes share one
     /// copy until the list next writes title memory. In play-g scene A lists
     /// made 4,057 constant views a frame, 2,637 of the 3,050 tables made
     /// afresh held one, and every view had a copy of its own. A shared copy
