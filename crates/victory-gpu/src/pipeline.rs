@@ -317,6 +317,12 @@ pub(crate) fn builder_rests(why: &'static str) {
     builder::rests(why);
 }
 
+/// `VICTORY_BVH_BUILDER=1`.
+#[cfg(windows)]
+pub(crate) fn builder_allowed() -> bool {
+    builder::allowed()
+}
+
 /// At a dispatch of a builder pipeline: whether the builder runs (see
 /// [`builder`]).
 #[cfg(windows)]
