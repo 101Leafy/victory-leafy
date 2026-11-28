@@ -224,7 +224,8 @@ pub extern "system" fn QueryApiImpl(
     iid: *const Guid,
     out: *mut *mut c_void,
 ) -> HRESULT {
-    static QUERIED: Mutex<Vec<(Guid, Guid)>> = Mutex::new(Vec::new());
+    // Each area asked for, with how often.
+    static QUERIED: Mutex<Vec<(Guid, Guid, u64)>> = Mutex::new(Vec::new());
     // SAFETY: the title passes pointers to GUIDs (null is tolerated).
     let (Some(&provider), Some(&iid)) = (unsafe { provider.as_ref() }, unsafe { iid.as_ref() })
     else {
@@ -253,9 +254,19 @@ pub extern "system" fn QueryApiImpl(
         return S_OK;
     }
     let mut queried = QUERIED.lock().unwrap_or_else(|e| e.into_inner());
-    if !queried.contains(&(provider, iid)) {
-        queried.push((provider, iid));
-        tracing::warn!(%provider, %iid, "runtime API area not implemented");
+    match queried.iter_mut().find(|(p, i, _)| (*p, *i) == (provider, iid)) {
+        None => {
+            queried.push((provider, iid, 1));
+            tracing::warn!(%provider, %iid, "runtime API area not implemented");
+        }
+        // At 2, 4, 8, ... asks, to see one rise with each line of dialogue.
+        Some((_, _, calls)) => {
+            *calls += 1;
+            #[cfg(feature = "diagnostics")]
+            if calls.is_power_of_two() {
+                tracing::info!(%provider, %iid, calls = *calls, "runtime API area not implemented, asked again");
+            }
+        }
     }
     NOT_SUPPORTED
 }

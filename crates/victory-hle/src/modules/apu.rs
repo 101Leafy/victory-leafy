@@ -295,7 +295,11 @@ pub extern "system" fn XApuEnqueueCommand(
                 }
             };
         }
-        DEACTIVATE => *decoder = None,
+        DEACTIVATE => {
+            *decoder = None;
+            #[cfg(feature = "diagnostics")]
+            opus_log(handle, stream, None);
+        }
         RESET => {
             if let Some(d) = decoder {
                 let _ = d.reset_state();
@@ -315,6 +319,8 @@ pub extern "system" fn XApuEnqueueCommand(
                 ),
                 None => result.error = INVALID_STREAM,
             }
+            #[cfg(feature = "diagnostics")]
+            opus_log(handle, stream, Some(result.frames));
         }
         _ => return INVALID_COMMAND,
     }
@@ -330,6 +336,38 @@ pub extern "system" fn XApuEnqueueCommand(
         unsafe { SetEvent(connection.event) };
     }
     S_OK
+}
+
+/// `VICTORY_VOICE_LOG=<ms>`: every `ms`, a line per active stream with the
+/// frames decoded for it since it was activated (`None`: deactivated).
+#[cfg(feature = "diagnostics")]
+fn opus_log(connection: *const Connection, stream: usize, frames: Option<u32>) {
+    use std::collections::BTreeMap;
+    use std::time::Instant;
+    type Log = (Option<Instant>, BTreeMap<(usize, usize), u64>);
+    static LOG: Mutex<Log> = Mutex::new((None, BTreeMap::new()));
+    let Some(ms) = super::audio::voice_log_ms() else {
+        return;
+    };
+    let mut log = LOG.lock().unwrap_or_else(|e| e.into_inner());
+    let key = (connection as usize, stream);
+    let Some(frames) = frames else {
+        log.1.remove(&key);
+        return;
+    };
+    *log.1.entry(key).or_default() += u64::from(frames);
+    if log.0.is_some_and(|t| t.elapsed().as_millis() < ms) {
+        return;
+    }
+    log.0 = Some(Instant::now());
+    for (&(connection, stream), &frames) in &log.1 {
+        tracing::info!(
+            connection = format_args!("{connection:#x}"),
+            stream,
+            frames,
+            "Opus stream position"
+        );
+    }
 }
 
 /// Decodes one packet into the command's output buffer, keeping the frames
