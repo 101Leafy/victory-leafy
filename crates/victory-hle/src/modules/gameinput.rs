@@ -29,6 +29,8 @@ use super::xgameruntime::{HRESULT, S_OK};
 use crate::{HleExport, HleModule};
 
 mod hid;
+#[cfg(any(windows, test))]
+mod menu_pad;
 
 /// The documented errors.
 pub const DEVICE_DISCONNECTED: HRESULT = 0x838A_0001_u32 as i32;
@@ -1397,6 +1399,7 @@ mod host {
 
     pub(super) struct Host {
         empty_until: [Option<Instant>; PADS],
+        menu_pad: super::menu_pad::MenuPad,
         /// Pads XInput does not list, and which of them sits in each slot
         /// XInput leaves empty.
         hid: super::hid::Pads,
@@ -1418,6 +1421,7 @@ mod host {
         pub(super) fn new(counts: Arc<Counts>) -> Host {
             Host {
                 empty_until: [None; PADS],
+                menu_pad: Default::default(),
                 hid: Default::default(),
                 hid_slots: [None; PADS],
                 counts,
@@ -1635,13 +1639,33 @@ mod host {
 
     impl Source for Host {
         fn pad(&mut self, slot: usize) -> Option<PadState> {
-            if let Some(pad) = self.xinput(slot) {
+            let previous_hid = self.hid_slots[slot];
+            let mut pad = if let Some(pad) = self.xinput(slot) {
                 // An XInput pad takes the slot; a HID pad there moves
                 // to a free one.
                 self.hid_slots[slot] = None;
-                return Some(pad);
+                Some(pad)
+            } else {
+                self.hid(slot)
+            };
+            if slot == 0 {
+                let mode = victory_gpu::settings_pad_mode();
+                // XInput and HID can trade slot zero without an empty sample in between.
+                if mode != victory_gpu::SettingsPadMode::Off && previous_hid != self.hid_slots[0] && pad.is_some() {
+                    self.menu_pad.disconnected(victory_gpu::settings_pad_key);
+                }
+                self.menu_pad.filter(
+                    &mut pad,
+                    mode,
+                    || {
+                        let (open, pending) = victory_gpu::settings_pad_capture();
+                        (focused(), open, pending)
+                    },
+                    Instant::now,
+                    victory_gpu::settings_pad_key,
+                );
             }
-            self.hid(slot)
+            pad
         }
 
         fn keys(&mut self) -> Vec<KeyState> {

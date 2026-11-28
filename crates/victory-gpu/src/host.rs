@@ -6093,6 +6093,7 @@ mod frames;
 mod font;
 mod lazy;
 mod menu;
+pub use menu::{settings_pad_capture, settings_pad_key};
 mod place;
 #[cfg(feature = "diagnostics")]
 pub(crate) mod pstats;
