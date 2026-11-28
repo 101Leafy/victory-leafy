@@ -67,14 +67,11 @@ pub fn rect_list_gs(vs: &[u8], ps: Option<&[u8]>) -> Result<Vec<u8>, ShaderError
 /// shader's inputs.
 fn build(mut outputs: Vec<SigElement>, ps_inputs: &[SigElement]) -> Result<Vec<u8>, ShaderError> {
     let unsupported = |what| ShaderError::Unsupported { offset: 0, what };
-    if outputs.iter().any(|e| e.row.is_none()) {
-        return Err(unsupported("a rectangle list output without a register"));
-    }
     let Some(position) = outputs
         .iter()
-        .position(|e| e.kind == 3 && e.comp == 9 && e.cols == 4)
+        .position(|e| e.kind == 3 && e.comp == 9 && (2..=4).contains(&e.cols))
     else {
-        return Err(unsupported("a rectangle list without a four-component position"));
+        return Err(unsupported("a rectangle list without a position"));
     };
     for e in &mut outputs {
         // Interpolation as `emit_program` declares a vertex shader's
@@ -142,7 +139,7 @@ fn build(mut outputs: Vec<SigElement>, ps_inputs: &[SigElement]) -> Result<Vec<u
     let (x, y, w) = (
         corners[position][0],
         corners[position][1],
-        corners[position][3],
+        corners[position].get(3).copied().unwrap_or([s.m.f32(1.0f32.to_bits()); 3]),
     );
     let zero = s.m.f32(0);
     let mut plain = s.m.cmp(b, pred::OGT, w[0], zero);
@@ -346,6 +343,26 @@ mod tests {
     /// Refused with a reason: no position, a primitive id in a register a
     /// vertex output has, more components than six vertices may carry.
     #[test]
+    fn rectangle_stages_accept_sub_four_component_positions_and_unassigned_rows() {
+        for cols in [2, 3] {
+            let sig = vec![
+                SigElement {
+                    usage: (1u8 << cols) - 1,
+                    ..element("SV_Position", 0, 3, 9, 0, cols)
+                },
+                SigElement {
+                    row: None,
+                    ..element("TEXCOORD", 0, 0, 9, 0, 2)
+                },
+            ];
+            let gs = build(sig, &[]).unwrap();
+            if let Ok(mut v) = super::super::validator::Validator::load(
+                None,
+            ) {
+                v.validate(&mut gs.clone()).unwrap();
+            }
+        }
+    }    #[test]
     fn rectangle_stages_that_cannot_be_made_are_refused() {
         assert!(build(outputs()[1..].to_vec(), &[]).is_err());
         let taken = [element("SV_PrimitiveID", 0, 10, 5, 1, 1)];
