@@ -227,7 +227,7 @@ fn shade() -> [f32; 2] {
 }
 
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=13, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2)"
+#define RS "RootConstants(num32BitConstants=13, b0), DescriptorTable(SRV(t0, flags=DESCRIPTORS_VOLATILE)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2)"
 #define CX 64
 #define CY 36
 #define CELLS (CX * CY)
