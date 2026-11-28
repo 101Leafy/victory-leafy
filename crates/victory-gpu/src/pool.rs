@@ -1183,6 +1183,196 @@ mod tests {
         assert!(pool.take(BLOCK, 65536, 0, make).is_none());
     }
 
+    /// Milliseconds calls took, summed up: mean, median, 99th percentile,
+    /// longest.
+    fn spread(mut ms: Vec<f64>) -> String {
+        ms.sort_by(f64::total_cmp);
+        let at = |q: f64| ms[((ms.len() - 1) as f64 * q).round() as usize];
+        format!(
+            "{} calls: mean {:.3} ms, median {:.3}, 99th {:.3}, longest {:.3}",
+            ms.len(),
+            ms.iter().sum::<f64>() / ms.len() as f64,
+            at(0.5),
+            at(0.99),
+            ms[ms.len() - 1]
+        )
+    }
+
+    /// A texture of `side` x `side` RGBA8, one level: 4 x side^2 bytes.
+    fn square(side: u64) -> D3D12_RESOURCE_DESC {
+        D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: side,
+            Height: side as u32,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            ..Default::default()
+        }
+    }
+
+    /// Bench (`--ignored --nocapture`, with `VICTORY_RIPE_BLOCKS=0`): a
+    /// thread places textures of 256 KiB, which blocks with pieces have
+    /// room for, while another places textures of 24 MiB, which need a new
+    /// block every second one.
+    #[test]
+    #[ignore]
+    fn bench_textures_placed_while_another_thread_makes_blocks() {
+        let Some(host) = crate::host::host() else { return };
+        let (small, big) = (square(256), square(2560));
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        // SAFETY: valid descriptions, here and below.
+        let mut keep: Vec<ID3D12Resource> = (0..4).filter_map(|_| unsafe { texture(&host.device, &small, D3D12_RESOURCE_STATE_COMMON) }).collect();
+        let mut ms = Vec::new();
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                let mut held = std::collections::VecDeque::new();
+                while !stop.load(Ordering::Relaxed) {
+                    held.extend(unsafe { texture(&host.device, &big, D3D12_RESOURCE_STATE_COMMON) });
+                    if held.len() > 16 {
+                        held.pop_front();
+                    }
+                }
+            });
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            for _ in 0..1000 {
+                let began = std::time::Instant::now();
+                keep.extend(unsafe { texture(&host.device, &small, D3D12_RESOURCE_STATE_COMMON) });
+                ms.push(began.elapsed().as_secs_f64() * 1e3);
+            }
+            stop.store(true, Ordering::Relaxed);
+        });
+        eprintln!(
+            "textures of 256 KiB placed while another thread makes blocks: {}",
+            spread(ms)
+        );
+    }
+
+
+
+    /// Bench (`--ignored --nocapture`): a thread stages pieces of 64 KiB
+    /// while another stages pieces of 8 MiB and keeps them, so that new
+    /// staging blocks are made.
+    #[test]
+    #[ignore]
+    fn bench_staging_while_another_thread_makes_blocks() {
+        let Some(host) = crate::host::host() else { return };
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let mut ms = Vec::new();
+        let mut keep = Vec::new();
+        keep.extend(staging(host, 64 << 10));
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                let mut held = std::collections::VecDeque::new();
+                while !stop.load(Ordering::Relaxed) {
+                    held.extend(staging(host, 8 << 20));
+                    if held.len() > 64 {
+                        held.pop_front();
+                    }
+                }
+            });
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            for _ in 0..1000 {
+                let began = std::time::Instant::now();
+                keep.extend(staging(host, 64 << 10));
+                ms.push(began.elapsed().as_secs_f64() * 1e3);
+            }
+            stop.store(true, Ordering::Relaxed);
+        });
+        eprintln!(
+            "staging of 64 KiB while another thread makes staging blocks: {}",
+            spread(ms)
+        );
+    }
+
+    /// Threads that place textures at once, some of them making new blocks
+    /// (outside the pool's lock, [`take_from`]), get every texture,
+    /// each in a piece of its own.
+    #[test]
+    fn threads_that_place_textures_at_once_make_blocks_and_keep_their_pieces_apart() {
+        let Some(host) = crate::host::host() else { return };
+        // 4 MiB each: 16 to a block, so 8 threads of 24 need new blocks
+        // while others place theirs.
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 1024,
+            Height: 1024,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            ..Default::default()
+        };
+        let made: Vec<ID3D12Resource> = std::thread::scope(|s| {
+            let threads: Vec<_> = (0..8)
+                .map(|_| {
+                    s.spawn(|| {
+                        (0..24)
+                            // SAFETY: a valid description.
+                            .filter_map(|_| unsafe { texture(&host.device, &desc, D3D12_RESOURCE_STATE_COMMON) })
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            threads.into_iter().flat_map(|t| t.join().unwrap()).collect()
+        });
+        assert_eq!(made.len(), 8 * 24, "every texture was placed");
+        // Each texture's piece is its own: no two of a block overlap.
+        let pool = lock(&TEXTURES);
+        let mut taken: Vec<(usize, u64, u64)> = Vec::new();
+        for (i, block) in pool.blocks.iter().enumerate() {
+            let Some(block) = block else { continue };
+            let mut at = 0;
+            for (&start, &len) in &block.free.0 {
+                if start > at {
+                    taken.push((i, at, start));
+                }
+                at = start + len;
+            }
+            if at < BLOCK {
+                taken.push((i, at, BLOCK));
+            }
+        }
+        let held: u64 = taken.iter().map(|&(_, a, b)| b - a).sum();
+        drop(pool);
+        assert!(held >= 8 * 24 * (4 << 20), "the pieces held cover every texture");
+        drop(made);
+        // SAFETY: plain query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+        assert_eq!(host.log_messages(), None, "the debug layer found an error");
+    }
+
+    /// Threads that stage at once, some making new staging blocks (outside
+    /// the pool's lock), each get pieces of their own that begin as zeros.
+    #[test]
+    fn threads_that_stage_at_once_get_zeroed_pieces_of_their_own() {
+        let Some(host) = crate::host::host() else { return };
+        const BYTES: usize = 8 << 20;
+        // Bytes looked at: upload memory is write-combined, and the CPU
+        // reads it slowly. One in every 4 KiB, and the last.
+        let looked = |data: *mut u8| (0..BYTES).step_by(4096).chain([BYTES - 1]).map(move |i| unsafe { *data.add(i) });
+        std::thread::scope(|s| {
+            for t in 0..8u8 {
+                s.spawn(move || {
+                    // 8 of 8 MiB a thread: 64 MiB each, so new blocks are made.
+                    let pieces: Vec<_> = (0..8).filter_map(|_| staging(host, BYTES as u64)).collect();
+                    assert_eq!(pieces.len(), 8);
+                    for (_, _, _, data) in &pieces {
+                        // SAFETY: the piece's mapping, ours alone.
+                        unsafe {
+                            assert!(looked(*data).all(|b| b == 0), "a piece is not zeros");
+                            std::ptr::write_bytes(*data, t + 1, BYTES);
+                        }
+                    }
+                    for (_, _, _, data) in &pieces {
+                        assert!(looked(*data).all(|b| b == t + 1), "another thread wrote this piece");
+                    }
+                });
+            }
+        });
+    }
+
     /// A pooled texture's piece comes back when its last reference goes, not
     /// before; its staging piece begins as zeros.
     #[test]
