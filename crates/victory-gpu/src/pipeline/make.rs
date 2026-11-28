@@ -55,6 +55,8 @@ pub(crate) struct Pending {
     scene_input: bool,
     /// Why it is never made ([`left_out`]).
     left_out: Option<&'static str>,
+    /// A compute program known to take seconds to make ([`long_compute`]).
+    long: bool,
     /// Whether draws already waited [`GIVE_UP`] for it in vain: later
     /// draws do not wait for it (see [`wait`]).
     given_up: AtomicBool,
@@ -101,6 +103,14 @@ fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
         return Some("ray activation shader without BVH, left out");
     }
     None
+}
+
+/// The compute programs that take 7 to 30 s each to make on a cold cache:
+/// run 164 still had CS_DepthCopy (3 ms) asked for 81 s while they held
+/// every compute place, the one past the cap too, before the slow list knew
+/// any of them.
+fn long_compute(shaders: &[Arc<Shader>]) -> bool {
+    named(shaders, b"CS_RaytracingResolve") || named(shaders, b"CS_GatherRaymarchedLocalLights")
 }
 
 /// Whether the opening scene's producers are made first
@@ -171,11 +181,13 @@ impl Pending {
             && !(scene_inputs() && shaders.iter().any(|s| s.stage == "mesh")))
             || scene_input;
         let left_out = left_out(&shaders);
+        let long = long_compute(&shaders);
         let made = if leave_out_hash(&shaders) { OnceLock::from(None) } else { OnceLock::new() };
         Pending {
             screen,
             scene_input,
             left_out,
+            long,
             formats: graphics.as_ref().map_or([0; 9], |g| g.formats()),
             variant: OnceLock::new(),
             shaders,
@@ -965,7 +977,7 @@ fn compute_first() -> bool {
 
 /// For [`compute_first`]: the quickest asked-for compute pipeline while
 /// compute has places, else, in one place past them, the one asked for last
-/// that the slow list does not name. A cold run has no slow list, and taking
+/// that neither the slow list names nor [`long_compute`] is. A cold run has no slow list, and taking
 /// the oldest went to the 15-30 s CS_RaytracingResolve variants asked for
 /// first (run 139: about 120 of them ahead of CS_DepthCopy).
 fn compute_ahead(list: &mut VecDeque<Arc<Pending>>, compute_free: bool, one_past: bool) -> Option<Arc<Pending>> {
@@ -975,7 +987,7 @@ fn compute_ahead(list: &mut VecDeque<Arc<Pending>>, compute_free: bool, one_past
     if !one_past {
         return None;
     }
-    let at = list.iter().rposition(|p| !super::library::slow(&p.key))?;
+    let at = list.iter().rposition(|p| !p.long && !super::library::slow(&p.key))?;
     list.remove(at)
 }
 
