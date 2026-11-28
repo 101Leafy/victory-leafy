@@ -622,15 +622,49 @@ fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -
     })
 }
 
+static PASS: OnceLock<Option<Pass>> = OnceLock::new();
+
+fn build() -> Option<Pass> {
+    let host = host()?;
+    make(&host.device, |bytes| host.uav_buffer(bytes))
+        .inspect_err(|e| tracing::warn!(error = %e, "no stand-in for the indirect light"))
+        .ok()
+}
+
+/// Whether the passes are made by a thread of ours and left out until they
+/// are (`VICTORY_AMBIENT_ASIDE=1`). Made by the list thread that first wants
+/// them, the seven creations took the driver as long as the title's own
+/// pipelines in a run with an empty cache, tens of seconds; the list threads
+/// behind it waited too, the submission they were translating stood at the
+/// head of the line, and the present behind it with the title's thread in it
+/// past the title's 30 s watchdog.
+fn aside() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_AMBIENT_ASIDE").is_some_and(|v| v == "1"))
+}
+
 fn pass() -> Option<&'static Pass> {
-    static PASS: OnceLock<Option<Pass>> = OnceLock::new();
-    PASS.get_or_init(|| {
-        let host = host()?;
-        make(&host.device, |bytes| host.uav_buffer(bytes))
-            .inspect_err(|e| tracing::warn!(error = %e, "no stand-in for the indirect light"))
-            .ok()
-    })
-    .as_ref()
+    if !aside() {
+        return PASS.get_or_init(build).as_ref();
+    }
+    static ASKED: std::sync::Once = std::sync::Once::new();
+    ASKED.call_once(|| {
+        let made = std::thread::Builder::new()
+            .name("victory-ambient".into())
+            .spawn(|| {
+                let began = std::time::Instant::now();
+                PASS.get_or_init(build);
+                tracing::info!(
+                    ms = began.elapsed().as_millis() as u64,
+                    "the passes of the stand-in for the indirect light are made"
+                );
+            });
+        if let Err(e) = made {
+            tracing::warn!(error = %e, "no thread to make the stand-in for the indirect light");
+            let _ = PASS.set(None);
+        }
+    });
+    PASS.get()?.as_ref()
 }
 
 fn uav_barrier(list: &ID3D12GraphicsCommandList) {
