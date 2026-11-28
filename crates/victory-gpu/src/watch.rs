@@ -889,6 +889,16 @@ fn ask_split() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_ASK_SPLIT").is_some_and(|v| v == "1"))
 }
 
+/// Whether [`ask_ahead`] finds its pieces' reservations before it holds
+/// the whole submission (`VICTORY_ASK_HOMES=1`; off by default), from
+/// `VICTORY_ASK_SPANS`' regions when that is on. With `VICTORY_ASK_SPLIT`
+/// the queries stood 300-380 ms a frame under the hold, and every refresh
+/// waited (run lp-ask-rf).
+fn ask_homes() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ASK_HOMES").is_some_and(|v| v == "1"))
+}
+
 /// The reservation `page` lies in: its allocation base, in pages.
 #[cfg(test)]
 fn reservation(page: usize) -> usize {
@@ -958,15 +968,28 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
     if journal().kept {
         return;
     }
-    let _all = Asking::hold_all();
+    let early = ask_homes();
+    let held = if early { None } else { Some(Asking::hold_all()) };
     let mut t = std::time::Instant::now();
     phase_count(13, pieces.len());
     let spans = ask_spans::on();
     let bases = if spans { ask_spans::bases(&mut pieces) } else { Vec::new() };
     phase(0, &mut t);
     let split = ask_split();
-    let homes: Vec<usize> = if split { reservations(&pieces) } else { Vec::new() };
+    let homes: Vec<usize> = if !split {
+        Vec::new()
+    } else if early && spans {
+        // A piece kept by ASK_SPANS lies in one reservation, found from
+        // the frame's regions: its base is the piece's.
+        bases.iter().map(|b| b / PAGE).collect()
+    } else {
+        reservations(&pieces)
+    };
     phase(1, &mut t);
+    let _all = held.unwrap_or_else(Asking::hold_all);
+    if early {
+        t = std::time::Instant::now();
+    }
     let (mut asked, mut written) = (Vec::new(), Vec::new());
     let mut i = 0;
     while i < pieces.len() {
