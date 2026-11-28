@@ -710,6 +710,7 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
     if let Some(host) = crate::host::host() {
         // SAFETY: the title passes `count` lists.
         let lists = unsafe { std::slice::from_raw_parts(lists, count as usize) };
+        crate::list::check_put(lists, "ExecuteCommandLists");
         if behind::on() && !this.is_null() {
             behind::submit(this, lists);
             return;
@@ -1052,6 +1053,8 @@ extern "system" fn present(
     #[cfg(all(windows, feature = "diagnostics"))]
     crate::copystat::present_begins();
     let called = crate::timeline::span("the title's Present");
+    #[cfg(windows)]
+    let entered = std::time::Instant::now();
     #[cfg(all(windows, feature = "diagnostics"))]
     crate::timeline::title_thread();
     // Submissions sent to the card and not waited for are settled first,
@@ -1075,10 +1078,16 @@ extern "system" fn present(
         release_held(forces());
     }
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
-    // The title's frame this flips, for its statistics.
+    // The title's frame this flips, for its statistics: now, or when the
+    // line shows it (VICTORY_FLIP_AT_SHOW=1).
     // SAFETY: the title passes `planes` plane descriptions.
-    if planes > 0 && let Some(plane) = unsafe { plane_parameters.as_ref() } {
-        crate::frame::flipped(plane.token);
+    let token = if planes > 0 && let Some(plane) = unsafe { plane_parameters.as_ref() } { plane.token } else { 0 };
+    #[cfg(windows)]
+    let at_show = behind::on() && crate::frame::flip_at_show();
+    #[cfg(not(windows))]
+    let at_show = false;
+    if !at_show {
+        crate::frame::flipped(token);
     }
     #[cfg(all(windows, feature = "diagnostics"))]
     planes_seen(frame, planes, plane_parameters);
@@ -1156,7 +1165,7 @@ extern "system" fn present(
             this,
             texture.map(|(_, copy, state)| (copy, state)),
             overlay.map(|(_, copy, state)| (copy, state)),
-            Shown { frame, resource },
+            Shown { frame, resource, token, entered },
         );
         called.end();
         #[cfg(feature = "diagnostics")]
@@ -1189,7 +1198,7 @@ extern "system" fn present(
                     (over, texture, state)
                 })
             });
-        show(texture, state, overlay.map(|(_, texture, state)| (texture, state)), Shown { frame, resource: resource as usize });
+        show(texture, state, overlay.map(|(_, texture, state)| (texture, state)), Shown { frame, resource: resource as usize, token, entered });
         crate::resource::host_transition(resource, state);
         if let Some((over, _, over_state)) = overlay {
             crate::resource::host_transition(over, over_state);
@@ -1278,6 +1287,9 @@ fn frame_ends() {
 struct Shown {
     frame: u64,
     resource: usize,
+    /// The title's frame token, and when its `PresentX` was entered.
+    token: u64,
+    entered: std::time::Instant,
 }
 
 /// Shows `texture`, in host state `state`, in our window, and `overlay`

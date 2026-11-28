@@ -4184,6 +4184,11 @@ struct Deferred {
     /// Where the list's copies at their place write (from, to), for the
     /// fills behind them ([`HostList::place_constants`]).
     placed: Vec<(usize, usize)>,
+    /// Scratch memory of constant views since the list last wrote title
+    /// memory, with `VICTORY_CBV_ONCE=1` (source, bytes): the buffer, its
+    /// GPU address, the CPU address of its fill, and whether more than one
+    /// slot shows it ([`HostList::constants_held`]).
+    constants: std::collections::HashMap<(usize, usize), (ID3D12Resource, u64, usize, bool), std::hash::BuildHasherDefault<AddressHash>>,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize, std::hash::BuildHasherDefault<AddressHash>>,
     /// Last GPU source copied into each aliased host texture in this list.
@@ -4245,6 +4250,7 @@ impl Deferred {
         self.refreshed.clear();
         self.gpu_written.clear();
         self.filled.clear();
+        self.constants.clear();
     }
     /// Clears all recorded entries while preserving heap allocations for reuse.
     fn clear(&mut self) {
@@ -6331,6 +6337,13 @@ fn continues(last: (usize, usize, usize), next: (usize, usize, usize)) -> bool {
 fn declare_once() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var("VICTORY_DECLARE_ONCE").map_or(true, |v| v != "0"))
+}
+
+/// Whether constant views of the same bytes share a copy
+/// ([`HostList::constants_held`], `VICTORY_CBV_ONCE=1`).
+fn cbv_once() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_CBV_ONCE"))
 }
 
 /// The ranges the shaders of `runs` may write, per host copy, as declared.
@@ -10628,9 +10641,50 @@ impl HostList {
         Some(gpu)
     }
 
+    /// Scratch memory that holds the `len` bytes of title memory at `src` as
+    /// of the list's submission, for the constant view in `slot` (a title
+    /// heap's address, and the slot): the buffer and the GPU address.
+    /// `VICTORY_CBV_ONCE=1`: the constant views of the same bytes share one
+    /// copy until the list next writes title memory. In play-g scene A lists
+    /// made 4,057 constant views a frame, 2,637 of the 3,050 tables made
+    /// afresh held one, and every view had a copy of its own. A shared copy
+    /// is filled on the CPU, not by the card ([`card_steps`]), which makes
+    /// a slot show its own copy.
+    pub(crate) fn constants_held(&self, src: *const u8, len: u64, slot: (usize, u32)) -> Option<(ID3D12Resource, u64)> {
+        let key = (src as usize, len as usize);
+        if cbv_once() {
+            let mut deferred = self.deferred();
+            if let Some((buffer, gpu, to, shared)) = deferred.constants.get(&key).cloned() {
+                // Its fill, one of the last steps: no longer the card's.
+                let left = shared
+                    || deferred.copies.iter_mut().rev().take(256).any(|step| match step {
+                        Step::Fill(dst, _, _, fill_to) if *dst == to => {
+                            *fill_to = None;
+                            true
+                        }
+                        _ => false,
+                    });
+                if left {
+                    if !shared && let Some(known) = deferred.constants.get_mut(&key) {
+                        known.3 = true;
+                    }
+                    #[cfg(feature = "diagnostics")]
+                    crate::copystat::add(crate::copystat::C::CbvShared, 1);
+                    return Some((buffer, gpu));
+                }
+            }
+        }
+        let (buffer, gpu, to) = self.scratch_held(len)?;
+        self.defer_constants(to, src, len as usize, slot);
+        if cbv_once() {
+            self.deferred().constants.insert(key, (buffer.clone(), gpu, to as usize, false));
+        }
+        Some((buffer, gpu))
+    }
+
     /// As [`HostList::defer_fill`], for upload memory that only `slot` (a
     /// title heap's address, and the slot) shows.
-    pub(crate) fn defer_constants(&self, dst: *mut u8, src: *const u8, len: usize, slot: (usize, u32)) {
+    fn defer_constants(&self, dst: *mut u8, src: *const u8, len: usize, slot: (usize, u32)) {
         self.deferred()
             .copies
             .push(Step::Fill(dst as usize, src as usize, len, Some(card_steps::FillTo::Slot(slot.0, slot.1))));
@@ -11330,6 +11384,7 @@ impl HostList {
         }
         PREPARING[0].fetch_add(us.as_micros() as u64, Ordering::Relaxed);
         PREPARING[1].fetch_add(bytes, Ordering::Relaxed);
+        crate::cores::log::note(crate::cores::log::COPIES, us.as_micros() as u64);
         #[cfg(feature = "diagnostics")]
         {
             add(C::Copies, copies);
@@ -11433,6 +11488,11 @@ fn heap_sync_first() -> bool {
 /// round of the heaps' records was begun first, and those that began
 /// another after a wait for flights.
 static HEAP_SYNC_FIRST: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// As [`FRONT`], of the flushes among the steps with more than a few
+/// refreshes ([`flush_sift`]).
+#[cfg(feature = "diagnostics")]
+static AMONG: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
 /// Counts into [`SPLIT`].
 #[cfg(feature = "diagnostics")]
@@ -11563,6 +11623,15 @@ fn split_line(frames: f64) {
         r[3],
         r[2] / 1e6,
         if front_sift() { "on" } else { "off" },
+    );
+    let r: Vec<f64> = AMONG.iter().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+    tracing::info!(
+        "refreshes among the steps per frame, flushes of many: {:.2} ms sifting, {:.2} asking the write watch ahead over {:.0}          ranges, {:.2} copying on the threads (VICTORY_FLUSH_SIFT is {})",
+        r[0] / 1e6,
+        r[1] / 1e6,
+        r[3],
+        r[2] / 1e6,
+        if flush_sift() { "on" } else { "off" },
     );
     tracing::info!(
         "asking about title memory per frame, all threads: {:.0} kernel askings over {:.0} MB ({:.1} ms, {:.0} pages of 4 KiB found \
@@ -11881,6 +11950,38 @@ fn sift_front(spans: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>)
     let left: Vec<_> = spans.into_iter().zip(keep.iter()).filter(|(_, k)| k.load(Ordering::Relaxed)).map(|(s, _)| s).collect();
     #[cfg(feature = "diagnostics")]
     FLUSHES[2].fetch_add((keep.len() - left.len()) as u64, Ordering::Relaxed);
+    left
+}
+
+/// As [`front_sift`], at a flush among the steps: with very many refreshes
+/// (the heap's buffer views once a frame), those known to copy nothing are
+/// sifted out on all threads before the write watch is asked ahead.
+fn flush_sift() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_FLUSH_SIFT"))
+}
+
+/// [`flush_sift`]: the refreshes that may copy something, in their order,
+/// each with its ranges that copy nothing left out.
+fn sift_refreshes(refreshes: Vec<Refresh>) -> Vec<Refresh> {
+    use std::sync::atomic::AtomicBool;
+    let refreshes = std::sync::Arc::new(refreshes);
+    let keep: std::sync::Arc<Vec<AtomicBool>> = std::sync::Arc::new((0..refreshes.len()).map(|_| AtomicBool::new(false)).collect());
+    let (r, k) = (refreshes.clone(), keep.clone());
+    crate::shadow::wide_each(refreshes.len(), move |i| {
+        let shadow = &r[i].0;
+        if ranges(&r[i]).any(|(from, to)| !shadow.nothing_new(from, to - from)) {
+            k[i].store(true, Ordering::Relaxed);
+        }
+    });
+    let refreshes = std::sync::Arc::try_unwrap(refreshes).unwrap_or_else(|a| (*a).clone());
+    #[cfg(feature = "diagnostics")]
+    let all = refreshes.len();
+    let mut left: Vec<_> = refreshes.into_iter().zip(keep.iter()).filter(|(_, k)| k.load(Ordering::Relaxed)).map(|(r, _)| r).collect();
+    // Few are left: their other ranges are sifted here.
+    left.retain_mut(keep_new);
+    #[cfg(feature = "diagnostics")]
+    FLUSHES[2].fetch_add((all - left.len()) as u64, Ordering::Relaxed);
     left
 }
 
@@ -12234,6 +12335,7 @@ impl Batch {
         }
         PREPARING[0].fetch_add(us, Ordering::Relaxed);
         PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+        crate::cores::log::note(crate::cores::log::COPIES, us);
     }
 
     /// Whether `staging` is still to be refreshed in this submission (and
@@ -12435,8 +12537,12 @@ impl Batch {
         } else {
             let fills = std::mem::take(&mut self.fills);
             crate::shadow::wide_each(fills.len().div_ceil(PART), move |i| {
+                let started = crate::cores::log::on().then(std::time::Instant::now);
                 for &(dst, src, len) in fills.iter().skip(i * PART).take(PART) {
                     copy_mapped(dst as *mut u8, src as *const u8, len, false);
+                }
+                if let Some(started) = started {
+                    crate::cores::log::note(crate::cores::log::COPIES, started.elapsed().as_micros() as u64);
                 }
             });
         }
@@ -12505,6 +12611,20 @@ impl Batch {
             #[cfg(feature = "diagnostics")]
             FLUSHES[2].fetch_add((all - self.refreshes.len()) as u64, Ordering::Relaxed);
         }
+        let many = light && self.refreshes.len() > FEW && !batch;
+        #[cfg(feature = "diagnostics")]
+        let mut lap = std::time::Instant::now();
+        let sifted = many && flush_sift();
+        if sifted {
+            let started = std::time::Instant::now();
+            self.refreshes = sift_refreshes(std::mem::take(&mut self.refreshes));
+            PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        }
+        #[cfg(feature = "diagnostics")]
+        if many {
+            AMONG[0].fetch_add(lap.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            lap = std::time::Instant::now();
+        }
         // One write-watch asking for the copies that lie close together,
         // not one per copy.
         let ahead = self.refreshes.len() > 1;
@@ -12516,8 +12636,17 @@ impl Batch {
                 .filter(|r| r.0.asked_ahead())
                 .flat_map(ranges)
                 .collect();
+            #[cfg(feature = "diagnostics")]
+            if many {
+                AMONG[3].fetch_add(ranges.len() as u64, Ordering::Relaxed);
+            }
             crate::watch::ask_ahead(&ranges);
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        }
+        #[cfg(feature = "diagnostics")]
+        if many {
+            AMONG[1].fetch_add(lap.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            lap = std::time::Instant::now();
         }
         if wide_refresh() && self.refreshes.len() >= 4 {
             // Each copy on its own, several at a time: a copy's refresh
@@ -12533,7 +12662,7 @@ impl Batch {
                 crate::shadow::wide_each_from(refreshes.len(), 0, crate::shadow::wide_chunk(), move |i| {
                     let shadow = &refreshes[i].0;
                     for (from, to) in ranges(&refreshes[i]) {
-                        if refreshes.len() > FEW && !batch && shadow.nothing_new(from, to - from) {
+                        if refreshes.len() > FEW && !batch && !sifted && shadow.nothing_new(from, to - from) {
                             #[cfg(feature = "diagnostics")]
                             FLUSHES[2].fetch_add(1, Ordering::Relaxed);
                             continue;
@@ -12558,6 +12687,10 @@ impl Batch {
             for r in self.refreshes.drain(..) {
                 ranges(&r).for_each(|(from, to)| Self::update(&r.0, from, to));
             }
+        }
+        #[cfg(feature = "diagnostics")]
+        if many {
+            AMONG[2].fetch_add(lap.elapsed().as_nanos() as u64, Ordering::Relaxed);
         }
         if ahead {
             crate::watch::ask_ahead_done();

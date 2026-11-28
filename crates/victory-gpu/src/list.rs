@@ -755,8 +755,71 @@ extern "system" fn list_type(this: This) -> u32 {
     // SAFETY: `this` is one of our lists.
     unsafe { (*this.cast::<List>()).kind }
 }
+/// `VICTORY_LIST_PUT_CHECK=1`: logs the first time a list's put pointer
+/// or a limit is not zero at its Close, Reset or submission, with the
+/// title's caller; `=2` also sets them back to zero. Off: 0.
+fn put_check() -> u8 {
+    static ON: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("VICTORY_LIST_PUT_CHECK").as_deref() {
+        Ok("1") => 1,
+        Ok("2") => 2,
+        _ => 0,
+    })
+}
+
+/// [`put_check`] for each list at `at`, called from the title's own call.
+#[inline(never)]
+pub(crate) fn check_put(lists: &[This], at: &str) {
+    let on = put_check();
+    if on == 0 {
+        return;
+    }
+    static SEEN: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+    for &this in lists {
+        if this.is_null() {
+            continue;
+        }
+        let list = this.cast_mut().cast::<List>();
+        // SAFETY: one of our lists; the title's inlined code writes these
+        // words behind our back, so they are read as memory.
+        let put = unsafe { std::ptr::read_volatile(&raw const (*list).put) };
+        if put == [0; 5] {
+            continue;
+        }
+        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        if !seen.contains(&(this as usize)) {
+            seen.push(this as usize);
+            tracing::warn!(
+                at,
+                list = ?this,
+                // SAFETY: as above.
+                kind = unsafe { (*list).kind },
+                // SAFETY: as above.
+                list_type = match unsafe { (*list).kind } {
+                    0 => "direct",
+                    1 => "bundle",
+                    2 => "compute",
+                    3 => "copy",
+                    _ => "other",
+                },
+                // SAFETY: as above.
+                bundle = unsafe { (*list).kind } == 1,
+                put = format_args!("{:#x?}", put),
+                caller = crate::object::caller(2),
+                zeroed = on == 2,
+                "a list's put pointer or limit is not zero"
+            );
+        }
+        if on == 2 {
+            // SAFETY: as above.
+            unsafe { std::ptr::write_volatile(&raw mut (*list).put, [0; 5]) };
+        }
+    }
+}
+
 extern "system" fn close(this: This) -> HRESULT {
     let _called = crate::timeline::span("the title's Close");
+    check_put(&[this], "Close");
     #[cfg(windows)]
     if let Some(host) = host_list(this) {
         host.close();
@@ -768,6 +831,7 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
         return E_INVALIDARG;
     }
     let _called = crate::timeline::span("the title's list Reset");
+    check_put(&[this], "Reset");
     // A wait recorded and never submitted goes with the recording.
     VALUE_WAITS
         .lock()

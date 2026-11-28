@@ -404,6 +404,10 @@ pub(crate) enum C {
     /// them (`draw.rs` `refresh_tail`).
     RootTailAsked,
     RootTailCovered,
+    /// Root views bound as the list bound them before, and looked up
+    /// (`draw.rs` `State::root_view`, `VICTORY_ROOT_SAME`).
+    RootSameHit,
+    RootSameMiss,
     /// Settles for tables that came back with too few slots, and the asks
     /// refused without one while the settles are held back after such a
     /// settle (`draw.rs` `dynamic_slots`, `VICTORY_SETTLE_BACKOFF`).
@@ -425,7 +429,9 @@ pub(crate) enum C {
     /// is a multiple of 256 (a host constant view could read the title's
     /// memory in place), with their bytes; tables holding constant views,
     /// those whose constant views all are, and their slots; slots of tables
-    /// asked again this frame whose constant views all are.
+    /// asked again this frame whose constant views all are; constant views
+    /// that found a copy of their bytes made for another
+    /// (`VICTORY_CBV_ONCE`).
     CbvViews,
     CbvAligned,
     CbvBytes,
@@ -434,6 +440,7 @@ pub(crate) enum C {
     CbvTablesAligned,
     CbvTablesAlignedSlots,
     CbvAgainAlignedSlots,
+    CbvShared,
     /// Windows given their side on the card late (`shadow.rs`
     /// `card_late_windows`, `VICTORY_CARD_WINDOWS_LATE`), and their bytes;
     /// and the times one due found no room.
@@ -488,10 +495,10 @@ pub(crate) enum C {
     UavFolded,
     UavQuiet,
 }
-const COUNTERS: usize = 256;
+const COUNTERS: usize = 259;
 
 /// The counters' names, in the order of [`C`], for the frame recorder's columns.
-pub(crate) const NAMES: [&str; 256] = [
+pub(crate) const NAMES: [&str; 259] = [
     "Submissions", "Copies", "CopyBytes", "Refreshes", "RefreshBytes", "Skipped", "SkippedBytes", "Runs",
     "RunUs", "Queries", "QueryUs", "MoveUs", "Unmapped", "Watches", "WatchUs", "Checked", "Unchanged",
     "Fallbacks", "GuardFaults", "TexWatched", "TexHashed", "TexChanged", "TexHot", "Frames", "RecordCalls",
@@ -536,11 +543,12 @@ pub(crate) const NAMES: [&str; 256] = [
     "TexRowsDetiled", "PlacedUavRefused",
     "HeapTexMirrorNs", "HeapTexHostNs", "HeapTexPrintNs",
     "RootTailAsked", "RootTailCovered",
+    "RootSameHit", "RootSameMiss",
     "SettlesBare", "SettlesHeld",
     "TableCacheHit", "TableCacheHitSlots", "TableCacheMiss", "TableCacheStale",
     "TableCacheChanged", "TableCacheRetired", "TableCacheRetiredSlots",
     "CbvViews", "CbvAligned", "CbvBytes", "CbvAlignedBytes",
-    "CbvTables", "CbvTablesAligned", "CbvTablesAlignedSlots", "CbvAgainAlignedSlots",
+    "CbvTables", "CbvTablesAligned", "CbvTablesAlignedSlots", "CbvAgainAlignedSlots", "CbvShared",
     "CardLateMoved", "CardLateMovedBytes", "CardLateRefused",
     "WaitsQuiet", "WaitsGroupsRead", "WaitsGroupsTexture",
     "TexPartialWritten", "TexPartialSkipped",

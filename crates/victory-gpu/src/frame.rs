@@ -346,6 +346,33 @@ mod pace {
         }
     }
 
+    /// Presents of the last 5 s: count, sum and most of the time from
+    /// `PresentX` to the line showing the frame.
+    #[cfg(windows)]
+    static SHOWN: Mutex<Option<(Instant, u32, Duration, Duration)>> = Mutex::new(None);
+
+    #[cfg(windows)]
+    pub(super) fn shown(late: Duration) {
+        if !on() {
+            return;
+        }
+        let now = Instant::now();
+        let mut shown = SHOWN.lock().unwrap_or_else(|e| e.into_inner());
+        let (since, n, sum, most) = shown.get_or_insert((now, 0, Duration::ZERO, Duration::ZERO));
+        *n += 1;
+        *sum += late;
+        *most = (*most).max(late);
+        if now - *since >= Duration::from_secs(5) {
+            tracing::info!(
+                presents = *n,
+                mean_ms = format_args!("{:.2}", sum.as_secs_f64() * 1e3 / f64::from(*n)),
+                max_ms = format_args!("{:.1}", most.as_secs_f64() * 1e3),
+                "presents in the last 5 s: from PresentX to the line showing the frame"
+            );
+            *shown = Some((now, 0, Duration::ZERO, Duration::ZERO));
+        }
+    }
+
     pub(super) fn begun() {
         if !on() {
             return;
@@ -448,6 +475,32 @@ pub(crate) fn flipped(token: u64) {
     // A token not from an origin wait of ours (none is expected): its frame
     // began no later than it was flipped.
     keep(&FLIPPED, (token, origin.unwrap_or(now).min(now), now));
+}
+
+/// Whether a frame's flip is taken when the line of submissions shows it
+/// rather than at its `PresentX` (`VICTORY_FLIP_AT_SHOW=1`, with
+/// VICTORY_ASYNC_SUBMIT). Off: the title can read a frame as flipped while
+/// it still waits in the line.
+#[cfg(windows)]
+pub(crate) fn flip_at_show() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("VICTORY_FLIP_AT_SHOW").is_ok_and(|v| v.trim() == "1");
+        if on {
+            tracing::info!("frames count as flipped when the line shows them (VICTORY_FLIP_AT_SHOW=1)");
+        }
+        on
+    })
+}
+
+/// The line showed the frame of `token`, whose `PresentX` was entered at
+/// `entered`.
+#[cfg(windows)]
+pub(crate) fn shown(token: u64, entered: Instant) {
+    if flip_at_show() {
+        flipped(token);
+    }
+    pace::shown(entered.elapsed());
 }
 
 /// Device method: one record for a frame that was flipped, as the console
