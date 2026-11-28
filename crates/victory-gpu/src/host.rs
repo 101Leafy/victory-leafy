@@ -1449,6 +1449,7 @@ fn create() -> anyhow::Result<Host> {
             let forced = std::env::var_os("VICTORY_HOST_RDNA").is_some_and(|v| v == "1");
             victory_shader::emit::set_host_rdna(forced || amd && o1.WaveLaneCountMin == 32 && o1.WaveLaneCountMax == 64);
         }
+        crate::pipeline::refused::read_caps(&device);
         let mut model = D3D12_FEATURE_DATA_SHADER_MODEL {
             HighestShaderModel: D3D_SHADER_MODEL_6_7,
         };

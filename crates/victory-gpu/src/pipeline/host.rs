@@ -890,7 +890,8 @@ impl HostPipeline {
         let (root, root_blob) = match made {
             Ok(root) => root,
             Err(e) => {
-                tracing::warn!(error = %e, ?shaders, "host root signature refused");
+                let dxils: Vec<&[u8]> = stages.iter().filter_map(|(s, _)| s.translated()).map(|t| t.host.dxil.as_slice()).collect();
+                super::refused::failed("root signature", shaders, &e, &dxils, false);
                 return None;
             }
         };
@@ -921,9 +922,11 @@ impl HostPipeline {
             let pso = match made {
                 Ok(pso) => pso,
                 Err(e) => {
-                    tracing::warn!(error = %e, ?shaders, "host pipeline refused");
-                    host.log_messages();
-                    return None;
+                    let dxils: Vec<&[u8]> = stages.iter().filter_map(|(s, _)| s.translated()).map(|t| t.host.dxil.as_slice()).collect();
+                    let crashed = super::library::crashed(&name);
+                    super::refused::failed("compute", shaders, &e, &dxils, crashed);
+                    // SAFETY: as above.
+                    super::refused::retry(shaders, &dxils, crashed, || unsafe { host.device.CreateComputePipelineState(&desc) })?
                 }
             };
             tracing::info!(?shaders, "host pipeline");
@@ -1005,8 +1008,8 @@ impl HostPipeline {
                 mesh_pipeline(&host.device, &root, amplification, ms_code, ps_code, &mesh_state, depth_bounds, &name)
             };
             let refused = |e: windows::core::Error| {
-                tracing::warn!(error = %e, ?shaders, "host mesh pipeline refused");
-                host.log_messages();
+                let dxils: Vec<&[u8]> = stages.iter().filter_map(|(s, _)| s.translated()).map(|t| t.host.dxil.as_slice()).collect();
+                super::refused::failed("mesh", shaders, &e, &dxils, false);
             };
             let (pso, launch) = match launch_roots {
                 Some(roots) => match make(true) {
@@ -1149,9 +1152,14 @@ impl HostPipeline {
         let pso = match made {
             Ok(pso) => pso,
             Err(e) => {
-                tracing::warn!(error = %e, ?shaders, "host pipeline refused");
-                host.log_messages();
-                return None;
+                let dxils: Vec<&[u8]> = stages.iter().filter_map(|(s, _)| s.translated()).map(|t| t.host.dxil.as_slice()).collect();
+                let crashed = super::library::crashed(&name(rect_gs.as_ref()));
+                super::refused::failed("graphics", shaders, &e, &dxils, crashed);
+                if depth_bounds {
+                    return None;
+                }
+                // SAFETY: as above.
+                super::refused::retry(shaders, &dxils, crashed, || unsafe { host.device.CreateGraphicsPipelineState(&desc) })?
             }
         };
         tracing::info!(?shaders, "host pipeline");
