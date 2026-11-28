@@ -1,0 +1,72 @@
+# Answers posts asking where to get the game: a dump, its files, the 200+ GB download, CyberLeak,
+# torrents. It says this cannot be discussed here (GitHub can take the repository down over it).
+# An issue that asks is closed and locked; a comment that asks gets a reply. The rules below
+# were tested on every issue and comment of this repository. The repository's owner, members and
+# collaborators are never answered.
+name: game-requests
+on:
+  issues:
+    types: [opened]
+  issue_comment:
+    types: [created]
+permissions:
+  issues: write
+jobs:
+  answer:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            // RULES-START
+            // What the game itself is called in a request: a dump, its files, the 200+ GB download, the leak.
+            const GAME = String.raw`(?:(?:my |your |the |a |an |own |game |full |whole )*(?:dump|dumps|dumped files)\b|game ?files?\b|game ?build\b|the game\b(?! (?:to|running|working|started|launch|start|run|work))|gta ?(?:vi|6)\b(?! (?:to|running|working|started|launch|start|run|work))|torrents?\b|magnet\b|cyber ?le[ae]ks?\b|\b\d{3} ?gb\b|game_scarlett_master|scarlett exe|official exe(?:cutable)?\b|xvc\b|the (?:iso|rom)\b)`;
+            const ASKS = [
+              // where/how ... get/find/download ... <game>
+              new RegExp(String.raw`\b(?:where|how)\b[^.?!\n]{0,25}?\b(?:get|find|download|obtain|grab|buy|acquire)\b[^.?!\n]{0,15}?` + GAME, 'i'),
+              // anyone have / send me / share ... <game> link
+              new RegExp(String.raw`\b(?:any ?one|anybody|someone|somebody|pls|please|can (?:you|u|someone))\b[^.?!\n]{0,30}?\b(?:have|has|got|send|share|give|upload|post|dm)\b[^.?!\n]{0,20}?(?:(?:a |the )?(?:link|links|source|mirror|download)\s+(?:to|for|of)\s+)?` + GAME, 'i'),
+              // link/source for <game>
+              new RegExp(String.raw`\b(?:link|links|source|mirror|download)\s+(?:to|for|of)\s+` + GAME, 'i'),
+              // i need the dump
+              new RegExp(String.raw`\b(?:i|we)\s+(?:need|want|dont have|don't have|do not have)\s+` + GAME, 'i'),
+            ];
+            // Quoted replies, code and logs are not the poster's own question.
+            const plain = (text) => (text || '')
+              .replace(/```[\s\S]*?```/g, ' ')
+              .replace(/`[^`\n]*`/g, ' ')
+              .split('\n').filter((l) => !/^\s*>/.test(l)).join('\n');
+            const asksForGame = (title, body) => {
+              const text = `${plain(title)}\n${plain(body)}`;
+              return ASKS.some((re) => re.test(text));
+            };
+            // RULES-END
+            const { owner, repo } = context.repo;
+            const p = context.payload;
+            const post = p.comment || p.issue;
+            if (['OWNER', 'MEMBER', 'COLLABORATOR'].includes(post.author_association)) return;
+            if (post.user.type === 'Bot') return;
+            const who = `@${post.user.login}`;
+            const why = "we can't help with where to get the game, a dump or any of its files, and it can't be " +
+              'discussed here at all: if this repository is used for that, GitHub can take it down for everyone. ' +
+              "Please don't ask for or post links, torrents or sources here.";
+            const issue_number = p.issue.number;
+            if (p.comment) {
+              if (!asksForGame('', p.comment.body)) return;
+              core.notice(`Answering comment ${p.comment.id} by ${p.comment.user.login} on #${issue_number}`);
+              await github.rest.issues.createComment({ owner, repo, issue_number, body: `${who} ${why}` });
+              return;
+            }
+            if (!asksForGame(p.issue.title, p.issue.body)) return;
+            core.notice(`Closing #${issue_number} by ${p.issue.user.login}: ${p.issue.title}`);
+            await github.rest.issues.createComment({
+              owner, repo, issue_number,
+              body: `Hi ${who}, ${why}\n\nThis issue is closed and locked. If you already have your own copy and VIctory has ` +
+                'a problem with it, please open a new issue with your logs.',
+            });
+            await github.rest.issues.update({ owner, repo, issue_number, state: 'closed', state_reason: 'not_planned' });
+            try {
+              await github.rest.issues.lock({ owner, repo, issue_number, lock_reason: 'off-topic' });
+            } catch (e) {
+              core.warning(`Could not lock #${issue_number}: ${e.message}`);
+            }
