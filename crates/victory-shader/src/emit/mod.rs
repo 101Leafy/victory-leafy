@@ -126,7 +126,7 @@ pub use sampler::StaticSampler;
 pub use lower::{host_settings, sampled_marks_on, set_host_max_wave, set_host_rdna, with_program};
 pub use rect::rect_list_gs;
 pub use shader::{
-    MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, ROOT_CBV_SPACE, SAMPLED_MARKS, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_SAMPLED, SLOT_STRIDES,
+    MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, ROOT_CBV_SPACE, SAMPLED_MARKS, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEET, SLOT_MEMORY, SLOT_SAMPLED, SLOT_STRIDES,
     SLOT_STRIDES_COUNT, SLOT_TABLE_STRIDES, USER_DATA_SPACE, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, USER_DISPATCH_THREADS_X, USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
     raw_views, set_raw_views, set_view_heap_limit, view_heap_limit,
 };
@@ -567,6 +567,16 @@ fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
     emit(&c, &native, &p, &st, &io, &res)
 }
 
+/// Meet sites the face-relocation compute emitted, or 0 before it is translated.
+pub fn defrag_meet_sites() -> u32 {
+    lower::meet_sites()
+}
+
+/// Shader LDS reads and writes that received their own half-meet.
+pub fn defrag_lds_sites() -> (u32, u32) {
+    lower::meet_lds_sites()
+}
+
 /// Emits a program whose earlier stages already ran ([`emit_once`]). A wave64 compute program
 /// that does not translate with the branches that close or leave its loops taken by each host
 /// wave together ([`loops_wave`]) is tried once more without them, as before that step: the
@@ -748,6 +758,8 @@ fn emit_once(
                     | [0x27, 0x7f, 0x65, 0x9e, 0x06, 0xf0, 0x2b, 0xa2, 0x68, 0x5a, 0xff, 0x1d, 0x0d, 0xf0, 0x3f, 0x5e]
                     | [0x4f, 0xa5, 0x83, 0x20, 0xd7, 0x61, 0xbf, 0x55, 0x81, 0x20, 0xf9, 0x2c, 0x19, 0xd3, 0x84, 0xaa]
                     | [0xe4, 0x91, 0x94, 0x2b, 0xdc, 0xb5, 0x01, 0x47, 0x3a, 0x9a, 0x4a, 0x00, 0xa0, 0xbd, 0x59, 0x33]
+                    // CS_CollisionRaytraced
+                    | [0xd3, 0x2c, 0xbc, 0xbf, 0xff, 0x6a, 0x0c, 0x04, 0x80, 0xb5, 0x06, 0xd8, 0xf7, 0xd6, 0x58, 0xf9]
             )
             || matches!(native.io, crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 128)
                 && c.digest == [0x50, 0xcf, 0x28, 0x32, 0x8b, 0x58, 0x05, 0x3d, 0xa8, 0x9a, 0x8d, 0xa0, 0x1a, 0xa1, 0x23, 0xc6];
@@ -758,6 +770,19 @@ fn emit_once(
             && c.digest == [0x4f, 0xa5, 0x83, 0x20, 0xd7, 0x61, 0xbf, 0x55, 0x81, 0x20, 0xf9, 0x2c, 0x19, 0xd3, 0x84, 0xaa]
             && matches!(native.io, crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 64);
         let wide_on = wide_option.as_ref().map_or(scene_kernel || water_portals, |v| v == "1");
+        // CS_DefragHeap_ComputeRelocations: a group of two console waves. Its
+        // divergent LDS is read and written in one region, so it only lowers
+        // once that region is taken by both halves of a wave. The other wave
+        // of the group does not wait (`with_half_meets`). Not the global switch.
+        // `VICTORY_DEFRAG=0` leaves this compute untranslated, so its dispatches
+        // are dropped and a run can be compared with one where it executes.
+        let defrag_off = std::env::var_os("VICTORY_DEFRAG").is_some_and(|v| v == "0");
+        let defrag = !defrag_off
+            && c.digest
+                == [
+                    0x50, 0xcf, 0x28, 0x32, 0x8b, 0x58, 0x05, 0x3d, 0xa8, 0x9a, 0x8d, 0xa0, 0x1a,
+                    0xa1, 0x23, 0xc6,
+                ];
         // A single guest wave can iterate an active-lane loop until both host
         // halves have finished. The precise latch and convergence conditions
         // for the driver compute route are checked by widen().
@@ -787,7 +812,7 @@ fn emit_once(
                 // Still stopped where not every lane runs: the per-lane branches around
                 // those places taken as the console takes them, by the whole wave at once
                 // ([`widen`]), at two group barriers per such branch.
-                if wide_on || driver_loop {
+                if wide_on || driver_loop || defrag {
                     let bases = [
                         deep.as_ref().map(|f| &f.0),
                         forms[1].1.as_ref().map(|f| &f.0),
@@ -795,7 +820,13 @@ fn emit_once(
                         Some(p),
                     ];
                     if let Some(base) = bases.into_iter().flatten().next() {
-                        let again = widen(c, native, base, why, driver_loop, wide_on);
+                        let again = if defrag {
+                            lower::with_half_meets(|| {
+                                widen(c, native, base, why, driver_loop, wide_on)
+                            })
+                        } else {
+                            widen(c, native, base, why, driver_loop, wide_on)
+                        };
                         report("wave-wide branches", &again);
                         if done(&again) {
                             return again.map(|(shader, _)| shader);
@@ -916,7 +947,9 @@ fn widen(
         // (a program whose waves are the host's meets no one: no barrier, any group)
         crate::native::StageIo::Cs(_) if !(native.wave64 && lower::host_max_wave() == 32) => {}
         crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 64 => {}
-        crate::native::StageIo::Cs(cs) if groups && cs.threads.iter().product::<u32>() % 64 == 0 => {}
+        crate::native::StageIo::Cs(cs)
+            if groups && cs.threads.iter().product::<u32>() % 64 == 0
+                || lower::half_meets() && cs.threads.iter().product::<u32>() == 128 => {}
         crate::native::StageIo::Cs(cs) => {
             if why {
                 eprintln!("WAVE64-WIDE not tried: thread groups of {:?}", cs.threads);
@@ -928,6 +961,7 @@ fn widen(
     // (several console waves to a group, each two host waves)
     let pairs = native.wave64
         && lower::host_max_wave() == 32
+        && !lower::half_meets()
         && matches!(native.io, crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() > 64);
     let mut wide = std::collections::HashSet::new();
     loop {

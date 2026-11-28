@@ -70,6 +70,9 @@ pub const SLOT_SAMPLED: u8 = 251;
 /// Dwords of the [`SLOT_SAMPLED`] buffer: a bit for each of 2^22 slots
 /// (the largest host view heap, raw twins included).
 pub const SAMPLED_MARKS: u32 = 1 << 17;
+/// Root UAV `u<SLOT_MEET>`: three dwords the face-relocation compute adds to,
+/// meetings, wait iterations and wait atomics. Ours, not the title's.
+pub const SLOT_MEET: u8 = 252;
 /// Entries of the [`SLOT_MEMORY`] directory: title addresses below 128 GiB.
 pub const MEMORY_PAGES: u32 = 1 << 21;
 /// In a directory entry's first dword: shaders do not store there by address
