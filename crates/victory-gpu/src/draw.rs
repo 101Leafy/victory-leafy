@@ -923,6 +923,68 @@ fn heap_recheck() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_RECHECK").is_none_or(|v| v != "0"))
 }
+
+/// Whether the pass over textures picked by index tells the queue what came
+/// of its slots a batch at a time ([`Tells`]), and takes what the queue
+/// knows of a slot looked at again with the slots due
+/// (`HostHeap::texture_slots_due_known`). Off by default:
+/// `VICTORY_QUEUE_BATCH=1` turns it on; without it each slot is told and
+/// asked at its turn, a take of the queue's lock each.
+fn queue_batch() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_QUEUE_BATCH").is_some_and(|v| v == "1"))
+}
+
+/// What the pass over textures picked by index found of its slots, told to
+/// the queue [`Tells::BATCH`] slots at a time and when the pass ends
+/// (`HostHeap::texture_slots_told`): a take of the queue's lock for a batch,
+/// where each slot took it once or twice (90,000-250,000 slots in 5 s of a
+/// cutscene, coolfox-20261126-233017, while the recording threads took it for
+/// every record they made). A slot's entry is told of after a few more slots'
+/// work, as it would be if the pass's thread had been held up for that long;
+/// the queue drops what is told of a write that is not the one it holds
+/// (`TextureQueue::same`), as before. With [`queue_batch`] off, each at once.
+struct Tells<'a> {
+    host: &'a crate::descriptor::host::HostHeap,
+    told: Vec<(u32, u64, crate::descriptor::host::Told)>,
+}
+
+impl Tells<'_> {
+    /// Few slots' work (some microseconds each), so that a pass that takes
+    /// the slots due meanwhile on another thread finds few of these told
+    /// late.
+    const BATCH: usize = 16;
+
+    fn tell(&mut self, index: u32, write: u64, what: crate::descriptor::host::Told) {
+        use crate::descriptor::host::Told;
+        let host = self.host;
+        if !queue_batch() {
+            match what {
+                Told::Done(again) => host.texture_slot_done(index, write, again),
+                Told::Recheck(due, at, print, looks, uploaded) => {
+                    host.texture_slot_recheck(index, write, due, at, print, looks, uploaded);
+                }
+                Told::Later(frame, most) => host.texture_slot_later(index, write, frame, most),
+                Told::Held(due) => host.texture_slot_held(index, write, due),
+            }
+            return;
+        }
+        self.told.push((index, write, what));
+        if self.told.len() >= Self::BATCH {
+            self.flush();
+        }
+    }
+
+    fn flush(&mut self) {
+        self.host.texture_slots_told(&mut self.told);
+    }
+}
+
+impl Drop for Tells<'_> {
+    fn drop(&mut self) {
+        self.flush();
+    }
+}
 /// Times a placed texture's slot was passed over because its memory is not
 /// mapped.
 pub(crate) static HEAP_TEXTURES_SAME: AtomicU64 = AtomicU64::new(0);
@@ -3194,15 +3256,21 @@ impl State {
         #[cfg(feature = "diagnostics")]
         lap(crate::copystat::C::HeapTexWaitingNs);
         let baking = crate::texture::BAKING.get();
-        let (mut due, census) = host.texture_slots_due(frame, if baking { 1 << 16 } else { 4096 });
+        // (And what the queue knew of each, `known`: see `Tells`.)
+        let (mut due, mut known, census) = host.texture_slots_due_known(frame, if baking { 1 << 16 } else { 4096 });
         // (Those that are due later after all that are due.)
         let on_time = due.len();
         if baking {
-            let known: std::collections::HashSet<u32> = due.iter().map(|&(index, _)| index).collect();
+            let taken: std::collections::HashSet<u32> = due.iter().map(|&(index, _)| index).collect();
             static AHEAD: AtomicU64 = AtomicU64::new(u64::MAX);
             let again = AHEAD.swap(frame, Ordering::Relaxed) == frame;
-            let (ahead, _) = host.texture_slots_due(frame + BAKE_AHEAD[usize::from(again)], 1 << 16);
-            due.extend(ahead.into_iter().filter(|(index, _)| !known.contains(index)));
+            let (ahead, ahead_known, _) = host.texture_slots_due_known(frame + BAKE_AHEAD[usize::from(again)], 1 << 16);
+            for (slot, knew) in ahead.into_iter().zip(ahead_known) {
+                if !taken.contains(&slot.0) {
+                    due.push(slot);
+                    known.push(knew);
+                }
+            }
         }
         HEAP_TEXTURES_WAITING.store(census[0], Ordering::Relaxed);
         for (count, now) in HEAP_TEXTURES_QUEUE.iter().zip(census) {
@@ -3284,7 +3352,9 @@ impl State {
             BAKE_SERVED.store(0, Ordering::Relaxed);
         }
         let mut served = true;
-        for (index, write) in due {
+        let mut tells = Tells { host, told: Vec::with_capacity(Tells::BATCH) };
+        use crate::descriptor::host::Told;
+        for ((index, write), knew) in due.into_iter().zip(known) {
             // The time since the last lap: the end of the slot before.
             laps.lap(Laps::REST);
             if SPENT.load(Ordering::Relaxed) >= bytes_at_most || began.elapsed() > span {
@@ -3336,7 +3406,14 @@ impl State {
             // (all their blocks are shown at other addresses too), and each
             // was shown four frames late, over and over.
             let mut again_in = RECHECK_FRAMES[0];
-            if let Some((at, len, print, looks, uploaded)) = host.texture_slot_checked(index) {
+            // What the queue knew of it when the slots due were taken, while
+            // its marks say it holds the write handed out still; else (or
+            // without `VICTORY_QUEUE_BATCH=1`) asked now.
+            let checked = match knew {
+                knew if queue_batch() && host.texture_slot_write(index) == Some(write) => knew,
+                _ => host.texture_slot_checked(index),
+            };
+            if let Some((at, len, print, looks, uploaded)) = checked {
                 #[cfg(feature = "diagnostics")]
                 let started = std::time::Instant::now();
                 let unchanged = crate::texture::fingerprint(at, len) == print;
@@ -3345,10 +3422,8 @@ impl State {
                 if unchanged {
                     HEAP_TEXTURES_RECHECKED[0].fetch_add(1, Ordering::Relaxed);
                     match RECHECK_FRAMES.get(usize::from(looks) + 1) {
-                        Some(wait) => {
-                            host.texture_slot_recheck(index, write, frame + wait, (at, len), print, looks + 1, uploaded)
-                        }
-                        None => host.texture_slot_done(index, write, None),
+                        Some(wait) => tells.tell(index, write, Told::Recheck(frame + wait, (at, len), print, looks + 1, uploaded)),
+                        None => tells.tell(index, write, Told::Done(None)),
                     }
                     continue;
                 }
@@ -3392,7 +3467,7 @@ impl State {
                     HEAP_TEXTURES_AWAY.fetch_add(1, Ordering::Relaxed);
                     // Streamed out: what the slot showed is let go.
                     host.texture_slot_gone(index);
-                    host.texture_slot_later(index, write, frame, most);
+                    tells.tell(index, write, Told::Later(frame, most));
                     continue;
                 }
                 host.texture_slot_here(index);
@@ -3400,7 +3475,7 @@ impl State {
                 if mapped < len {
                     if mapped <= host.texture_slot_mapped(index) {
                         HEAP_TEXTURES_PARTLY[0].fetch_add(1, Ordering::Relaxed);
-                        host.texture_slot_later(index, write, frame, most);
+                        tells.tell(index, write, Told::Later(frame, most));
                         continue;
                     }
                     if !crate::texture::committed(address as *const u8, 1) {
@@ -3417,7 +3492,7 @@ impl State {
                 && crate::resource::buffer_bytes(object as This).is_none()
                 && !crate::resource::title_fills(object as This)
             {
-                host.texture_slot_done(index, write, None);
+                tells.tell(index, write, Told::Done(None));
                 continue;
             }
             // From here on a host texture is made: not without room. The
@@ -3445,7 +3520,7 @@ impl State {
                         // Held back for the frames of about four seconds
                         // (`most`), or until the card has room; the pass
                         // goes on, within a count that bounds one pass.
-                        host.texture_slot_held(index, write, frame + most);
+                        tells.tell(index, write, Told::Held(frame + most));
                         if refused > 1024 {
                             break;
                         }
@@ -3560,7 +3635,7 @@ impl State {
                 Some(&View::Shader(resource, _)) => resource as This,
                 _ => {
                     at_once();
-                    host.texture_slot_done(index, write, None);
+                    tells.tell(index, write, Told::Done(None));
                     continue;
                 }
             };
@@ -3573,14 +3648,14 @@ impl State {
             // the queue and is looked at again once the card may have room
             // (marked done, it was never uploaded).
             if texture.is_none() && crate::resource::retrying(resource) {
-                host.texture_slot_held(index, write, frame + 1);
+                tells.tell(index, write, Told::Held(frame + 1));
                 continue;
             }
             let title_fills = texture.is_some_and(crate::texture::title_written);
             if !title_fills {
                 at_once();
                 // a render target, a depth or unordered access texture: the host's own
-                host.texture_slot_done(index, write, None);
+                tells.tell(index, write, Told::Done(None));
                 continue;
             }
             laps.lap(Laps::MAKE);
@@ -3630,9 +3705,9 @@ impl State {
                         let print = crate::texture::fingerprint(at, len);
                         #[cfg(feature = "diagnostics")]
                         crate::copystat::lap(crate::copystat::C::HeapTexPrintNs, started);
-                        host.texture_slot_recheck(index, write, frame + again_in, (at, len), print, 0, frame);
+                        tells.tell(index, write, Told::Recheck(frame + again_in, (at, len), print, 0, frame));
                     }
-                    None => host.texture_slot_done(index, write, again),
+                    None => tells.tell(index, write, Told::Done(again)),
                 }
                 continue;
             }
@@ -3736,7 +3811,7 @@ impl State {
                 // next draw that reads the texture through a table stage,
                 // detile and upload all of it once more.
                 HEAP_TEXTURES_TABLED.fetch_add(1, Ordering::Relaxed);
-                host.texture_slot_done(index, write, again);
+                tells.tell(index, write, Told::Done(again));
                 continue;
             }
             // Uploaded: the list holds the staging buffer until it has run;
@@ -3767,11 +3842,13 @@ impl State {
                     let print = crate::texture::fingerprint(at, len);
                     #[cfg(feature = "diagnostics")]
                     crate::copystat::lap(crate::copystat::C::HeapTexPrintNs, started);
-                    host.texture_slot_recheck(index, write, frame + again_in, (at, len), print, 0, frame);
+                    tells.tell(index, write, Told::Recheck(frame + again_in, (at, len), print, 0, frame));
                 }
-                None => host.texture_slot_done(index, write, again),
+                None => tells.tell(index, write, Told::Done(again)),
             }
         }
+        // Told before anything after the loop looks at the queue.
+        tells.flush();
         laps.lap(Laps::REST);
         // Where this pass's time went, for the frame line (`HEAP_TEXTURE_PARTS`).
         let [made, made_us] = crate::resource::made_here();
