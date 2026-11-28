@@ -63,6 +63,10 @@ const ITEMS: &[Item] = &[
     Item { var: "VICTORY_CARD_STEPS", label: "CARD STEPS", values: STAGES, live: false },
     Item { var: "VICTORY_INDIRECT_BATCH", label: "INDIRECT BATCH", values: STAGES, live: false },
     Item { var: "VICTORY_PORT_CONSTANTS", label: "CONSTANTS HEAP IN PLACE", values: UNSET_ON, live: false },
+    // The mouse on the stand-in pad's right stick (controls.rs): the same
+    // `VICTORY_MOUSE_SENS` a player would set before the start, changeable
+    // at once so the feel can be matched to the title's own slider.
+    Item { var: "VICTORY_MOUSE_SENS", label: "MOUSE LOOK SENSITIVITY", values: &[("", "THE TITLE'S OWN"), ("0.5", "0.5 (SLOW)"), ("1", "1"), ("1.5", "1.5"), ("2", "2"), ("3", "3 (FAST)")], live: true },
 ];
 /// The lines after the settings.
 const ACTIONS: [&str; 3] = ["SAVE FOR NEXT START", "RESET ALL TO PLAY DEFAULTS", "CLOSE"];
@@ -361,6 +365,8 @@ impl Menu {
         }
         match var {
             "VICTORY_FPS_LINE" => fps_line_on().store(value != "0", Ordering::Relaxed),
+            // The look's deflection per pixel, from the next poll on.
+            "VICTORY_MOUSE_SENS" => crate::set_kbm_mouse_sens(value.parse().unwrap_or(1.0)),
             _ => {}
         }
     }

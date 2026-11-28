@@ -69,6 +69,38 @@ pub fn settings_pad_mode() -> SettingsPadMode {
 /// The F1 settings menu is shown (`host/menu.rs`): the title gets no keyboard meanwhile
 /// (read by the input module).
 pub static SETTINGS_MENU_OPEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// The keyboard-and-mouse look's sensitivity multiplier, the bits of an
+/// `f32` (`f32::to_bits`): 0 says "not asked of this process yet", and the
+/// first [`kbm_mouse_sens`] answers from `VICTORY_MOUSE_SENS` (1 when unset
+/// or not a positive number). The F1 settings menu changes it live
+/// ([`set_kbm_mouse_sens`], read by the input module's mouse-look).
+pub static KBM_MOUSE_SENS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// [`KBM_MOUSE_SENS`] as a multiplier (never 0: an unset or broken variable
+/// answers 1, and the answer is kept so the variable is asked once).
+pub fn kbm_mouse_sens() -> f32 {
+    use std::sync::atomic::Ordering::Relaxed;
+    let bits = KBM_MOUSE_SENS.load(Relaxed);
+    if bits == 0 {
+        let sens = std::env::var("VICTORY_MOUSE_SENS")
+            .ok()
+            .and_then(|s| s.trim().parse::<f32>().ok())
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .unwrap_or(1.0);
+        KBM_MOUSE_SENS.store(sens.to_bits(), Relaxed);
+        return sens;
+    }
+    f32::from_bits(bits)
+}
+
+/// Sets [`KBM_MOUSE_SENS`] from the settings menu (a change of
+/// `VICTORY_MOUSE_SENS` in the menu's own environment goes with it; a
+/// value that is not a positive finite number means the build's own 1).
+pub fn set_kbm_mouse_sens(value: f32) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let sens = if value.is_finite() && value > 0.0 { value } else { 1.0 };
+    KBM_MOUSE_SENS.store(sens.to_bits(), Relaxed);
+}
 #[cfg(windows)]
 mod indirect;
 #[cfg(windows)]
