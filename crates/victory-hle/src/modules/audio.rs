@@ -821,6 +821,58 @@ fn dump_input(index: u32, context: Context) {
     let _ = std::fs::write(dir.join(format!("{n:02}-{index}.xma")), input.unwrap_or_default());
 }
 
+/// The ms of `VICTORY_VOICE_LOG=<ms>`, shared with the Opus decoder's log.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn voice_log_ms() -> Option<u128> {
+    static MS: OnceLock<Option<u128>> = OnceLock::new();
+    *MS.get_or_init(|| {
+        std::env::var("VICTORY_VOICE_LOG")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&ms| ms > 0)
+    })
+}
+
+/// `VICTORY_VOICE_LOG=<ms>`: every `ms`, a line per enabled voice with the
+/// samples per channel decoded into its ring and taken from it by the title
+/// since it was enabled. A voice heard while these stand still would hold a
+/// lip sync clip that follows its play position (gdkx.md 15.3).
+#[cfg(feature = "diagnostics")]
+fn voice_log(xma: &Xma) {
+    static LAST: Mutex<Option<Instant>> = Mutex::new(None);
+    let Some(ms) = voice_log_ms() else {
+        return;
+    };
+    let mut last = lock(&LAST);
+    if last.is_some_and(|t| t.elapsed().as_millis() < ms) {
+        return;
+    }
+    *last = Some(Instant::now());
+    drop(last);
+    for (index, slot) in xma.voices.iter().enumerate() {
+        if !slot.enabled.load(Ordering::Acquire) {
+            continue;
+        }
+        let Some(context) = xma.context(index as u32) else {
+            continue;
+        };
+        let voice = lock(&slot.voice);
+        let Some(voice) = voice.as_ref() else {
+            continue;
+        };
+        let taken = lock(&slot.ring).taken * SAMPLES_PER_BLOCK / context.channels();
+        tracing::info!(
+            index,
+            ms = voice.trace.since.elapsed().as_millis(),
+            produced = voice.trace.produced,
+            taken,
+            read_bit = context.field(2, 0, 26),
+            ended = voice.ended,
+            "XMA voice position"
+        );
+    }
+}
+
 /// Starts the decoding thread on the first enabled voice, and has it fill
 /// rings now: a voice just enabled or read from.
 fn wake_decoder() {
@@ -832,6 +884,8 @@ fn wake_decoder() {
                 .spawn(|| {
                     raise_priority();
                     loop {
+                        #[cfg(feature = "diagnostics")]
+                        voice_log(&xma());
                         let active = xma().pump();
                         if active == 0 {
                             // Enabling a voice wakes the thread.
