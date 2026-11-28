@@ -2,17 +2,20 @@
 //! 1.0.2.1): the title presents at 3840x2160 on Series X, its scene drawn at
 //! 2560x1440 and scaled up by its own temporal pass. With 1440p asked for
 //! (`VICTORY_NATIVE_1440P=1`, or `VICTORY_RENDER_1080P=1` for a 1920x1080
-//! scene scaled to 1440p), the image's SDR display mode, the UI memory pool,
-//! the legacy UI flag and the temporal scene scale are patched before it is
-//! mapped: the title then makes a 1440p output, lays its UI out on the
-//! 3840x2160 size its menus are authored for and scales it onto the 2560x1440
-//! targets (as Series S does at 1080p), and no 4K pass runs.
+//! scene scaled to 1440p), the title's own settings get what Series S's
+//! preset gives them, with a 2560x1440 output, and the UI memory pool and the
+//! temporal scene scale are patched before the image is mapped. The SDR
+//! display mode stays at stock 3840x2160, as Series S keeps it. The title then
+//! makes a 1440p output, lays its UI and pause map out on the 3840x2160 size
+//! they are authored for, scales them onto the 2560x1440 targets, and runs no
+//! 4K pass.
 //!
-//! The legacy UI flag (`0xA9438F4`, byte) is what scales the UI: the title
-//! sets it from its console preset, 1 on Series S, 0 on Series X, where the
-//! output is always 3840x2160 and nothing needs scaling. Left at 0 with the
-//! 1440p output, menus and the HUD were laid out on a 2560x1440 stage with
-//! their 4K-sized content, 1.5 times too large and overlapping.
+//! Series S's preset sets three video settings: the legacy UI flag (1), the
+//! legacy UI size (3840x2160) and the output size (1920x1080). Every reader
+//! (the UI layout, the title's screen size `0x92D7924`, the pause map's
+//! target size) takes what it needs from them. Series X's preset has the flag
+//! at 0 and no legacy size, so with a 1440p output its menus and HUD were laid
+//! out on a 2560x1440 stage with their 4K-sized content, 1.5 times too large.
 //!
 //! Ported from DexNom's fork (DexNom/VIctory, `apps/victory/src/native_1440p.rs`,
 //! GPL-3.0-or-later), its native 1440p part only. Every field is checked
@@ -42,13 +45,51 @@ const LEGACY_UI_HEIGHT: u32 = 2160;
 /// `cmovne` on the title's Series S check).
 const UI_POOL: u32 = 0x0247_ad4a;
 const TEMPORAL_SCALE: u32 = 0x028f_1e7e;
-/// The legacy UI flag from the console preset: `mov al, [rdi+0x1e8]`, then
-/// stored to the flag (`mov [rsi+0x13c], al`).
-const LEGACY_UI_PRESET: u32 = 0x01e0_fb69;
-const STOCK_LEGACY_UI_PRESET: &str = "79b808935d64ed64f88414b9bb8f696c996005b2ce05e5a81ac93b3c6218f739";
-/// The settings update storing the flag again: `mov [rsi+0x13c], r8b`.
-const LEGACY_UI_FLAG_STORE: u32 = 0x0261_92f9;
-const STOCK_LEGACY_UI_FLAG_STORE: &str = "edaab24aa453924381dd65cfc5724a1e254c071d1894f738ddb20dd6f7d8e809";
+/// The settings collection's copy (`0x1D70750`), which every settings store
+/// goes through (the init's apply, the runtime updates, the backups): its
+/// last store of the video block and the `vzeroupper` after it (11 bytes).
+/// The video settings start at collection `+0x450`, so the legacy UI flag is
+/// at `+0x638` (settings `+0x1E8`, byte), the legacy UI size at
+/// `+0x63C/+0x640` (`+0x1EC/+0x1F0`) and the output size at `+0x654/+0x658`
+/// (`+0x204/+0x208`).
+const SETTINGS_COPY: u32 = 0x01d7_0b98;
+const STOCK_SETTINGS_COPY: &str = "9d8829e6720f7624fd7004b8905ccfd6e1d9c6610ec186100f8350e091344038";
+const SETTINGS_COPY_LEN: usize = 11;
+/// Padding (`int3`, 60 bytes from `0x55FF284`) between two functions, inside
+/// the mapped code.
+const SETTINGS_CAVE: u32 = 0x055f_f285;
+const SETTINGS_CAVE_LEN: usize = 59;
+
+/// Our code for the cave: the copy's store (as `vmovdqu`, the same store),
+/// then the three settings as Series S has them, with a 2560x1440 output, and
+/// the jump back after the patched site.
+fn settings_cave_bytes() -> Result<Vec<u8>> {
+    let pair = |w: u32, h: u32| (u64::from(h) << 32 | u64::from(w)).to_le_bytes();
+    let mut cave = Vec::with_capacity(SETTINGS_CAVE_LEN);
+    cave.extend_from_slice(&[0xc5, 0xfe, 0x7f, 0x86, 0x38, 0x06, 0, 0]); // vmovdqu [rsi+0x638], ymm0
+    cave.extend_from_slice(&[0xc6, 0x86, 0x38, 0x06, 0, 0, 0x01]); // mov byte [rsi+0x638], 1
+    cave.extend_from_slice(&[0x48, 0xb8]); // mov rax, legacy size
+    cave.extend_from_slice(&pair(LEGACY_UI_WIDTH, LEGACY_UI_HEIGHT));
+    cave.extend_from_slice(&[0x48, 0x89, 0x86, 0x3c, 0x06, 0, 0]); // mov [rsi+0x63c], rax
+    cave.extend_from_slice(&[0x48, 0xb8]); // mov rax, output size
+    cave.extend_from_slice(&pair(WIDTH, HEIGHT));
+    cave.extend_from_slice(&[0x48, 0x89, 0x86, 0x54, 0x06, 0, 0]); // mov [rsi+0x654], rax
+    cave.extend_from_slice(&[0xc5, 0xf8, 0x77]); // vzeroupper
+    let back = i64::from(SETTINGS_COPY) + SETTINGS_COPY_LEN as i64 - (i64::from(SETTINGS_CAVE) + cave.len() as i64 + 5);
+    cave.push(0xe9); // jmp back
+    cave.extend_from_slice(&i32::try_from(back)?.to_le_bytes());
+    ensure!(cave.len() <= SETTINGS_CAVE_LEN, "settings cave code too long");
+    Ok(cave)
+}
+
+/// `jmp cave` and NOPs over the copy's last store.
+fn settings_copy_bytes() -> Result<[u8; SETTINGS_COPY_LEN]> {
+    let mut site = [0x90; SETTINGS_COPY_LEN];
+    site[0] = 0xe9;
+    let to = i64::from(SETTINGS_CAVE) - (i64::from(SETTINGS_COPY) + 5);
+    site[1..5].copy_from_slice(&i32::try_from(to)?.to_le_bytes());
+    Ok(site)
+}
 
 /// Bytes of one 64 KiB-aligned, 64 KiB-tiled RGBA8 UI surface.
 fn ui_surface_bytes(width: u32, height: u32) -> Result<u64> {
@@ -74,10 +115,10 @@ pub(super) fn prepare(image: &mut PreparedImage, render_1080p: bool) -> Result<(
         "1440p output is only known for the retail build {RETAIL_BUILD}"
     );
 
-    let mode = field::<16>(image, SDR_MODE)?;
-    ensure!(same(&mode[..], STOCK_SDR_MODE), "unexpected Series X SDR mode");
-    mode[..4].copy_from_slice(&WIDTH.to_le_bytes());
-    mode[4..8].copy_from_slice(&HEIGHT.to_le_bytes());
+    // The SDR mode stays at stock 3840x2160: the pause map's targets and the
+    // title's screen size follow the layout size, which stays 4K as on
+    // Series S. Only checked here.
+    ensure!(same(&field::<16>(image, SDR_MODE)?[..], STOCK_SDR_MODE), "unexpected Series X SDR mode");
 
     // With the legacy UI flag set, the UI setup makes two 3840x2160 legacy
     // UI surfaces and two 2560x1440 UI targets in one pool, and asserts that
@@ -93,15 +134,17 @@ pub(super) fn prepare(image: &mut PreparedImage, render_1080p: bool) -> Result<(
     ensure!(*pool == [0xb9, 0, 0, 0, 4], "unexpected Series X UI pool size");
     pool[1..].copy_from_slice(&pool_size.to_le_bytes());
 
-    // The legacy UI flag set on Series X too: the preset's byte loads as 1
-    // (`mov al, 1`), and the settings update stores 1 (`mov byte [rsi+0x13c],
-    // 1`). The rest of the preset stays Series X.
-    let preset = field::<6>(image, LEGACY_UI_PRESET)?;
-    ensure!(same(&preset[..], STOCK_LEGACY_UI_PRESET), "unexpected legacy UI preset load");
-    *preset = [0xb0, 0x01, 0x90, 0x90, 0x90, 0x90];
-    let store = field::<7>(image, LEGACY_UI_FLAG_STORE)?;
-    ensure!(same(&store[..], STOCK_LEGACY_UI_FLAG_STORE), "unexpected legacy UI flag store");
-    *store = [0xc6, 0x86, 0x3c, 0x01, 0x00, 0x00, 0x01];
+    // The output settings as Series S's preset has them (legacy UI flag 1,
+    // legacy UI size 3840x2160), with a 2560x1440 output, written into the
+    // title's settings each time they are stored. The rest of the preset
+    // stays Series X.
+    let site = field::<SETTINGS_COPY_LEN>(image, SETTINGS_COPY)?;
+    ensure!(same(&site[..], STOCK_SETTINGS_COPY), "unexpected settings copy");
+    let cave = field::<SETTINGS_CAVE_LEN>(image, SETTINGS_CAVE)?;
+    ensure!(cave.iter().all(|b| *b == 0xcc), "settings cave is not free padding");
+    let code = settings_cave_bytes()?;
+    cave[..code.len()].copy_from_slice(&code);
+    *field::<SETTINGS_COPY_LEN>(image, SETTINGS_COPY)? = settings_copy_bytes()?;
 
     let scale = field::<4>(image, TEMPORAL_SCALE)?;
     ensure!(*scale == (2.0f32 / 3.0).to_le_bytes(), "unexpected Series X temporal scene scale");
@@ -201,19 +244,19 @@ mod tests {
         for (render_1080p, scene) in [(false, (2560, 1440)), (true, (1920, 1080))] {
             let mut image = victory_loader::prepare(&bytes).unwrap();
             assert_eq!(prepare(&mut image, render_1080p).unwrap(), scene);
-            let mode = *field::<16>(&mut image, SDR_MODE).unwrap();
-            assert_eq!(mode[..4], WIDTH.to_le_bytes());
-            assert_eq!(mode[4..8], HEIGHT.to_le_bytes());
+            assert!(same(&field::<16>(&mut image, SDR_MODE).unwrap()[..], STOCK_SDR_MODE));
             let scale = f32::from_le_bytes(*field::<4>(&mut image, TEMPORAL_SCALE).unwrap());
             assert_eq!((WIDTH as f32 * scale) as u32, scene.0);
             // The UI pool holds two legacy surfaces and two 1440p targets.
             assert_eq!(*field::<5>(&mut image, UI_POOL).unwrap(), [0xb9, 0x00, 0x00, 0xe0, 0x05]);
-            // The legacy UI flag is set from the preset and by the update.
-            assert_eq!(*field::<6>(&mut image, LEGACY_UI_PRESET).unwrap(), [0xb0, 0x01, 0x90, 0x90, 0x90, 0x90]);
-            assert_eq!(
-                *field::<7>(&mut image, LEGACY_UI_FLAG_STORE).unwrap(),
-                [0xc6, 0x86, 0x3c, 0x01, 0x00, 0x00, 0x01]
-            );
+            // The settings copy jumps to the cave, whose jump comes back
+            // right after the patched site.
+            assert_eq!(*field::<SETTINGS_COPY_LEN>(&mut image, SETTINGS_COPY).unwrap(), settings_copy_bytes().unwrap());
+            let code = settings_cave_bytes().unwrap();
+            let cave = *field::<SETTINGS_CAVE_LEN>(&mut image, SETTINGS_CAVE).unwrap();
+            assert_eq!(cave[..code.len()], code[..]);
+            let back = i32::from_le_bytes(code[code.len() - 4..].try_into().unwrap());
+            assert_eq!((SETTINGS_CAVE + code.len() as u32).wrapping_add_signed(back), SETTINGS_COPY + SETTINGS_COPY_LEN as u32);
             // Patched once, the image is no longer the stock one: refused.
             assert!(prepare(&mut image, render_1080p).is_err());
         }
