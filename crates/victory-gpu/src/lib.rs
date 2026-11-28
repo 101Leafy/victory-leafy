@@ -85,6 +85,8 @@ mod safecopy;
 #[cfg(windows)]
 mod sampler;
 #[cfg(windows)]
+mod sampled;
+#[cfg(windows)]
 pub mod shader_cache;
 #[cfg(windows)]
 mod memory;
