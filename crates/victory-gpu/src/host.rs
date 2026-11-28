@@ -14972,20 +14972,24 @@ mod refresh_tests {
                 crate::watch::ask_once_end();
                 copied
             };
-            assert_eq!(look(false, "never taken"), len);
+            // With VICTORY_WHOLE_PAGES (on by default) a watched copy's refresh
+            // takes the pages the range touches, so its ends too.
+            let whole = std::env::var_os("VICTORY_WHOLE_PAGES").is_none_or(|v| v != "0");
+            let part = if view { PAGE } else { 4096 };
+            assert_eq!(look(false, "never taken"), if whole { 6 * PAGE } else { len });
             assert_eq!(look(true, "taken"), 0);
             assert_eq!(look(true, "taken"), 0);
             // SAFETY: the test's own memory.
             unsafe { ((region + 600) as *mut u8).write_volatile(1) };
             // (The kernel names the 4 KiB, the guards only the block.)
-            assert_eq!(look(false, "written at its end"), if view { PAGE } else { 4096 } - 500);
+            assert_eq!(look(false, "written at its end"), if whole { part } else { part - 500 });
             assert_eq!(look(true, "taken again"), 0);
             // Outside the range, on its last page.
             // SAFETY: as above.
             unsafe { ((region + 5 * PAGE + 600) as *mut u8).write_volatile(1) };
-            assert_eq!(look(false, "written on its last page"), 500);
+            assert_eq!(look(false, "written on its last page"), if whole { part } else { 500 });
             // A longer range was never taken whole.
-            assert!(!copy.nothing_new(region, 6 * PAGE));
+            assert!(!copy.nothing_new(region, if whole { 7 * PAGE } else { 6 * PAGE }));
         }
     }
 
