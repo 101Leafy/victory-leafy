@@ -687,6 +687,7 @@ fn since_epoch_us() -> u64 {
 
 /// A frame reached our window.
 pub(crate) fn presented() {
+    held_limit();
     PRESENTED_US.store(since_epoch_us() + 1, Ordering::Relaxed);
 }
 
@@ -700,8 +701,13 @@ pub(crate) fn presented() {
 fn held_limit() -> Option<Duration> {
     static LIMIT: OnceLock<Option<Duration>> = OnceLock::new();
     *LIMIT.get_or_init(|| {
-        let millis = std::env::var("VICTORY_HELD_FRAME_MS").ok()?.trim().parse::<u64>().ok()?;
-        (millis > 0).then(|| Duration::from_millis(millis))
+        let raw = std::env::var("VICTORY_HELD_FRAME_MS").unwrap_or_default();
+        let limit = raw.trim().parse::<u64>().ok().filter(|&m| m > 0).map(Duration::from_millis);
+        match limit {
+            Some(l) => eprintln!("VICTORY_HELD_FRAME_MS={raw:?}: pipeline waits stop after {} ms without a present", l.as_millis()),
+            None => eprintln!("VICTORY_HELD_FRAME_MS={raw:?}: off"),
+        }
+        limit
     })
 }
 
