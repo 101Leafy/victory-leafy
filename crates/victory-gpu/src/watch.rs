@@ -1085,17 +1085,12 @@ static TO_SETTLE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsiz
 /// block another thread is opening waits for that one (100 microseconds at
 /// most), and one with every view of its page to open
 /// (`VICTORY_OPEN_ONE_VIEW=0`) goes the locked way.
-fn unlocked_from_env(val: Option<&std::ffi::OsStr>) -> bool {
-    val.is_none_or(|v| v != "0")
-}
-
 fn unlocked() -> bool {
     #[cfg(test)]
     if UNLOCKED_IN_TEST.get() {
         return true;
     }
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| unlocked_from_env(std::env::var_os("VICTORY_FAULT_UNLOCKED").as_deref()))
+    crate::toggled!("VICTORY_FAULT_UNLOCKED")
 }
 
 #[cfg(test)]
@@ -2019,9 +2014,11 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
             came.push((block, is_view(block * BLOCK, (block + 1) * BLOCK)));
         }
     }
-    let soft = soft_runs(first * BLOCK, (last - first) * BLOCK);
     let rest = rest();
     let mut g = guards_timed();
+    // Read under the lock: a view made real meanwhile (`title_memory_made_real`, which
+    // opens it under this lock) must not be taken as still soft, guarded with no protection.
+    let soft = soft_runs(first * BLOCK, (last - first) * BLOCK);
     #[cfg(feature = "diagnostics")]
     tally(4, 1);
     for &(block, view) in &came {
@@ -5286,14 +5283,5 @@ mod many_askers_tests {
         BITS.clear_all(0, usize::MAX);
         assert!(!BITS.any(0, 1 << 31));
         assert!(!BITS.swap_on(70) && BITS.swap_on(70) && BITS.all(70, 71));
-    }
-
-    #[test]
-    fn unlocked_defaults_on_unless_zero() {
-        use std::ffi::OsStr;
-        assert!(super::unlocked_from_env(None));
-        assert!(super::unlocked_from_env(Some(OsStr::new(""))));
-        assert!(super::unlocked_from_env(Some(OsStr::new("1"))));
-        assert!(!super::unlocked_from_env(Some(OsStr::new("0"))));
     }
 }
