@@ -932,7 +932,15 @@ mod tests {
         let p = Arc::new(p);
 
         assert!(!super::super::library::wanted_early(&p.key));
-        assert!(ready(&p).is_none());
+        let r = ready(&p);
+        if compute_waits() {
+            // A compute pipeline is made on the asking thread (#243,
+            // `VICTORY_PIPELINE_COMPUTE_WAIT`, on by default): nothing waits
+            // for the next launch.
+            assert!(p.made.get().is_some());
+            return;
+        }
+        assert!(r.is_none());
         assert!(p.made.get().is_none());
         assert!(super::super::library::wanted_early(&p.key));
     }
