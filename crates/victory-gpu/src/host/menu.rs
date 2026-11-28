@@ -118,11 +118,12 @@ const S_RES: &str = "VICTORY_MENU_S_RES";
 /// The Series S scene sizes and the DLSS mode of each (the picture is 1920x1080). Only DLSS
 /// changes it: the title's own FidelityFX path from 540 stopped it at the start (0xc0000094,
 /// a division by zero in the title, 2026-11-28), so with DLSS off the scene stays at 720.
-const S_MODES: [(&str, &str); 4] = [("1080", "dlaa"), ("720", "quality"), ("626", "balanced"), ("540", "performance")];
+const S_MODES: [(&str, &str); 5] =
+    [("1080", "dlaa"), ("720", "quality"), ("626", "balanced"), ("540", "performance"), ("360", "ultraperformance")];
 const ABOUT_S_RES: [&str; 3] = [
     "THE SIZE THE GAME RENDERS AT. THE PICTURE IS 1920X1080.",
-    "OTHER THAN 720 NEEDS DLSS: THIS SETS ITS MODE (1080 IS",
-    "DLAA, 720 QUALITY, 626 BALANCED, 540 PERFORMANCE).",
+    "OTHER THAN 720 NEEDS DLSS, AND SETS ITS MODE: 1080 DLAA, 720",
+    "QUALITY, 626 BALANCED, 540 PERFORMANCE, 360 ULTRA PERF.",
 ];
 /// The note after the first Enter on it: the second one does it.
 const CONFIRM_PRELOAD: &str = "ENTER AGAIN: SAVE, CLOSE THE GAME AND PRELOAD";
@@ -148,7 +149,7 @@ const STAGES: &[(&str, &str)] = &[("2", "2"), ("1", "1"), ("0", "0 OFF")];
 #[rustfmt::skip]
 const ITEMS: &[Item] = &[
     // The launcher's own choices.
-    Item { var: "VICTORY_MENU_DLSS", label: "DLSS", values: &[("quality", "QUALITY"), ("balanced", "BALANCED"), ("performance", "PERFORMANCE"), ("dlaa", "DLAA (NATIVE)"), ("off", "OFF")], live: false },
+    Item { var: "VICTORY_MENU_DLSS", label: "DLSS", values: &[("quality", "QUALITY"), ("balanced", "BALANCED"), ("performance", "PERFORMANCE"), ("ultraperformance", "ULTRA PERFORMANCE"), ("dlaa", "DLAA (NATIVE)"), ("off", "OFF")], live: false },
     Item { var: "VICTORY_MENU_FRAMEGEN", label: "FRAME GENERATION", values: &[("0", "OFF"), ("2", "2X"), ("3", "3X"), ("4", "4X"), ("5", "5X"), ("6", "6X (MOST)")], live: false },
     // DLSS Frame Generation where it runs (RTX 40 and later), else AMD's FSR 3 (2X only).
     Item { var: "VICTORY_MENU_FG_TYPE", label: "FRAME GEN TYPE", values: &[("auto", "AUTO"), ("dlss", "DLSS"), ("fsr", "FSR 3 (OLDER CARDS)")], live: false },
@@ -166,7 +167,7 @@ const ITEMS: &[Item] = &[
     Item { var: "VICTORY_MENU_CONSOLE", label: "CONSOLE", values: &[("series-x", "SERIES X"), ("series-s", "SERIES S (FASTER)")], live: false },
     Item { var: X_RES, label: "SERIES X PICTURE", values: &[("1440", "2560X1440"), ("1080to1440", "1080P TO 1440P"), ("4k", "3840X2160")], live: false },
     // In place of SERIES X PICTURE when CONSOLE is Series S.
-    Item { var: S_RES, label: "SERIES S PICTURE", values: &[("1080", "1920X1080 (DLAA)"), ("720", "1280X720 (THE GAME)"), ("626", "1113X626"), ("540", "960X540 (FASTEST)")], live: false },
+    Item { var: S_RES, label: "SERIES S PICTURE", values: &[("1080", "1920X1080 (DLAA)"), ("720", "1280X720 (THE GAME)"), ("626", "1113X626"), ("540", "960X540"), ("360", "640X360 (FASTEST)")], live: false },
     // The layer's switches.
     Item { var: "VICTORY_DLSS_PRESET", label: "DLSS MODEL", values: &[("", "DEFAULT"), ("k", "K"), ("j", "J"), ("m", "M"), ("l", "L")], live: false },
     Item { var: "VICTORY_AMBIENT", label: "LIGHT ESTIMATE", values: &[("0.8", "0.8"), ("1", "1"), ("0.5", "0.5"), ("", "OFF")], live: false },

@@ -78,6 +78,22 @@ impl Mode {
     pub fn render_size(self, output: [u32; 2]) -> [u32; 2] {
         output.map(|v| (v as f32 * self.scale()) as u32)
     }
+
+    /// The mode whose scene for `output` is `size` (within a pixel), if one is.
+    pub fn of_size(size: [u32; 2], output: [u32; 2]) -> Option<Self> {
+        [Mode::Dlaa, Mode::Quality, Mode::Balanced, Mode::Performance, Mode::UltraPerformance]
+            .into_iter()
+            .find(|m| m.render_size(output).iter().zip(size).all(|(a, b)| a.abs_diff(b) <= 1))
+    }
+}
+
+/// The one render size DLSS answered for every mode, if it answered the same for all.
+/// A driver-side DLSS override (the NVIDIA App's) does that: on an RTX 3060 with the
+/// override at ultra performance, 640x360 for a 1920x1080 output, as optimal, minimum
+/// and maximum alike, so no other scene size is taken.
+pub fn one_size_for_all(sizes: &[(u32, Option<[u32; 2]>)]) -> Option<[u32; 2]> {
+    let first = sizes.first()?.1?;
+    (sizes.len() > 1 && sizes.iter().all(|s| s.1 == Some(first))).then_some(first)
 }
 
 /// `VICTORY_DLSS_PRESET`: the DLSS model for every mode (`sl::DLSSPreset`).
@@ -383,6 +399,31 @@ mod tests {
         assert_eq!(pick_mode([2561, 1440], out, optimal_1440p), None);
         assert_eq!(pick_mode([0, 1440], out, optimal_1440p), None);
         assert_eq!(pick_mode([1280, 720], out, |_| None), None);
+    }
+
+    #[test]
+    fn one_size_for_every_mode_is_told_with_its_mode() {
+        let out = [1920, 1080];
+        // A driver override: 640x360 for every mode, so a 960x540 scene fits none.
+        let fixed: Vec<(u32, Option<[u32; 2]>)> = MODES.iter().map(|&m| (m, Some([640, 360]))).collect();
+        assert_eq!(pick_mode([960, 540], out, |m| fixed.iter().find(|s| s.0 == m).and_then(|s| s.1)), None);
+        assert_eq!(one_size_for_all(&fixed), Some([640, 360]));
+        assert_eq!(Mode::of_size([640, 360], out), Some(Mode::UltraPerformance));
+        assert_eq!(pick_mode([640, 360], out, |m| fixed.iter().find(|s| s.0 == m).and_then(|s| s.1)), Some(MODES[0]));
+        // Sizes of their own, a missing answer or a single mode: not one size.
+        let s = |mode: u32| optimal_1440p(mode).map(|[w, h]| [w * 3 / 4, h * 3 / 4]);
+        let own: Vec<(u32, Option<[u32; 2]>)> = MODES.iter().map(|&m| (m, s(m))).collect();
+        assert_eq!(one_size_for_all(&own), None);
+        let mut gap = fixed.clone();
+        gap[2].1 = None;
+        assert_eq!(one_size_for_all(&gap), None);
+        assert_eq!(one_size_for_all(&fixed[..1]), None);
+        assert_eq!(one_size_for_all(&[]), None);
+        // Each mode's own scene is found again; a size of none is not.
+        for mode in [Mode::Dlaa, Mode::Quality, Mode::Balanced, Mode::Performance, Mode::UltraPerformance] {
+            assert_eq!(Mode::of_size(mode.render_size(out), out), Some(mode));
+        }
+        assert_eq!(Mode::of_size([1000, 600], out), None);
     }
 
     #[test]
