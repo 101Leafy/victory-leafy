@@ -3927,10 +3927,10 @@ pub(crate) fn texture_kind(this: This) -> Option<(u64, u32, u32)> {
 
 /// Texture `this`'s console layout (one plane), where it lies in title
 /// memory and the bytes that layout takes, for `crate::texback`; `None` for
-/// a buffer or a texture with planes. An `R32_FLOAT` texture at a 64 KiB
-/// boundary in `SW_64KB_R_X` (the ocean's height map) is addressed with the
-/// console's pipes and packers
-/// ([`victory_formats::texture::Layout::configure_render_xor`]).
+/// a buffer or a texture with planes. A texture in an XOR mode at a block
+/// boundary (as the ocean's height map in `SW_64KB_R_X`) is addressed with
+/// the console's pipes and packers
+/// ([`victory_formats::texture::Layout::configure_xor`]).
 #[cfg(windows)]
 pub(crate) fn title_texture(this: This) -> Option<(victory_formats::texture::Layout, usize, usize)> {
     if this.is_null() {
@@ -3943,14 +3943,9 @@ pub(crate) fn title_texture(this: This) -> Option<(victory_formats::texture::Lay
     let t = texture_layout(&r.desc)?;
     let [mut plane]: [_; 1] = t.planes.try_into().ok()?;
     let at = r.data() as usize;
-    const R32_FLOAT: u32 = 41;
-    if r.desc.format == R32_FLOAT && at.is_multiple_of(65536) {
-        use victory_formats::texture::RenderPipeConfig;
-        let pipes = match crate::console::current() {
-            crate::console::Console::SeriesS => RenderPipeConfig::Pipes8Packers4,
-            crate::console::Console::SeriesX => RenderPipeConfig::Pipes32Packers8,
-        };
-        plane.layout.configure_render_xor(pipes);
+    // The XOR modes' addresses assume a block-aligned start.
+    if at.is_multiple_of(plane.layout.alignment as usize) {
+        plane.layout.configure_xor(crate::console::current().pipes());
     }
     Some((plane.layout, at, t.size as usize))
 }
@@ -4422,11 +4417,11 @@ mod tests {
 
     #[test]
     #[cfg(windows)]
-    fn the_ocean_height_map_layout_is_addressed_at_a_64_kib_boundary() {
-        // SW_4KB_S always; SW_64KB_R_X only at a 64 KiB boundary; SW_64KB_S_X
-        // not (no XOR mode but that one has addresses yet).
+    fn xor_layouts_are_addressed_at_a_block_boundary() {
+        // SW_4KB_S always; the XOR modes (SW_64KB_R_X, SW_64KB_S_X) only at
+        // a 64 KiB boundary.
         for (swizzle, bias, addressable) in [(0x105, 0, true), (0x11b, 0, true),
-            (0x11b, 256, false), (0x119, 0, false)] {
+            (0x11b, 256, false), (0x119, 0, true), (0x119, 4096, false)] {
             let desc = ResourceDesc { layout: swizzle, flags: 4, ..texture(256, 256, 41, 1) };
             let bytes = footprint(&desc).unwrap().size as usize;
             let memory = vec![0u8; bytes + 65536 + bias];
