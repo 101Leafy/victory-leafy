@@ -3468,6 +3468,9 @@ mod tests {
         // SAFETY: mapped read-write.
         let shown = unsafe { ((at(b, 1) as *const u8).read(), (at(b, 2) as *const u8).read()) };
         assert_eq!(shown, (44, 44));
+        assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
+    }
+
     /// Lazy views (`VICTORY_LAZY_VIEWS`): mapped in the books, told of, a
     /// placeholder of their own on the host until touched; a touch (a read
     /// that faults, the GPU side's or the title's own questions) maps them,
